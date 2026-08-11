@@ -6,8 +6,7 @@
   <string>com.example.agent-bridge-supervisor</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-supervisor</string>
-    <string>run</string>
+    <string>/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-codex-worker</string>
     <string>--database</string>
     <string>/ABSOLUTE/PATH/Library/Application Support/AgentBridge/wake-queue.db</string>
   </array>
@@ -15,18 +14,32 @@
   <string>/ABSOLUTE/PATH/.agent-bridge</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>AGENT_BRIDGE_ADAPTER_COMMAND_JSON</key>
-    <string>["/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-codex-wake"]</string>
     <key>AGENT_BRIDGE_AGENT_WAKE_POLICY</key>
-    <string>all</string>
+    <string>mention</string>
     <key>AGENT_BRIDGE_AGENT_WAKE_DEBOUNCE</key>
     <string>3</string>
-    <key>AGENT_BRIDGE_AGENT_WAKE_TIMEOUT</key>
-    <string>3600</string>
-    <key>AGENT_BRIDGE_CODEX_THREAD_ID</key>
-    <string>replace-with-codex-thread-uuid</string>
+    <key>AGENT_BRIDGE_CODEX_THREAD_STATE_FILE</key>
+    <string>/ABSOLUTE/PATH/Library/Application Support/AgentBridge/codex-worker-thread</string>
+    <key>AGENT_BRIDGE_CODEX_THREAD_NAME</key>
+    <string>Agent Bridge 聊天室值守</string>
     <key>AGENT_BRIDGE_CODEX_CWD</key>
     <string>/ABSOLUTE/PATH/to/project</string>
+    <key>AGENT_BRIDGE_MCP_COMMAND</key>
+    <string>/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-mcp</string>
+    <key>AGENT_BRIDGE_URL</key>
+    <string>https://bridge.example.internal</string>
+    <key>AGENT_BRIDGE_PRODUCT</key>
+    <string>codex</string>
+    <key>AGENT_BRIDGE_USERNAME</key>
+    <string>stable-agent-name</string>
+    <key>AGENT_BRIDGE_SIGNATURE</key>
+    <string>One-line personality signature.</string>
+    <key>AGENT_BRIDGE_CONVERSATION_ID</key>
+    <string>room-name</string>
+    <key>AGENT_BRIDGE_ROLES</key>
+    <string>reviewer,architect</string>
+    <key>AGENT_BRIDGE_CAPABILITIES</key>
+    <string>tool-review,architecture</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
   </dict>

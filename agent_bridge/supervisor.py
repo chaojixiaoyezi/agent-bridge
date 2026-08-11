@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -195,12 +196,24 @@ def _connect(database: Path) -> sqlite3.Connection:
             claimed_at REAL,
             handled_at REAL,
             attempt_count INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT
+            last_error TEXT,
+            claim_owner TEXT,
+            adapter_run_id TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_wake_events_dispatch
             ON wake_events(state, available_at, created_at);
+        CREATE INDEX IF NOT EXISTS idx_wake_events_priority_dispatch
+            ON wake_events(state, available_at, priority, created_at);
         """
     )
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(wake_events)").fetchall()
+    }
+    if "claim_owner" not in columns:
+        connection.execute("ALTER TABLE wake_events ADD COLUMN claim_owner TEXT")
+    if "adapter_run_id" not in columns:
+        connection.execute("ALTER TABLE wake_events ADD COLUMN adapter_run_id TEXT")
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -211,7 +224,7 @@ def _connect(database: Path) -> sqlite3.Connection:
 def enqueue_event(database: Path, raw: bytes, *, now: float | None = None) -> bool:
     payload, encoded, idempotency_key = _validated_envelope(raw)
     created_at = float(time.time() if now is None else now)
-    with _connect(database) as connection:
+    with closing(_connect(database)) as connection:
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO wake_events
@@ -234,7 +247,7 @@ def enqueue_event(database: Path, raw: bytes, *, now: float | None = None) -> bo
 
 
 def queue_status(database: Path) -> dict[str, Any]:
-    with _connect(database) as connection:
+    with closing(_connect(database)) as connection:
         counts = {
             str(row["state"]): int(row["count"])
             for row in connection.execute(
@@ -244,6 +257,15 @@ def queue_status(database: Path) -> dict[str, Any]:
         newest = connection.execute(
             "SELECT MAX(event_id) AS event_id FROM wake_events"
         ).fetchone()
+        active_runs = int(
+            connection.execute(
+                """
+                SELECT COUNT(DISTINCT adapter_run_id) AS count
+                FROM wake_events
+                WHERE state = 'inflight' AND adapter_run_id IS NOT NULL
+                """
+            ).fetchone()["count"]
+        )
     return {
         "database": str(database.expanduser().resolve()),
         "counts": {
@@ -253,6 +275,7 @@ def queue_status(database: Path) -> dict[str, Any]:
             "handled": counts.get("handled", 0),
         },
         "newest_event_id": newest["event_id"] if newest is not None else None,
+        "active_adapter_runs": active_runs,
     }
 
 
@@ -268,6 +291,7 @@ def _claim_batch(
     debounce: float,
     now: float,
     limit: int = 256,
+    claim_owner: str | None = None,
 ) -> list[sqlite3.Row]:
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -276,6 +300,7 @@ def _claim_batch(
             UPDATE wake_events
             SET state = 'pending', claimed_at = NULL,
                 available_at = MIN(available_at, ?),
+                claim_owner = NULL, adapter_run_id = NULL,
                 last_error = COALESCE(last_error, 'recovered stale inflight event')
             WHERE state = 'inflight' AND claimed_at < ?
             """,
@@ -285,7 +310,14 @@ def _claim_batch(
             """
             SELECT * FROM wake_events
             WHERE state IN ('pending', 'deferred') AND available_at <= ?
-            ORDER BY created_at, idempotency_key
+            ORDER BY
+                CASE priority
+                    WHEN 'mention' THEN 2
+                    WHEN 'important' THEN 1
+                    ELSE 0
+                END DESC,
+                created_at,
+                idempotency_key
             LIMIT ?
             """,
             (now, max(1, min(int(limit), 1000))),
@@ -293,7 +325,14 @@ def _claim_batch(
         if not rows:
             connection.execute("COMMIT")
             return []
-        newest_created_at = max(float(row["created_at"]) for row in rows)
+        highest_priority = max(
+            PRIORITIES[str(row["priority"])] for row in rows
+        )
+        newest_created_at = max(
+            float(row["created_at"])
+            for row in rows
+            if PRIORITIES[str(row["priority"])] == highest_priority
+        )
         if newest_created_at + max(0.0, debounce) > now:
             connection.execute("COMMIT")
             return []
@@ -309,10 +348,11 @@ def _claim_batch(
         connection.executemany(
             """
             UPDATE wake_events
-            SET state = 'inflight', claimed_at = ?, attempt_count = attempt_count + 1
+            SET state = 'inflight', claimed_at = ?, attempt_count = attempt_count + 1,
+                claim_owner = ?, adapter_run_id = NULL
             WHERE idempotency_key = ?
             """,
-            [(now, key) for key in keys],
+            [(now, claim_owner, key) for key in keys],
         )
         connection.execute("COMMIT")
         return rows
@@ -324,7 +364,9 @@ def _claim_batch(
 def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
     priorities = Counter(str(row["priority"]) for row in rows)
     highest = max(priorities, key=lambda priority: PRIORITIES[priority])
-    event_ids = [int(row["event_id"]) for row in rows if row["event_id"] is not None]
+    event_ids = sorted(
+        int(row["event_id"]) for row in rows if row["event_id"] is not None
+    )
     payload = {
         "schema_version": 1,
         "source": "agent-bridge-supervisor",
@@ -349,6 +391,140 @@ def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def claim_batch(
+    database: Path,
+    *,
+    wake_policy: str,
+    debounce: float,
+    claim_owner: str,
+    now: float | None = None,
+    limit: int = 256,
+) -> list[sqlite3.Row]:
+    current_time = float(time.time() if now is None else now)
+    with closing(_connect(database)) as connection:
+        return _claim_batch(
+            connection,
+            wake_policy=wake_policy,
+            debounce=max(0.0, min(float(debounce), 300.0)),
+            now=current_time,
+            limit=limit,
+            claim_owner=claim_owner,
+        )
+
+
+def recover_inflight(
+    database: Path,
+    *,
+    reason: str,
+    now: float | None = None,
+) -> int:
+    current_time = float(time.time() if now is None else now)
+    detail = str(reason or "adapter owner restarted")[-1000:]
+    with closing(_connect(database)) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE wake_events
+            SET state = 'pending', claimed_at = NULL,
+                available_at = MIN(available_at, ?),
+                claim_owner = NULL, adapter_run_id = NULL,
+                last_error = ?
+            WHERE state = 'inflight'
+            """,
+            (current_time, detail),
+        )
+        return int(cursor.rowcount)
+
+
+def attach_adapter_run(
+    database: Path,
+    *,
+    idempotency_keys: Sequence[str],
+    claim_owner: str,
+    adapter_run_id: str,
+) -> int:
+    keys = tuple(str(key) for key in idempotency_keys)
+    if not keys:
+        return 0
+    run_id = str(adapter_run_id or "").strip()
+    if not run_id:
+        raise SupervisorError("adapter run id is required")
+    with closing(_connect(database)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor_count = 0
+            for key in keys:
+                cursor = connection.execute(
+                    """
+                    UPDATE wake_events
+                    SET adapter_run_id = ?
+                    WHERE idempotency_key = ? AND state = 'inflight'
+                      AND claim_owner = ?
+                    """,
+                    (run_id, key, claim_owner),
+                )
+                cursor_count += int(cursor.rowcount)
+            if cursor_count != len(keys):
+                raise SupervisorError(
+                    "wake batch ownership changed before adapter attachment"
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+    return cursor_count
+
+
+def finish_adapter_run(
+    database: Path,
+    *,
+    adapter_run_id: str,
+    successful: bool,
+    error: str | None = None,
+    now: float | None = None,
+) -> int:
+    current_time = float(time.time() if now is None else now)
+    run_id = str(adapter_run_id or "").strip()
+    if not run_id:
+        raise SupervisorError("adapter run id is required")
+    with closing(_connect(database)) as connection:
+        rows = connection.execute(
+            """
+            SELECT idempotency_key, attempt_count
+            FROM wake_events
+            WHERE state = 'inflight' AND adapter_run_id = ?
+            """,
+            (run_id,),
+        ).fetchall()
+        if not rows:
+            return 0
+        if successful:
+            cursor = connection.execute(
+                """
+                UPDATE wake_events
+                SET state = 'handled', handled_at = ?, claimed_at = NULL,
+                    claim_owner = NULL, adapter_run_id = NULL, last_error = NULL
+                WHERE state = 'inflight' AND adapter_run_id = ?
+                """,
+                (current_time, run_id),
+            )
+            return int(cursor.rowcount)
+        highest_attempt = max(int(row["attempt_count"]) for row in rows)
+        retry_at = current_time + min(
+            300.0,
+            max(1.0, 2.0 ** min(max(highest_attempt, 1), 8)),
+        )
+        cursor = connection.execute(
+            """
+            UPDATE wake_events
+            SET state = 'pending', claimed_at = NULL, available_at = ?,
+                claim_owner = NULL, adapter_run_id = NULL, last_error = ?
+            WHERE state = 'inflight' AND adapter_run_id = ?
+            """,
+            (retry_at, str(error or "adapter turn failed")[-1000:], run_id),
+        )
+        return int(cursor.rowcount)
 
 
 def _run_adapter(
@@ -391,12 +567,13 @@ def process_once(
     now: float | None = None,
 ) -> int:
     current_time = float(time.time() if now is None else now)
-    with _connect(database) as connection:
+    with closing(_connect(database)) as connection:
         rows = _claim_batch(
             connection,
             wake_policy=wake_policy,
             debounce=debounce,
             now=current_time,
+            claim_owner=f"sync:{os.getpid()}",
         )
         if not rows:
             return 0
@@ -417,7 +594,7 @@ def process_once(
                 """
                 UPDATE wake_events
                 SET state = 'pending', claimed_at = NULL, available_at = ?,
-                    last_error = ?
+                    claim_owner = NULL, adapter_run_id = NULL, last_error = ?
                 WHERE idempotency_key = ?
                 """,
                 [(retry_at, str(exc)[-1000:], key) for key in keys],
@@ -427,7 +604,7 @@ def process_once(
             """
             UPDATE wake_events
             SET state = 'handled', handled_at = ?, claimed_at = NULL,
-                last_error = NULL
+                claim_owner = NULL, adapter_run_id = NULL, last_error = NULL
             WHERE idempotency_key = ?
             """,
             [(current_time, key) for key in keys],

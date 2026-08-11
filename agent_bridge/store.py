@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -776,6 +777,59 @@ class BridgeStore:
                 f"mentions cannot contain more than {MAX_MENTIONS_PER_MESSAGE} entries"
             )
         return normalized
+
+    @staticmethod
+    def _infer_text_mentions_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        body_text: str,
+    ) -> list[str]:
+        """Normalize exact visible @aliases into structured public mentions.
+
+        Explicit participant IDs remain authoritative. This compatibility path
+        exists for Agent clients that visibly write ``@name`` but forget the
+        structured ``mentions`` argument. Ambiguous aliases are ignored.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT participant.participant_id,
+                   participant.client_type,
+                   participant.display_name
+            FROM memberships AS membership
+            JOIN participants AS participant
+              ON participant.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND membership.active = 1
+              AND participant.participant_id != ?
+            """,
+            (conversation_id, sender_participant_id),
+        ).fetchall()
+        alias_targets: dict[str, set[str]] = {}
+        alias_display: dict[str, str] = {}
+        for row in rows:
+            participant_id = str(row["participant_id"])
+            for candidate in (row["client_type"], row["display_name"]):
+                visible = str(candidate or "").strip()
+                if not visible:
+                    continue
+                folded = visible.casefold()
+                alias_targets.setdefault(folded, set()).add(participant_id)
+                alias_display.setdefault(folded, visible)
+        inferred: list[str] = []
+        for folded, targets in alias_targets.items():
+            if len(targets) != 1:
+                continue
+            visible = alias_display[folded]
+            pattern = (
+                rf"(?<![\w@])@{re.escape(visible)}"
+                r"(?=$|[\s,，。.!！?？:：;；、)）\]】}>》])"
+            )
+            if re.search(pattern, body_text, flags=re.IGNORECASE):
+                inferred.append(next(iter(targets)))
+        return sorted(set(inferred))
 
     @staticmethod
     def _backfill_implicit_participant_mentions(conn: sqlite3.Connection) -> None:
@@ -2127,6 +2181,19 @@ class BridgeStore:
                     now=now,
                 )
                 self._require_membership(conn, sender, conversation)
+            for inferred in self._infer_text_mentions_locked(
+                conn,
+                conversation_id=conversation,
+                sender_participant_id=sender,
+                body_text=normalized_body,
+            ):
+                if inferred not in normalized_mentions:
+                    normalized_mentions.append(inferred)
+            if len(normalized_mentions) > MAX_MENTIONS_PER_MESSAGE:
+                raise ValidationError(
+                    "mentions cannot contain more than "
+                    f"{MAX_MENTIONS_PER_MESSAGE} entries"
+                )
             if normalized_audience == "participant":
                 self._require_membership(conn, normalized_target, conversation)
             if normalized_reply:
@@ -2696,7 +2763,14 @@ class BridgeStore:
                 WHERE delivery.participant_id = ?
                   AND delivery.state IN ('pending', 'delivered')
                   AND message.sender_participant_id != ?
-                ORDER BY message.sequence
+                ORDER BY
+                    CASE delivery.priority
+                        WHEN 'direct' THEN 2
+                        WHEN 'mention' THEN 2
+                        WHEN 'important' THEN 1
+                        ELSE 0
+                    END DESC,
+                    message.sequence
                 LIMIT 500
                 """,
                 (participant_id, participant_id),

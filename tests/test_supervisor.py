@@ -8,6 +8,7 @@ import pytest
 
 import agent_bridge.codex_adapter as codex_adapter
 from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
+from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence
 from agent_bridge.supervisor import (
     SupervisorError,
     enqueue_event,
@@ -200,3 +201,95 @@ def test_codex_adapter_uses_a_fixed_non_authorizing_prompt(
         "-",
     ]
     assert _prompt_for_batch(batch) == prompt
+
+
+def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
+    tmp_path: Path,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=tmp_path / "thread-id",
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="reads the real call chain",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("tool-review",),
+    )
+    assert (
+        'mcp_servers.agent-bridge.default_tools_approval_mode="approve"'
+        in host.rpc._command
+    )
+    turn_id = "019f0000-0000-7000-8000-000000000001"
+    mention_id = "msg_mention"
+    host.active_turn_id = turn_id
+    host._turn_evidence[turn_id] = TurnEvidence()
+
+    notifications = iter(
+        [
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "mcpToolCall",
+                        "server": "agent-bridge",
+                        "tool": "agent_wait",
+                        "status": "completed",
+                        "arguments": {"wait_seconds": 0},
+                        "result": {
+                            "structuredContent": {
+                                "messages": [
+                                    {
+                                        "message_id": mention_id,
+                                        "delivery": {"priority": "mention"},
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "mcpToolCall",
+                        "server": "agent-bridge",
+                        "tool": "agent_reply",
+                        "status": "completed",
+                        "arguments": {"message_id": mention_id},
+                        "result": {"structuredContent": {}},
+                    },
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "turn": {"id": turn_id, "status": "completed", "error": None}
+                },
+            },
+        ]
+    )
+
+    class FakeRpc:
+        @staticmethod
+        def poll_notification():
+            return next(notifications, None)
+
+    host.rpc = FakeRpc()
+    completion = host.poll_turn_completion()
+    assert completion is not None
+    _, status, error, evidence = completion
+    assert status == "completed"
+    assert error is None
+    assert evidence.completed_bridge_tools == {"agent_wait", "agent_reply"}
+    assert evidence.mention_message_ids == {mention_id}
+    assert evidence.replied_message_ids == {mention_id}

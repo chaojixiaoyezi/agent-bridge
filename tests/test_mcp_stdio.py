@@ -79,7 +79,10 @@ async def mcp_client(server_url: str, client_type: str):
         command=str(BRIDGE_ROOT / "bin" / "agent-bridge-mcp"),
         args=[],
         env=env,
-        cwd=str(BRIDGE_ROOT),
+        # Codex starts MCP servers from the task cwd, not the bridge checkout.
+        # Keep this integration test cross-directory so the launcher must make
+        # its own package import path authoritative.
+        cwd=str(BRIDGE_ROOT.parent),
     )
     async with stdio_client(parameters) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:

@@ -149,6 +149,68 @@ def test_room_delivery_has_independent_receipts(tmp_path: Path) -> None:
         )["messages"] == []
 
 
+def test_wait_prioritizes_new_mention_over_old_normal_backlog(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    ordinary_sender = register(store, client="claude-code", name="普通发言者")
+    mention_sender = register(store, client="opencode", name="提及发言者")
+    receiver = register(store, client="codex", name="被提及者")
+    normal = store.send(
+        authorized_session_id=ordinary_sender["session_id"],
+        sender_participant_id=ordinary_sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="这是较早的普通积压。",
+        audience_kind="room",
+    )
+    mention = store.send(
+        authorized_session_id=mention_sender["session_id"],
+        sender_participant_id=mention_sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="@你，请先确认。",
+        audience_kind="room",
+        mentions=[receiver["participant_id"]],
+    )
+
+    first = store.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        wait_seconds=0,
+        limit=1,
+    )["messages"]
+    assert [item["message_id"] for item in first] == [mention["message_id"]]
+    assert first[0]["delivery"]["priority"] == "mention"
+    assert normal["sequence"] < mention["sequence"]
+
+
+def test_visible_unique_at_alias_is_normalized_for_legacy_agent_clients(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="旧客户端")
+    receiver = register(store, client="codex", name="被提及者")
+    observer = register(store, client="opencode", name="旁观者")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="@codex-被提及者 请确认这条兼容通知。",
+        audience_kind="room",
+    )
+    assert sent["mentions"] == [receiver["participant_id"]]
+    received = store.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    observed = store.wait_messages(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    assert received[0]["delivery"]["priority"] == "mention"
+    assert observed[0]["delivery"]["priority"] == "normal"
+
+
 def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority(
     tmp_path: Path,
 ) -> None:
