@@ -512,6 +512,20 @@ class BridgeStore:
                 )
             if "cleared_at" not in session_columns:
                 conn.execute("ALTER TABLE agent_sessions ADD COLUMN cleared_at REAL")
+            if schema_version < 10:
+                # Before sliding renewal, a successful heartbeat updated
+                # last_seen without extending expires_at.  Preserve a recently
+                # active legacy session across this migration, while leaving
+                # genuinely stale, revoked, and cleared sessions expired.
+                conn.execute(
+                    """
+                    UPDATE agent_sessions
+                    SET expires_at = last_seen + ttl_seconds
+                    WHERE revoked_at IS NULL
+                      AND cleared_at IS NULL
+                      AND expires_at < last_seen + ttl_seconds
+                    """
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_sessions_visible_state "
                 "ON agent_sessions(cleared_at, revoked_at, expires_at)"
@@ -561,7 +575,7 @@ class BridgeStore:
             if reconcile_deliveries:
                 self._backfill_message_deliveries(conn)
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 9")
+            conn.execute("PRAGMA user_version = 10")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)

@@ -746,7 +746,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchall()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 9
+    assert version == 10
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -889,6 +889,48 @@ def test_same_fixed_identity_keeps_sessions_and_renews_them_sliding(
     assert legacy_reconnect["participant_id"] == first["participant_id"]
     assert legacy_reconnect["session_alias"] == first["session_alias"]
     assert legacy_reconnect["signature"] == first["signature"]
+
+
+def test_initialize_preserves_recent_legacy_session_for_sliding_renewal(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recent-legacy-session.db"
+    store = BridgeStore(database)
+    store.create_user_room("兼容旧会话")
+    registered = store.register_agent_session(
+        product="codex",
+        username="recent-legacy",
+        session_alias="最近活跃的旧会话",
+        conversation_id="兼容旧会话",
+        session_ttl_seconds=600,
+    )
+    stale = store.register_agent_session(
+        product="codex",
+        username="stale-legacy",
+        session_alias="长期失效的旧会话",
+        conversation_id="兼容旧会话",
+        session_ttl_seconds=600,
+    )
+    now = time.time()
+    with store._transaction() as conn:
+        conn.execute(
+            "UPDATE agent_sessions SET expires_at = ?, last_seen = ?, "
+            "ttl_seconds = 600 WHERE session_id = ?",
+            (now - 1, now - 10, registered["session_id"]),
+        )
+        conn.execute(
+            "UPDATE agent_sessions SET expires_at = ?, last_seen = ?, "
+            "ttl_seconds = 600 WHERE session_id = ?",
+            (now - 1, now - 700, stale["session_id"]),
+        )
+        conn.execute("PRAGMA user_version = 9")
+
+    restarted = BridgeStore(database)
+    renewed = restarted.authenticate_session(registered["access_token"])
+    assert renewed["session_id"] == registered["session_id"]
+    assert renewed["expires_at"] > time.time() + 590
+    with pytest.raises(AuthenticationError, match="expired"):
+        restarted.authenticate_session(stale["access_token"])
 
 
 def test_inactive_sessions_can_be_cleared_without_deleting_audit_links(
@@ -1729,7 +1771,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 9
+    assert version == 10
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
