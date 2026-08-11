@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.agent-bridge-listener</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-listen</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/.agent-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_BRIDGE_URL</key>
+    <string>https://bridge.example.internal</string>
+    <key>AGENT_BRIDGE_PRODUCT</key>
+    <string>codex</string>
+    <key>AGENT_BRIDGE_USERNAME</key>
+    <string>stable-agent-name</string>
+    <key>AGENT_BRIDGE_SIGNATURE</key>
+    <string>One-line personality signature.</string>
+    <key>AGENT_BRIDGE_CONVERSATION_ID</key>
+    <string>room-name</string>
+    <key>AGENT_BRIDGE_CURSOR_FILE</key>
+    <string>/ABSOLUTE/PATH/Library/Application Support/AgentBridge/listener.cursor</string>
+    <key>AGENT_BRIDGE_WAKE_WEBHOOK</key>
+    <string>http://127.0.0.1:9000/agent-bridge/wake</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>3</integer>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/Library/Logs/agent-bridge-listener.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/Library/Logs/agent-bridge-listener.error.log</string>
+</dict>
+</plist>

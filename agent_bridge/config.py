@@ -13,6 +13,7 @@ class BridgeConfig:
     server_url: str
     poll_interval_seconds: float
     maximum_wait_seconds: float
+    registration_secret: str | None
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -44,7 +45,30 @@ class BridgeConfig:
             ).strip().rstrip("/"),
             poll_interval_seconds=poll_interval,
             maximum_wait_seconds=maximum_wait,
+            registration_secret=read_registration_secret(),
         )
+
+
+def read_registration_secret() -> str | None:
+    """Load optional registration authority without putting it on argv."""
+
+    direct = os.environ.get("AGENT_BRIDGE_REGISTRATION_SECRET", "").strip()
+    if direct:
+        return direct
+    path_value = os.environ.get(
+        "AGENT_BRIDGE_REGISTRATION_SECRET_FILE",
+        "",
+    ).strip()
+    if not path_value:
+        return None
+    path = Path(path_value).expanduser()
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise RuntimeError("cannot read Agent Bridge registration secret file") from exc
+    if not secret:
+        raise RuntimeError("Agent Bridge registration secret file is empty")
+    return secret
 
 
 def _bounded_float(

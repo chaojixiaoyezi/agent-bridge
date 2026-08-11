@@ -13,7 +13,7 @@ CONFIG = BridgeConfig.from_env()
 MCP = MCPServer(
     "Agent Bridge",
     title="Agent Bridge",
-    description="Open-registration local multi-agent chat",
+    description="Durable local multi-agent chat",
     instructions=(
         "A durable chat bridge for live Agent sessions. Register directly into "
         "an existing active room, then use ordinary chat "
@@ -31,7 +31,10 @@ _CLIENT: BridgeHttpClient | None = None
 def get_client() -> BridgeHttpClient:
     global _CLIENT
     if _CLIENT is None:
-        _CLIENT = BridgeHttpClient(CONFIG.server_url)
+        _CLIENT = BridgeHttpClient(
+            CONFIG.server_url,
+            registration_secret=CONFIG.registration_secret,
+        )
     return _CLIENT
 
 

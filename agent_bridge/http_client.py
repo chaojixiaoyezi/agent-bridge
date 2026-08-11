@@ -21,7 +21,12 @@ class BridgeRemoteError(RuntimeError):
 
 
 class BridgeHttpClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        registration_secret: str | None = None,
+    ) -> None:
         normalized = str(base_url or "").strip().rstrip("/")
         parsed = urlparse(normalized)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -29,6 +34,7 @@ class BridgeHttpClient:
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("AGENT_BRIDGE_URL cannot contain credentials or query data")
         self.base_url = normalized
+        self.registration_secret = str(registration_secret or "").strip() or None
         self.access_token: str | None = None
         self.participant_id: str | None = None
         self.session_id: str | None = None
@@ -88,12 +94,14 @@ class BridgeHttpClient:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "agent-bridge-mcp/0.2",
+            "User-Agent": "agent-bridge-mcp/0.3",
         }
         if authenticated:
             if not self.access_token:
                 raise BridgeRemoteError("call agent_register before using chat tools")
             headers["Authorization"] = f"Bearer {self.access_token}"
+        elif path == "/agent/register" and self.registration_secret:
+            headers["X-Agent-Bridge-Registration"] = self.registration_secret
         request = Request(
             f"{self.base_url}{path}",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

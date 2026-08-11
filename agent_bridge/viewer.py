@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import sqlite3
 import time
 from pathlib import Path
@@ -53,7 +54,11 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
-def create_app(database: str | Path) -> Starlette:
+def create_app(
+    database: str | Path,
+    *,
+    registration_secret: str | None = None,
+) -> Starlette:
     # Read projections stay query_only. Owner room creation and owner-authored
     # chat both go through the same BridgeStore authority used by MCP and CLI.
     store = BridgeStore(database)
@@ -71,8 +76,22 @@ def create_app(database: str | Path) -> Starlette:
             media_type="application/javascript",
         )
 
+    required_registration_secret = (
+        str(registration_secret or "").strip() or None
+    )
+
     async def health(_: Request) -> Response:
-        return _json_call(repository.health)
+        def payload() -> dict:
+            result = repository.health()
+            result["open_registration_enabled"] = (
+                required_registration_secret is None
+            )
+            result["registration_secret_required"] = (
+                required_registration_secret is not None
+            )
+            return result
+
+        return _json_call(payload)
 
     async def rooms(request: Request) -> Response:
         return _json_call(
@@ -108,7 +127,8 @@ def create_app(database: str | Path) -> Starlette:
             lambda: {
                 "sessions": repository.sessions(limit=200),
                 "stats": repository.session_stats(),
-            }
+            },
+            before=store.clear_inactive_sessions,
         )
 
     async def clear_inactive_sessions(request: Request) -> Response:
@@ -144,6 +164,14 @@ def create_app(database: str | Path) -> Starlette:
         )
 
     async def register_agent(request: Request) -> Response:
+        if required_registration_secret is not None and not secrets.compare_digest(
+            request.headers.get("x-agent-bridge-registration", ""),
+            required_registration_secret,
+        ):
+            return JSONResponse(
+                {"error": "registration authorization is required"},
+                status_code=401,
+            )
         try:
             payload = await _json_body(
                 request,
@@ -558,7 +586,12 @@ def create_app(database: str | Path) -> Starlette:
             nonlocal cursor
             previous_revision: list[object] | None = None
             last_output = time.monotonic()
+            last_maintenance = 0.0
             while not await request.is_disconnected():
+                monotonic_now = time.monotonic()
+                if monotonic_now - last_maintenance >= 60:
+                    await asyncio.to_thread(store.clear_inactive_sessions)
+                    last_maintenance = monotonic_now
                 snapshot = await asyncio.to_thread(
                     repository.event_snapshot,
                     after_sequence=cursor,
@@ -841,7 +874,10 @@ def main() -> None:
     if not 1024 <= port <= 65535:
         raise RuntimeError("AGENT_BRIDGE_VIEWER_PORT must be between 1024 and 65535")
     uvicorn.run(
-        create_app(config.database),
+        create_app(
+            config.database,
+            registration_secret=config.registration_secret,
+        ),
         host=host,
         port=port,
         access_log=False,

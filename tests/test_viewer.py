@@ -165,7 +165,9 @@ def test_dashboard_rejects_invalid_room_ids_and_limits(tmp_path: Path) -> None:
     assert health["counts"]["messages"] == 1
 
 
-def test_local_owner_can_clear_expired_sessions_from_dashboard(tmp_path: Path) -> None:
+def test_dashboard_auto_clears_expired_sessions_and_keeps_manual_cleanup(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "bridge.db"
     store, sender, receiver = seed(database)
     with store._transaction() as connection:
@@ -179,7 +181,10 @@ def test_local_owner_can_clear_expired_sessions_from_dashboard(tmp_path: Path) -
     )
 
     before = client.get("/api/sessions").json()
-    assert before["stats"] == {"active_count": 1, "clearable_count": 1}
+    assert before["stats"] == {"active_count": 1, "clearable_count": 0}
+    assert [item["session_id"] for item in before["sessions"]] == [
+        receiver["session_id"]
+    ]
     assert client.post("/api/sessions/cleanup").status_code == 403
     cleaned = client.post(
         "/api/sessions/cleanup",
@@ -189,7 +194,7 @@ def test_local_owner_can_clear_expired_sessions_from_dashboard(tmp_path: Path) -
         },
     )
     assert cleaned.status_code == 200
-    assert cleaned.json()["cleared_count"] == 1
+    assert cleaned.json()["cleared_count"] == 0
     after = client.get("/api/sessions").json()
     assert after["stats"] == {"active_count": 1, "clearable_count": 0}
     assert [item["session_id"] for item in after["sessions"]] == [
@@ -353,6 +358,42 @@ def test_dashboard_separates_abandoned_rooms_and_retains_history(
     assert "废弃聊天室" in javascript
 
 
+def test_registration_secret_is_optional_and_reported_by_health(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    store.create_user_room("受控登记群")
+    client = TestClient(
+        create_app(database, registration_secret="registration-authority")
+    )
+    registration = {
+        "product": "codex",
+        "username": "远端监听者",
+        "signature": "只被事件唤醒。",
+        "conversation_id": "受控登记群",
+    }
+
+    assert client.post("/agent/register", json=registration).status_code == 401
+    assert (
+        client.post(
+            "/agent/register",
+            json=registration,
+            headers={"X-Agent-Bridge-Registration": "wrong"},
+        ).status_code
+        == 401
+    )
+    accepted = client.post(
+        "/agent/register",
+        json=registration,
+        headers={"X-Agent-Bridge-Registration": "registration-authority"},
+    )
+    assert accepted.status_code == 201
+    health = client.get("/api/health").json()
+    assert health["open_registration_enabled"] is False
+    assert health["registration_secret_required"] is True
+
+
 def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     tmp_path: Path,
 ) -> None:
@@ -481,7 +522,7 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     ]
     assert delivered_owner_message.json()["messages"][0]["delivery"][
         "priority"
-    ] == "important"
+    ] == "mention"
     acknowledged_owner_message = client.post(
         "/agent/action",
         json={

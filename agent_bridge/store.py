@@ -574,8 +574,18 @@ class BridgeStore:
             self._backfill_legacy_rooms(conn)
             if reconcile_deliveries:
                 self._backfill_message_deliveries(conn)
+            if schema_version < 11:
+                # v8-v10 stored explicit structured mentions as ``important``.
+                # Keep the existing CHECK-compatible ``direct`` storage value,
+                # which is projected publicly as ``mention`` and does not imply
+                # hidden visibility or actionability.
+                conn.execute(
+                    "UPDATE message_deliveries SET priority = 'direct' "
+                    "WHERE priority = 'important' "
+                    "AND instr(reasons_json, '\"mention\"') > 0"
+                )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 10")
+            conn.execute("PRAGMA user_version = 11")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -830,11 +840,10 @@ class BridgeStore:
                 reasons.append("mention")
             if participant in followers:
                 reasons.append("follow")
-            if audience_kind == "participant" and primary_recipient:
+            if participant in mention_ids:
                 priority = "direct"
             elif (
-                "mention" in reasons
-                or "follow" in reasons
+                "follow" in reasons
                 or (audience_kind == "role" and primary_recipient)
             ):
                 priority = "important"
@@ -2337,15 +2346,34 @@ class BridgeStore:
         after_sequence: int | None = None,
         wait_seconds: float = 25.0,
     ) -> dict[str, Any]:
-        """Wait for a durable delivery newer than a sequence cursor.
+        """Wait for room activity without repeatedly rebuilding delivery aggregates.
 
-        This is intentionally a low-cost database wait. It never marks a message
-        delivered or acknowledged, so reconnecting listeners can always rebuild
-        state from the authoritative delivery ledger.
+        The append-only global sequence is the cheap change detector.  Full
+        participant-scoped manifests and sliding-session renewal run only when
+        that sequence changes (plus the initial snapshot), while delivery rows
+        remain the authoritative backlog and are never consumed here.
         """
         wait_for = max(0.0, min(float(wait_seconds), 60.0))
         deadline = time.monotonic() + wait_for
+        snapshot = self.notification_snapshot(
+            participant_id=participant_id,
+            authorized_session_id=authorized_session_id,
+            after_sequence=after_sequence,
+        )
+        if snapshot["has_room_activity"]:
+            snapshot["timed_out"] = False
+            return snapshot
+        observed_sequence = int(snapshot["cursor"])
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                snapshot["timed_out"] = True
+                return snapshot
+            time.sleep(min(max(self.poll_interval_seconds, 0.5), remaining))
+            latest_sequence = self._global_message_sequence()
+            if latest_sequence <= observed_sequence:
+                continue
+            observed_sequence = latest_sequence
             snapshot = self.notification_snapshot(
                 participant_id=participant_id,
                 authorized_session_id=authorized_session_id,
@@ -2354,11 +2382,16 @@ class BridgeStore:
             if snapshot["has_room_activity"]:
                 snapshot["timed_out"] = False
                 return snapshot
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                snapshot["timed_out"] = True
-                return snapshot
-            time.sleep(min(max(self.poll_interval_seconds, 0.5), remaining))
+
+    def _global_message_sequence(self) -> int:
+        """Read the one monotonic notification change key without session writes."""
+
+        with self._connection() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM messages"
+                ).fetchone()[0]
+            )
 
     def message_action(
         self,
@@ -2960,10 +2993,17 @@ class BridgeStore:
             }
             for row in rows
         ]
+        priority_counts = {
+            priority: sum(
+                int(item["priority_counts"][priority]) for item in conversations
+            )
+            for priority in ("mention", "important", "normal")
+        }
         return {
             "activity_count": sum(
                 int(item["activity_count"]) for item in conversations
             ),
+            "priority_counts": priority_counts,
             "oldest_sequence": (
                 min(item["oldest_sequence"] for item in conversations)
                 if conversations

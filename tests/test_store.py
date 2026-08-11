@@ -208,6 +208,7 @@ def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority
         "audience:room",
         "mention",
     ]
+    assert mentioned_message["delivery"]["priority"] == "mention"
     assert mentioned_message["delivery"]["actionable"] is False
     assert observer_message["delivery"] == {
         "state": "delivered",
@@ -260,7 +261,7 @@ def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority
     assert direct_received["delivery"]["priority"] == "mention"
     assert direct_received["delivery"]["actionable"] is True
     assert follower_direct["message_id"] == direct["message_id"]
-    assert follower_direct["delivery"]["priority"] == "important"
+    assert follower_direct["delivery"]["priority"] == "mention"
     assert follower_direct["delivery"]["actionable"] is False
     assert observer_direct["message_id"] == direct["message_id"]
     assert observer_direct["delivery"]["reasons"] == ["room_activity"]
@@ -605,6 +606,11 @@ def test_notification_wait_is_metadata_only_and_reconnect_safe(tmp_path: Path) -
     assert notification["cursor"] == sent["sequence"]
     assert notification["new_since_cursor"]["pending_count"] == 1
     assert notification["new_since_cursor"]["priority_counts"]["mention"] == 1
+    assert notification["room_activity_since_cursor"]["priority_counts"] == {
+        "mention": 1,
+        "important": 0,
+        "normal": 0,
+    }
     assert "正文不进入唤醒事件" not in str(notification)
     with first_store._connection() as connection:
         delivery = connection.execute(
@@ -669,6 +675,59 @@ def test_notification_wait_is_metadata_only_and_reconnect_safe(tmp_path: Path) -
     assert already_processed["room_activity_since_cursor"]["activity_count"] == 1
     assert already_processed["has_new"] is False
     assert already_processed["new_since_cursor"]["pending_count"] == 0
+
+
+def test_version_eleven_migration_promotes_existing_explicit_mentions(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    store.create_user_room("mention-migration")
+    sender = store.register_agent_session(
+        product="codex",
+        username="迁移发送者",
+        signature="发送提醒。",
+        conversation_id="mention-migration",
+    )
+    receiver = store.register_agent_session(
+        product="claude-code",
+        username="迁移接收者",
+        signature="接收提醒。",
+        conversation_id="mention-migration",
+    )
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="mention-migration",
+        body_text="旧版本结构化 @。",
+        audience_kind="room",
+        mentions=[receiver["participant_id"]],
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE message_deliveries SET priority = 'important' "
+            "WHERE message_id = ? AND participant_id = ?",
+            (message["message_id"], receiver["participant_id"]),
+        )
+        connection.execute("PRAGMA user_version = 10")
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        raw = connection.execute(
+            "SELECT priority, reasons_json FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (message["message_id"], receiver["participant_id"]),
+        ).fetchone()
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    assert version == 11
+    assert raw["priority"] == "direct"
+    assert "mention" in raw["reasons_json"]
+    delivered = migrated.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    assert delivered[0]["delivery"]["priority"] == "mention"
 
 
 def test_data_persists_across_store_instances(tmp_path: Path) -> None:
@@ -746,7 +805,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchall()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 10
+    assert version == 11
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -1771,7 +1830,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 10
+    assert version == 11
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
