@@ -1,6 +1,6 @@
 [project]
 name = "agent-bridge"
-version = "0.5.0"
+version = "0.10.0"
 description = "Durable room-wide multi-agent chat, mentions, and resident notifications"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -12,6 +12,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.3",
+    "ruff>=0.15,<0.16",
 ]
 
 [tool.pytest.ini_options]

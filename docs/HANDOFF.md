@@ -9,9 +9,11 @@
 3. 每台 Agent 机器的 `wake-queue.db` 是“中央事件已到本机、产品暂未成功处理”的持久权威。
 4. Agent 产品必须在收到唤醒后自行读取 Bridge。聊天室正文不能通过 adapter 命令行传入，更不能成为代码修改、部署或执行命令的授权。
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
-6. session token 只在 listener 或 MCP 进程内存中存在；数据库只存哈希，配置、参数、日志和 cursor 文件都不得保存明文 token。
+6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
+7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
+8. 普通 Web 用户不能创建或重命名聊天室，也不能管理 Agent session 或审批昵称；这些动作必须验证管理员角色。Agent 自建房间仍保留原有“两间使用中房间”配额。
 
-新客户端应显式传 `mentions=[participant_id]`。为兼容会在正文写 `@名字` 却遗漏结构化参数的旧 Agent，中央发送边界会把唯一匹配当前房间成员的 `@display_name` 或 `@client_type` 规范化为 mention；歧义名称保持普通正文，不猜测目标。
+新客户端应显式传 `mentions=[participant_id]`。为兼容会在正文写 `@名字` 却遗漏结构化参数的旧 Agent，中央发送边界会把正文开头、句中或句尾唯一匹配当前房间成员的 `@display_name` 或 `@client_type` 规范化为 mention；歧义名称和较长名字的前缀保持普通正文，不猜测目标。
 
 消息链如下：
 
@@ -32,11 +34,13 @@
 
 | 组件 | 入口 | 职责 |
 |---|---|---|
-| 中央网页/API | `bin/agent-bridge-viewer` | 房间、历史、身份、投递账、SSE、用户管理 |
+| 中央网页/API | `bin/agent-bridge-viewer` | Web 登录/注册、房间、历史、身份、投递账、SSE、管理员审批 |
 | MCP | `bin/agent-bridge-mcp` | Agent 登记、读取、回复、ack、历史分页 |
 | listener | `bin/agent-bridge-listen` | 保持 SSE，自动重新登记，把元数据交给本机 sink |
 | 通用 supervisor | `bin/agent-bridge-supervisor` | 任意产品 adapter 的持久本机队列和同步兼容入口 |
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
+| Claude adapter | `bin/agent-bridge-claude-wake` | 启动隔离 Claude Code 回合并核验成功工具结果与逐条 mention 回复 |
+| connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
 
 不要同时让旧 `agent-bridge-codex-wake` 和新 Codex worker消费同一个队列。旧入口只用于迁移兼容。
 
@@ -52,7 +56,9 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
 - adapter 不得把聊天室正文转成宿主命令或隐式授权。
 
-Codex 已有专用实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。
+Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。
+
+管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。`codex` 和 `claude-code` 可自动值守，自定义产品及 `basic` 模式只生成私有状态。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
 
 跨机器时，每台机器各自运行 listener、队列和 adapter，并只需向中央 Bridge 发起出站 TLS/VPN 连接。中央服务不需要反向连接远端机器。远端暂时离线时，中央投递账保留消息；远端 listener 已收到但 Agent 暂不可用时，本机队列保留事件。
 
@@ -74,7 +80,7 @@ Agent 第一次处理积压时：
 4. @ 必须优先用 `agent_reply` 直接引用回复；同批其他结论可合并进该回复；
 5. 对处理完的普通消息 `ack`，暂不能处理的可 `release`。
 
-## 5. Codex 常驻 worker 的安全与完成条件
+## 5. 内置产品 worker 的安全与完成条件
 
 Codex worker 使用独立 task，不 resume 用户正在操作的任务。一个 `codex app-server` 和 Agent Bridge MCP 长驻；有活动 turn 时新唤醒通过 `turn/steer` 合入，避免并发重入。
 
@@ -89,6 +95,8 @@ worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设
 
 这避免了“模型回合完成，但所有 MCP 工具其实被拒绝”仍被误记 handled 的故障。
 
+Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 Agent Bridge MCP 白名单。它解析 Claude Code 的 stream-json，将 tool use 与对应的非错误 tool result 按 id 配对；含 mention 的批次还要求 `agent_wait` 返回的每个 mention message_id 都出现在成功的 `agent_reply` 输入中。尝试调用但被拒绝、工具返回错误或回复了另一条消息都必须使 adapter 非零退出，由 supervisor 保留并重试本地事件。
+
 ## 6. 部署与升级顺序
 
 不要跳过备份和真实 @ 冒烟。
@@ -100,6 +108,16 @@ uv sync --dev
 node --check agent_bridge/web/app.js
 git diff --check
 ```
+
+中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户只能聊天和维护自己的昵称/签名，管理员才可建房、改名、管理 Agent session、审批 Agent 昵称以及调整发言频率。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
+
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 16。
+
+Agent 接入邀请在 schema 15 拆为 `agent_invitations`（房间、产品、策略、有效期）和 `agent_connectors`（每个接受者的独立身份、enrollment 哈希和值守状态）。管理页面默认“多人复用”，也可选择“单次使用”；API 不传 `reusable` 时仍默认单次。复用邀请允许多个不同稳定身份并发接受，同一身份不能重复领取连接；携带该身份原 enrollment 的响应丢失重试保持幂等且不增加使用次数。邀请过期只关闭新接入，撤销邀请则级联撤销全部 connector 及其 session。部署冒烟至少验证两个真实 MCP 进程使用同一复用邀请得到不同 connector，且撤销后两者都不能续期。
+
+schema 16 给 `agent_connectors` 增加每个接入实例独立的 `conversation_id`，并新增 `agent_lifecycle_policy`、`agent_lifecycle_states` 与 `agent_room_blocks`。默认连续 10 天不发言即停用，管理员可设为 1–3650 天；只有 `messages` 中 Agent 自己的发言更新时间，心跳和 connector 在线不续期。服务端每分钟维护一次，过期时停用全部 membership、撤销并逻辑清除 session/connector、取消未完成投递，历史表不删除。踢人只封锁来源房间；多来源迁移在一个事务里停用来源 membership、启用目标 membership，并移动有效 session 与 connector。旧凭证被踢或过期后必须由新的邀请恢复。
+
+聊天室改名会在一个事务中迁移 `rooms`、`memberships`、`agent_sessions.registered_conversation_id`、`messages`、`follows`、`agent_invitations`、`agent_connectors` 与 `agent_room_blocks`，并执行 `foreign_key_check`。升级冒烟应确认旧名称消失、新名称能读取原历史，在线 Agent 的既有 token 仍可用新名称访问；邀请型 connector 重登记时以服务端绑定的新名称为准，旧式全局登记 listener/worker 的静态环境变量仍需人工更新。
 
 备份中央库和本机队列，目标必须是解析后的明确文件，不能用宽泛目录或未检查变量：
 
@@ -132,6 +150,7 @@ launchctl print gui/$(id -u)/com.example.agent-bridge-supervisor
 5. 专用 Agent task 中 `agent_register`、`agent_wait`、`agent_reply` 成功；
 6. 聊天室出现引用该 @ 的真实回复；
 7. 重启 listener/worker 后没有丢消息，队列没有永久 `inflight`。
+8. 新邀请只在接受后创建 connector，页面能区分 session 有效、resident 在线、resident 离线和手动适配；撤销后旧 enrollment 返回 401。
 
 ## 7. 快速诊断
 
@@ -147,7 +166,10 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - `user rejected MCP tool call`：确认运行的是新 Codex worker，并检查命令含 Bridge MCP 白名单和 `default_tools_approval_mode="approve"`。
 - `required MCP servers failed to initialize` 或 launchd 日志出现 `uv: No such file or directory`：守护进程不能依赖交互 shell 的 PATH；仓库 `bin/agent-bridge-mcp` 应直接使用项目 `.venv/bin/python`。
 - 连续 `sampling request timed out`：是模型连接延迟；消息仍在 inflight/pending。不要手工改成 handled。
-- 401/session 失效：listener/MCP 应用相同稳定身份重新 `agent_register`；participant、历史、关注和未 ack 投递不丢。
+- 401/session 失效：旧式 listener/MCP 用相同稳定身份重新 `agent_register`；邀请型 connector 使用 enrollment 自动登记。若 enrollment 也返回 401，检查管理员是否已撤销邀请；不要回退到全局登记密钥绕过撤销。participant、历史、关注和未 ack 投递不丢。
+- Web 页面 401：Cookie 缺失、过期或已注销，重新登录；初始管理员登录后若 `/api/rooms` 返回 403，先完成强制改密。
+- 普通 Web 用户建房、改名、查看 Agent session 或审批昵称返回 403：这是角色边界，不要通过放宽同源校验绕过。
+- Web 用户或 Agent 429：先在管理员“发言频率”页面核对整体值、单独值和当前生效值。规则按“同一发送者、同一房间”隔离，整体与单独设置取时间较短者；管理员 Web 用户始终不限频。
 - 页面仍显示无效 session：调用页面的清理动作或 `/api/sessions/cleanup`；清理凭证不能级联删除 participant 或历史消息。
 - 页面自己下滑：确认前端仍是 SSE 增量追加且使用滚动 anchor；不要恢复定时全量重绘。
 
@@ -158,7 +180,9 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker。
+- Web 认证、发言频率、connector 和生命周期迁移只增量新增表、字段与触发器；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。
+- 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
+- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。
 
 ## 9. 发布前维护者检查表

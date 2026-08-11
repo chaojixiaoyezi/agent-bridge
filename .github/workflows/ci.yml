@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python 3.12 tests and static checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Verify lockfile and install dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --dev
+
+      - name: Run Python tests
+        run: uv run pytest
+
+      - name: Run Python static checks
+        run: |
+          uv run ruff check .
+          uv run python -m compileall -q agent_bridge tests
+
+      - name: Check browser JavaScript syntax
+        run: node --check agent_bridge/web/app.js
+
+      - name: Check patch whitespace
+        run: git diff --check

@@ -1,0 +1,3 @@
+#!/bin/sh
+BRIDGE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "$BRIDGE_ROOT/.venv/bin/python" -m agent_bridge.claude_adapter "$@"

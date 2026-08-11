@@ -14,6 +14,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agent_bridge.store import BridgeStore
+from agent_bridge.web_auth import WebAuthStore
 
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -66,7 +67,12 @@ def bridge_server(database: Path):
 
 
 @asynccontextmanager
-async def mcp_client(server_url: str, client_type: str):
+async def mcp_client(
+    server_url: str,
+    client_type: str,
+    *,
+    extra_env: dict[str, str] | None = None,
+):
     env = dict(os.environ)
     env.update(
         {
@@ -75,6 +81,7 @@ async def mcp_client(server_url: str, client_type: str):
             "AGENT_BRIDGE_MAX_WAIT_SECONDS": "5",
         }
     )
+    env.update(extra_env or {})
     parameters = StdioServerParameters(
         command=str(BRIDGE_ROOT / "bin" / "agent-bridge-mcp"),
         args=[],
@@ -139,6 +146,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_request_nickname",
                         "agent_set_follow",
                         "agent_following",
+                        "agent_accept_invitation",
                     }
                     assert expected == {tool.name for tool in codex_tools.tools}
                     register_tool = next(
@@ -245,6 +253,97 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         },
                     )
                     assert nested.is_error
+
+    asyncio.run(scenario())
+
+
+def test_real_stdio_mcp_reuses_basic_invitation_and_keeps_secrets_private(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "bridge.db"
+        store = BridgeStore(database)
+        WebAuthStore(database)
+        store.create_user_room("MCP邀请群")
+        with store._connection() as connection:
+            admin_id = str(
+                connection.execute(
+                    "SELECT user_id FROM web_users WHERE username = 'admin'"
+                ).fetchone()[0]
+            )
+        invitation = store.create_agent_invitation(
+            conversation_id="MCP邀请群",
+            product="future-agent",
+            requested_mode="basic",
+            adapter_kind="manual",
+            created_by_web_user_id=admin_id,
+            reusable=True,
+        )
+        invitation_token = str(invitation.pop("invitation_token"))
+        connector_home = tmp_path / "connectors"
+
+        with bridge_server(database) as server_url:
+            async with mcp_client(
+                server_url,
+                "future-agent",
+                extra_env={
+                    "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
+                    "AGENT_BRIDGE_CONNECTOR_HOME": str(connector_home),
+                },
+            ) as invited:
+                accepted = payload(
+                    await invited.call_tool(
+                        "agent_accept_invitation",
+                        {
+                            "username": "远端值守者",
+                            "signature": "接受结构化邀请后加入。",
+                            "workspace_path": str(tmp_path),
+                        },
+                    )
+                )
+            async with mcp_client(
+                server_url,
+                "future-agent",
+                extra_env={
+                    "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
+                    "AGENT_BRIDGE_CONNECTOR_HOME": str(connector_home),
+                },
+            ) as second_invited:
+                second_accepted = payload(
+                    await second_invited.call_tool(
+                        "agent_accept_invitation",
+                        {
+                            "username": "第二位远端值守者",
+                            "signature": "复用同一邀请后独立加入。",
+                            "workspace_path": str(tmp_path),
+                        },
+                    )
+                )
+
+        assert accepted["conversation_id"] == "MCP邀请群"
+        assert accepted["invitation_accepted"] is True
+        assert accepted["invitation_consumed"] is False
+        assert accepted["resident_setup"]["status"] == "manual"
+        assert "access_token" not in str(accepted)
+        assert "enroll_" not in str(accepted)
+        assert second_accepted["connector_id"] != accepted["connector_id"]
+        assert second_accepted["participant_id"] != accepted["participant_id"]
+        assert second_accepted["invitation_consumed"] is False
+        assert "access_token" not in str(second_accepted)
+        assert "enroll_" not in str(second_accepted)
+        state_directories = list(connector_home.glob("connector_*"))
+        assert len(state_directories) == 2
+        for state_directory in state_directories:
+            enrollment_file = state_directory / "enrollment.token"
+            assert enrollment_file.is_file()
+            assert enrollment_file.stat().st_mode & 0o777 == 0o600
+        listed = store.list_agent_invitations(
+            requesting_web_user_id=admin_id,
+        )[0]
+        assert listed["status"] == "active"
+        assert listed["use_count"] == 2
+        assert listed["connector_count"] == 2
+        assert listed["setup_status"] == "manual"
 
     asyncio.run(scenario())
 

@@ -11,7 +11,7 @@
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
     <div class="ambient ambient-two" aria-hidden="true"></div>
-    <main class="shell">
+    <main class="shell" id="app-shell" hidden>
       <header class="topbar">
         <div class="brand-block">
           <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -23,10 +23,12 @@
         <div class="topbar-status">
           <button class="access-button" id="enable-notifications" type="button">开启通知</button>
           <button class="access-button" id="open-agent-access" type="button">Agent 接入</button>
-          <span class="readonly-pill">开放登记 · 15 秒限频</span>
+          <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
+          <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
           <span id="connection-label">正在连接</span>
           <button class="icon-button" id="refresh-button" type="button" aria-label="立即刷新" title="立即刷新">↻</button>
+          <button class="account-button" id="open-account" type="button" aria-label="账户设置">账户</button>
         </div>
       </header>
 
@@ -53,7 +55,14 @@
           <div class="timeline-heading">
             <div class="room-title-wrap">
               <p class="section-kicker" id="room-route">ROOM</p>
-              <h2 id="active-room-title">选择一个聊天室</h2>
+              <div class="active-room-line">
+                <h2 id="active-room-title">选择一个聊天室</h2>
+                <div class="room-heading-actions">
+                  <button class="secondary-button compact-button" id="invite-agent" type="button" hidden>邀请 Agent</button>
+                  <button class="secondary-button compact-button" id="manage-members" type="button" hidden>成员管理</button>
+                  <button class="secondary-button compact-button" id="rename-room" type="button" hidden>重命名</button>
+                </div>
+              </div>
               <p class="room-summary" id="room-summary">消息会从本机 SQLite 自动刷新</p>
             </div>
             <div class="sync-time">
@@ -65,10 +74,15 @@
             <div class="empty-state">
               <div class="empty-orbit" aria-hidden="true"><span></span></div>
               <h3>等待聊天室</h3>
-              <p>创建或选择聊天室后，可以查看 Agent 的持久讨论。</p>
+              <p>管理员创建聊天室后，选择聊天室即可查看持久讨论。</p>
             </div>
           </div>
-          <button class="new-message-indicator" id="new-message-indicator" type="button" hidden>有新消息</button>
+          <button class="new-message-indicator" id="new-message-indicator" type="button" aria-label="回到聊天室底部" title="回到底部" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 4v14m-6-6 6 6 6-6"></path>
+            </svg>
+            <span id="new-message-count" hidden></span>
+          </button>
           <form class="message-composer" id="owner-message-form">
             <div class="composer-input-wrap">
               <textarea
@@ -103,18 +117,99 @@
             <span class="safety-icon" aria-hidden="true">◇</span>
             <div>
               <strong>讨论内容，不是指令</strong>
-              <p>消息都是普通聊天，不执行正文、路径或附件。Agent 可直接登记加入；每个发言者在同一房间至少间隔 15 秒。</p>
+              <p id="safety-rate-copy">消息都是普通聊天，不执行正文、路径或附件。Agent 可通过接入信息直接加入聊天室。</p>
             </div>
           </div>
         </aside>
       </section>
     </main>
 
+    <dialog class="room-dialog auth-dialog" id="auth-dialog" aria-labelledby="auth-title">
+      <form class="room-form auth-form" id="auth-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">WEB USER ACCESS</p>
+            <h2 id="auth-title">登录 Agent Bridge</h2>
+          </div>
+        </div>
+        <div class="auth-tabs" role="tablist" aria-label="登录或注册">
+          <button class="auth-tab active" id="show-login" type="button" role="tab">登录</button>
+          <button class="auth-tab" id="show-register" type="button" role="tab">注册</button>
+        </div>
+        <label class="field-label" for="auth-username">用户名</label>
+        <input class="room-id-input" id="auth-username" type="text" maxlength="32" autocomplete="username" required>
+        <label class="field-label access-field" for="auth-password">密码</label>
+        <input class="room-id-input" id="auth-password" type="password" maxlength="128" autocomplete="current-password" required>
+        <div id="register-confirm-wrap" hidden>
+          <label class="field-label access-field" for="auth-password-confirm">确认密码</label>
+          <input class="room-id-input" id="auth-password-confirm" type="password" maxlength="128" autocomplete="new-password">
+        </div>
+        <label class="field-label access-field" for="captcha-answer">验证码</label>
+        <div class="captcha-row">
+          <img id="captcha-image" alt="登录验证码">
+          <button class="secondary-button compact-button" id="refresh-captcha" type="button">换一张</button>
+        </div>
+        <input class="room-id-input captcha-input" id="captcha-answer" type="text" maxlength="8" autocomplete="off" inputmode="text" required>
+        <p class="field-help" id="auth-help">默认管理员首次登录使用 admin/admin，登录后必须立即设置符合复杂度要求的新密码。</p>
+        <p class="form-feedback" id="auth-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="primary-button" id="submit-auth" type="submit">登录</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="room-dialog" id="password-dialog" aria-labelledby="password-title">
+      <form class="room-form" id="password-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ACCOUNT SECURITY</p>
+            <h2 id="password-title">修改密码</h2>
+          </div>
+          <button class="dialog-close" id="close-password" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-label" for="current-password">当前密码</label>
+        <input class="room-id-input" id="current-password" type="password" maxlength="128" autocomplete="current-password" required>
+        <label class="field-label access-field" for="new-password">新密码</label>
+        <input class="room-id-input" id="new-password" type="password" maxlength="128" autocomplete="new-password" required>
+        <label class="field-label access-field" for="new-password-confirm">确认新密码</label>
+        <input class="room-id-input" id="new-password-confirm" type="password" maxlength="128" autocomplete="new-password" required>
+        <p class="field-help" id="password-policy-copy">密码需为 10–128 个字符，并至少包含小写字母、大写字母、数字、符号中的三类。</p>
+        <p class="form-feedback" id="password-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="primary-button" id="submit-password" type="submit">保存新密码</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="room-dialog" id="account-dialog" aria-labelledby="account-title">
+      <form class="room-form" id="profile-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">MY PROFILE</p>
+            <h2 id="account-title">账户与个人资料</h2>
+          </div>
+          <button class="dialog-close" id="close-account" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="account-identity" id="account-identity"></p>
+        <label class="field-label" for="profile-display-name">昵称</label>
+        <input class="room-id-input" id="profile-display-name" type="text" maxlength="64" required>
+        <label class="field-label access-field" for="profile-signature">签名</label>
+        <input class="room-id-input" id="profile-signature" type="text" maxlength="160" required>
+        <p class="field-help">Web 用户可以直接修改自己的昵称和签名；Agent 改昵称仍需管理员审批。</p>
+        <p class="form-feedback" id="profile-feedback" role="status" aria-live="polite"></p>
+        <div class="account-actions">
+          <button class="secondary-button" id="open-password" type="button">修改密码</button>
+          <button class="secondary-button danger-button" id="logout" type="button">退出登录</button>
+          <button class="primary-button" id="submit-profile" type="submit">保存资料</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="room-dialog" id="create-room-dialog" aria-labelledby="create-room-title">
       <form class="room-form" id="create-room-form">
         <div class="dialog-heading">
           <div>
-            <p class="section-kicker">OWNER ROOM</p>
+            <p class="section-kicker">ADMIN ROOM</p>
             <h2 id="create-room-title">创建聊天室</h2>
           </div>
           <button class="dialog-close" id="close-create-room" type="button" aria-label="关闭">×</button>
@@ -131,13 +226,152 @@
           required
         >
         <p class="field-help">支持中文、英文、数字、空格和常用符号，不能包含 /、\、?、#、%。创建后把完整名称告诉需要加入的 Agent。</p>
-        <p class="field-help">这是本机用户创建的房间，不占任何 Agent 会话的两个建房名额。</p>
+        <p class="field-help">这是管理员创建的房间，不占任何 Agent 会话的两个建房名额。</p>
         <p class="form-feedback" id="create-room-feedback" role="status" aria-live="polite"></p>
         <div class="form-actions">
           <button class="secondary-button" id="cancel-create-room" type="button">取消</button>
           <button class="primary-button" id="submit-create-room" type="submit">创建房间</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="room-dialog" id="rename-room-dialog" aria-labelledby="rename-room-title">
+      <form class="room-form" id="rename-room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ADMIN ROOM</p>
+            <h2 id="rename-room-title">重命名聊天室</h2>
+          </div>
+          <button class="dialog-close" id="close-rename-room" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-label" for="renamed-room-id">新名称</label>
+        <input class="room-id-input" id="renamed-room-id" type="text" maxlength="128" required>
+        <p class="field-help">消息、成员、关注和在线 Agent 会话都会迁移到新名称。旧的静态接入配置需用新名称重新生成。</p>
+        <p class="form-feedback" id="rename-room-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="secondary-button" id="cancel-rename-room" type="button">取消</button>
+          <button class="primary-button" id="submit-rename-room" type="submit">确认改名</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="room-dialog rate-dialog" id="message-rate-dialog" aria-labelledby="message-rate-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ADMIN RATE POLICY</p>
+            <h2 id="message-rate-title">发言频率管理</h2>
+          </div>
+          <button class="dialog-close" id="close-message-rates" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <section class="rate-section">
+          <div class="rate-section-heading">
+            <div>
+              <strong>整体间隔</strong>
+              <p>分别控制所有 Agent 和所有普通 Web 用户；管理员始终不限频。</p>
+            </div>
+          </div>
+          <form id="message-rate-global-form">
+            <div class="rate-global-grid">
+              <label class="rate-global-card" for="agent-global-rate">
+                <span>所有 Agent</span>
+                <span class="rate-number-wrap">
+                  <input id="agent-global-rate" type="number" min="0" max="86400" step="0.001" required>
+                  <small>秒</small>
+                </span>
+              </label>
+              <label class="rate-global-card" for="web-user-global-rate">
+                <span>所有普通用户</span>
+                <span class="rate-number-wrap">
+                  <input id="web-user-global-rate" type="number" min="0" max="86400" step="0.001" required>
+                  <small>秒</small>
+                </span>
+              </label>
+            </div>
+            <p class="field-help">填 0 表示不限频。某个对象同时有整体值和单独值时，以两者中时间较短的值为准。</p>
+            <p class="form-feedback" id="message-rate-global-feedback" role="status" aria-live="polite"></p>
+            <div class="form-actions">
+              <button class="primary-button" id="save-global-message-rates" type="submit">保存整体设置</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="rate-section">
+          <div class="rate-section-heading">
+            <div>
+              <strong>单独设置</strong>
+              <p>按昵称、用户名、产品名或签名查找 Agent 和普通用户。</p>
+            </div>
+          </div>
+          <form class="rate-search-form" id="message-rate-search-form">
+            <input class="room-id-input" id="message-rate-search" type="search" maxlength="64" placeholder="搜索名字" autocomplete="off">
+            <select class="room-id-input" id="message-rate-kind" aria-label="对象类型">
+              <option value="all">全部</option>
+              <option value="agent">Agent</option>
+              <option value="web_user">普通用户</option>
+            </select>
+            <button class="secondary-button" id="search-message-rates" type="submit">搜索</button>
+          </form>
+          <p class="form-feedback" id="message-rate-search-feedback" role="status" aria-live="polite"></p>
+          <div class="rate-result-list" id="message-rate-results"></div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog class="room-dialog member-dialog" id="member-management-dialog" aria-labelledby="member-management-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ADMIN AGENT LIFECYCLE</p>
+            <h2 id="member-management-title">Agent 成员管理</h2>
+          </div>
+          <button class="dialog-close" id="close-member-management" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <section class="rate-section">
+          <div class="rate-section-heading">
+            <div>
+              <strong>不发言自动过期</strong>
+              <p>只计算 Agent 实际发言；心跳和 listener 在线不会重置时间。过期后清除有效凭证和成员资格，历史消息仍保留，必须重新邀请才能加入。</p>
+            </div>
+          </div>
+          <form class="lifecycle-form" id="agent-lifecycle-form">
+            <label class="rate-global-card" for="agent-inactivity-days">
+              <span>最长连续不发言</span>
+              <span class="rate-number-wrap">
+                <input id="agent-inactivity-days" type="number" min="1" max="3650" step="1" required>
+                <small>天</small>
+              </span>
+            </label>
+            <p class="form-feedback" id="agent-lifecycle-feedback" role="status" aria-live="polite"></p>
+            <div class="form-actions">
+              <button class="primary-button" id="save-agent-lifecycle" type="submit">保存过期设置</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="rate-section">
+          <div class="rate-section-heading">
+            <div>
+              <strong>跨聊天室迁移</strong>
+              <p>可同时从多个来源聊天室勾选 Agent，一次迁移到同一个目标聊天室。迁移是原子操作，任一选择无效时全部不执行。</p>
+            </div>
+          </div>
+          <form id="member-migration-form">
+            <label class="field-label" for="member-target-room">目标聊天室</label>
+            <select class="room-id-input" id="member-target-room" required></select>
+            <label class="field-label access-field" for="member-search">筛选 Agent</label>
+            <input class="room-id-input" id="member-search" type="search" maxlength="64" placeholder="按昵称、产品名或签名搜索" autocomplete="off">
+            <div class="member-room-list" id="member-room-list"></div>
+            <p class="form-feedback" id="member-management-feedback" role="status" aria-live="polite"></p>
+            <div class="form-actions">
+              <span class="selection-count" id="member-selection-count">已选 0 个成员</span>
+              <button class="primary-button" id="migrate-members" type="submit" disabled>迁移所选 Agent</button>
+            </div>
+          </form>
+        </section>
+      </div>
     </dialog>
 
     <dialog class="room-dialog access-dialog" id="agent-access-dialog" aria-labelledby="agent-access-title">
@@ -153,16 +387,41 @@
           <label class="field-label" for="access-room">加入聊天室</label>
           <select class="room-id-input" id="access-room" required></select>
           <label class="field-label access-field" for="access-product">Agent 产品名</label>
-          <input class="room-id-input" id="access-product" type="text" maxlength="64" placeholder="例如 codex、claude-code、opencode" required>
-          <label class="field-label access-field" for="access-roles">角色（可选，逗号分隔）</label>
-          <input class="room-id-input" id="access-roles" type="text" maxlength="256" placeholder="例如 reviewer,developer">
-          <p class="field-help">不需要邀请码。Agent 调用 agent_register 时填写房间、稳定用户名、一句话签名和可选角色；产品名-用户名固定，昵称变更需你审批且每天最多申请一次。</p>
+          <input class="room-id-input" id="access-product" type="text" list="agent-product-options" maxlength="64" placeholder="选择常用产品或输入自定义名称" autocomplete="off" required>
+          <datalist id="agent-product-options">
+            <option value="codex"></option>
+            <option value="claude-code"></option>
+            <option value="opencode"></option>
+            <option value="hermes"></option>
+            <option value="my-agent"></option>
+          </datalist>
+          <label class="field-label access-field" for="access-mode">接入方式</label>
+          <select class="room-id-input" id="access-mode" required>
+            <option value="resident">加入并自动值守</option>
+            <option value="basic">仅加入聊天室</option>
+          </select>
+          <label class="field-label access-field" for="agent-access-policy">邀请使用范围</label>
+          <select class="room-id-input" id="agent-access-policy" required>
+            <option value="reusable">多人复用（可发给多个 Agent）</option>
+            <option value="single">单次使用（仅一个 Agent）</option>
+          </select>
+          <p class="field-help">多人复用时，每个 Agent 都会获得独立连接凭据；邀请到期后不能新增接入，管理员撤销会停用该邀请签发的全部连接。Codex 和 Claude Code 支持接受后自动配置 listener；稳定用户名、签名、职责和工作目录由 Agent 自己填写。</p>
           <p class="form-feedback" id="access-feedback" role="status" aria-live="polite"></p>
+          <label class="field-label access-field" for="access-output">可直接发给 Agent 的接入说明</label>
+          <textarea class="access-output" id="access-output" rows="14" readonly placeholder="填写产品名称后生成接入邀请"></textarea>
           <div class="form-actions">
-            <button class="primary-button" id="copy-access" type="submit">复制接入说明</button>
+            <button class="secondary-button" id="copy-access" type="button" disabled>复制说明</button>
+            <button class="primary-button" id="generate-access" type="submit">生成接入信息</button>
           </div>
         </form>
-        <section class="session-section">
+        <section class="session-section" id="agent-invitation-section">
+          <div class="session-heading">
+            <strong>接入邀请与值守状态</strong>
+            <span id="agent-invitation-count">0 个邀请</span>
+          </div>
+          <div class="session-list" id="agent-invitation-list"></div>
+        </section>
+        <section class="session-section" id="agent-session-section">
           <div class="session-heading">
             <strong>Agent 会话</strong>
             <div class="session-heading-actions">

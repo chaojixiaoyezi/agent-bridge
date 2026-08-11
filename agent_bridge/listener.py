@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .config import read_registration_secret
+from .config import read_enrollment_token, read_registration_secret
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -23,6 +23,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
     "AGENT_BRIDGE_REGISTRATION_SECRET",
+    "AGENT_BRIDGE_INVITATION_TOKEN",
+    "AGENT_BRIDGE_ENROLLMENT_TOKEN",
 }
 
 
@@ -236,6 +238,13 @@ def _read_registration_secret() -> str | None:
         raise ListenerError(str(exc)) from exc
 
 
+def _read_enrollment_token() -> str | None:
+    try:
+        return read_enrollment_token()
+    except RuntimeError as exc:
+        raise ListenerError(str(exc)) from exc
+
+
 def _read_cursor(path: Path | None) -> int:
     if path is None or not path.exists():
         return 0
@@ -440,13 +449,16 @@ def _register(
     base_url: str,
     registration: Registration,
     registration_secret: str | None,
+    enrollment_token: str | None = None,
 ) -> str:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": "agent-bridge-listener/0.3",
     }
-    if registration_secret:
+    if enrollment_token:
+        headers["X-Agent-Bridge-Enrollment"] = enrollment_token
+    elif registration_secret:
         headers["X-Agent-Bridge-Registration"] = registration_secret
     request = Request(
         f"{base_url}/agent/register",
@@ -484,6 +496,7 @@ def listen(
     wake_policy: str,
     wake_timeout: float,
     cursor_file: Path | None,
+    enrollment_token: str | None = None,
     once: bool = False,
 ) -> None:
     cursor = _read_cursor(cursor_file)
@@ -504,6 +517,7 @@ def listen(
                     base_url=base_url,
                     registration=registration,
                     registration_secret=registration_secret,
+                    enrollment_token=enrollment_token,
                 )
             headers = {
                 "Accept": "text/event-stream",
@@ -577,6 +591,7 @@ def main(argv: list[str] | None = None) -> None:
         command = _parse_json_argv(args.wake_command_json)
         registration = _registration_from_args(args)
         registration_secret = _read_registration_secret()
+        enrollment_token = _read_enrollment_token()
         cursor_file = Path(args.cursor_file).expanduser() if args.cursor_file else None
         wake_timeout = max(0.25, min(float(args.wake_timeout), 120.0))
         listen(
@@ -584,6 +599,7 @@ def main(argv: list[str] | None = None) -> None:
             access_token=access_token,
             registration=registration,
             registration_secret=registration_secret,
+            enrollment_token=enrollment_token,
             webhook=webhook,
             command=command,
             wake_policy=args.wake_policy,

@@ -20,6 +20,7 @@ from agent_bridge.store import (
 )
 from agent_bridge.validation import ValidationError, product_username
 from agent_bridge.viewer_store import ViewerRepository
+from agent_bridge.web_auth import WebAuthStore
 
 
 def make_store(tmp_path: Path) -> BridgeStore:
@@ -54,6 +55,39 @@ def register(
     assert authorized["participant_id"] == participant["participant_id"]
     authorized["room_created"] = participant["room_created"]
     return authorized
+
+
+def admin_web_user_id(store: BridgeStore) -> str:
+    WebAuthStore(store.database)
+    with store._connection() as connection:
+        return str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+
+
+def invite_agent(
+    store: BridgeStore,
+    *,
+    admin_id: str,
+    room: str,
+    username: str,
+    product: str = "codex",
+) -> dict:
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product=product,
+        requested_mode="resident",
+        adapter_kind="codex" if product == "codex" else "manual",
+        created_by_web_user_id=admin_id,
+    )
+    return store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product=product,
+        username=username,
+        signature=f"{username} 的测试签名。",
+    )
 
 
 def expire_sender_cooldown(
@@ -209,6 +243,36 @@ def test_visible_unique_at_alias_is_normalized_for_legacy_agent_clients(
     )["messages"]
     assert received[0]["delivery"]["priority"] == "mention"
     assert observed[0]["delivery"]["priority"] == "normal"
+
+
+def test_visible_at_alias_is_inferred_at_start_middle_and_end(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="位置测试发送者")
+    receiver = register(store, client="codex", name="位置测试接收者")
+    visible_alias = receiver["client_type"]
+    bodies = [
+        f"@{visible_alias} 请确认开头提及。",
+        f"请在这里@{visible_alias} ，确认句中提及。",
+        f"最后请通知@{visible_alias}",
+    ]
+
+    for index, body in enumerate(bodies):
+        if index:
+            expire_sender_cooldown(
+                store,
+                participant_id=sender["participant_id"],
+                conversation_id="tools-room",
+            )
+        sent = store.send(
+            authorized_session_id=sender["session_id"],
+            sender_participant_id=sender["participant_id"],
+            conversation_id="tools-room",
+            body_text=body,
+            audience_kind="room",
+        )
+        assert sent["mentions"] == [receiver["participant_id"]]
 
 
 def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority(
@@ -781,7 +845,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 11
+    assert version == 16
     assert raw["priority"] == "direct"
     assert "mention" in raw["reasons_json"]
     delivered = migrated.wait_messages(
@@ -867,7 +931,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchall()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 11
+    assert version == 16
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -1845,6 +1909,225 @@ def test_message_insert_updates_authoritative_room_activity(tmp_path: Path) -> N
     assert after >= before
 
 
+def test_reusable_invitation_accepts_distinct_agents_concurrently(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    WebAuthStore(tmp_path / "bridge.db")
+    store.create_user_room("并发复用邀请群")
+    with store._connection() as connection:
+        admin_id = str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+    invitation = store.create_agent_invitation(
+        conversation_id="并发复用邀请群",
+        product="codex",
+        requested_mode="basic",
+        adapter_kind="codex",
+        created_by_web_user_id=admin_id,
+        reusable=True,
+    )
+    invitation_token = str(invitation.pop("invitation_token"))
+
+    def accept(index: int) -> dict:
+        return store.accept_agent_invitation(
+            invitation_token=invitation_token,
+            product="codex",
+            username=f"concurrent-{index}",
+            signature=f"并发接入 {index}",
+            enrollment_token="enroll_" + f"{index:048d}",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        registrations = list(pool.map(accept, range(12)))
+
+    assert len({item["participant_id"] for item in registrations}) == 12
+    assert len({item["connector_id"] for item in registrations}) == 12
+    listed = store.list_agent_invitations(
+        requesting_web_user_id=admin_id,
+    )[0]
+    assert listed["status"] == "active"
+    assert listed["reusable"] is True
+    assert listed["use_count"] == 12
+    assert listed["connector_count"] == 12
+    assert listed["active_connector_count"] == 12
+    with store._connection() as connection:
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_version_fourteen_invitations_migrate_without_losing_connectors(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "version-fourteen.db"
+    store = BridgeStore(database)
+    WebAuthStore(database)
+    store.create_user_room("旧邀请群")
+    accepted_agent = store.register_agent_session(
+        product="codex",
+        username="legacy-invitee",
+        signature="旧版已接入 Agent。",
+        conversation_id="旧邀请群",
+    )
+    with store._connection() as connection:
+        admin_id = str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+
+    now = time.time()
+    pending_token = "invite_v14_pending_abcdefghijklmnopqrstuvwxyz"
+    enrollment_token = "enroll_" + ("e" * 48)
+    connection = sqlite3.connect(database)
+    connection.execute("DROP TABLE agent_connectors")
+    connection.execute("DROP TABLE agent_invitations")
+    connection.executescript(
+        """
+        CREATE TABLE agent_invitations (
+            invitation_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            conversation_id TEXT NOT NULL,
+            product TEXT NOT NULL,
+            requested_mode TEXT NOT NULL
+                CHECK (requested_mode IN ('basic', 'resident')),
+            adapter_kind TEXT NOT NULL
+                CHECK (adapter_kind IN ('codex', 'claude-code', 'manual')),
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'accepted', 'revoked', 'expired')),
+            created_by_web_user_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            accepted_at REAL,
+            accepted_participant_id TEXT,
+            accepted_session_id TEXT,
+            connector_id TEXT UNIQUE,
+            enrollment_token_hash TEXT UNIQUE,
+            enrollment_last_used_at REAL,
+            setup_status TEXT NOT NULL DEFAULT 'awaiting_acceptance'
+                CHECK (setup_status IN (
+                    'awaiting_acceptance', 'awaiting_setup', 'configured',
+                    'manual', 'failed', 'revoked'
+                )),
+            setup_detail_json TEXT NOT NULL DEFAULT '{}',
+            setup_updated_at REAL,
+            connector_last_seen_at REAL,
+            revoked_at REAL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+            FOREIGN KEY (created_by_web_user_id) REFERENCES web_users(user_id),
+            FOREIGN KEY (accepted_participant_id) REFERENCES participants(participant_id),
+            FOREIGN KEY (accepted_session_id) REFERENCES agent_sessions(session_id)
+        );
+        CREATE INDEX idx_agent_invitations_room_created
+            ON agent_invitations(conversation_id, created_at DESC);
+        CREATE INDEX idx_agent_invitations_status_expires
+            ON agent_invitations(status, expires_at);
+        CREATE INDEX idx_agent_invitations_participant
+            ON agent_invitations(accepted_participant_id, status, updated_at DESC);
+        CREATE INDEX idx_agent_invitations_connector
+            ON agent_invitations(connector_id, status);
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_invitations
+            (invitation_id, token_hash, conversation_id, product,
+             requested_mode, adapter_kind, status, created_by_web_user_id,
+             created_at, expires_at, setup_status, updated_at)
+        VALUES (:invitation_id, :token_hash, :conversation_id, :product,
+                'basic', 'manual', 'pending', :admin_id,
+                :created_at, :expires_at, 'awaiting_acceptance', :updated_at)
+        """,
+        {
+            "invitation_id": "agent_invitation_v14_pending",
+            "token_hash": BridgeStore._secret_hash(pending_token),
+            "conversation_id": "旧邀请群",
+            "product": "future-agent",
+            "admin_id": admin_id,
+            "created_at": now - 20,
+            "expires_at": now + 3600,
+            "updated_at": now - 20,
+        },
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_invitations
+            (invitation_id, token_hash, conversation_id, product,
+             requested_mode, adapter_kind, status, created_by_web_user_id,
+             created_at, expires_at, accepted_at, accepted_participant_id,
+             accepted_session_id, connector_id, enrollment_token_hash,
+             enrollment_last_used_at, setup_status, setup_detail_json,
+             setup_updated_at, connector_last_seen_at, updated_at)
+        VALUES (:invitation_id, :token_hash, :conversation_id, 'codex',
+                'resident', 'codex', 'accepted', :admin_id,
+                :created_at, :expires_at, :accepted_at, :participant_id,
+                :session_id, :connector_id, :enrollment_hash,
+                :accepted_at, 'configured', '{"listener_service":"legacy"}',
+                :accepted_at, :accepted_at, :accepted_at)
+        """,
+        {
+            "invitation_id": "agent_invitation_v14_accepted",
+            "token_hash": BridgeStore._secret_hash(
+                "invite_v14_accepted_abcdefghijklmnopqrstuvwxyz"
+            ),
+            "conversation_id": "旧邀请群",
+            "admin_id": admin_id,
+            "created_at": now - 30,
+            "expires_at": now + 3600,
+            "accepted_at": now - 10,
+            "participant_id": accepted_agent["participant_id"],
+            "session_id": accepted_agent["session_id"],
+            "connector_id": "connector_v14_accepted",
+            "enrollment_hash": BridgeStore._secret_hash(enrollment_token),
+        },
+    )
+    connection.execute(
+        "UPDATE agent_sessions SET connector_id = ? WHERE session_id = ?",
+        ("connector_v14_accepted", accepted_agent["session_id"]),
+    )
+    connection.execute("PRAGMA user_version = 14")
+    connection.commit()
+    connection.close()
+
+    migrated = BridgeStore(database)
+    listed = {
+        item["invitation_id"]: item
+        for item in migrated.list_agent_invitations(
+            requesting_web_user_id=admin_id,
+        )
+    }
+    assert listed["agent_invitation_v14_pending"]["status"] == "active"
+    assert listed["agent_invitation_v14_pending"]["connector_count"] == 0
+    accepted = listed["agent_invitation_v14_accepted"]
+    assert accepted["status"] == "exhausted"
+    assert accepted["use_count"] == 1
+    assert accepted["connector_count"] == 1
+    assert accepted["setup_status"] == "configured"
+    renewed = migrated.register_agent_session_from_enrollment(
+        enrollment_token=enrollment_token,
+        product="codex",
+        username="legacy-invitee",
+        signature="迁移后仍可续期。",
+    )
+    assert renewed["connector_id"] == "connector_v14_accepted"
+    newly_accepted = migrated.accept_agent_invitation(
+        invitation_token=pending_token,
+        product="future-agent",
+        username="new-after-migration",
+        signature="迁移后的单次邀请仍可接受。",
+    )
+    assert newly_accepted["invitation_reusable"] is False
+    with migrated._connection() as migrated_connection:
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert migrated_connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'agent_invitations_v14'"
+        ).fetchone() is None
+        assert migrated_connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
     tmp_path: Path,
 ) -> None:
@@ -1892,7 +2175,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 11
+    assert version == 16
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -2010,3 +2293,376 @@ def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
     assert authenticated["signature"] == "旧会话"
     assert authenticated["renewal_mode"] == "sliding"
     assert foreign_key_errors == []
+
+
+def test_agent_inactivity_uses_speech_not_heartbeat_and_requires_reinvite(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("十天过期群")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="十天过期群",
+        username="inactive-agent",
+    )
+    sent = store.send(
+        authorized_session_id=agent["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="十天过期群",
+        body_text="这条发言会成为不活跃计时锚点。",
+    )
+    now = time.time()
+    old_speech = now - (11 * 86_400)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_lifecycle_states "
+            "SET access_granted_at = ?, last_spoke_at = ?, updated_at = ? "
+            "WHERE participant_id = ?",
+            (old_speech - 60, old_speech, old_speech, agent["participant_id"]),
+        )
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ?, last_seen = ? "
+            "WHERE session_id = ?",
+            (now + 3600, now, agent["session_id"]),
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET connector_last_seen_at = ? "
+            "WHERE connector_id = ?",
+            (now, agent["connector_id"]),
+        )
+
+    store.heartbeat(
+        agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+    )
+    with store._connection() as connection:
+        state_before_cleanup = connection.execute(
+            "SELECT last_spoke_at FROM agent_lifecycle_states "
+            "WHERE participant_id = ?",
+            (agent["participant_id"],),
+        ).fetchone()
+    assert state_before_cleanup["last_spoke_at"] == old_speech
+
+    cleared = store.clear_inactive_sessions(now=now)
+    assert cleared["expired_agent_count"] == 1
+    with store._connection() as connection:
+        membership = connection.execute(
+            "SELECT active FROM memberships WHERE conversation_id = ? "
+            "AND participant_id = ?",
+            ("十天过期群", agent["participant_id"]),
+        ).fetchone()
+        session = connection.execute(
+            "SELECT revoked_at, cleared_at FROM agent_sessions WHERE session_id = ?",
+            (agent["session_id"],),
+        ).fetchone()
+        connector = connection.execute(
+            "SELECT revoked_at FROM agent_connectors WHERE connector_id = ?",
+            (agent["connector_id"],),
+        ).fetchone()
+        lifecycle = connection.execute(
+            "SELECT reinvite_required, expired_reason FROM agent_lifecycle_states "
+            "WHERE participant_id = ?",
+            (agent["participant_id"],),
+        ).fetchone()
+        preserved = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?",
+            (sent["message_id"],),
+        ).fetchone()[0]
+    assert membership["active"] == 0
+    assert session["revoked_at"] is not None and session["cleared_at"] is not None
+    assert connector["revoked_at"] is not None
+    assert lifecycle["reinvite_required"] == 1
+    assert lifecycle["expired_reason"] == "inactive"
+    assert preserved == 1
+    with pytest.raises(ConflictError, match="new invitation"):
+        store.register_agent_session(
+            product="codex",
+            username="inactive-agent",
+            signature="直接登记不能复活。",
+            conversation_id="十天过期群",
+        )
+    with pytest.raises(AuthenticationError, match="revoked"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=agent["enrollment_token"],
+            product="codex",
+            username="inactive-agent",
+            signature="旧 enrollment 不能复活。",
+        )
+
+    restored = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="十天过期群",
+        username="inactive-agent",
+    )
+    assert restored["participant_id"] == agent["participant_id"]
+    assert restored["connector_id"] != agent["connector_id"]
+    with store._connection() as connection:
+        restored_state = connection.execute(
+            "SELECT reinvite_required FROM agent_lifecycle_states "
+            "WHERE participant_id = ?",
+            (agent["participant_id"],),
+        ).fetchone()
+        restored_membership = connection.execute(
+            "SELECT active FROM memberships WHERE conversation_id = ? "
+            "AND participant_id = ?",
+            ("十天过期群", agent["participant_id"]),
+        ).fetchone()
+    assert restored_state["reinvite_required"] == 0
+    assert restored_membership["active"] == 1
+
+
+def test_admin_kick_preserves_history_and_blocks_old_agent_credentials(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("踢人测试群")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="踢人测试群",
+        username="kick-target",
+    )
+    message = store.send(
+        authorized_session_id=agent["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="踢人测试群",
+        body_text="踢出后这条历史仍须保留。",
+    )
+
+    kicked = store.kick_agent_from_room(
+        conversation_id="踢人测试群",
+        participant_id=agent["participant_id"],
+        kicked_by_web_user_id=admin_id,
+    )
+    assert kicked["history_preserved"] is True
+    assert kicked["reinvite_required_for_room"] is True
+    with pytest.raises(AuthenticationError):
+        store.authenticate_session(agent["access_token"])
+    with pytest.raises(AuthenticationError, match="revoked"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=agent["enrollment_token"],
+            product="codex",
+            username="kick-target",
+            signature="旧 enrollment 已失效。",
+        )
+    with pytest.raises(ConflictError, match="new invitation"):
+        store.register_agent_session(
+            product="codex",
+            username="kick-target",
+            signature="直接登记不能返回。",
+            conversation_id="踢人测试群",
+        )
+    with store._connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ?",
+            (message["message_id"],),
+        ).fetchone()[0] == 1
+
+    restored = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="踢人测试群",
+        username="kick-target",
+    )
+    assert restored["participant_id"] == agent["participant_id"]
+
+
+def test_admin_migrates_agents_from_multiple_rooms_atomically(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    for room in ("来源-A", "目标-B", "来源-C", "回滚-D"):
+        store.create_user_room(room)
+    from_a = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="来源-A",
+        username="from-a",
+    )
+    from_c_one = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="来源-C",
+        username="from-c-one",
+    )
+    from_c_two = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="来源-C",
+        username="from-c-two",
+    )
+
+    migrated = store.migrate_agents(
+        target_conversation_id="目标-B",
+        selections=[
+            {
+                "source_conversation_id": "来源-A",
+                "participant_ids": [from_a["participant_id"]],
+            },
+            {
+                "source_conversation_id": "来源-C",
+                "participant_ids": [
+                    from_c_one["participant_id"],
+                    from_c_two["participant_id"],
+                ],
+            },
+        ],
+        migrated_by_web_user_id=admin_id,
+    )
+    assert migrated["membership_count"] == 3
+    assert migrated["agent_count"] == 3
+    with store._connection() as connection:
+        for registration, source in (
+            (from_a, "来源-A"),
+            (from_c_one, "来源-C"),
+            (from_c_two, "来源-C"),
+        ):
+            source_membership = connection.execute(
+                "SELECT active FROM memberships WHERE conversation_id = ? "
+                "AND participant_id = ?",
+                (source, registration["participant_id"]),
+            ).fetchone()
+            target_membership = connection.execute(
+                "SELECT active FROM memberships WHERE conversation_id = ? "
+                "AND participant_id = ?",
+                ("目标-B", registration["participant_id"]),
+            ).fetchone()
+            session_room = connection.execute(
+                "SELECT registered_conversation_id FROM agent_sessions "
+                "WHERE session_id = ?",
+                (registration["session_id"],),
+            ).fetchone()[0]
+            connector_room = connection.execute(
+                "SELECT conversation_id FROM agent_connectors "
+                "WHERE connector_id = ?",
+                (registration["connector_id"],),
+            ).fetchone()[0]
+            assert source_membership["active"] == 0
+            assert target_membership["active"] == 1
+            assert session_room == "目标-B"
+            assert connector_room == "目标-B"
+
+    moved_message = store.send(
+        authorized_session_id=from_a["session_id"],
+        sender_participant_id=from_a["participant_id"],
+        conversation_id="目标-B",
+        body_text="迁移后原会话可以直接在目标群发言。",
+    )
+    assert moved_message["conversation_id"] == "目标-B"
+    with pytest.raises(ConflictError, match="not in conversation"):
+        store.send(
+            authorized_session_id=from_a["session_id"],
+            sender_participant_id=from_a["participant_id"],
+            conversation_id="来源-A",
+            body_text="不能再回来源群发言。",
+        )
+    renewed = store.register_agent_session_from_enrollment(
+        enrollment_token=from_c_one["enrollment_token"],
+        product="codex",
+        username="from-c-one",
+        signature="迁移后 enrollment 续到目标群。",
+    )
+    assert renewed["conversation_id"] == "目标-B"
+
+    with pytest.raises(ConflictError, match="not active"):
+        store.migrate_agents(
+            target_conversation_id="回滚-D",
+            selections=[
+                {
+                    "source_conversation_id": "目标-B",
+                    "participant_ids": [from_a["participant_id"]],
+                },
+                {
+                    "source_conversation_id": "来源-C",
+                    "participant_ids": [from_a["participant_id"]],
+                },
+            ],
+            migrated_by_web_user_id=admin_id,
+        )
+    with store._connection() as connection:
+        assert connection.execute(
+            "SELECT active FROM memberships WHERE conversation_id = '目标-B' "
+            "AND participant_id = ?",
+            (from_a["participant_id"],),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memberships WHERE conversation_id = '回滚-D' "
+            "AND participant_id = ? AND active = 1",
+            (from_a["participant_id"],),
+        ).fetchone()[0] == 0
+
+
+def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "version-fifteen.db"
+    store = BridgeStore(database)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("v15-room")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="v15-room",
+        username="v15-agent",
+    )
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA foreign_keys = OFF")
+    connection.executescript(
+        """
+        DROP TRIGGER IF EXISTS trg_agent_lifecycle_message_insert;
+        DROP TABLE agent_room_blocks;
+        DROP TABLE agent_lifecycle_states;
+        DROP TABLE agent_lifecycle_policy;
+        ALTER TABLE agent_connectors RENAME TO agent_connectors_v16;
+        CREATE TABLE agent_connectors (
+            connector_id TEXT PRIMARY KEY,
+            invitation_id TEXT NOT NULL,
+            accepted_participant_id TEXT NOT NULL,
+            initial_session_id TEXT NOT NULL,
+            enrollment_token_hash TEXT UNIQUE,
+            enrollment_last_used_at REAL,
+            setup_status TEXT NOT NULL DEFAULT 'awaiting_setup',
+            setup_detail_json TEXT NOT NULL DEFAULT '{}',
+            setup_updated_at REAL,
+            connector_last_seen_at REAL,
+            created_at REAL NOT NULL,
+            revoked_at REAL,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO agent_connectors
+            (connector_id, invitation_id, accepted_participant_id,
+             initial_session_id, enrollment_token_hash,
+             enrollment_last_used_at, setup_status, setup_detail_json,
+             setup_updated_at, connector_last_seen_at, created_at,
+             revoked_at, updated_at)
+        SELECT connector_id, invitation_id, accepted_participant_id,
+               initial_session_id, enrollment_token_hash,
+               enrollment_last_used_at, setup_status, setup_detail_json,
+               setup_updated_at, connector_last_seen_at, created_at,
+               revoked_at, updated_at
+        FROM agent_connectors_v16;
+        DROP TABLE agent_connectors_v16;
+        PRAGMA user_version = 15;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute(
+            "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
+            (agent["connector_id"],),
+        ).fetchone()[0] == "v15-room"
+        assert connection.execute(
+            "SELECT access_granted_at FROM agent_lifecycle_states "
+            "WHERE participant_id = ?",
+            (agent["participant_id"],),
+        ).fetchone()[0] > 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

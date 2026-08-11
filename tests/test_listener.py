@@ -196,6 +196,8 @@ def test_wake_command_is_argv_only_and_strips_session_secrets(
     monkeypatch.setenv("AGENT_BRIDGE_TOKEN", "never-forward")
     monkeypatch.setenv("AGENT_TOKEN", "never-forward-either")
     monkeypatch.setenv("AGENT_BRIDGE_REGISTRATION_SECRET", "never-forward-secret")
+    monkeypatch.setenv("AGENT_BRIDGE_INVITATION_TOKEN", "never-forward-invite")
+    monkeypatch.setenv("AGENT_BRIDGE_ENROLLMENT_TOKEN", "never-forward-enrollment")
     captured: dict = {}
 
     def fake_run(command, **kwargs):
@@ -212,6 +214,8 @@ def test_wake_command_is_argv_only_and_strips_session_secrets(
     assert "AGENT_BRIDGE_TOKEN" not in captured["env"]
     assert "AGENT_TOKEN" not in captured["env"]
     assert "AGENT_BRIDGE_REGISTRATION_SECRET" not in captured["env"]
+    assert "AGENT_BRIDGE_INVITATION_TOKEN" not in captured["env"]
+    assert "AGENT_BRIDGE_ENROLLMENT_TOKEN" not in captured["env"]
 
 
 def test_auto_registration_sends_optional_authority_header_without_persisting_token(
@@ -252,6 +256,23 @@ def test_auto_registration_sends_optional_authority_header_without_persisting_to
         "registration-authority"
     )
     assert b"session-memory-only" not in request.data
+
+    _register(
+        base_url="https://bridge.example.test",
+        registration=Registration(
+            product="codex",
+            username="listener",
+            signature="event driven",
+            conversation_id="tools-room",
+        ),
+        registration_secret="must-not-win",
+        enrollment_token="enroll_connector-authority",
+    )
+    request = captured["request"]
+    assert request.get_header("X-agent-bridge-enrollment") == (
+        "enroll_connector-authority"
+    )
+    assert request.get_header("X-agent-bridge-registration") is None
 
 
 def test_listener_retries_failed_sink_and_advances_cursor_only_after_acceptance(

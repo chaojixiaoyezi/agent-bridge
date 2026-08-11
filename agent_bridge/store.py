@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import math
 import os
 import re
 import secrets
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 from .validation import (
     ValidationError,
@@ -26,6 +28,7 @@ from .validation import (
     string_tokens,
     token,
 )
+from .web_auth import WEB_AUTH_SCHEMA
 
 
 AUDIENCE_KINDS = {"participant", "room", "role", "broadcast"}
@@ -33,11 +36,30 @@ PRESENCE_STATES = {"online", "offline"}
 MESSAGE_ACTIONS = {"claim", "ack", "release"}
 DELIVERY_STATES = {"pending", "delivered", "acked", "cancelled"}
 MESSAGE_COOLDOWN_SECONDS = 15.0
+WEB_USER_MESSAGE_COOLDOWN_SECONDS = 60.0
+MAX_MESSAGE_COOLDOWN_SECONDS = 24 * 60 * 60
+RATE_LIMIT_ACTOR_KINDS = {"agent", "web_user"}
 AGENT_ACTIVE_ROOM_LIMIT = 2
 ROOM_ABANDON_AFTER_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_SESSION_TTL_SECONDS = 2 * 60 * 60
 NICKNAME_REQUEST_COOLDOWN_SECONDS = 24 * 60 * 60
 MAX_MENTIONS_PER_MESSAGE = 64
+DEFAULT_INVITATION_TTL_SECONDS = 30 * 60
+MAX_INVITATION_TTL_SECONDS = 24 * 60 * 60
+CONNECTOR_ONLINE_WINDOW_SECONDS = 75.0
+DEFAULT_AGENT_INACTIVITY_DAYS = 10
+MIN_AGENT_INACTIVITY_DAYS = 1
+MAX_AGENT_INACTIVITY_DAYS = 3650
+INVITATION_MODES = {"basic", "resident"}
+INVITATION_ADAPTERS = {"codex", "claude-code", "manual"}
+INVITATION_STATUSES = {"active", "exhausted", "revoked", "expired"}
+CONNECTOR_SETUP_STATUSES = {
+    "awaiting_setup",
+    "configured",
+    "manual",
+    "failed",
+    "revoked",
+}
 OWNER_PARTICIPANT_ID = "participant_web_owner"
 OWNER_AUTHORIZATION_ID = "owner_web_ui"
 OWNER_CLIENT_TYPE = "web-user"
@@ -101,6 +123,7 @@ CREATE TABLE {clause}{table_name} (
     revoked_at REAL,
     revoked_reason TEXT,
     cleared_at REAL,
+    connector_id TEXT,
     FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
     FOREIGN KEY (registered_conversation_id) REFERENCES rooms(conversation_id)
 );
@@ -291,8 +314,10 @@ CREATE TABLE IF NOT EXISTS nickname_requests (
     requested_session_id TEXT NOT NULL,
     reviewed_at REAL,
     review_note TEXT,
+    reviewed_by_web_user_id TEXT,
     FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
-    FOREIGN KEY (requested_session_id) REFERENCES agent_sessions(session_id)
+    FOREIGN KEY (requested_session_id) REFERENCES agent_sessions(session_id),
+    FOREIGN KEY (reviewed_by_web_user_id) REFERENCES web_users(user_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_display_name_unique
@@ -307,12 +332,17 @@ CREATE INDEX IF NOT EXISTS idx_nickname_requests_participant_requested
 DROP TRIGGER IF EXISTS trg_participants_display_name_requires_pending_request;
 CREATE TRIGGER trg_participants_display_name_requires_pending_request
 BEFORE UPDATE OF display_name ON participants
-WHEN NEW.display_name != OLD.display_name AND NOT EXISTS (
-    SELECT 1 FROM nickname_requests
-    WHERE participant_id = OLD.participant_id
-      AND requested_display_name = NEW.display_name
-      AND status = 'pending'
+WHEN NEW.display_name != OLD.display_name
+AND NOT EXISTS (
+    SELECT 1 FROM web_users
+    WHERE participant_id = OLD.participant_id AND active = 1
 )
+AND NOT EXISTS (
+        SELECT 1 FROM nickname_requests
+        WHERE participant_id = OLD.participant_id
+          AND requested_display_name = NEW.display_name
+          AND status = 'pending'
+    )
 BEGIN
     SELECT RAISE(ABORT, 'NICKNAME_APPROVAL_REQUIRED');
 END;
@@ -427,18 +457,338 @@ END;
 """
 
 
+RATE_LIMIT_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS message_rate_defaults (
+    actor_kind TEXT PRIMARY KEY CHECK (actor_kind IN ('agent', 'web_user')),
+    cooldown_seconds REAL NOT NULL
+        CHECK (cooldown_seconds >= 0 AND cooldown_seconds <= {MAX_MESSAGE_COOLDOWN_SECONDS}),
+    updated_at REAL NOT NULL,
+    updated_by_web_user_id TEXT,
+    FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_rate_overrides (
+    participant_id TEXT PRIMARY KEY,
+    cooldown_seconds REAL NOT NULL
+        CHECK (cooldown_seconds >= 0 AND cooldown_seconds <= {MAX_MESSAGE_COOLDOWN_SECONDS}),
+    updated_at REAL NOT NULL,
+    updated_by_web_user_id TEXT NOT NULL,
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_rate_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+
+INSERT OR IGNORE INTO message_rate_state (singleton, revision, updated_at)
+VALUES (1, 0, CAST(strftime('%s', 'now') AS REAL));
+
+DROP TRIGGER IF EXISTS trg_message_rate_defaults_revision_insert;
+DROP TRIGGER IF EXISTS trg_message_rate_defaults_revision_update;
+DROP TRIGGER IF EXISTS trg_message_rate_defaults_revision_delete;
+DROP TRIGGER IF EXISTS trg_message_rate_overrides_revision_insert;
+DROP TRIGGER IF EXISTS trg_message_rate_overrides_revision_update;
+DROP TRIGGER IF EXISTS trg_message_rate_overrides_revision_delete;
+
+CREATE TRIGGER trg_message_rate_defaults_revision_insert
+AFTER INSERT ON message_rate_defaults
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER trg_message_rate_defaults_revision_update
+AFTER UPDATE ON message_rate_defaults
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER trg_message_rate_defaults_revision_delete
+AFTER DELETE ON message_rate_defaults
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER trg_message_rate_overrides_revision_insert
+AFTER INSERT ON message_rate_overrides
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER trg_message_rate_overrides_revision_update
+AFTER UPDATE ON message_rate_overrides
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+CREATE TRIGGER trg_message_rate_overrides_revision_delete
+AFTER DELETE ON message_rate_overrides
+BEGIN
+    UPDATE message_rate_state
+    SET revision = revision + 1,
+        updated_at = CAST(strftime('%s', 'now') AS REAL)
+    WHERE singleton = 1;
+END;
+
+INSERT OR IGNORE INTO message_rate_defaults
+    (actor_kind, cooldown_seconds, updated_at, updated_by_web_user_id)
+VALUES
+    ('agent', {MESSAGE_COOLDOWN_SECONDS}, CAST(strftime('%s', 'now') AS REAL), NULL),
+    ('web_user', {WEB_USER_MESSAGE_COOLDOWN_SECONDS}, CAST(strftime('%s', 'now') AS REAL), NULL);
+"""
+
+
+INVITATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_invitations (
+    invitation_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL,
+    product TEXT NOT NULL,
+    requested_mode TEXT NOT NULL
+        CHECK (requested_mode IN ('basic', 'resident')),
+    adapter_kind TEXT NOT NULL
+        CHECK (adapter_kind IN ('codex', 'claude-code', 'manual')),
+    reuse_policy TEXT NOT NULL DEFAULT 'single'
+        CHECK (reuse_policy IN ('single', 'reusable')),
+    max_uses INTEGER
+        CHECK (max_uses IS NULL OR max_uses >= 1),
+    use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'exhausted', 'revoked', 'expired')),
+    created_by_web_user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    first_accepted_at REAL,
+    last_accepted_at REAL,
+    revoked_at REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (created_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_connectors (
+    connector_id TEXT PRIMARY KEY,
+    invitation_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    accepted_participant_id TEXT NOT NULL,
+    initial_session_id TEXT NOT NULL,
+    enrollment_token_hash TEXT UNIQUE,
+    enrollment_last_used_at REAL,
+    setup_status TEXT NOT NULL DEFAULT 'awaiting_setup'
+        CHECK (setup_status IN (
+            'awaiting_setup', 'configured', 'manual', 'failed', 'revoked'
+        )),
+    setup_detail_json TEXT NOT NULL DEFAULT '{}',
+    setup_updated_at REAL,
+    connector_last_seen_at REAL,
+    created_at REAL NOT NULL,
+    revoked_at REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (invitation_id) REFERENCES agent_invitations(invitation_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (accepted_participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (initial_session_id) REFERENCES agent_sessions(session_id),
+    UNIQUE (invitation_id, accepted_participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_invitations_room_created
+    ON agent_invitations(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_invitations_status_expires
+    ON agent_invitations(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_agent_connectors_invitation_created
+    ON agent_connectors(invitation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_connectors_room_participant
+    ON agent_connectors(conversation_id, accepted_participant_id, revoked_at);
+CREATE INDEX IF NOT EXISTS idx_agent_connectors_participant
+    ON agent_connectors(accepted_participant_id, revoked_at, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_connectors_setup_seen
+    ON agent_connectors(setup_status, connector_last_seen_at);
+"""
+
+
+AGENT_LIFECYCLE_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS agent_lifecycle_policy (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    inactivity_days INTEGER NOT NULL
+        CHECK (inactivity_days BETWEEN {MIN_AGENT_INACTIVITY_DAYS}
+                                   AND {MAX_AGENT_INACTIVITY_DAYS}),
+    updated_at REAL NOT NULL,
+    updated_by_web_user_id TEXT,
+    FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_lifecycle_states (
+    participant_id TEXT PRIMARY KEY,
+    access_granted_at REAL NOT NULL,
+    last_spoke_at REAL,
+    reinvite_required INTEGER NOT NULL DEFAULT 0
+        CHECK (reinvite_required IN (0, 1)),
+    expired_at REAL,
+    expired_reason TEXT,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_room_blocks (
+    conversation_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('kicked', 'migrated', 'inactive')),
+    blocked_at REAL NOT NULL,
+    blocked_by_web_user_id TEXT,
+    PRIMARY KEY (conversation_id, participant_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (blocked_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_lifecycle_expiration
+    ON agent_lifecycle_states(reinvite_required, last_spoke_at, access_granted_at);
+CREATE INDEX IF NOT EXISTS idx_agent_room_blocks_participant
+    ON agent_room_blocks(participant_id, conversation_id);
+
+INSERT OR IGNORE INTO agent_lifecycle_policy
+    (singleton, inactivity_days, updated_at, updated_by_web_user_id)
+VALUES
+    (1, {DEFAULT_AGENT_INACTIVITY_DAYS}, CAST(strftime('%s', 'now') AS REAL), NULL);
+
+DROP TRIGGER IF EXISTS trg_agent_lifecycle_message_insert;
+CREATE TRIGGER trg_agent_lifecycle_message_insert
+AFTER INSERT ON messages
+WHEN NEW.sender_participant_id != '{OWNER_PARTICIPANT_ID}'
+ AND NOT EXISTS (
+    SELECT 1 FROM web_users
+    WHERE participant_id = NEW.sender_participant_id
+)
+BEGIN
+    INSERT INTO agent_lifecycle_states
+        (participant_id, access_granted_at, last_spoke_at,
+         reinvite_required, expired_at, expired_reason, updated_at)
+    VALUES
+        (NEW.sender_participant_id, NEW.created_at, NEW.created_at,
+         0, NULL, NULL, NEW.created_at)
+    ON CONFLICT(participant_id) DO UPDATE SET
+        last_spoke_at = CASE
+            WHEN agent_lifecycle_states.last_spoke_at IS NULL
+              OR excluded.last_spoke_at > agent_lifecycle_states.last_spoke_at
+            THEN excluded.last_spoke_at
+            ELSE agent_lifecycle_states.last_spoke_at
+        END,
+        updated_at = MAX(agent_lifecycle_states.updated_at, excluded.updated_at);
+END;
+"""
+
+
 AUTHORIZATION_SCHEMA = f"""
 CREATE INDEX IF NOT EXISTS idx_messages_authorized_session
     ON messages(authorized_session_id, sequence);
 
 DROP TRIGGER IF EXISTS trg_messages_require_live_mcp_session;
 DROP TRIGGER IF EXISTS trg_messages_require_authorized_sender;
+DROP TRIGGER IF EXISTS trg_messages_sender_cooldown;
+
+CREATE TRIGGER trg_messages_sender_cooldown
+BEFORE INSERT ON messages
+WHEN NOT EXISTS (
+    SELECT 1
+    FROM web_sessions AS web_session
+    JOIN web_users AS web_user ON web_user.user_id = web_session.user_id
+    WHERE web_session.session_id = NEW.authorized_session_id
+      AND web_user.participant_id = NEW.sender_participant_id
+      AND web_user.role = 'admin'
+      AND web_user.active = 1
+      AND web_session.revoked_at IS NULL
+      AND web_session.expires_at > CAST(strftime('%s', 'now') AS REAL)
+)
+AND EXISTS (
+    SELECT 1 FROM messages AS previous
+    WHERE previous.conversation_id = NEW.conversation_id
+      AND previous.sender_participant_id = NEW.sender_participant_id
+      AND previous.created_at > NEW.created_at - CASE
+          WHEN NEW.authorized_session_id = '{OWNER_AUTHORIZATION_ID}'
+               AND NEW.sender_participant_id = '{OWNER_PARTICIPANT_ID}'
+          THEN {MESSAGE_COOLDOWN_SECONDS}
+          WHEN EXISTS (
+              SELECT 1
+              FROM web_sessions AS web_session
+              JOIN web_users AS web_user
+                ON web_user.user_id = web_session.user_id
+              WHERE web_session.session_id = NEW.authorized_session_id
+                AND web_user.participant_id = NEW.sender_participant_id
+                AND web_user.role = 'user'
+                AND web_user.active = 1
+                AND web_session.revoked_at IS NULL
+                AND web_session.expires_at > CAST(strftime('%s', 'now') AS REAL)
+          ) THEN MIN(
+              COALESCE(
+                  (SELECT cooldown_seconds FROM message_rate_defaults
+                   WHERE actor_kind = 'web_user'),
+                  {WEB_USER_MESSAGE_COOLDOWN_SECONDS}
+              ),
+              COALESCE(
+                  (SELECT cooldown_seconds FROM message_rate_overrides
+                   WHERE participant_id = NEW.sender_participant_id),
+                  COALESCE(
+                      (SELECT cooldown_seconds FROM message_rate_defaults
+                       WHERE actor_kind = 'web_user'),
+                      {WEB_USER_MESSAGE_COOLDOWN_SECONDS}
+                  )
+              )
+          )
+          ELSE MIN(
+              COALESCE(
+                  (SELECT cooldown_seconds FROM message_rate_defaults
+                   WHERE actor_kind = 'agent'),
+                  {MESSAGE_COOLDOWN_SECONDS}
+              ),
+              COALESCE(
+                  (SELECT cooldown_seconds FROM message_rate_overrides
+                   WHERE participant_id = NEW.sender_participant_id),
+                  COALESCE(
+                      (SELECT cooldown_seconds FROM message_rate_defaults
+                       WHERE actor_kind = 'agent'),
+                      {MESSAGE_COOLDOWN_SECONDS}
+                  )
+              )
+          )
+      END
+)
+BEGIN
+    SELECT RAISE(ABORT, 'MESSAGE_RATE_LIMITED');
+END;
+
 CREATE TRIGGER trg_messages_require_authorized_sender
 BEFORE INSERT ON messages
 WHEN NOT (
     (
         NEW.authorized_session_id = '{OWNER_AUTHORIZATION_ID}'
         AND NEW.sender_participant_id = '{OWNER_PARTICIPANT_ID}'
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM web_sessions AS web_session
+        JOIN web_users AS web_user ON web_user.user_id = web_session.user_id
+        WHERE web_session.session_id = NEW.authorized_session_id
+          AND web_user.participant_id = NEW.sender_participant_id
+          AND web_user.active = 1
+          AND web_session.revoked_at IS NULL
+          AND web_session.expires_at > CAST(strftime('%s', 'now') AS REAL)
     )
     OR EXISTS (
         SELECT 1
@@ -513,6 +863,8 @@ class BridgeStore:
                 )
             if "cleared_at" not in session_columns:
                 conn.execute("ALTER TABLE agent_sessions ADD COLUMN cleared_at REAL")
+            if "connector_id" not in session_columns:
+                conn.execute("ALTER TABLE agent_sessions ADD COLUMN connector_id TEXT")
             if schema_version < 10:
                 # Before sliding renewal, a successful heartbeat updated
                 # last_seen without extending expires_at.  Preserve a recently
@@ -547,7 +899,25 @@ class BridgeStore:
                 )
             if schema_version < 8 or mentions_column_added:
                 self._backfill_implicit_participant_mentions(conn)
+            conn.executescript(WEB_AUTH_SCHEMA)
+            conn.executescript(RATE_LIMIT_SCHEMA)
             conn.executescript(PROFILE_SCHEMA)
+            self._migrate_reusable_agent_invitations(conn)
+            self._migrate_agent_connector_conversations(conn)
+            conn.executescript(INVITATION_SCHEMA)
+            conn.executescript(AGENT_LIFECYCLE_SCHEMA)
+            self._backfill_agent_lifecycle_states(conn)
+            nickname_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(nickname_requests)"
+                ).fetchall()
+            }
+            if "reviewed_by_web_user_id" not in nickname_columns:
+                conn.execute(
+                    "ALTER TABLE nickname_requests "
+                    "ADD COLUMN reviewed_by_web_user_id TEXT"
+                )
             delivery_table_existed = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'message_deliveries'"
@@ -586,7 +956,7 @@ class BridgeStore:
                     "AND instr(reasons_json, '\"mention\"') > 0"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 11")
+            conn.execute("PRAGMA user_version = 16")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -679,6 +1049,190 @@ class BridgeStore:
             raise
         finally:
             conn.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_reusable_agent_invitations(conn: sqlite3.Connection) -> None:
+        """Split v14's one-connector invitation row into reusable grants."""
+
+        invitation_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'agent_invitations'"
+        ).fetchone()
+        if invitation_table is None:
+            return
+        columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_invitations)"
+            ).fetchall()
+        }
+        if "reuse_policy" in columns:
+            connector_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'agent_connectors'"
+            ).fetchone()
+            if connector_table is None:
+                raise BridgeError("reusable invitations require agent_connectors")
+            return
+        if "connector_id" not in columns:
+            raise BridgeError("unsupported agent_invitations schema")
+
+        legacy_table = "agent_invitations_v14"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+            conn.execute(
+                f"ALTER TABLE agent_invitations RENAME TO {legacy_table}"
+            )
+            for index_name in (
+                "idx_agent_invitations_room_created",
+                "idx_agent_invitations_status_expires",
+                "idx_agent_invitations_participant",
+                "idx_agent_invitations_connector",
+            ):
+                conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+            for statement in INVITATION_SCHEMA.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
+            conn.execute(
+                f"""
+                INSERT INTO agent_invitations
+                    (invitation_id, token_hash, conversation_id, product,
+                     requested_mode, adapter_kind, reuse_policy, max_uses,
+                     use_count, status, created_by_web_user_id, created_at,
+                     expires_at, first_accepted_at, last_accepted_at,
+                     revoked_at, updated_at)
+                SELECT invitation_id, token_hash, conversation_id, product,
+                       requested_mode, adapter_kind, 'single', 1,
+                       CASE WHEN accepted_at IS NOT NULL THEN 1 ELSE 0 END,
+                       CASE status
+                           WHEN 'pending' THEN 'active'
+                           WHEN 'accepted' THEN 'exhausted'
+                           ELSE status
+                       END,
+                       created_by_web_user_id, created_at, expires_at,
+                       accepted_at, accepted_at, revoked_at, updated_at
+                FROM {legacy_table}
+                """
+            )
+            conn.execute(
+                f"""
+                INSERT INTO agent_connectors
+                    (connector_id, invitation_id, conversation_id,
+                     accepted_participant_id,
+                     initial_session_id, enrollment_token_hash,
+                     enrollment_last_used_at, setup_status,
+                     setup_detail_json, setup_updated_at,
+                     connector_last_seen_at, created_at, revoked_at, updated_at)
+                SELECT connector_id, invitation_id, conversation_id,
+                       accepted_participant_id,
+                       accepted_session_id, enrollment_token_hash,
+                       enrollment_last_used_at,
+                       CASE WHEN setup_status = 'awaiting_acceptance'
+                            THEN 'awaiting_setup' ELSE setup_status END,
+                       setup_detail_json, setup_updated_at,
+                       connector_last_seen_at,
+                       COALESCE(accepted_at, updated_at),
+                       CASE WHEN status = 'revoked' THEN revoked_at ELSE NULL END,
+                       updated_at
+                FROM {legacy_table}
+                WHERE connector_id IS NOT NULL
+                  AND accepted_participant_id IS NOT NULL
+                  AND accepted_session_id IS NOT NULL
+                  AND enrollment_token_hash IS NOT NULL
+                """
+            )
+            conn.execute(f"DROP TABLE {legacy_table}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_agent_connector_conversations(conn: sqlite3.Connection) -> None:
+        """Give every v15 connector its own movable room binding."""
+
+        connector_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'agent_connectors'"
+        ).fetchone()
+        if connector_table is None:
+            return
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(agent_connectors)").fetchall()
+        }
+        if "conversation_id" in columns:
+            return
+        conn.execute(
+            "ALTER TABLE agent_connectors ADD COLUMN conversation_id TEXT "
+            "REFERENCES rooms(conversation_id)"
+        )
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET conversation_id = (
+                SELECT invitation.conversation_id
+                FROM agent_invitations AS invitation
+                WHERE invitation.invitation_id = agent_connectors.invitation_id
+            )
+            """
+        )
+        missing = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM agent_connectors "
+                "WHERE conversation_id IS NULL OR trim(conversation_id) = ''"
+            ).fetchone()[0]
+        )
+        if missing:
+            raise BridgeError(
+                "agent connector room migration would leave "
+                f"{missing} connector(s) without a room"
+            )
+
+    @staticmethod
+    def _backfill_agent_lifecycle_states(conn: sqlite3.Connection) -> None:
+        """Seed inactivity anchors without changing any current membership."""
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO agent_lifecycle_states
+                (participant_id, access_granted_at, last_spoke_at,
+                 reinvite_required, expired_at, expired_reason, updated_at)
+            SELECT participant.participant_id,
+                   MAX(
+                       participant.created_at,
+                       COALESCE((
+                           SELECT MAX(membership.joined_at)
+                           FROM memberships AS membership
+                           WHERE membership.participant_id = participant.participant_id
+                       ), participant.created_at),
+                       COALESCE((
+                           SELECT MAX(session.created_at)
+                           FROM agent_sessions AS session
+                           WHERE session.participant_id = participant.participant_id
+                       ), participant.created_at),
+                       COALESCE((
+                           SELECT MAX(connector.created_at)
+                           FROM agent_connectors AS connector
+                           WHERE connector.accepted_participant_id = participant.participant_id
+                       ), participant.created_at)
+                   ),
+                   (
+                       SELECT MAX(message.created_at)
+                       FROM messages AS message
+                       WHERE message.sender_participant_id = participant.participant_id
+                   ),
+                   0, NULL, NULL, participant.last_seen
+            FROM participants AS participant
+            WHERE participant.participant_id != ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM web_users AS web_user
+                  WHERE web_user.participant_id = participant.participant_id
+              )
+            """,
+            (OWNER_PARTICIPANT_ID,),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -823,8 +1377,11 @@ class BridgeStore:
             if len(targets) != 1:
                 continue
             visible = alias_display[folded]
+            # A visible mention may appear at the beginning, in the middle, or
+            # at the end of a sentence.  The right boundary still prevents a
+            # short nickname from matching the prefix of a longer token.
             pattern = (
-                rf"(?<![\w@])@{re.escape(visible)}"
+                rf"@{re.escape(visible)}"
                 r"(?=$|[\s,，。.!！?？:：;；、)）\]】}>》])"
             )
             if re.search(pattern, body_text, flags=re.IGNORECASE):
@@ -1101,7 +1658,11 @@ class BridgeStore:
         participant_id: str,
         conversation_id: str,
         now: float,
+        cooldown_seconds: float = MESSAGE_COOLDOWN_SECONDS,
     ) -> None:
+        cooldown = max(0.0, float(cooldown_seconds))
+        if cooldown == 0:
+            return
         row = conn.execute(
             """
             SELECT created_at
@@ -1115,13 +1676,169 @@ class BridgeStore:
         if row is None:
             return
         retry_after = (
-            float(row["created_at"]) + MESSAGE_COOLDOWN_SECONDS - float(now)
+            float(row["created_at"]) + cooldown - float(now)
         )
         if retry_after > 0:
             raise RateLimitError(
                 retry_after_seconds=retry_after,
                 conversation_id=conversation_id,
             )
+
+    @staticmethod
+    def _normalize_rate_actor_kind(value: str, *, allow_all: bool = False) -> str:
+        actor_kind = str(value or "").strip().lower()
+        allowed = RATE_LIMIT_ACTOR_KINDS | ({"all"} if allow_all else set())
+        if actor_kind not in allowed:
+            choices = "agent, web_user" + (", or all" if allow_all else "")
+            raise ValidationError(f"actor_kind must be {choices}")
+        return actor_kind
+
+    @staticmethod
+    def _normalize_message_cooldown(value: object) -> float:
+        if isinstance(value, bool):
+            raise ValidationError("cooldown_seconds must be a number")
+        try:
+            cooldown = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("cooldown_seconds must be a number") from exc
+        if not math.isfinite(cooldown):
+            raise ValidationError("cooldown_seconds must be finite")
+        if not 0 <= cooldown <= MAX_MESSAGE_COOLDOWN_SECONDS:
+            raise ValidationError(
+                "cooldown_seconds must be between 0 and "
+                f"{MAX_MESSAGE_COOLDOWN_SECONDS}"
+            )
+        return round(cooldown, 3)
+
+    @staticmethod
+    def _message_rate_defaults_locked(
+        conn: sqlite3.Connection,
+    ) -> dict[str, float]:
+        rows = conn.execute(
+            "SELECT actor_kind, cooldown_seconds FROM message_rate_defaults"
+        ).fetchall()
+        values = {str(row["actor_kind"]): float(row["cooldown_seconds"]) for row in rows}
+        values.setdefault("agent", MESSAGE_COOLDOWN_SECONDS)
+        values.setdefault("web_user", WEB_USER_MESSAGE_COOLDOWN_SECONDS)
+        return values
+
+    @classmethod
+    def _effective_message_cooldown_locked(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        participant_id: str,
+        actor_kind: str,
+    ) -> float:
+        kind = cls._normalize_rate_actor_kind(actor_kind)
+        defaults = cls._message_rate_defaults_locked(conn)
+        override = conn.execute(
+            "SELECT cooldown_seconds FROM message_rate_overrides "
+            "WHERE participant_id = ?",
+            (participant_id,),
+        ).fetchone()
+        if override is None:
+            return defaults[kind]
+        return min(defaults[kind], float(override["cooldown_seconds"]))
+
+    @staticmethod
+    def _require_active_rate_admin_locked(
+        conn: sqlite3.Connection,
+        web_user_id: str,
+    ) -> sqlite3.Row:
+        administrator = conn.execute(
+            "SELECT * FROM web_users WHERE user_id = ? "
+            "AND role = 'admin' AND active = 1",
+            (web_user_id,),
+        ).fetchone()
+        if administrator is None:
+            raise AuthenticationError(
+                "an active administrator is required to manage message rates"
+            )
+        return administrator
+
+    @staticmethod
+    def _participant_rate_identity_locked(
+        conn: sqlite3.Connection,
+        participant_id: str,
+    ) -> tuple[sqlite3.Row, str]:
+        row = conn.execute(
+            """
+            SELECT participant.*, web_user.user_id AS web_user_id,
+                   web_user.username AS web_username,
+                   web_user.role AS web_role,
+                   web_user.active AS web_active,
+                   override.cooldown_seconds AS individual_cooldown_seconds,
+                   override.updated_at AS rate_updated_at,
+                   override.updated_by_web_user_id AS rate_updated_by_web_user_id
+            FROM participants AS participant
+            LEFT JOIN web_users AS web_user
+              ON web_user.participant_id = participant.participant_id
+            LEFT JOIN message_rate_overrides AS override
+              ON override.participant_id = participant.participant_id
+            WHERE participant.participant_id = ?
+            """,
+            (participant_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"unknown participant: {participant_id}")
+        if str(row["participant_id"]) == OWNER_PARTICIPANT_ID:
+            raise ConflictError("legacy owner message rate is not configurable")
+        if row["web_user_id"] is None:
+            return row, "agent"
+        if str(row["web_role"]) == "admin":
+            raise ConflictError("administrator message rate is always unlimited")
+        if not bool(row["web_active"]):
+            raise ConflictError("inactive web users cannot receive a message rate override")
+        return row, "web_user"
+
+    @staticmethod
+    def _participant_rate_payload(
+        row: sqlite3.Row,
+        *,
+        actor_kind: str,
+        global_cooldown_seconds: float,
+    ) -> dict[str, Any]:
+        individual = (
+            float(row["individual_cooldown_seconds"])
+            if row["individual_cooldown_seconds"] is not None
+            else None
+        )
+        effective = (
+            global_cooldown_seconds
+            if individual is None
+            else min(global_cooldown_seconds, individual)
+        )
+        return {
+            "participant_id": str(row["participant_id"]),
+            "actor_kind": actor_kind,
+            "display_name": str(row["display_name"]),
+            "identity": (
+                str(row["web_username"])
+                if actor_kind == "web_user"
+                else str(row["client_type"])
+            ),
+            "username": (
+                str(row["web_username"])
+                if actor_kind == "web_user"
+                else None
+            ),
+            "client_type": str(row["client_type"]),
+            "signature": str(row["signature"]),
+            "global_cooldown_seconds": global_cooldown_seconds,
+            "individual_cooldown_seconds": individual,
+            "effective_cooldown_seconds": effective,
+            "rate_updated_at": (
+                float(row["rate_updated_at"])
+                if row["rate_updated_at"] is not None
+                else None
+            ),
+            "rate_updated_by_web_user_id": (
+                str(row["rate_updated_by_web_user_id"])
+                if row["rate_updated_by_web_user_id"] is not None
+                else None
+            ),
+        }
 
     @staticmethod
     def _ensure_owner_membership_locked(
@@ -1167,6 +1884,50 @@ class BridgeStore:
                 OWNER_PARTICIPANT_ID,
                 float(now),
                 float(now),
+            ),
+        )
+
+    @staticmethod
+    def _ensure_web_membership_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        participant_id: str,
+        display_name: str,
+        signature: str,
+        role: str,
+        now: float,
+    ) -> None:
+        participant = conn.execute(
+            "SELECT participant_id FROM participants WHERE participant_id = ?",
+            (participant_id,),
+        ).fetchone()
+        if participant is None:
+            raise AuthenticationError("web user participant identity is missing")
+        conn.execute(
+            "UPDATE participants SET display_name = ?, signature = ?, "
+            "profile_updated_at = ?, status = 'online', last_seen = ? "
+            "WHERE participant_id = ?",
+            (display_name, signature, now, now, participant_id),
+        )
+        membership_role = "admin" if role == "admin" else "web-user"
+        conn.execute(
+            """
+            INSERT INTO memberships
+                (conversation_id, participant_id, roles_json, active,
+                 joined_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                roles_json = excluded.roles_json,
+                active = 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                conversation_id,
+                participant_id,
+                compact_json([membership_role]),
+                now,
+                now,
             ),
         )
 
@@ -1369,6 +2130,1815 @@ class BridgeStore:
             "owned_active_room_limit": AGENT_ACTIVE_ROOM_LIMIT,
         }
 
+    def message_rate_summary(
+        self,
+        *,
+        web_participant_id: str,
+        web_role: str,
+    ) -> dict[str, Any]:
+        participant = opaque_id(web_participant_id, field="web_participant_id")
+        role = str(web_role or "").strip().lower()
+        if role not in {"admin", "user"}:
+            raise ValidationError("web_role must be admin or user")
+        with self._connection() as conn:
+            defaults = self._message_rate_defaults_locked(conn)
+            effective = (
+                0.0
+                if role == "admin"
+                else self._effective_message_cooldown_locked(
+                    conn,
+                    participant_id=participant,
+                    actor_kind="web_user",
+                )
+            )
+        return {
+            "agent_global_cooldown_seconds": defaults["agent"],
+            "web_user_global_cooldown_seconds": defaults["web_user"],
+            "current_user_effective_cooldown_seconds": effective,
+            "resolution": "minimum",
+            "maximum_cooldown_seconds": MAX_MESSAGE_COOLDOWN_SECONDS,
+        }
+
+    def message_rate_configuration(
+        self,
+        *,
+        requesting_web_user_id: str,
+    ) -> dict[str, Any]:
+        reviewer = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        with self._connection() as conn:
+            self._require_active_rate_admin_locked(conn, reviewer)
+            rows = conn.execute(
+                """
+                SELECT rate.*, web_user.username AS updated_by_username
+                FROM message_rate_defaults AS rate
+                LEFT JOIN web_users AS web_user
+                  ON web_user.user_id = rate.updated_by_web_user_id
+                ORDER BY rate.actor_kind
+                """
+            ).fetchall()
+        globals_payload = {
+            str(row["actor_kind"]): {
+                "actor_kind": str(row["actor_kind"]),
+                "cooldown_seconds": float(row["cooldown_seconds"]),
+                "updated_at": float(row["updated_at"]),
+                "updated_by_web_user_id": (
+                    str(row["updated_by_web_user_id"])
+                    if row["updated_by_web_user_id"] is not None
+                    else None
+                ),
+                "updated_by_username": str(row["updated_by_username"] or ""),
+            }
+            for row in rows
+        }
+        return {
+            "globals": globals_payload,
+            "resolution": "minimum",
+            "maximum_cooldown_seconds": MAX_MESSAGE_COOLDOWN_SECONDS,
+        }
+
+    def update_global_message_rate(
+        self,
+        *,
+        actor_kind: str,
+        cooldown_seconds: object,
+        updated_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        kind = self._normalize_rate_actor_kind(actor_kind)
+        cooldown = self._normalize_message_cooldown(cooldown_seconds)
+        reviewer = opaque_id(
+            updated_by_web_user_id,
+            field="updated_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_rate_admin_locked(conn, reviewer)
+            conn.execute(
+                """
+                INSERT INTO message_rate_defaults
+                    (actor_kind, cooldown_seconds, updated_at,
+                     updated_by_web_user_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(actor_kind) DO UPDATE SET
+                    cooldown_seconds = excluded.cooldown_seconds,
+                    updated_at = excluded.updated_at,
+                    updated_by_web_user_id = excluded.updated_by_web_user_id
+                """,
+                (kind, cooldown, now, reviewer),
+            )
+        return {
+            "actor_kind": kind,
+            "cooldown_seconds": cooldown,
+            "updated_at": now,
+            "updated_by_web_user_id": reviewer,
+        }
+
+    def search_message_rate_participants(
+        self,
+        *,
+        requesting_web_user_id: str,
+        query: str = "",
+        actor_kind: str = "all",
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        reviewer = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        kind = self._normalize_rate_actor_kind(actor_kind, allow_all=True)
+        normalized_query = str(query or "").strip()
+        if len(normalized_query) > 64 or any(
+            ord(character) < 32 for character in normalized_query
+        ):
+            raise ValidationError("rate participant search must be at most 64 characters")
+        normalized_limit = max(1, min(int(limit), 100))
+        escaped = (
+            normalized_query.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        kind_clause = {
+            "all": "",
+            "agent": "AND web_user.user_id IS NULL",
+            "web_user": "AND web_user.role = 'user' AND web_user.active = 1",
+        }[kind]
+        with self._connection() as conn:
+            self._require_active_rate_admin_locked(conn, reviewer)
+            defaults = self._message_rate_defaults_locked(conn)
+            rows = conn.execute(
+                f"""
+                SELECT participant.*, web_user.user_id AS web_user_id,
+                       web_user.username AS web_username,
+                       web_user.role AS web_role,
+                       web_user.active AS web_active,
+                       override.cooldown_seconds AS individual_cooldown_seconds,
+                       override.updated_at AS rate_updated_at,
+                       override.updated_by_web_user_id
+                           AS rate_updated_by_web_user_id
+                FROM participants AS participant
+                LEFT JOIN web_users AS web_user
+                  ON web_user.participant_id = participant.participant_id
+                LEFT JOIN message_rate_overrides AS override
+                  ON override.participant_id = participant.participant_id
+                WHERE (
+                    web_user.user_id IS NULL
+                    OR (web_user.role = 'user' AND web_user.active = 1)
+                )
+                AND participant.participant_id != '{OWNER_PARTICIPANT_ID}'
+                {kind_clause}
+                AND (
+                    ? = ''
+                    OR participant.display_name LIKE ? ESCAPE '\\'
+                    OR participant.client_type LIKE ? ESCAPE '\\'
+                    OR participant.signature LIKE ? ESCAPE '\\'
+                    OR COALESCE(web_user.username, '') LIKE ? ESCAPE '\\'
+                )
+                ORDER BY participant.display_name COLLATE NOCASE,
+                         participant.participant_id
+                LIMIT ?
+                """,
+                (
+                    normalized_query,
+                    pattern,
+                    pattern,
+                    pattern,
+                    pattern,
+                    normalized_limit,
+                ),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            row_kind = "web_user" if row["web_user_id"] is not None else "agent"
+            result.append(
+                self._participant_rate_payload(
+                    row,
+                    actor_kind=row_kind,
+                    global_cooldown_seconds=defaults[row_kind],
+                )
+            )
+        return result
+
+    def set_participant_message_rate(
+        self,
+        *,
+        participant_id: str,
+        cooldown_seconds: object,
+        updated_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        cooldown = self._normalize_message_cooldown(cooldown_seconds)
+        reviewer = opaque_id(
+            updated_by_web_user_id,
+            field="updated_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_rate_admin_locked(conn, reviewer)
+            _, actor_kind = self._participant_rate_identity_locked(conn, participant)
+            conn.execute(
+                """
+                INSERT INTO message_rate_overrides
+                    (participant_id, cooldown_seconds, updated_at,
+                     updated_by_web_user_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(participant_id) DO UPDATE SET
+                    cooldown_seconds = excluded.cooldown_seconds,
+                    updated_at = excluded.updated_at,
+                    updated_by_web_user_id = excluded.updated_by_web_user_id
+                """,
+                (participant, cooldown, now, reviewer),
+            )
+            row, _ = self._participant_rate_identity_locked(conn, participant)
+            defaults = self._message_rate_defaults_locked(conn)
+        return self._participant_rate_payload(
+            row,
+            actor_kind=actor_kind,
+            global_cooldown_seconds=defaults[actor_kind],
+        )
+
+    def clear_participant_message_rate(
+        self,
+        *,
+        participant_id: str,
+        updated_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        reviewer = opaque_id(
+            updated_by_web_user_id,
+            field="updated_by_web_user_id",
+        )
+        with self._transaction() as conn:
+            self._require_active_rate_admin_locked(conn, reviewer)
+            _, actor_kind = self._participant_rate_identity_locked(conn, participant)
+            conn.execute(
+                "DELETE FROM message_rate_overrides WHERE participant_id = ?",
+                (participant,),
+            )
+            row, _ = self._participant_rate_identity_locked(conn, participant)
+            defaults = self._message_rate_defaults_locked(conn)
+        return self._participant_rate_payload(
+            row,
+            actor_kind=actor_kind,
+            global_cooldown_seconds=defaults[actor_kind],
+        )
+
+    @staticmethod
+    def _require_active_admin_locked(
+        conn: sqlite3.Connection,
+        web_user_id: str,
+    ) -> sqlite3.Row:
+        administrator = conn.execute(
+            "SELECT * FROM web_users WHERE user_id = ? "
+            "AND role = 'admin' AND active = 1",
+            (web_user_id,),
+        ).fetchone()
+        if administrator is None:
+            raise AuthenticationError("an active administrator is required")
+        return administrator
+
+    @staticmethod
+    def _normalize_agent_inactivity_days(value: object) -> int:
+        if isinstance(value, bool):
+            raise ValidationError("Agent inactivity days must be an integer")
+        try:
+            days = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("Agent inactivity days must be an integer") from exc
+        if str(value).strip() != str(days) and not isinstance(value, int):
+            raise ValidationError("Agent inactivity days must be an integer")
+        if not MIN_AGENT_INACTIVITY_DAYS <= days <= MAX_AGENT_INACTIVITY_DAYS:
+            raise ValidationError(
+                "Agent inactivity days must be between "
+                f"{MIN_AGENT_INACTIVITY_DAYS} and {MAX_AGENT_INACTIVITY_DAYS}"
+            )
+        return days
+
+    @staticmethod
+    def _ensure_agent_lifecycle_state_locked(
+        conn: sqlite3.Connection,
+        *,
+        participant_id: str,
+        now: float,
+    ) -> sqlite3.Row:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO agent_lifecycle_states
+                (participant_id, access_granted_at, last_spoke_at,
+                 reinvite_required, expired_at, expired_reason, updated_at)
+            VALUES (?, ?, NULL, 0, NULL, NULL, ?)
+            """,
+            (participant_id, now, now),
+        )
+        return conn.execute(
+            "SELECT * FROM agent_lifecycle_states WHERE participant_id = ?",
+            (participant_id,),
+        ).fetchone()
+
+    def _assert_agent_registration_allowed_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        participant_id: str,
+        conversation_id: str,
+        now: float,
+    ) -> None:
+        state = self._ensure_agent_lifecycle_state_locked(
+            conn,
+            participant_id=participant_id,
+            now=now,
+        )
+        if bool(state["reinvite_required"]):
+            raise ConflictError(
+                "Agent access expired after inactivity; a new invitation is required"
+            )
+        block = conn.execute(
+            "SELECT reason FROM agent_room_blocks "
+            "WHERE conversation_id = ? AND participant_id = ?",
+            (conversation_id, participant_id),
+        ).fetchone()
+        if block is not None:
+            raise ConflictError(
+                f"Agent was {block['reason']} from conversation {conversation_id}; "
+                "a new invitation is required"
+            )
+
+    def _grant_agent_invitation_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        participant_id: str,
+        conversation_id: str,
+        now: float,
+    ) -> None:
+        self._ensure_agent_lifecycle_state_locked(
+            conn,
+            participant_id=participant_id,
+            now=now,
+        )
+        conn.execute(
+            """
+            UPDATE agent_lifecycle_states
+            SET access_granted_at = ?, reinvite_required = 0,
+                expired_at = NULL, expired_reason = NULL, updated_at = ?
+            WHERE participant_id = ?
+            """,
+            (now, now, participant_id),
+        )
+        conn.execute(
+            "DELETE FROM agent_room_blocks "
+            "WHERE conversation_id = ? AND participant_id = ?",
+            (conversation_id, participant_id),
+        )
+
+    @staticmethod
+    def _cancel_agent_room_deliveries_locked(
+        conn: sqlite3.Connection,
+        *,
+        participant_id: str,
+        conversation_id: str,
+    ) -> int:
+        return int(
+            conn.execute(
+                """
+                UPDATE message_deliveries
+                SET state = 'cancelled', actionable = 0
+                WHERE participant_id = ?
+                  AND state IN ('pending', 'delivered')
+                  AND message_id IN (
+                      SELECT message_id FROM messages WHERE conversation_id = ?
+                  )
+                """,
+                (participant_id, conversation_id),
+            ).rowcount
+        )
+
+    @staticmethod
+    def _require_agent_participant_locked(
+        conn: sqlite3.Connection,
+        participant_id: str,
+    ) -> sqlite3.Row:
+        participant = conn.execute(
+            """
+            SELECT participant.*
+            FROM participants AS participant
+            WHERE participant.participant_id = ?
+              AND participant.participant_id != ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM web_users AS web_user
+                  WHERE web_user.participant_id = participant.participant_id
+              )
+            """,
+            (participant_id, OWNER_PARTICIPANT_ID),
+        ).fetchone()
+        if participant is None:
+            raise ConflictError("only Agent participants can be managed here")
+        return participant
+
+    def _expire_inactive_agents_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        policy = conn.execute(
+            "SELECT inactivity_days FROM agent_lifecycle_policy WHERE singleton = 1"
+        ).fetchone()
+        inactivity_days = int(policy["inactivity_days"])
+        cutoff = now - (inactivity_days * 86_400.0)
+        candidates = conn.execute(
+            """
+            SELECT state.participant_id, participant.display_name,
+                   state.access_granted_at, state.last_spoke_at,
+                   MAX(state.access_granted_at,
+                       COALESCE(state.last_spoke_at, state.access_granted_at))
+                       AS inactivity_anchor
+            FROM agent_lifecycle_states AS state
+            JOIN participants AS participant
+              ON participant.participant_id = state.participant_id
+            WHERE state.reinvite_required = 0
+              AND MAX(state.access_granted_at,
+                      COALESCE(state.last_spoke_at, state.access_granted_at)) <= ?
+              AND EXISTS (
+                  SELECT 1 FROM memberships AS membership
+                  WHERE membership.participant_id = state.participant_id
+                    AND membership.active = 1
+              )
+            ORDER BY inactivity_anchor, state.participant_id
+            """,
+            (cutoff,),
+        ).fetchall()
+        expired: list[dict[str, Any]] = []
+        for candidate in candidates:
+            participant_id = str(candidate["participant_id"])
+            rooms = [
+                str(row["conversation_id"])
+                for row in conn.execute(
+                    "SELECT conversation_id FROM memberships "
+                    "WHERE participant_id = ? AND active = 1 "
+                    "ORDER BY conversation_id",
+                    (participant_id,),
+                ).fetchall()
+            ]
+            for conversation_id in rooms:
+                conn.execute(
+                    """
+                    INSERT INTO agent_room_blocks
+                        (conversation_id, participant_id, reason, blocked_at,
+                         blocked_by_web_user_id)
+                    VALUES (?, ?, 'inactive', ?, NULL)
+                    ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                        reason = 'inactive', blocked_at = excluded.blocked_at,
+                        blocked_by_web_user_id = NULL
+                    """,
+                    (conversation_id, participant_id, now),
+                )
+                self._cancel_agent_room_deliveries_locked(
+                    conn,
+                    participant_id=participant_id,
+                    conversation_id=conversation_id,
+                )
+            conn.execute(
+                "UPDATE memberships SET active = 0, updated_at = ? "
+                "WHERE participant_id = ? AND active = 1",
+                (now, participant_id),
+            )
+            conn.execute(
+                """
+                UPDATE agent_lifecycle_states
+                SET reinvite_required = 1, expired_at = ?,
+                    expired_reason = 'inactive', updated_at = ?
+                WHERE participant_id = ?
+                """,
+                (now, now, participant_id),
+            )
+            conn.execute(
+                """
+                UPDATE agent_sessions
+                SET revoked_at = COALESCE(revoked_at, ?),
+                    revoked_reason = COALESCE(revoked_reason, 'agent_inactive'),
+                    cleared_at = COALESCE(cleared_at, ?)
+                WHERE participant_id = ?
+                """,
+                (now, now, participant_id),
+            )
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET setup_status = 'revoked',
+                    revoked_at = COALESCE(revoked_at, ?),
+                    setup_updated_at = ?, updated_at = ?
+                WHERE accepted_participant_id = ? AND revoked_at IS NULL
+                """,
+                (now, now, now, participant_id),
+            )
+            conn.execute(
+                "UPDATE participants SET status = 'offline' "
+                "WHERE participant_id = ?",
+                (participant_id,),
+            )
+            expired.append(
+                {
+                    "participant_id": participant_id,
+                    "display_name": str(candidate["display_name"]),
+                    "conversation_ids": rooms,
+                    "last_spoke_at": (
+                        float(candidate["last_spoke_at"])
+                        if candidate["last_spoke_at"] is not None
+                        else None
+                    ),
+                    "inactivity_anchor": float(candidate["inactivity_anchor"]),
+                    "expired_at": now,
+                }
+            )
+        return expired
+
+    def agent_lifecycle_configuration(
+        self,
+        *,
+        requesting_web_user_id: str,
+    ) -> dict[str, Any]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, requester)
+            expired = self._expire_inactive_agents_locked(conn, now=now)
+            policy = conn.execute(
+                "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
+            ).fetchone()
+        return {
+            "inactivity_days": int(policy["inactivity_days"]),
+            "minimum_days": MIN_AGENT_INACTIVITY_DAYS,
+            "maximum_days": MAX_AGENT_INACTIVITY_DAYS,
+            "updated_at": float(policy["updated_at"]),
+            "expired_count": len(expired),
+        }
+
+    def update_agent_lifecycle_configuration(
+        self,
+        *,
+        inactivity_days: object,
+        updated_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        days = self._normalize_agent_inactivity_days(inactivity_days)
+        reviewer = opaque_id(
+            updated_by_web_user_id,
+            field="updated_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, reviewer)
+            conn.execute(
+                """
+                UPDATE agent_lifecycle_policy
+                SET inactivity_days = ?, updated_at = ?,
+                    updated_by_web_user_id = ?
+                WHERE singleton = 1
+                """,
+                (days, now, reviewer),
+            )
+            expired = self._expire_inactive_agents_locked(conn, now=now)
+        return {
+            "inactivity_days": days,
+            "minimum_days": MIN_AGENT_INACTIVITY_DAYS,
+            "maximum_days": MAX_AGENT_INACTIVITY_DAYS,
+            "updated_at": now,
+            "expired_count": len(expired),
+            "expired_agents": expired,
+        }
+
+    def admin_room_agents(
+        self,
+        *,
+        requesting_web_user_id: str,
+    ) -> dict[str, Any]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, requester)
+            self._expire_inactive_agents_locked(conn, now=now)
+            inactivity_days = int(
+                conn.execute(
+                    "SELECT inactivity_days FROM agent_lifecycle_policy "
+                    "WHERE singleton = 1"
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                """
+                SELECT room.conversation_id, participant.participant_id,
+                       participant.client_type, participant.display_name,
+                       participant.signature, participant.status,
+                       membership.roles_json, membership.joined_at,
+                       state.access_granted_at, state.last_spoke_at
+                FROM rooms AS room
+                JOIN memberships AS membership
+                  ON membership.conversation_id = room.conversation_id
+                 AND membership.active = 1
+                JOIN participants AS participant
+                  ON participant.participant_id = membership.participant_id
+                LEFT JOIN agent_lifecycle_states AS state
+                  ON state.participant_id = participant.participant_id
+                WHERE room.status = 'active'
+                  AND participant.participant_id != ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM web_users AS web_user
+                      WHERE web_user.participant_id = participant.participant_id
+                  )
+                ORDER BY room.conversation_id,
+                         participant.display_name COLLATE NOCASE,
+                         participant.participant_id
+                """,
+                (OWNER_PARTICIPANT_ID,),
+            ).fetchall()
+            active_rooms = [
+                str(row["conversation_id"])
+                for row in conn.execute(
+                    "SELECT conversation_id FROM rooms WHERE status = 'active' "
+                    "ORDER BY conversation_id"
+                ).fetchall()
+            ]
+        rooms: dict[str, list[dict[str, Any]]] = {
+            conversation_id: [] for conversation_id in active_rooms
+        }
+        for row in rows:
+            access_granted_at = float(row["access_granted_at"] or row["joined_at"])
+            last_spoke_at = (
+                float(row["last_spoke_at"])
+                if row["last_spoke_at"] is not None
+                else None
+            )
+            inactivity_anchor = max(access_granted_at, last_spoke_at or 0.0)
+            rooms.setdefault(str(row["conversation_id"]), []).append(
+                {
+                    "participant_id": str(row["participant_id"]),
+                    "client_type": str(row["client_type"]),
+                    "display_name": str(row["display_name"]),
+                    "signature": str(row["signature"]),
+                    "status": str(row["status"]),
+                    "roles": json.loads(str(row["roles_json"] or "[]")),
+                    "joined_at": float(row["joined_at"]),
+                    "access_granted_at": access_granted_at,
+                    "last_spoke_at": last_spoke_at,
+                    "inactivity_expires_at": (
+                        inactivity_anchor + inactivity_days * 86_400.0
+                    ),
+                }
+            )
+        return {
+            "rooms": [
+                {"conversation_id": room, "agents": agents}
+                for room, agents in rooms.items()
+            ],
+            "inactivity_days": inactivity_days,
+        }
+
+    def kick_agent_from_room(
+        self,
+        *,
+        conversation_id: str,
+        participant_id: str,
+        kicked_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        conversation = validate_conversation_id(conversation_id)
+        participant = opaque_id(participant_id, field="participant_id")
+        administrator = opaque_id(
+            kicked_by_web_user_id,
+            field="kicked_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, administrator)
+            self._expire_inactive_agents_locked(conn, now=now)
+            self._require_active_room(conn, conversation)
+            profile = self._require_agent_participant_locked(conn, participant)
+            membership = conn.execute(
+                "SELECT roles_json FROM memberships WHERE conversation_id = ? "
+                "AND participant_id = ? AND active = 1",
+                (conversation, participant),
+            ).fetchone()
+            if membership is None:
+                raise ConflictError(
+                    f"Agent {participant} is not active in conversation {conversation}"
+                )
+            conn.execute(
+                "UPDATE memberships SET active = 0, updated_at = ? "
+                "WHERE conversation_id = ? AND participant_id = ?",
+                (now, conversation, participant),
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_room_blocks
+                    (conversation_id, participant_id, reason, blocked_at,
+                     blocked_by_web_user_id)
+                VALUES (?, ?, 'kicked', ?, ?)
+                ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                    reason = 'kicked', blocked_at = excluded.blocked_at,
+                    blocked_by_web_user_id = excluded.blocked_by_web_user_id
+                """,
+                (conversation, participant, now, administrator),
+            )
+            revoked_sessions = int(
+                conn.execute(
+                    """
+                    UPDATE agent_sessions
+                    SET revoked_at = COALESCE(revoked_at, ?),
+                        revoked_reason = COALESCE(revoked_reason, 'agent_kicked'),
+                        cleared_at = COALESCE(cleared_at, ?)
+                    WHERE participant_id = ?
+                      AND registered_conversation_id = ?
+                      AND cleared_at IS NULL
+                    """,
+                    (now, now, participant, conversation),
+                ).rowcount
+            )
+            revoked_connectors = int(
+                conn.execute(
+                    """
+                    UPDATE agent_connectors
+                    SET setup_status = 'revoked',
+                        revoked_at = COALESCE(revoked_at, ?),
+                        setup_updated_at = ?, updated_at = ?
+                    WHERE accepted_participant_id = ? AND conversation_id = ?
+                      AND revoked_at IS NULL
+                    """,
+                    (now, now, now, participant, conversation),
+                ).rowcount
+            )
+            cancelled_deliveries = self._cancel_agent_room_deliveries_locked(
+                conn,
+                participant_id=participant,
+                conversation_id=conversation,
+            )
+            conn.execute(
+                """
+                UPDATE participants
+                SET status = 'offline'
+                WHERE participant_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM agent_sessions AS session
+                      WHERE session.participant_id = participants.participant_id
+                        AND session.cleared_at IS NULL
+                        AND session.revoked_at IS NULL
+                        AND session.expires_at > ?
+                  )
+                """,
+                (participant, now),
+            )
+        return {
+            "conversation_id": conversation,
+            "participant_id": participant,
+            "display_name": str(profile["display_name"]),
+            "kicked_at": now,
+            "revoked_session_count": revoked_sessions,
+            "revoked_connector_count": revoked_connectors,
+            "cancelled_delivery_count": cancelled_deliveries,
+            "reinvite_required_for_room": True,
+            "history_preserved": True,
+        }
+
+    def migrate_agents(
+        self,
+        *,
+        target_conversation_id: str,
+        selections: object,
+        migrated_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        target = validate_conversation_id(target_conversation_id)
+        administrator = opaque_id(
+            migrated_by_web_user_id,
+            field="migrated_by_web_user_id",
+        )
+        if not isinstance(selections, Sequence) or isinstance(
+            selections, (str, bytes)
+        ):
+            raise ValidationError("selections must be a list")
+        sources: dict[str, list[str]] = {}
+        for selection in selections:
+            if not isinstance(selection, dict):
+                raise ValidationError("each migration selection must be an object")
+            unexpected = set(selection) - {"source_conversation_id", "participant_ids"}
+            if unexpected or "source_conversation_id" not in selection or (
+                "participant_ids" not in selection
+            ):
+                raise ValidationError(
+                    "each migration selection requires source_conversation_id "
+                    "and participant_ids"
+                )
+            source = validate_conversation_id(selection["source_conversation_id"])
+            if source == target:
+                raise ConflictError("migration source and target rooms must differ")
+            participant_ids = selection["participant_ids"]
+            if not isinstance(participant_ids, Sequence) or isinstance(
+                participant_ids, (str, bytes)
+            ):
+                raise ValidationError("participant_ids must be a list")
+            normalized = sources.setdefault(source, [])
+            for participant_id in participant_ids:
+                participant = opaque_id(participant_id, field="participant_id")
+                if participant not in normalized:
+                    normalized.append(participant)
+        sources = {source: participants for source, participants in sources.items() if participants}
+        selected_count = sum(len(participants) for participants in sources.values())
+        if selected_count < 1:
+            raise ValidationError("select at least one Agent to migrate")
+        if selected_count > 500:
+            raise ValidationError("cannot migrate more than 500 Agent memberships at once")
+
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, administrator)
+            self._expire_inactive_agents_locked(conn, now=now)
+            self._require_active_room(conn, target)
+            participant_sources: dict[str, list[str]] = {}
+            participant_roles: dict[str, set[str]] = {}
+            participant_names: dict[str, str] = {}
+            for source, participant_ids in sources.items():
+                self._require_active_room(conn, source)
+                for participant in participant_ids:
+                    profile = self._require_agent_participant_locked(conn, participant)
+                    membership = conn.execute(
+                        "SELECT roles_json FROM memberships "
+                        "WHERE conversation_id = ? AND participant_id = ? "
+                        "AND active = 1",
+                        (source, participant),
+                    ).fetchone()
+                    if membership is None:
+                        raise ConflictError(
+                            f"Agent {participant} is not active in conversation {source}"
+                        )
+                    participant_sources.setdefault(participant, []).append(source)
+                    participant_roles.setdefault(participant, set()).update(
+                        json.loads(str(membership["roles_json"] or "[]"))
+                    )
+                    participant_names[participant] = str(profile["display_name"])
+
+            for participant, source_rooms in participant_sources.items():
+                target_membership = conn.execute(
+                    "SELECT roles_json FROM memberships "
+                    "WHERE conversation_id = ? AND participant_id = ?",
+                    (target, participant),
+                ).fetchone()
+                if target_membership is not None:
+                    participant_roles[participant].update(
+                        json.loads(str(target_membership["roles_json"] or "[]"))
+                    )
+                for source in source_rooms:
+                    conn.execute(
+                        "UPDATE memberships SET active = 0, updated_at = ? "
+                        "WHERE conversation_id = ? AND participant_id = ?",
+                        (now, source, participant),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO agent_room_blocks
+                            (conversation_id, participant_id, reason, blocked_at,
+                             blocked_by_web_user_id)
+                        VALUES (?, ?, 'migrated', ?, ?)
+                        ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                            reason = 'migrated', blocked_at = excluded.blocked_at,
+                            blocked_by_web_user_id = excluded.blocked_by_web_user_id
+                        """,
+                        (source, participant, now, administrator),
+                    )
+                    self._cancel_agent_room_deliveries_locked(
+                        conn,
+                        participant_id=participant,
+                        conversation_id=source,
+                    )
+                placeholders = ",".join("?" for _ in source_rooms)
+                conn.execute(
+                    "UPDATE agent_sessions SET registered_conversation_id = ? "
+                    f"WHERE participant_id = ? AND registered_conversation_id IN ({placeholders}) "
+                    "AND cleared_at IS NULL AND revoked_at IS NULL",
+                    (target, participant, *source_rooms),
+                )
+                conn.execute(
+                    "UPDATE agent_connectors SET conversation_id = ?, updated_at = ? "
+                    f"WHERE accepted_participant_id = ? AND conversation_id IN ({placeholders}) "
+                    "AND revoked_at IS NULL",
+                    (target, now, participant, *source_rooms),
+                )
+                roles = sorted(participant_roles[participant])
+                conn.execute(
+                    """
+                    INSERT INTO memberships
+                        (conversation_id, participant_id, roles_json, active,
+                         joined_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                        roles_json = excluded.roles_json, active = 1,
+                        updated_at = excluded.updated_at
+                    """,
+                    (target, participant, compact_json(roles), now, now),
+                )
+                conn.execute(
+                    "DELETE FROM agent_room_blocks "
+                    "WHERE conversation_id = ? AND participant_id = ?",
+                    (target, participant),
+                )
+
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise BridgeError("Agent migration would violate database relationships")
+        return {
+            "target_conversation_id": target,
+            "migrated_at": now,
+            "membership_count": selected_count,
+            "agent_count": len(participant_sources),
+            "agents": [
+                {
+                    "participant_id": participant,
+                    "display_name": participant_names[participant],
+                    "source_conversation_ids": source_rooms,
+                }
+                for participant, source_rooms in participant_sources.items()
+            ],
+            "history_preserved": True,
+        }
+
+    @staticmethod
+    def _normalize_invitation_mode(value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode not in INVITATION_MODES:
+            raise ValidationError("invitation mode must be basic or resident")
+        return mode
+
+    @staticmethod
+    def _normalize_invitation_adapter(value: str) -> str:
+        adapter = str(value or "").strip().lower()
+        if adapter not in INVITATION_ADAPTERS:
+            raise ValidationError(
+                "invitation adapter must be codex, claude-code, or manual"
+            )
+        return adapter
+
+    @staticmethod
+    def _expire_agent_invitations_locked(
+        conn: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> int:
+        cursor = conn.execute(
+            """
+            UPDATE agent_invitations
+            SET status = 'expired', updated_at = ?
+            WHERE status = 'active' AND expires_at <= ?
+            """,
+            (now, now),
+        )
+        return int(cursor.rowcount)
+
+    @staticmethod
+    def _connector_detail(value: object) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValidationError("connector detail must be an object")
+        forbidden = {"token", "secret", "password", "authorization", "credential"}
+        normalized: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key or "").strip()
+            if not key or len(key) > 64 or key.casefold() in forbidden:
+                raise ValidationError("connector detail contains an invalid field")
+            if isinstance(raw_value, bool) or raw_value is None:
+                normalized[key] = raw_value
+            elif isinstance(raw_value, (int, float)):
+                normalized[key] = raw_value
+            else:
+                text = str(raw_value)
+                if len(text) > 512 or any(ord(character) < 32 for character in text):
+                    raise ValidationError("connector detail value is invalid")
+                normalized[key] = text
+        encoded = compact_json(normalized)
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValidationError("connector detail is too large")
+        return normalized
+
+    @staticmethod
+    def _agent_invitation_payload(
+        row: sqlite3.Row,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        keys = set(row.keys())
+
+        def integer(name: str) -> int:
+            return int(row[name] or 0) if name in keys else 0
+
+        connector_count = integer("connector_count")
+        active_connector_count = integer("active_connector_count")
+        online_connector_count = integer("online_connector_count")
+        configured_connector_count = integer("configured_connector_count")
+        manual_connector_count = integer("manual_connector_count")
+        failed_connector_count = integer("failed_connector_count")
+        latest_seen = (
+            float(row["latest_connector_last_seen_at"])
+            if "latest_connector_last_seen_at" in keys
+            and row["latest_connector_last_seen_at"] is not None
+            else None
+        )
+        invitation_status = str(row["status"])
+        if invitation_status == "revoked":
+            resident_status = "revoked"
+            setup_status = "revoked"
+        elif online_connector_count > 0:
+            resident_status = "online"
+            setup_status = "configured"
+        elif configured_connector_count > 0:
+            resident_status = "offline"
+            setup_status = "configured"
+        elif failed_connector_count > 0:
+            resident_status = "failed"
+            setup_status = "failed"
+        elif active_connector_count > 0 and (
+            manual_connector_count == active_connector_count
+        ):
+            resident_status = "manual"
+            setup_status = "manual"
+        elif active_connector_count > 0:
+            resident_status = "awaiting_setup"
+            setup_status = "awaiting_setup"
+        else:
+            resident_status = (
+                invitation_status
+                if invitation_status in {"expired", "exhausted"}
+                else "awaiting_acceptance"
+            )
+            setup_status = "awaiting_acceptance"
+        max_uses = (
+            int(row["max_uses"])
+            if row["max_uses"] is not None
+            else None
+        )
+        use_count = int(row["use_count"])
+        return {
+            "invitation_id": str(row["invitation_id"]),
+            "conversation_id": str(row["conversation_id"]),
+            "product": str(row["product"]),
+            "requested_mode": str(row["requested_mode"]),
+            "adapter_kind": str(row["adapter_kind"]),
+            "resident_capable": str(row["adapter_kind"]) != "manual",
+            "reuse_policy": str(row["reuse_policy"]),
+            "reusable": str(row["reuse_policy"]) == "reusable",
+            "max_uses": max_uses,
+            "use_count": use_count,
+            "remaining_uses": (
+                max(0, max_uses - use_count) if max_uses is not None else None
+            ),
+            "status": invitation_status,
+            "created_by_web_user_id": str(row["created_by_web_user_id"]),
+            "created_by_username": (
+                str(row["created_by_username"] or "")
+                if "created_by_username" in keys
+                else ""
+            ),
+            "created_at": float(row["created_at"]),
+            "expires_at": float(row["expires_at"]),
+            "first_accepted_at": (
+                float(row["first_accepted_at"])
+                if row["first_accepted_at"] is not None
+                else None
+            ),
+            "last_accepted_at": (
+                float(row["last_accepted_at"])
+                if row["last_accepted_at"] is not None
+                else None
+            ),
+            "accepted_at": (
+                float(row["first_accepted_at"])
+                if row["first_accepted_at"] is not None
+                else None
+            ),
+            "last_accepted_display_name": (
+                str(row["last_accepted_display_name"] or "")
+                if "last_accepted_display_name" in keys
+                else ""
+            ),
+            "last_accepted_client_type": (
+                str(row["last_accepted_client_type"] or "")
+                if "last_accepted_client_type" in keys
+                else ""
+            ),
+            "connector_count": connector_count,
+            "active_connector_count": active_connector_count,
+            "online_connector_count": online_connector_count,
+            "configured_connector_count": configured_connector_count,
+            "manual_connector_count": manual_connector_count,
+            "failed_connector_count": failed_connector_count,
+            "setup_status": setup_status,
+            "connector_last_seen_at": latest_seen,
+            "resident_status": resident_status,
+            "revoked_at": (
+                float(row["revoked_at"]) if row["revoked_at"] is not None else None
+            ),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _agent_invitation_row_locked(
+        conn: sqlite3.Connection,
+        *,
+        invitation_id: str,
+        now: float,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT invitation.*, creator.username AS created_by_username,
+                   COUNT(connector.connector_id) AS connector_count,
+                   SUM(CASE WHEN connector.connector_id IS NOT NULL
+                                 AND connector.revoked_at IS NULL
+                            THEN 1 ELSE 0 END) AS active_connector_count,
+                   SUM(CASE WHEN connector.revoked_at IS NULL
+                                 AND connector.setup_status = 'configured'
+                                 AND connector.connector_last_seen_at >= ?
+                            THEN 1 ELSE 0 END) AS online_connector_count,
+                   SUM(CASE WHEN connector.revoked_at IS NULL
+                                 AND connector.setup_status = 'configured'
+                            THEN 1 ELSE 0 END) AS configured_connector_count,
+                   SUM(CASE WHEN connector.revoked_at IS NULL
+                                 AND connector.setup_status = 'manual'
+                            THEN 1 ELSE 0 END) AS manual_connector_count,
+                   SUM(CASE WHEN connector.revoked_at IS NULL
+                                 AND connector.setup_status = 'failed'
+                            THEN 1 ELSE 0 END) AS failed_connector_count,
+                   MAX(connector.connector_last_seen_at)
+                       AS latest_connector_last_seen_at,
+                   (
+                       SELECT participant.display_name
+                       FROM agent_connectors AS recent
+                       JOIN participants AS participant
+                         ON participant.participant_id = recent.accepted_participant_id
+                       WHERE recent.invitation_id = invitation.invitation_id
+                       ORDER BY recent.created_at DESC
+                       LIMIT 1
+                   ) AS last_accepted_display_name,
+                   (
+                       SELECT participant.client_type
+                       FROM agent_connectors AS recent
+                       JOIN participants AS participant
+                         ON participant.participant_id = recent.accepted_participant_id
+                       WHERE recent.invitation_id = invitation.invitation_id
+                       ORDER BY recent.created_at DESC
+                       LIMIT 1
+                   ) AS last_accepted_client_type
+            FROM agent_invitations AS invitation
+            JOIN web_users AS creator
+              ON creator.user_id = invitation.created_by_web_user_id
+            LEFT JOIN agent_connectors AS connector
+              ON connector.invitation_id = invitation.invitation_id
+            WHERE invitation.invitation_id = ?
+            GROUP BY invitation.invitation_id
+            """,
+            (now - CONNECTOR_ONLINE_WINDOW_SECONDS, invitation_id),
+        ).fetchone()
+
+    @staticmethod
+    def _agent_connector_payload(
+        row: sqlite3.Row,
+        *,
+        now: float,
+    ) -> dict[str, Any]:
+        last_seen = (
+            float(row["connector_last_seen_at"])
+            if row["connector_last_seen_at"] is not None
+            else None
+        )
+        setup_status = str(row["setup_status"])
+        revoked = (
+            row["revoked_at"] is not None
+            or str(row["invitation_status"]) == "revoked"
+        )
+        if revoked:
+            resident_status = "revoked"
+        elif setup_status == "configured" and last_seen is not None and (
+            now - last_seen <= CONNECTOR_ONLINE_WINDOW_SECONDS
+        ):
+            resident_status = "online"
+        elif setup_status == "configured":
+            resident_status = "offline"
+        else:
+            resident_status = setup_status
+        return {
+            "connector_id": str(row["connector_id"]),
+            "invitation_id": str(row["invitation_id"]),
+            "conversation_id": str(row["conversation_id"]),
+            "product": str(row["product"]),
+            "adapter_kind": str(row["adapter_kind"]),
+            "accepted_participant_id": str(row["accepted_participant_id"]),
+            "setup_status": setup_status,
+            "setup_detail": json.loads(str(row["setup_detail_json"] or "{}")),
+            "setup_updated_at": (
+                float(row["setup_updated_at"])
+                if row["setup_updated_at"] is not None
+                else None
+            ),
+            "connector_last_seen_at": last_seen,
+            "resident_status": resident_status,
+            "revoked_at": (
+                float(row["revoked_at"])
+                if row["revoked_at"] is not None
+                else None
+            ),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def create_agent_invitation(
+        self,
+        *,
+        conversation_id: str,
+        product: str,
+        requested_mode: str,
+        adapter_kind: str,
+        created_by_web_user_id: str,
+        reusable: bool = False,
+        ttl_seconds: float = DEFAULT_INVITATION_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        conversation = validate_conversation_id(conversation_id)
+        normalized_product = token(product, field="product_name")
+        mode = self._normalize_invitation_mode(requested_mode)
+        adapter = self._normalize_invitation_adapter(adapter_kind)
+        creator = opaque_id(created_by_web_user_id, field="created_by_web_user_id")
+        if not isinstance(reusable, bool):
+            raise ValidationError("reusable must be a boolean")
+        reuse_policy = "reusable" if reusable else "single"
+        max_uses = None if reusable else 1
+        if isinstance(ttl_seconds, bool):
+            raise ValidationError("invitation ttl must be a number")
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("invitation ttl must be a number") from exc
+        if not math.isfinite(ttl):
+            raise ValidationError("invitation ttl must be finite")
+        ttl = max(60.0, min(ttl, MAX_INVITATION_TTL_SECONDS))
+        now = time.time()
+        invitation_id = f"invite_{uuid.uuid4().hex}"
+        invitation_token = f"invite_{secrets.token_urlsafe(32)}"
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, creator)
+            self._require_active_room(conn, conversation)
+            self._expire_agent_invitations_locked(conn, now=now)
+            conn.execute(
+                """
+                INSERT INTO agent_invitations
+                    (invitation_id, token_hash, conversation_id, product,
+                     requested_mode, adapter_kind, reuse_policy, max_uses,
+                     use_count, status,
+                     created_by_web_user_id, created_at, expires_at,
+                     updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?)
+                """,
+                (
+                    invitation_id,
+                    self._secret_hash(invitation_token),
+                    conversation,
+                    normalized_product,
+                    mode,
+                    adapter,
+                    reuse_policy,
+                    max_uses,
+                    creator,
+                    now,
+                    now + ttl,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_invitations WHERE invitation_id = ?",
+                (invitation_id,),
+            ).fetchone()
+        result = self._agent_invitation_payload(row, now=now)
+        result["invitation_token"] = invitation_token
+        return result
+
+    def list_agent_invitations(
+        self,
+        *,
+        requesting_web_user_id: str,
+        conversation_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        conversation = (
+            validate_conversation_id(conversation_id) if conversation_id else None
+        )
+        normalized_limit = max(1, min(int(limit), 500))
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, requester)
+            self._expire_agent_invitations_locked(conn, now=now)
+            rows = conn.execute(
+                """
+                SELECT invitation.*, creator.username AS created_by_username,
+                       COUNT(connector.connector_id) AS connector_count,
+                       SUM(CASE WHEN connector.connector_id IS NOT NULL
+                                     AND connector.revoked_at IS NULL
+                                THEN 1 ELSE 0 END) AS active_connector_count,
+                       SUM(CASE WHEN connector.revoked_at IS NULL
+                                     AND connector.setup_status = 'configured'
+                                     AND connector.connector_last_seen_at >= ?
+                                THEN 1 ELSE 0 END) AS online_connector_count,
+                       SUM(CASE WHEN connector.revoked_at IS NULL
+                                     AND connector.setup_status = 'configured'
+                                THEN 1 ELSE 0 END) AS configured_connector_count,
+                       SUM(CASE WHEN connector.revoked_at IS NULL
+                                     AND connector.setup_status = 'manual'
+                                THEN 1 ELSE 0 END) AS manual_connector_count,
+                       SUM(CASE WHEN connector.revoked_at IS NULL
+                                     AND connector.setup_status = 'failed'
+                                THEN 1 ELSE 0 END) AS failed_connector_count,
+                       MAX(connector.connector_last_seen_at)
+                           AS latest_connector_last_seen_at,
+                       (
+                           SELECT participant.display_name
+                           FROM agent_connectors AS recent
+                           JOIN participants AS participant
+                             ON participant.participant_id = recent.accepted_participant_id
+                           WHERE recent.invitation_id = invitation.invitation_id
+                           ORDER BY recent.created_at DESC LIMIT 1
+                       ) AS last_accepted_display_name,
+                       (
+                           SELECT participant.client_type
+                           FROM agent_connectors AS recent
+                           JOIN participants AS participant
+                             ON participant.participant_id = recent.accepted_participant_id
+                           WHERE recent.invitation_id = invitation.invitation_id
+                           ORDER BY recent.created_at DESC LIMIT 1
+                       ) AS last_accepted_client_type
+                FROM agent_invitations AS invitation
+                JOIN web_users AS creator
+                  ON creator.user_id = invitation.created_by_web_user_id
+                LEFT JOIN agent_connectors AS connector
+                  ON connector.invitation_id = invitation.invitation_id
+                WHERE (? IS NULL OR invitation.conversation_id = ?)
+                GROUP BY invitation.invitation_id
+                ORDER BY invitation.created_at DESC
+                LIMIT ?
+                """,
+                (
+                    now - CONNECTOR_ONLINE_WINDOW_SECONDS,
+                    conversation,
+                    conversation,
+                    normalized_limit,
+                ),
+            ).fetchall()
+        return [self._agent_invitation_payload(row, now=now) for row in rows]
+
+    def revoke_agent_invitation(
+        self,
+        *,
+        invitation_id: str,
+        revoked_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        invitation = opaque_id(invitation_id, field="invitation_id")
+        reviewer = opaque_id(
+            revoked_by_web_user_id,
+            field="revoked_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, reviewer)
+            self._expire_agent_invitations_locked(conn, now=now)
+            row = conn.execute(
+                "SELECT * FROM agent_invitations WHERE invitation_id = ?",
+                (invitation,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"unknown agent invitation: {invitation}")
+            if str(row["status"]) == "revoked":
+                projected = self._agent_invitation_row_locked(
+                    conn,
+                    invitation_id=invitation,
+                    now=now,
+                )
+                return self._agent_invitation_payload(projected, now=now)
+            conn.execute(
+                """
+                UPDATE agent_invitations
+                SET status = 'revoked', revoked_at = ?, updated_at = ?
+                WHERE invitation_id = ?
+                """,
+                (now, now, invitation),
+            )
+            conn.execute(
+                "UPDATE agent_connectors SET setup_status = 'revoked', "
+                "revoked_at = COALESCE(revoked_at, ?), "
+                "setup_updated_at = ?, updated_at = ? "
+                "WHERE invitation_id = ?",
+                (now, now, now, invitation),
+            )
+            conn.execute(
+                "UPDATE agent_sessions SET revoked_at = ?, "
+                "revoked_reason = 'connector_invitation_revoked' "
+                "WHERE connector_id IN (SELECT connector_id FROM agent_connectors "
+                "WHERE invitation_id = ?) AND revoked_at IS NULL",
+                (now, invitation),
+            )
+            updated = self._agent_invitation_row_locked(
+                conn,
+                invitation_id=invitation,
+                now=now,
+            )
+        return self._agent_invitation_payload(updated, now=now)
+
+    def accept_agent_invitation(
+        self,
+        *,
+        invitation_token: str,
+        product: str,
+        username: str,
+        signature: str,
+        roles: Sequence[str] | None = None,
+        capabilities: Sequence[str] | None = None,
+        enrollment_token: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_invitation_token = opaque_id(
+            invitation_token,
+            field="invitation_token",
+        )
+        normalized_product = token(product, field="product_name")
+        normalized_enrollment = None
+        if enrollment_token is not None:
+            normalized_enrollment = opaque_id(
+                enrollment_token,
+                field="enrollment_token",
+            )
+            if not normalized_enrollment.startswith("enroll_") or len(
+                normalized_enrollment
+            ) < 40:
+                raise ValidationError("enrollment_token must be a strong enroll_ token")
+        now = time.time()
+        with self._transaction() as conn:
+            self._expire_agent_invitations_locked(conn, now=now)
+            self._expire_inactive_agents_locked(conn, now=now)
+            invitation = conn.execute(
+                "SELECT * FROM agent_invitations WHERE token_hash = ?",
+                (self._secret_hash(normalized_invitation_token),),
+            ).fetchone()
+            if invitation is None:
+                raise AuthenticationError("invalid Agent invitation")
+            invitation_status = str(invitation["status"])
+            if invitation_status == "revoked":
+                raise ConflictError("Agent invitation is revoked")
+            if not secrets.compare_digest(
+                normalized_product,
+                str(invitation["product"]),
+            ):
+                raise AuthenticationError("Agent invitation product does not match")
+            registration = self._normalized_agent_registration(
+                product=normalized_product,
+                username=username,
+                session_alias=None,
+                signature=signature,
+                conversation_id=str(invitation["conversation_id"]),
+                roles=roles,
+                capabilities=capabilities,
+                session_ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
+            )
+            existing_connector = None
+            if normalized_enrollment is not None:
+                existing_connector = conn.execute(
+                    """
+                    SELECT connector.*, participant.client_type
+                    FROM agent_connectors AS connector
+                    JOIN participants AS participant
+                      ON participant.participant_id = connector.accepted_participant_id
+                    WHERE connector.enrollment_token_hash = ?
+                    """,
+                    (self._secret_hash(normalized_enrollment),),
+                ).fetchone()
+            if existing_connector is not None:
+                if str(existing_connector["invitation_id"]) != str(
+                    invitation["invitation_id"]
+                ):
+                    raise ConflictError(
+                        "enrollment token is already bound to another invitation"
+                    )
+                if existing_connector["revoked_at"] is not None:
+                    raise ConflictError("Agent connector is revoked")
+                if not secrets.compare_digest(
+                    str(registration["identity"]),
+                    str(existing_connector["client_type"]),
+                ):
+                    raise AuthenticationError(
+                        "Agent invitation retry identity does not match"
+                    )
+                connector_id = str(existing_connector["connector_id"])
+                registration["conversation_id"] = str(
+                    existing_connector["conversation_id"]
+                )
+                registered = self._register_agent_session_locked(
+                    conn,
+                    registration=registration,
+                    connector_id=connector_id,
+                    invitation_grant=False,
+                    now=now,
+                )
+                conn.execute(
+                    "UPDATE agent_connectors SET enrollment_last_used_at = ?, "
+                    "updated_at = ? WHERE connector_id = ?",
+                    (now, now, connector_id),
+                )
+                setup_status = str(existing_connector["setup_status"])
+            else:
+                if invitation_status != "active":
+                    raise ConflictError(
+                        f"Agent invitation is {invitation_status}"
+                    )
+                duplicate_identity = conn.execute(
+                    """
+                    SELECT connector.connector_id
+                    FROM agent_connectors AS connector
+                    JOIN participants AS participant
+                      ON participant.participant_id = connector.accepted_participant_id
+                    WHERE connector.invitation_id = ?
+                      AND participant.client_type = ?
+                    """,
+                    (
+                        str(invitation["invitation_id"]),
+                        str(registration["identity"]),
+                    ),
+                ).fetchone()
+                if duplicate_identity is not None:
+                    raise ConflictError(
+                        "this Agent identity already accepted the invitation"
+                    )
+                connector_id = f"connector_{uuid.uuid4().hex}"
+                normalized_enrollment = normalized_enrollment or (
+                    f"enroll_{secrets.token_urlsafe(32)}"
+                )
+                registered = self._register_agent_session_locked(
+                    conn,
+                    registration=registration,
+                    connector_id=connector_id,
+                    invitation_grant=True,
+                    now=now,
+                )
+                setup_status = (
+                    "awaiting_setup"
+                    if str(invitation["requested_mode"]) == "resident"
+                    and str(invitation["adapter_kind"]) != "manual"
+                    else "manual"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO agent_connectors
+                        (connector_id, invitation_id, conversation_id,
+                         accepted_participant_id,
+                         initial_session_id, enrollment_token_hash,
+                         enrollment_last_used_at, setup_status,
+                         setup_updated_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        connector_id,
+                        str(invitation["invitation_id"]),
+                        str(registration["conversation_id"]),
+                        registered["participant_id"],
+                        registered["session_id"],
+                        self._secret_hash(normalized_enrollment),
+                        now,
+                        setup_status,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE agent_invitations
+                    SET use_count = use_count + 1,
+                        first_accepted_at = COALESCE(first_accepted_at, ?),
+                        last_accepted_at = ?,
+                        status = CASE
+                            WHEN max_uses IS NOT NULL
+                             AND use_count + 1 >= max_uses
+                            THEN 'exhausted'
+                            ELSE status
+                        END,
+                        updated_at = ?
+                    WHERE invitation_id = ? AND status = 'active'
+                    """,
+                    (now, now, now, str(invitation["invitation_id"])),
+                )
+        registered.update(
+            {
+                "invitation_id": str(invitation["invitation_id"]),
+                "requested_mode": str(invitation["requested_mode"]),
+                "adapter_kind": str(invitation["adapter_kind"]),
+                "reuse_policy": str(invitation["reuse_policy"]),
+                "invitation_reusable": (
+                    str(invitation["reuse_policy"]) == "reusable"
+                ),
+                "enrollment_token": normalized_enrollment,
+                "setup_status": setup_status,
+            }
+        )
+        return registered
+
+    def register_agent_session_from_enrollment(
+        self,
+        *,
+        enrollment_token: str,
+        product: str,
+        username: str,
+        session_alias: str | None = None,
+        signature: str | None = None,
+        roles: Sequence[str] | None = None,
+        capabilities: Sequence[str] | None = None,
+        session_ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+    ) -> dict[str, Any]:
+        normalized_enrollment = opaque_id(
+            enrollment_token,
+            field="enrollment_token",
+        )
+        normalized_product = token(product, field="product_name")
+        normalized_identity = product_username(normalized_product, username)
+        now = time.time()
+        with self._transaction() as conn:
+            self._expire_inactive_agents_locked(conn, now=now)
+            invitation = conn.execute(
+                """
+                SELECT invitation.*, connector.connector_id,
+                       connector.conversation_id AS connector_conversation_id,
+                       connector.accepted_participant_id,
+                       connector.revoked_at AS connector_revoked_at,
+                       participant.client_type
+                FROM agent_connectors AS connector
+                JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
+                JOIN participants AS participant
+                  ON participant.participant_id = connector.accepted_participant_id
+                WHERE connector.enrollment_token_hash = ?
+                """,
+                (self._secret_hash(normalized_enrollment),),
+            ).fetchone()
+            if (
+                invitation is None
+                or str(invitation["status"]) == "revoked"
+                or invitation["connector_revoked_at"] is not None
+            ):
+                raise AuthenticationError("invalid or revoked Agent enrollment")
+            if not secrets.compare_digest(
+                normalized_identity,
+                str(invitation["client_type"]),
+            ):
+                raise AuthenticationError("Agent enrollment identity does not match")
+            registration = self._normalized_agent_registration(
+                product=normalized_product,
+                username=username,
+                session_alias=session_alias,
+                signature=signature,
+                conversation_id=str(invitation["connector_conversation_id"]),
+                roles=roles,
+                capabilities=capabilities,
+                session_ttl_seconds=session_ttl_seconds,
+            )
+            registered = self._register_agent_session_locked(
+                conn,
+                registration=registration,
+                connector_id=str(invitation["connector_id"]),
+                invitation_grant=False,
+                now=now,
+            )
+            conn.execute(
+                "UPDATE agent_connectors SET enrollment_last_used_at = ?, "
+                "updated_at = ? WHERE connector_id = ?",
+                (now, now, str(invitation["connector_id"])),
+            )
+        registered["invitation_id"] = str(invitation["invitation_id"])
+        registered["adapter_kind"] = str(invitation["adapter_kind"])
+        return registered
+
+    def report_agent_connector_setup(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        setup_status: str,
+        detail: object = None,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        status = str(setup_status or "").strip().lower()
+        if status not in {"awaiting_setup", "configured", "manual", "failed"}:
+            raise ValidationError("unsupported connector setup status")
+        normalized_detail = self._connector_detail(detail)
+        now = time.time()
+        with self._transaction() as conn:
+            session = self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            if str(session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            cursor = conn.execute(
+                """
+                UPDATE agent_connectors
+                SET setup_status = ?, setup_detail_json = ?,
+                    setup_updated_at = ?, updated_at = ?
+                WHERE connector_id = ? AND accepted_participant_id = ?
+                  AND revoked_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM agent_invitations AS invitation
+                      WHERE invitation.invitation_id = agent_connectors.invitation_id
+                        AND invitation.status != 'revoked'
+                  )
+                """,
+                (
+                    status,
+                    compact_json(normalized_detail),
+                    now,
+                    now,
+                    connector,
+                    participant,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise NotFoundError("active connector invitation was not found")
+            row = conn.execute(
+                """
+                SELECT connector.*, invitation.product, invitation.adapter_kind,
+                       invitation.status AS invitation_status
+                FROM agent_connectors AS connector
+                JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
+                WHERE connector.connector_id = ?
+                """,
+                (connector,),
+            ).fetchone()
+        return self._agent_connector_payload(row, now=now)
+
+    def touch_agent_connector(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+    ) -> dict[str, Any] | None:
+        participant = opaque_id(participant_id, field="participant_id")
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        now = time.time()
+        with self._transaction() as conn:
+            session = self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            if str(session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            cursor = conn.execute(
+                """
+                UPDATE agent_connectors
+                SET connector_last_seen_at = ?, updated_at = ?
+                WHERE connector_id = ? AND accepted_participant_id = ?
+                  AND revoked_at IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM agent_invitations AS invitation
+                      WHERE invitation.invitation_id = agent_connectors.invitation_id
+                        AND invitation.status != 'revoked'
+                  )
+                """,
+                (now, now, connector, participant),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = conn.execute(
+                """
+                SELECT connector.*, invitation.product, invitation.adapter_kind,
+                       invitation.status AS invitation_status
+                FROM agent_connectors AS connector
+                JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
+                WHERE connector.connector_id = ?
+                """,
+                (connector,),
+            ).fetchone()
+        return self._agent_connector_payload(row, now=now)
+
     def create_user_room(self, conversation_id: str) -> dict[str, Any]:
         """Create an owner-managed room without consuming an agent quota."""
         conversation = validate_conversation_id(conversation_id)
@@ -1399,6 +3969,103 @@ class BridgeStore:
             "creator_kind": "user",
             "created_at": now,
             "last_activity_at": now,
+        }
+
+    def room(self, conversation_id: str) -> dict[str, Any]:
+        """Return one room's authoritative identity and lifecycle state."""
+
+        conversation = validate_conversation_id(conversation_id)
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM rooms WHERE conversation_id = ?",
+                (conversation,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"unknown conversation: {conversation}")
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "status": str(row["status"]),
+            "creator_kind": str(row["creator_kind"]),
+            "created_at": float(row["created_at"]),
+            "last_activity_at": float(row["last_activity_at"]),
+            "abandoned_at": (
+                float(row["abandoned_at"])
+                if row["abandoned_at"] is not None
+                else None
+            ),
+        }
+
+    def rename_room(
+        self,
+        *,
+        conversation_id: str,
+        new_conversation_id: str,
+    ) -> dict[str, Any]:
+        """Rename one room while preserving every foreign-key-linked record."""
+
+        current = validate_conversation_id(conversation_id)
+        renamed = validate_conversation_id(new_conversation_id)
+        now = time.time()
+        with self._transaction() as conn:
+            room = conn.execute(
+                "SELECT * FROM rooms WHERE conversation_id = ?",
+                (current,),
+            ).fetchone()
+            if room is None:
+                raise NotFoundError(f"unknown conversation: {current}")
+            if renamed == current:
+                return {
+                    "previous_conversation_id": current,
+                    "conversation_id": current,
+                    "status": str(room["status"]),
+                    "renamed_at": now,
+                }
+            duplicate = conn.execute(
+                "SELECT status FROM rooms WHERE conversation_id = ?",
+                (renamed,),
+            ).fetchone()
+            if duplicate is not None:
+                raise ConflictError(
+                    f"conversation {renamed} already exists with status "
+                    f"{duplicate['status']}"
+                )
+            conn.execute("PRAGMA defer_foreign_keys = ON")
+            conn.execute(
+                "UPDATE rooms SET conversation_id = ?, "
+                "last_activity_at = MAX(last_activity_at, ?) "
+                "WHERE conversation_id = ?",
+                (renamed, now, current),
+            )
+            for table in (
+                "memberships",
+                "agent_sessions",
+                "messages",
+                "agent_invitations",
+                "agent_connectors",
+                "agent_room_blocks",
+            ):
+                column = (
+                    "registered_conversation_id"
+                    if table == "agent_sessions"
+                    else "conversation_id"
+                )
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE {column} = ?",
+                    (renamed, current),
+                )
+            conn.execute(
+                "UPDATE follows SET conversation_id = ?, updated_at = ? "
+                "WHERE conversation_id = ?",
+                (renamed, now, current),
+            )
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise BridgeError("room rename would violate database relationships")
+        return {
+            "previous_conversation_id": current,
+            "conversation_id": renamed,
+            "status": str(room["status"]),
+            "renamed_at": now,
         }
 
     def create_agent_room(
@@ -1468,17 +4135,17 @@ class BridgeStore:
             "owned_active_room_limit": AGENT_ACTIVE_ROOM_LIMIT,
         }
 
-    def register_agent_session(
-        self,
+    @staticmethod
+    def _normalized_agent_registration(
         *,
         product: str,
         username: str,
-        session_alias: str | None = None,
-        signature: str | None = None,
+        session_alias: str | None,
+        signature: str | None,
         conversation_id: str,
-        roles: Sequence[str] | None = None,
-        capabilities: Sequence[str] | None = None,
-        session_ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+        roles: Sequence[str] | None,
+        capabilities: Sequence[str] | None,
+        session_ttl_seconds: float,
     ) -> dict[str, Any]:
         normalized_product = token(product, field="product_name")
         normalized_identity = product_username(normalized_product, username)
@@ -1495,108 +4162,163 @@ class BridgeStore:
             field="capabilities",
         )
         session_ttl = max(300.0, min(float(session_ttl_seconds), 28_800.0))
-        now = time.time()
+        return {
+            "product": normalized_product,
+            "identity": normalized_identity,
+            "alias": normalized_alias,
+            "signature": normalized_signature,
+            "signature_supplied": signature is not None,
+            "conversation_id": conversation,
+            "roles": normalized_roles,
+            "capabilities": normalized_capabilities,
+            "session_ttl_seconds": session_ttl,
+        }
+
+    def _register_agent_session_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        registration: dict[str, Any],
+        connector_id: str | None,
+        invitation_grant: bool,
+        now: float,
+    ) -> dict[str, Any]:
+        normalized_identity = str(registration["identity"])
+        normalized_alias = str(registration["alias"])
+        normalized_signature = str(registration["signature"])
+        conversation = str(registration["conversation_id"])
+        normalized_roles = list(registration["roles"])
+        normalized_capabilities = list(registration["capabilities"])
+        session_ttl = float(registration["session_ttl_seconds"])
         session_id = f"session_{uuid.uuid4().hex}"
         access_token = f"session_{secrets.token_urlsafe(32)}"
-
-        with self._transaction() as conn:
-            self._archive_stale_rooms_locked(conn, now=now)
-            self._require_active_room(conn, conversation)
-            existing = conn.execute(
-                "SELECT * FROM participants WHERE client_type = ?",
-                (normalized_identity,),
-            ).fetchone()
-            if existing is None:
-                participant_id = f"participant_{uuid.uuid4().hex}"
-                conn.execute(
-                    """
-                    INSERT INTO participants
-                        (participant_id, client_type, session_alias,
-                         display_name, signature, profile_updated_at,
-                         capabilities_json, status, created_at, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
-                    """,
-                    (
-                        participant_id,
-                        normalized_identity,
-                        normalized_alias,
-                        normalized_identity,
-                        normalized_signature,
-                        now,
-                        compact_json(normalized_capabilities),
-                        now,
-                        now,
-                    ),
+        self._archive_stale_rooms_locked(conn, now=now)
+        self._expire_inactive_agents_locked(conn, now=now)
+        self._require_active_room(conn, conversation)
+        existing = conn.execute(
+            "SELECT * FROM participants WHERE client_type = ?",
+            (normalized_identity,),
+        ).fetchone()
+        if existing is None:
+            participant_id = f"participant_{uuid.uuid4().hex}"
+            conn.execute(
+                """
+                INSERT INTO participants
+                    (participant_id, client_type, session_alias,
+                     display_name, signature, profile_updated_at,
+                     capabilities_json, status, created_at, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'online', ?, ?)
+                """,
+                (
+                    participant_id,
+                    normalized_identity,
+                    normalized_alias,
+                    normalized_identity,
+                    normalized_signature,
+                    now,
+                    compact_json(normalized_capabilities),
+                    now,
+                    now,
+                ),
+            )
+        else:
+            participant_id = str(existing["participant_id"])
+            if invitation_grant:
+                self._grant_agent_invitation_locked(
+                    conn,
+                    participant_id=participant_id,
+                    conversation_id=conversation,
+                    now=now,
                 )
             else:
-                participant_id = str(existing["participant_id"])
-                # Old clients used session_alias for a per-process purpose and
-                # may send a different value after reconnecting.  It is no
-                # longer identity or profile authority, so accept and ignore
-                # it for an existing stable product-username participant.
-                conn.execute(
-                    """
-                    UPDATE participants
-                    SET capabilities_json = ?,
-                        signature = CASE WHEN ? = 1 THEN ? ELSE signature END,
-                        profile_updated_at = ?,
-                        status = 'online', last_seen = ?
-                    WHERE participant_id = ?
-                    """,
-                    (
-                        compact_json(normalized_capabilities),
-                        1 if signature is not None else 0,
-                        normalized_signature,
-                        now,
-                        now,
-                        participant_id,
-                    ),
+                self._assert_agent_registration_allowed_locked(
+                    conn,
+                    participant_id=participant_id,
+                    conversation_id=conversation,
+                    now=now,
+                )
+            # Old clients used session_alias for a per-process purpose and may
+            # send a different value after reconnecting. It is no longer
+            # identity authority, so accept and ignore it for stable identities.
+            conn.execute(
+                """
+                UPDATE participants
+                SET capabilities_json = ?,
+                    signature = CASE WHEN ? = 1 THEN ? ELSE signature END,
+                    profile_updated_at = ?,
+                    status = 'online', last_seen = ?
+                WHERE participant_id = ?
+                """,
+                (
+                    compact_json(normalized_capabilities),
+                    1 if registration["signature_supplied"] else 0,
+                    normalized_signature,
+                    now,
+                    now,
+                    participant_id,
+                ),
+            )
+
+        if existing is None:
+            if invitation_grant:
+                self._grant_agent_invitation_locked(
+                    conn,
+                    participant_id=participant_id,
+                    conversation_id=conversation,
+                    now=now,
+                )
+            else:
+                self._ensure_agent_lifecycle_state_locked(
+                    conn,
+                    participant_id=participant_id,
+                    now=now,
                 )
 
-            conn.execute(
-                """
-                INSERT INTO memberships
-                    (conversation_id, participant_id, roles_json, active,
-                     joined_at, updated_at)
-                VALUES (?, ?, ?, 1, ?, ?)
-                ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
-                    roles_json = excluded.roles_json,
-                    active = 1,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    conversation,
-                    participant_id,
-                    compact_json(normalized_roles),
-                    now,
-                    now,
-                ),
-            )
-            conn.execute(
-                """
-                INSERT INTO agent_sessions
-                    (session_id, participant_id, registered_conversation_id,
-                     token_hash, transport, created_at, expires_at,
-                     ttl_seconds, last_seen)
-                VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    participant_id,
-                    conversation,
-                    self._secret_hash(access_token),
-                    now,
-                    now + session_ttl,
-                    session_ttl,
-                    now,
-                ),
-            )
-            owned_count = self._agent_active_room_count(conn, participant_id)
-            profile = conn.execute(
-                "SELECT session_alias, display_name, signature FROM participants "
-                "WHERE participant_id = ?",
-                (participant_id,),
-            ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO memberships
+                (conversation_id, participant_id, roles_json, active,
+                 joined_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
+                roles_json = excluded.roles_json,
+                active = 1,
+                updated_at = excluded.updated_at
+            """,
+            (
+                conversation,
+                participant_id,
+                compact_json(normalized_roles),
+                now,
+                now,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_sessions
+                (session_id, participant_id, registered_conversation_id,
+                 token_hash, transport, created_at, expires_at,
+                 ttl_seconds, last_seen, connector_id)
+            VALUES (?, ?, ?, ?, 'mcp', ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                participant_id,
+                conversation,
+                self._secret_hash(access_token),
+                now,
+                now + session_ttl,
+                session_ttl,
+                now,
+                connector_id,
+            ),
+        )
+        owned_count = self._agent_active_room_count(conn, participant_id)
+        profile = conn.execute(
+            "SELECT session_alias, display_name, signature FROM participants "
+            "WHERE participant_id = ?",
+            (participant_id,),
+        ).fetchone()
 
         return {
             "participant_id": participant_id,
@@ -1615,12 +4337,49 @@ class BridgeStore:
             "session_renewal_mode": "sliding",
             "owned_active_room_count": owned_count,
             "owned_active_room_limit": AGENT_ACTIVE_ROOM_LIMIT,
+            "connector_id": connector_id,
         }
+
+    def register_agent_session(
+        self,
+        *,
+        product: str,
+        username: str,
+        session_alias: str | None = None,
+        signature: str | None = None,
+        conversation_id: str,
+        roles: Sequence[str] | None = None,
+        capabilities: Sequence[str] | None = None,
+        session_ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+        connector_id: str | None = None,
+    ) -> dict[str, Any]:
+        registration = self._normalized_agent_registration(
+            product=product,
+            username=username,
+            session_alias=session_alias,
+            signature=signature,
+            conversation_id=conversation_id,
+            roles=roles,
+            capabilities=capabilities,
+            session_ttl_seconds=session_ttl_seconds,
+        )
+        normalized_connector = (
+            opaque_id(connector_id, field="connector_id") if connector_id else None
+        )
+        with self._transaction() as conn:
+            return self._register_agent_session_locked(
+                conn,
+                registration=registration,
+                connector_id=normalized_connector,
+                invitation_grant=False,
+                now=time.time(),
+            )
 
     def authenticate_session(self, access_token: str) -> dict[str, Any]:
         normalized_token = opaque_id(access_token, field="access_token")
         now = time.time()
         with self._transaction() as conn:
+            self._expire_inactive_agents_locked(conn, now=now)
             row = conn.execute(
                 """
                 SELECT session.*, participant.client_type,
@@ -1663,6 +4422,11 @@ class BridgeStore:
             "session_alias": str(row["session_alias"]),
             "display_name": str(row["display_name"]),
             "signature": str(row["signature"]),
+            "connector_id": (
+                str(row["connector_id"])
+                if row["connector_id"] is not None
+                else None
+            ),
             "expires_at": renewed_expires_at,
             "ttl_seconds": ttl_seconds,
             "renewal_mode": "sliding",
@@ -1719,6 +4483,10 @@ class BridgeStore:
         """
         cleared_at = time.time() if now is None else float(now)
         with self._transaction() as conn:
+            expired_agents = self._expire_inactive_agents_locked(
+                conn,
+                now=cleared_at,
+            )
             cleared_count = conn.execute(
                 """
                 UPDATE agent_sessions
@@ -1744,12 +4512,16 @@ class BridgeStore:
                 """,
                 (cleared_at,),
             )
-        return {
+        result = {
             "cleared_count": int(cleared_count),
             "cleared_at": cleared_at,
             "mode": "logical",
             "audit_links_preserved": True,
         }
+        if expired_agents:
+            result["expired_agent_count"] = len(expired_agents)
+            result["expired_agents"] = expired_agents
+        return result
 
     def archive_stale_rooms(self, *, now: float | None = None) -> dict[str, Any]:
         """Move rooms with no messages for 90 days into immutable abandonment."""
@@ -1963,12 +4735,18 @@ class BridgeStore:
         request_id: str,
         action: str,
         review_note: str | None = None,
+        reviewed_by_web_user_id: str | None = None,
     ) -> dict[str, Any]:
         request = opaque_id(request_id, field="request_id")
         normalized_action = str(action or "").strip().lower()
         if normalized_action not in {"approve", "reject"}:
             raise ValidationError("action must be approve or reject")
         note = alias(review_note, field="review_note") if review_note else None
+        reviewer = (
+            opaque_id(reviewed_by_web_user_id, field="reviewed_by_web_user_id")
+            if reviewed_by_web_user_id
+            else None
+        )
         now = time.time()
         status = "approved" if normalized_action == "approve" else "rejected"
         with self._transaction() as conn:
@@ -1996,10 +4774,20 @@ class BridgeStore:
                     "WHERE participant_id = ?",
                     (requested, now, str(row["participant_id"])),
                 )
+            if reviewer is not None:
+                administrator = conn.execute(
+                    "SELECT user_id FROM web_users WHERE user_id = ? "
+                    "AND role = 'admin' AND active = 1",
+                    (reviewer,),
+                ).fetchone()
+                if administrator is None:
+                    raise AuthenticationError(
+                        "an active administrator is required to review nicknames"
+                    )
             conn.execute(
                 "UPDATE nickname_requests SET status = ?, reviewed_at = ?, "
-                "review_note = ? WHERE request_id = ?",
-                (status, now, note, request),
+                "review_note = ?, reviewed_by_web_user_id = ? WHERE request_id = ?",
+                (status, now, note, reviewer, request),
             )
             reviewed = conn.execute(
                 "SELECT request.*, profile.client_type, profile.display_name, "
@@ -2133,6 +4921,7 @@ class BridgeStore:
         refs: Sequence[dict[str, Any]] | None = None,
         mentions: Sequence[str] | None = None,
         _owner_ui: bool = False,
+        _web_user: bool = False,
     ) -> dict[str, Any]:
         session = opaque_id(
             authorized_session_id,
@@ -2164,6 +4953,7 @@ class BridgeStore:
 
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
+            cooldown_seconds = MESSAGE_COOLDOWN_SECONDS
             if _owner_ui:
                 if session != OWNER_AUTHORIZATION_ID or sender != OWNER_PARTICIPANT_ID:
                     raise AuthenticationError("invalid owner UI sender binding")
@@ -2173,6 +4963,32 @@ class BridgeStore:
                     conversation_id=conversation,
                     now=now,
                 )
+            elif _web_user:
+                web_identity = self._require_live_web_session(
+                    conn,
+                    session_id=session,
+                    participant_id=sender,
+                    now=now,
+                )
+                self._require_active_room(conn, conversation)
+                self._ensure_web_membership_locked(
+                    conn,
+                    conversation_id=conversation,
+                    participant_id=sender,
+                    display_name=str(web_identity["display_name"]),
+                    signature=str(web_identity["signature"]),
+                    role=str(web_identity["role"]),
+                    now=now,
+                )
+                cooldown_seconds = (
+                    0.0
+                    if str(web_identity["role"]) == "admin"
+                    else self._effective_message_cooldown_locked(
+                        conn,
+                        participant_id=sender,
+                        actor_kind="web_user",
+                    )
+                )
             else:
                 self._require_live_session(
                     conn,
@@ -2181,6 +4997,11 @@ class BridgeStore:
                     now=now,
                 )
                 self._require_membership(conn, sender, conversation)
+                cooldown_seconds = self._effective_message_cooldown_locked(
+                    conn,
+                    participant_id=sender,
+                    actor_kind="agent",
+                )
             for inferred in self._infer_text_mentions_locked(
                 conn,
                 conversation_id=conversation,
@@ -2216,6 +5037,7 @@ class BridgeStore:
                 participant_id=sender,
                 conversation_id=conversation,
                 now=now,
+                cooldown_seconds=cooldown_seconds,
             )
             try:
                 conn.execute(
@@ -2251,6 +5073,7 @@ class BridgeStore:
                         participant_id=sender,
                         conversation_id=conversation,
                         now=now,
+                        cooldown_seconds=cooldown_seconds,
                     )
                 if "REPLY_CHAIN_NOT_ALLOWED" in error_text:
                     raise ConflictError(
@@ -2262,8 +5085,8 @@ class BridgeStore:
                     or "AUTHORIZED_SENDER_REQUIRED" in error_text
                 ):
                     raise AuthenticationError(
-                        "an authenticated Agent session or owner UI action is "
-                        "required to chat"
+                        "an authenticated Agent session or web user session is required "
+                        "to chat"
                     ) from exc
                 raise
             row = conn.execute(
@@ -2290,6 +5113,28 @@ class BridgeStore:
             audience_value="*",
             mentions=mentions,
             _owner_ui=True,
+        )
+
+    def send_web_message(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_id: str,
+        body_text: str,
+        mentions: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Send one authenticated web user's room message under its own identity."""
+
+        return self.send(
+            authorized_session_id=authorized_session_id,
+            sender_participant_id=participant_id,
+            conversation_id=conversation_id,
+            body_text=body_text,
+            audience_kind="room",
+            audience_value="*",
+            mentions=mentions,
+            _web_user=True,
         )
 
     def wait_messages(
@@ -3401,6 +6246,35 @@ class BridgeStore:
         return row
 
     @staticmethod
+    def _require_live_web_session(
+        conn: sqlite3.Connection,
+        *,
+        session_id: str,
+        participant_id: str,
+        now: float,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT web_session.*, web_user.username, web_user.role,
+                   web_user.participant_id, web_user.display_name,
+                   web_user.signature
+            FROM web_sessions AS web_session
+            JOIN web_users AS web_user ON web_user.user_id = web_session.user_id
+            WHERE web_session.session_id = ?
+              AND web_user.participant_id = ?
+              AND web_user.active = 1
+              AND web_session.revoked_at IS NULL
+              AND web_session.expires_at > ?
+            """,
+            (session_id, participant_id, float(now)),
+        ).fetchone()
+        if row is None:
+            raise AuthenticationError(
+                "a live authenticated web user session is required to chat"
+            )
+        return row
+
+    @staticmethod
     def _secret_hash(secret: str) -> str:
         return hashlib.sha256(str(secret).encode("utf-8")).hexdigest()
 
@@ -3476,6 +6350,12 @@ class BridgeStore:
             "review_note": (
                 str(row["review_note"])
                 if row["review_note"] is not None
+                else None
+            ),
+            "reviewed_by_web_user_id": (
+                str(row["reviewed_by_web_user_id"])
+                if "reviewed_by_web_user_id" in set(row.keys())
+                and row["reviewed_by_web_user_id"] is not None
                 else None
             ),
             "next_request_at": requested_at + NICKNAME_REQUEST_COOLDOWN_SECONDS,

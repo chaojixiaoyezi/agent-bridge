@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import quote
 
 from .store import ROOM_ABANDON_AFTER_SECONDS
@@ -51,6 +52,12 @@ class ViewerRepository:
                     "nickname_requests",
                     "follows",
                     "message_deliveries",
+                    "web_users",
+                    "web_sessions",
+                    "agent_invitations",
+                    "agent_connectors",
+                    "agent_lifecycle_states",
+                    "agent_room_blocks",
                 )
             }
             room_states = {
@@ -72,6 +79,7 @@ class ViewerRepository:
             "room_creation_enabled": True,
             "owner_message_enabled": True,
             "open_registration_enabled": True,
+            "web_login_required": True,
         }
 
     def sessions(self, *, limit: int = 200) -> list[dict[str, Any]]:
@@ -82,10 +90,17 @@ class ViewerRepository:
                 """
                 SELECT session.*, participant.client_type,
                        participant.session_alias, participant.display_name,
-                       participant.signature
+                       participant.signature,
+                       connector.setup_status AS connector_setup_status,
+                       connector.connector_last_seen_at,
+                       invitation.adapter_kind AS connector_adapter_kind
                 FROM agent_sessions AS session
                 JOIN participants AS participant
                   ON participant.participant_id = session.participant_id
+                LEFT JOIN agent_connectors AS connector
+                  ON connector.connector_id = session.connector_id
+                LEFT JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
                 WHERE session.cleared_at IS NULL
                 ORDER BY session.created_at DESC
                 LIMIT ?
@@ -123,6 +138,22 @@ class ViewerRepository:
                     ),
                     "revoked_reason": str(row["revoked_reason"] or ""),
                     "cleared_at": None,
+                    "connector_id": (
+                        str(row["connector_id"])
+                        if row["connector_id"] is not None
+                        else None
+                    ),
+                    "connector_setup_status": str(
+                        row["connector_setup_status"] or ""
+                    ),
+                    "connector_adapter_kind": str(
+                        row["connector_adapter_kind"] or ""
+                    ),
+                    "connector_last_seen_at": (
+                        float(row["connector_last_seen_at"])
+                        if row["connector_last_seen_at"] is not None
+                        else None
+                    ),
                 }
             )
         return result
@@ -155,6 +186,7 @@ class ViewerRepository:
         normalized_limit = max(1, min(int(limit), 500))
         now = time.time()
         online_after = now - 90.0
+        connector_online_after = now - 75.0
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -168,14 +200,23 @@ class ViewerRepository:
                             CASE
                                 WHEN m.active = 1
                                  AND (
-                                    p.client_type = 'web-user'
-                                    OR EXISTS (
+                                    EXISTS (
                                         SELECT 1
                                         FROM agent_sessions AS session
                                         WHERE session.participant_id = p.participant_id
                                           AND session.cleared_at IS NULL
                                           AND session.revoked_at IS NULL
                                           AND session.expires_at > ?
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM web_sessions AS web_session
+                                        JOIN web_users AS web_user
+                                          ON web_user.user_id = web_session.user_id
+                                        WHERE web_user.participant_id = p.participant_id
+                                          AND web_user.active = 1
+                                          AND web_session.revoked_at IS NULL
+                                          AND web_session.expires_at > ?
                                     )
                                  ) THEN 1
                                 ELSE 0
@@ -184,8 +225,21 @@ class ViewerRepository:
                         SUM(
                             CASE
                                 WHEN m.active = 1
-                                 AND p.status = 'online'
-                                 AND p.last_seen >= ? THEN 1
+                                 AND (
+                                    (p.status = 'online' AND p.last_seen >= ?)
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM agent_connectors AS connector
+                                        JOIN agent_invitations AS invitation
+                                          ON invitation.invitation_id = connector.invitation_id
+                                        WHERE connector.accepted_participant_id = p.participant_id
+                                          AND connector.conversation_id = m.conversation_id
+                                          AND invitation.status != 'revoked'
+                                          AND connector.revoked_at IS NULL
+                                          AND connector.setup_status = 'configured'
+                                          AND connector.connector_last_seen_at >= ?
+                                    )
+                                 ) THEN 1
                                 ELSE 0
                             END
                         ) AS online_count
@@ -240,7 +294,7 @@ class ViewerRepository:
                     room.conversation_id
                 LIMIT ?
                 """,
-                (now, online_after, normalized_limit),
+                (now, now, online_after, connector_online_after, normalized_limit),
             ).fetchall()
         return [
             {
@@ -423,12 +477,32 @@ class ViewerRepository:
             )
             active_session_revision = str(
                 connection.execute(
-                    "SELECT COALESCE(GROUP_CONCAT(session_id, '|'), '') "
-                    "FROM (SELECT session_id FROM agent_sessions "
-                    "WHERE cleared_at IS NULL AND revoked_at IS NULL "
-                    "AND expires_at > ? "
-                    "ORDER BY session_id)",
-                    (now,),
+                    "SELECT COALESCE(GROUP_CONCAT(session_key, '|'), '') FROM ("
+                    "SELECT 'agent:' || session_id AS session_key "
+                    "FROM agent_sessions WHERE cleared_at IS NULL "
+                    "AND revoked_at IS NULL AND expires_at > ? "
+                    "UNION ALL "
+                    "SELECT 'web:' || web_session.session_id AS session_key "
+                    "FROM web_sessions AS web_session "
+                    "JOIN web_users AS web_user ON web_user.user_id = web_session.user_id "
+                    "WHERE web_user.active = 1 AND web_session.revoked_at IS NULL "
+                    "AND web_session.expires_at > ? "
+                    "ORDER BY session_key)",
+                    (now, now),
+                ).fetchone()[0]
+            )
+            connector_revision = str(
+                connection.execute(
+                    "SELECT COALESCE(GROUP_CONCAT(connector_state, '|'), '') FROM ("
+                    "SELECT 'invite:' || invitation_id || ':' || status || ':' || "
+                    "CAST(use_count AS TEXT) || ':' || CAST(updated_at AS TEXT) "
+                    "AS connector_state FROM agent_invitations "
+                    "UNION ALL "
+                    "SELECT 'connector:' || connector_id || ':' || conversation_id || ':' || "
+                    "setup_status || ':' || "
+                    "COALESCE(CAST(connector_last_seen_at AS TEXT), '') || ':' || "
+                    "COALESCE(CAST(revoked_at AS TEXT), '') AS connector_state "
+                    "FROM agent_connectors ORDER BY connector_state)"
                 ).fetchone()[0]
             )
             session_revocation_revision = float(
@@ -449,6 +523,11 @@ class ViewerRepository:
                     "COALESCE(abandoned_at, 0))), 0) FROM rooms"
                 ).fetchone()[0]
             )
+            rate_revision = int(
+                connection.execute(
+                    "SELECT revision FROM message_rate_state WHERE singleton = 1"
+                ).fetchone()[0]
+            )
         return {
             "cursor": max(cursor, global_sequence),
             "changed_rooms": changed_rooms,
@@ -463,6 +542,8 @@ class ViewerRepository:
                 session_revocation_revision,
                 session_clear_revision,
                 room_revision,
+                connector_revision,
+                rate_revision,
             ],
             "server_time": now,
         }
@@ -471,6 +552,7 @@ class ViewerRepository:
         conversation = validate_conversation_id(conversation_id)
         now = time.time()
         online_after = now - 90.0
+        connector_online_after = now - 75.0
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -480,31 +562,65 @@ class ViewerRepository:
                     m.joined_at,
                     m.active AS membership_active,
                     room.status AS room_status,
+                    connector.connector_id,
+                    invitation.adapter_kind AS connector_adapter_kind,
+                    connector.setup_status AS connector_setup_status,
+                    connector.connector_last_seen_at,
                     (
                         SELECT COUNT(*) FROM agent_sessions AS session
                         WHERE session.participant_id = p.participant_id
                           AND session.cleared_at IS NULL
                           AND session.revoked_at IS NULL
                           AND session.expires_at > ?
-                    ) AS active_session_count
+                    ) AS active_agent_session_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM web_sessions AS web_session
+                        JOIN web_users AS web_user
+                          ON web_user.user_id = web_session.user_id
+                        WHERE web_user.participant_id = p.participant_id
+                          AND web_user.active = 1
+                          AND web_session.revoked_at IS NULL
+                          AND web_session.expires_at > ?
+                    ) AS active_web_session_count
                 FROM memberships AS m
                 JOIN participants AS p
                   ON p.participant_id = m.participant_id
                 JOIN rooms AS room
                   ON room.conversation_id = m.conversation_id
+                LEFT JOIN agent_connectors AS connector
+                  ON connector.connector_id = (
+                    SELECT recent.connector_id
+                    FROM agent_connectors AS recent
+                    JOIN agent_invitations AS recent_invitation
+                      ON recent_invitation.invitation_id = recent.invitation_id
+                    WHERE recent.accepted_participant_id = p.participant_id
+                      AND recent.conversation_id = m.conversation_id
+                      AND recent_invitation.status != 'revoked'
+                      AND recent.revoked_at IS NULL
+                    ORDER BY recent.updated_at DESC
+                    LIMIT 1
+                  )
+                LEFT JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
                 WHERE m.conversation_id = ?
                 ORDER BY
                     CASE
                         WHEN room.status = 'active'
                          AND m.active = 1
-                         AND p.status = 'online'
-                         AND p.last_seen >= ? THEN 0
+                         AND (
+                            (p.status = 'online' AND p.last_seen >= ?)
+                            OR (
+                                connector.setup_status = 'configured'
+                                AND connector.connector_last_seen_at >= ?
+                            )
+                         ) THEN 0
                         ELSE 1
                     END,
                     p.display_name,
                     p.participant_id
                 """,
-                (now, conversation, online_after),
+                (now, now, conversation, online_after, connector_online_after),
             ).fetchall()
         return [
             {
@@ -519,23 +635,65 @@ class ViewerRepository:
                     "online"
                     if str(row["room_status"]) == "active"
                     and int(row["membership_active"]) == 1
-                    and str(row["status"]) == "online"
-                    and float(row["last_seen"]) >= online_after
+                    and (
+                        (
+                            str(row["status"]) == "online"
+                            and float(row["last_seen"]) >= online_after
+                        )
+                        or (
+                            str(row["connector_setup_status"] or "") == "configured"
+                            and row["connector_last_seen_at"] is not None
+                            and float(row["connector_last_seen_at"])
+                            >= connector_online_after
+                        )
+                    )
                     else "offline"
                 ),
                 "membership_active": bool(row["membership_active"]),
                 "room_status": str(row["room_status"]),
                 "last_seen": float(row["last_seen"]),
                 "joined_at": float(row["joined_at"]),
-                "active_session_count": int(row["active_session_count"] or 0),
+                "active_session_count": int(
+                    row["active_agent_session_count"] or 0
+                )
+                + int(row["active_web_session_count"] or 0),
+                "connector_id": (
+                    str(row["connector_id"])
+                    if row["connector_id"] is not None
+                    else None
+                ),
+                "connector_adapter_kind": str(
+                    row["connector_adapter_kind"] or ""
+                ),
+                "connector_setup_status": str(
+                    row["connector_setup_status"] or ""
+                ),
+                "connector_last_seen_at": (
+                    float(row["connector_last_seen_at"])
+                    if row["connector_last_seen_at"] is not None
+                    else None
+                ),
+                "resident_status": (
+                    "online"
+                    if str(row["connector_setup_status"] or "") == "configured"
+                    and row["connector_last_seen_at"] is not None
+                    and float(row["connector_last_seen_at"])
+                    >= connector_online_after
+                    else (
+                        "offline"
+                        if str(row["connector_setup_status"] or "") == "configured"
+                        else str(row["connector_setup_status"] or "none")
+                    )
+                ),
             }
             for row in rows
             if str(row["room_status"]) != "active"
             or (
                 int(row["membership_active"]) == 1
                 and (
-                    str(row["client_type"]) == "web-user"
-                    or int(row["active_session_count"] or 0) > 0
+                    int(row["active_agent_session_count"] or 0) > 0
+                    or int(row["active_web_session_count"] or 0) > 0
+                    or row["connector_id"] is not None
                 )
             )
         ]

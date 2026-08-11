@@ -6,6 +6,11 @@ from typing import Any, Literal
 from mcp.server.mcpserver import MCPServer
 
 from .config import BridgeConfig
+from .connector import (
+    ConnectorSetupError,
+    configure_resident_connector,
+    validate_connector_preflight,
+)
 from .http_client import BridgeHttpClient
 
 
@@ -37,6 +42,8 @@ def get_client() -> BridgeHttpClient:
         _CLIENT = BridgeHttpClient(
             CONFIG.server_url,
             registration_secret=CONFIG.registration_secret,
+            enrollment_token=CONFIG.enrollment_token,
+            invitation_token=CONFIG.invitation_token,
         )
     return _CLIENT
 
@@ -66,6 +73,95 @@ def agent_register(
         conversation_id=conversation_id,
         roles=roles,
     )
+
+
+@MCP.tool()
+def agent_accept_invitation(
+    username: str,
+    signature: str,
+    workspace_path: str = "",
+    roles: list[str] | None = None,
+    capabilities: list[str] | None = None,
+    enable_resident: bool = True,
+) -> dict[str, Any]:
+    """Accept a server-signed invitation and configure local resident wake-up.
+
+    The launcher fixes the product and supplies a single-use or reusable invitation.
+    Choose the stable username, signature, optional roles/capabilities, and the
+    workspace this Agent may use. A resident setup writes only private connector
+    state and user-level service files after this explicit tool call. Ordinary
+    room messages can never invoke this operation.
+    """
+
+    _, validated_workspace = validate_connector_preflight(
+        bridge_url=CONFIG.server_url,
+        workspace_path=workspace_path or None,
+    )
+    client = get_client()
+    accepted = client.accept_invitation(
+        product=CONFIG.client_type,
+        username=username,
+        signature=signature,
+        roles=roles,
+        capabilities=capabilities,
+    )
+    enrollment_token = str(accepted.pop("_enrollment_token", ""))
+    connector_id = str(accepted["connector_id"])
+    setup_payload: dict[str, Any]
+    try:
+        setup = configure_resident_connector(
+            connector_id=connector_id,
+            enrollment_token=enrollment_token,
+            bridge_url=CONFIG.server_url,
+            product=CONFIG.client_type,
+            username=username,
+            signature=signature,
+            conversation_id=str(accepted["conversation_id"]),
+            adapter_kind=str(accepted["adapter_kind"]),
+            requested_mode=str(accepted["requested_mode"]),
+            roles=roles,
+            capabilities=capabilities,
+            workspace_path=str(validated_workspace),
+            enable_resident=bool(enable_resident),
+        )
+        setup_payload = setup.public_payload()
+    except (ConnectorSetupError, OSError) as exc:
+        setup_payload = {
+            "status": "failed",
+            "platform": "unknown",
+            "adapter_kind": str(accepted["adapter_kind"]),
+            "connector_id": connector_id,
+            "state_directory": "",
+            "listener_service": None,
+            "worker_service": None,
+            "detail": str(exc),
+        }
+    report_detail = {
+        key: value
+        for key, value in setup_payload.items()
+        if key not in {"status", "connector_id", "state_directory"}
+    }
+    try:
+        connector = client.post(
+            "/agent/connector/setup",
+            {
+                "connector_id": connector_id,
+                "setup_status": setup_payload["status"],
+                "detail": report_detail,
+            },
+        )["connector"]
+    except Exception as exc:
+        setup_payload["report_warning"] = (
+            "local setup finished but Bridge status reporting failed: " + str(exc)
+        )
+        connector = None
+    accepted["resident_setup"] = setup_payload
+    accepted["connector"] = connector
+    accepted["invitation_accepted"] = True
+    accepted["invitation_consumed"] = not bool(
+        accepted.get("invitation_reusable", False)
+    )
+    return accepted
 
 
 @MCP.tool()

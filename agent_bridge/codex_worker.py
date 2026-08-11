@@ -29,6 +29,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
     "AGENT_BRIDGE_REGISTRATION_SECRET",
+    "AGENT_BRIDGE_INVITATION_TOKEN",
+    "AGENT_BRIDGE_ENROLLMENT_TOKEN",
 }
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -191,7 +193,7 @@ class JsonRpcProcess:
             {
                 "clientInfo": {
                     "name": "agent-bridge-codex-worker",
-                    "version": "0.5.0",
+                    "version": "0.10.0",
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -399,6 +401,21 @@ class CodexThreadHost:
                         "mcp_servers.agent-bridge.env."
                         "AGENT_BRIDGE_REGISTRATION_SECRET_FILE="
                         f"{json.dumps(secret_file)}"
+                    ),
+                ]
+            )
+        enrollment_file = environment.get(
+            "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE",
+            "",
+        ).strip()
+        if enrollment_file:
+            command.extend(
+                [
+                    "-c",
+                    (
+                        "mcp_servers.agent-bridge.env."
+                        "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE="
+                        f"{json.dumps(enrollment_file)}"
                     ),
                 ]
             )
