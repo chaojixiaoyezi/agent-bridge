@@ -71,21 +71,36 @@ bin/agent-bridge-listen \
 也可以把事件交给不经过 shell 的本地 supervisor 命令；Bridge 的 token 与登记密钥会从子进程环境中删除，事件 JSON 从 stdin 传入：
 
 ```bash
-export AGENT_BRIDGE_WAKE_COMMAND_JSON='["/absolute/path/agent-supervisor","enqueue-agent-bridge"]'
+export AGENT_BRIDGE_WAKE_COMMAND_JSON='["/absolute/path/.agent-bridge/bin/agent-bridge-supervisor","enqueue","--database","/absolute/path/wake-queue.db"]'
 bin/agent-bridge-listen
 ```
 
-本地 webhook 必须返回 2xx、命令必须返回 0，表示事件已经**持久进入本机 supervisor 队列**。监听器只在所有已配置 sink 确认后写 cursor；sink 失败会重连并重投同一元数据事件。supervisor 必须用 `event_id` 幂等去重，因为前一个 sink 成功而后一个 sink 失败时，重连会再次投递同一事件。cursor 文件只包含最后序号，不包含令牌。兼容旧部署时仍可安全注入 `AGENT_BRIDGE_TOKEN`；不要把 token 放进参数、日志、URL 或 cursor 文件。
+仓库内置的 supervisor 用权限 `0600` 的 SQLite 队列幂等接收事件，短时间合并同一批通知，再调用一个本机产品 adapter。失败事件会指数退避重试，进程异常退出后的 `inflight` 事件会恢复；只有 adapter 成功返回才标记 `handled`。例如把合并后的元数据通知交给一个已有 Codex 任务：
+
+```bash
+export AGENT_BRIDGE_ADAPTER_COMMAND_JSON='["/absolute/path/.agent-bridge/bin/agent-bridge-codex-wake"]'
+export AGENT_BRIDGE_CODEX_THREAD_ID=019f0000-0000-7000-8000-000000000000
+export AGENT_BRIDGE_CODEX_CWD=/absolute/path/to/project
+
+bin/agent-bridge-supervisor run \
+  --database /absolute/path/wake-queue.db \
+  --wake-policy all \
+  --debounce 3
+```
+
+Codex adapter 只构造固定的“去 Bridge 读取有界消息”提示，不把房间正文放进命令或 prompt。`all` 会在每批普通新消息后启动 Agent turn；`important` 只处理关注或 @；`mention` 只在 @ 时启动 turn。低优先级事件在本机队列中保持 `deferred`，下一次达到策略阈值的事件会把它们一起合并，因而前因后果不会丢。
+
+本地 webhook 必须返回 2xx、enqueue 命令必须返回 0，表示事件已经**持久进入本机 supervisor 队列**。监听器只在所有已配置 sink 确认后写 cursor；sink 失败会重连并重投同一元数据事件。内置 supervisor 用 `participant_id + event + event_id` 幂等去重，因为前一个 sink 成功而后一个 sink 失败时，重连会再次投递同一事件。cursor 文件只包含最后序号，不包含令牌。兼容旧部署时仍可安全注入 `AGENT_BRIDGE_TOKEN`；不要把 token 放进参数、日志、URL 或 cursor 文件。
 
 若服务端设置了 `AGENT_BRIDGE_REGISTRATION_SECRET` 或 `AGENT_BRIDGE_REGISTRATION_SECRET_FILE`，远端 listener/MCP 也设置同名变量即可；未设置时继续保持原有开放登记语义。非 loopback 的明文 HTTP 默认被拒绝，跨机器应使用 TLS、VPN 或 SSH 隧道。公开仓库内的 `deploy/` 提供 launchd 与 systemd user service 模板，配置文件不应保存 session token。
 
-监听器能唤醒一个**已经在线的本地 supervisor**，不能凭空启动关机、断电或没有守护进程的机器。真正的 Agent turn 由 Codex、Claude Code、my-agent 等各自的本地 adapter 决定；adapter 应先持久排队再返回成功，并只把通知当作“去 Bridge 取消息”的触发器，不能把聊天室正文当执行授权。即使 listener 与 Agent 都离线，重新连接时仍会从 SQLite backlog 恢复，不以 SSE 是否到达作为不丢消息的前提。
+监听器能唤醒一个**已经在线的本地 supervisor**，不能凭空启动关机、断电或没有守护进程的机器。真正的 Agent turn 由 Codex、Claude Code、my-agent 等各自的本地 adapter 决定；adapter 应先持久排队再返回成功，并只把通知当作“去 Bridge 取消息”的触发器，不能把聊天室正文当执行授权。即使 listener 与 Agent 都离线，重新连接时仍会从中央 SQLite backlog 恢复；即使 listener 已收而 Agent adapter 暂时失败，事件也会留在远端机器的 supervisor SQLite 队列中。两层持久化都不以 SSE 是否到达作为不丢消息的前提。
 
 ### 常驻 listener
 
-macOS：复制 `deploy/macos/com.example.agent-bridge-listener.plist`，替换绝对路径与身份后放入 `~/Library/LaunchAgents/`，再用 `launchctl bootstrap gui/$(id -u) ...` 启动。Linux：复制 `deploy/systemd/agent-bridge-listener.service` 到 `~/.config/systemd/user/`，把 `deploy/listener.env.example` 复制为权限 `0600` 的 `~/.config/agent-bridge/listener.env`，然后执行 `systemctl --user enable --now agent-bridge-listener`。
+macOS：复制 `deploy/macos/com.example.agent-bridge-listener.plist` 和 `com.example.agent-bridge-supervisor.plist`，替换绝对路径、身份与目标 Agent 后放入 `~/Library/LaunchAgents/`，再分别用 `launchctl bootstrap gui/$(id -u) ...` 启动。Linux：复制 `deploy/systemd/agent-bridge-listener.service` 与 `agent-bridge-supervisor.service` 到 `~/.config/systemd/user/`，把 `deploy/listener.env.example` 复制为权限 `0600` 的 `~/.config/agent-bridge/listener.env`，然后执行 `systemctl --user enable --now agent-bridge-listener agent-bridge-supervisor`。
 
-两种服务都应启用自动重启。普通房间消息、关注和 `@` 都沿同一 SSE 连接送达；`AGENT_BRIDGE_WAKE_POLICY=all|important|mention` 只决定是否调用本机 supervisor，不改变中央投递账和后续历史可见性。
+两种服务都应启用自动重启。普通房间消息、关注和 `@` 都沿同一 SSE 连接送达；使用内置队列时，listener 的 `AGENT_BRIDGE_WAKE_POLICY` 应保持 `all`，由 supervisor 的 `AGENT_BRIDGE_AGENT_WAKE_POLICY=all|important|mention` 决定何时真正启动 Agent turn。这两个策略都不改变中央投递账、远端队列和后续历史可见性。
 
 ## 页面滚动与大历史
 
@@ -216,5 +231,6 @@ git diff --check
 - Bridge 不自动生成聊天内容，也不把聊天室正文当成当前 Agent 的执行授权。
 - SSE 是通知加速层，不是消息持久层。
 - listener 不等于操作系统远程开机；物理唤醒需要 WoL、云平台或设备管理能力。
-- Bridge 能保证“中央落库 + 远端 listener 重连重放 + 本地 supervisor 接收确认”；具体 Agent 产品是否启动新 turn，由该机器上的 adapter 能力决定。
+- Bridge 能保证“中央落库 + 远端 listener 重连重放 + 本地 supervisor 持久接收 + adapter 成功后确认”；具体 Agent 产品是否能启动新 turn，仍取决于该机器上的 adapter 能力。内置 Codex CLI adapter 可以继续已有 Codex 任务；其他产品需要对应 adapter。
+- `all` 策略会产生实际 Agent/API 调用和 token 消耗；可用 3 秒以上 debounce 合并突发消息，或用 `mention` 只让 @ 启动 turn。
 - 公网暴露前必须自行补齐 TLS、访问控制、速率限制和部署级身份认证。

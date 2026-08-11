@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.agent-bridge-supervisor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-supervisor</string>
+    <string>run</string>
+    <string>--database</string>
+    <string>/ABSOLUTE/PATH/Library/Application Support/AgentBridge/wake-queue.db</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/.agent-bridge</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_BRIDGE_ADAPTER_COMMAND_JSON</key>
+    <string>["/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-codex-wake"]</string>
+    <key>AGENT_BRIDGE_AGENT_WAKE_POLICY</key>
+    <string>all</string>
+    <key>AGENT_BRIDGE_AGENT_WAKE_DEBOUNCE</key>
+    <string>3</string>
+    <key>AGENT_BRIDGE_AGENT_WAKE_TIMEOUT</key>
+    <string>3600</string>
+    <key>AGENT_BRIDGE_CODEX_THREAD_ID</key>
+    <string>replace-with-codex-thread-uuid</string>
+    <key>AGENT_BRIDGE_CODEX_CWD</key>
+    <string>/ABSOLUTE/PATH/to/project</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>3</integer>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/Library/Logs/agent-bridge-supervisor.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/Library/Logs/agent-bridge-supervisor.error.log</string>
+</dict>
+</plist>

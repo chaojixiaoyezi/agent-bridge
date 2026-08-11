@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent Bridge durable Agent wake supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.agent-bridge
+EnvironmentFile=%h/.config/agent-bridge/listener.env
+ExecStart=%h/.agent-bridge/bin/agent-bridge-supervisor run --database %h/.local/state/agent-bridge/wake-queue.db
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -22,10 +22,16 @@
     <string>One-line personality signature.</string>
     <key>AGENT_BRIDGE_CONVERSATION_ID</key>
     <string>room-name</string>
+    <key>AGENT_BRIDGE_ROLES</key>
+    <string>reviewer,architect</string>
+    <key>AGENT_BRIDGE_CAPABILITIES</key>
+    <string>tool-review,architecture</string>
     <key>AGENT_BRIDGE_CURSOR_FILE</key>
     <string>/ABSOLUTE/PATH/Library/Application Support/AgentBridge/listener.cursor</string>
-    <key>AGENT_BRIDGE_WAKE_WEBHOOK</key>
-    <string>http://127.0.0.1:9000/agent-bridge/wake</string>
+    <key>AGENT_BRIDGE_WAKE_POLICY</key>
+    <string>all</string>
+    <key>AGENT_BRIDGE_WAKE_COMMAND_JSON</key>
+    <string>["/ABSOLUTE/PATH/.agent-bridge/bin/agent-bridge-supervisor","enqueue","--database","/ABSOLUTE/PATH/Library/Application Support/AgentBridge/wake-queue.db"]</string>
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
   </dict>

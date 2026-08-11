@@ -27,6 +27,7 @@ from agent_bridge.listener import (
     _write_cursor,
 )
 from agent_bridge.store import BridgeStore
+from agent_bridge.supervisor import queue_status
 
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -393,3 +394,111 @@ def test_remote_listener_auto_registers_and_delivers_existing_backlog_to_supervi
     assert wake["event_id"] == sent["sequence"]
     assert "这段正文" not in wake_file.read_text(encoding="utf-8")
     assert _read_cursor(cursor_file) == sent["sequence"]
+
+
+def test_remote_listener_and_builtin_supervisor_survive_an_offline_backlog(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    store.create_user_room("离线重放群")
+    receiver = store.register_agent_session(
+        product="codex",
+        username="离线接收者",
+        signature="重连后先收元数据。",
+        conversation_id="离线重放群",
+    )
+    sender = store.register_agent_session(
+        product="my-agent",
+        username="离线发送者",
+        signature="正文只留在中央消息库。",
+        conversation_id="离线重放群",
+    )
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="离线重放群",
+        body_text="接收机器现在断线，但恢复后必须知道有这条消息。",
+        audience_kind="room",
+        mentions=[receiver["participant_id"]],
+    )
+    queue = tmp_path / "remote" / "wake-queue.db"
+    cursor_file = tmp_path / "remote" / "listener.cursor"
+    enqueue_command = [
+        str(BRIDGE_ROOT / "bin" / "agent-bridge-supervisor"),
+        "enqueue",
+        "--database",
+        str(queue),
+    ]
+
+    with bridge_server(database) as server_url:
+        environment = dict(os.environ)
+        for name in (
+            "AGENT_BRIDGE_TOKEN",
+            "AGENT_TOKEN",
+            "AGENT_BRIDGE_REGISTRATION_SECRET",
+        ):
+            environment.pop(name, None)
+        environment.update(
+            {
+                "AGENT_BRIDGE_URL": server_url,
+                "AGENT_BRIDGE_PRODUCT": "codex",
+                "AGENT_BRIDGE_USERNAME": "离线接收者",
+                "AGENT_BRIDGE_SIGNATURE": "重连后先收元数据。",
+                "AGENT_BRIDGE_CONVERSATION_ID": "离线重放群",
+                "AGENT_BRIDGE_CURSOR_FILE": str(cursor_file),
+                "AGENT_BRIDGE_WAKE_COMMAND_JSON": json.dumps(enqueue_command),
+                "AGENT_BRIDGE_WAKE_POLICY": "all",
+            }
+        )
+        listener_run = subprocess.run(
+            [str(BRIDGE_ROOT / "bin" / "agent-bridge-listen"), "--once"],
+            cwd=str(BRIDGE_ROOT),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+
+    assert listener_run.returncode == 0, listener_run.stderr
+    assert queue_status(queue)["counts"]["pending"] == 1
+    assert _read_cursor(cursor_file) == sent["sequence"]
+
+    captured = tmp_path / "wake-batch.json"
+    adapter = [
+        str(BRIDGE_ROOT / ".venv" / "bin" / "python"),
+        "-c",
+        (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        ),
+        str(captured),
+    ]
+    supervisor_run = subprocess.run(
+        [
+            str(BRIDGE_ROOT / "bin" / "agent-bridge-supervisor"),
+            "run",
+            "--database",
+            str(queue),
+            "--adapter-command-json",
+            json.dumps(adapter),
+            "--wake-policy",
+            "all",
+            "--debounce",
+            "0",
+            "--once",
+        ],
+        cwd=str(BRIDGE_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=12,
+        check=False,
+    )
+
+    assert supervisor_run.returncode == 0, supervisor_run.stderr
+    assert queue_status(queue)["counts"]["handled"] == 1
+    batch = json.loads(captured.read_text(encoding="utf-8"))
+    assert batch["wake_priority"] == "mention"
+    assert batch["last_event_id"] == sent["sequence"]
+    assert "接收机器现在断线" not in captured.read_text(encoding="utf-8")
