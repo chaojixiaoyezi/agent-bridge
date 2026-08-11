@@ -167,6 +167,23 @@ class ViewerRepository:
                         SUM(
                             CASE
                                 WHEN m.active = 1
+                                 AND (
+                                    p.client_type = 'web-user'
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM agent_sessions AS session
+                                        WHERE session.participant_id = p.participant_id
+                                          AND session.cleared_at IS NULL
+                                          AND session.revoked_at IS NULL
+                                          AND session.expires_at > ?
+                                    )
+                                 ) THEN 1
+                                ELSE 0
+                            END
+                        ) AS current_participant_count,
+                        SUM(
+                            CASE
+                                WHEN m.active = 1
                                  AND p.status = 'online'
                                  AND p.last_seen >= ? THEN 1
                                 ELSE 0
@@ -190,6 +207,8 @@ class ViewerRepository:
                     COALESCE(ms.participant_count, 0) AS participant_count,
                     COALESCE(ms.active_participant_count, 0)
                         AS active_participant_count,
+                    COALESCE(ms.current_participant_count, 0)
+                        AS current_participant_count,
                     CASE
                         WHEN room.status = 'active' THEN COALESCE(ms.online_count, 0)
                         ELSE 0
@@ -221,7 +240,7 @@ class ViewerRepository:
                     room.conversation_id
                 LIMIT ?
                 """,
-                (online_after, normalized_limit),
+                (now, online_after, normalized_limit),
             ).fetchall()
         return [
             {
@@ -239,6 +258,9 @@ class ViewerRepository:
                 "participant_count": int(row["participant_count"] or 0),
                 "active_participant_count": int(
                     row["active_participant_count"] or 0
+                ),
+                "current_participant_count": int(
+                    row["current_participant_count"] or 0
                 ),
                 "online_count": int(row["online_count"] or 0),
                 "message_count": int(row["message_count"] or 0),
@@ -508,6 +530,14 @@ class ViewerRepository:
                 "active_session_count": int(row["active_session_count"] or 0),
             }
             for row in rows
+            if str(row["room_status"]) != "active"
+            or (
+                int(row["membership_active"]) == 1
+                and (
+                    str(row["client_type"]) == "web-user"
+                    or int(row["active_session_count"] or 0) > 0
+                )
+            )
         ]
 
     @staticmethod

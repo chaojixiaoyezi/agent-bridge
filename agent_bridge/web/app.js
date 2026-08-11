@@ -183,7 +183,10 @@ function renderRooms() {
 
       const meta = makeElement("div", "room-meta");
       if (!abandoned) meta.append(makeElement("span", "online-count", `${room.online_count} 在线`));
-      meta.append(makeElement("span", "", `${room.participant_count} 会话`));
+      const participantCount = abandoned
+        ? Number(room.participant_count || 0)
+        : Number(room.current_participant_count ?? room.participant_count ?? 0);
+      meta.append(makeElement("span", "", `${participantCount} 会话`));
       meta.append(makeElement("span", "", `${room.message_count} 消息`));
       button.append(meta);
       button.addEventListener("click", () => selectRoom(room.conversation_id));
@@ -648,7 +651,7 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   elements.roomSummary.textContent = activeRoom
     ? abandoned
       ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`
-      : `${roomCreator(activeRoom)} · ${activeRoom.participant_count} 个会话 · ${activeRoom.message_count} 条持久消息`
+      : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
     : "本机聊天室";
   renderParticipants(participantPayload.participants);
   if (messagePayload) {

@@ -81,6 +81,7 @@ def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None
     room_one = next(room for room in rooms if room["conversation_id"] == "room-one")
     assert room_one["message_count"] == 1
     assert room_one["participant_count"] == 2
+    assert room_one["current_participant_count"] == 2
 
     messages = client.get("/api/rooms/room-one/messages").json()["messages"]
     assert messages[0]["body"] == "请看一下事务边界。"
@@ -194,6 +195,22 @@ def test_local_owner_can_clear_expired_sessions_from_dashboard(tmp_path: Path) -
     assert [item["session_id"] for item in after["sessions"]] == [
         receiver["session_id"]
     ]
+    participants = client.get("/api/rooms/room-one/participants").json()[
+        "participants"
+    ]
+    assert [person["participant_id"] for person in participants] == [
+        receiver["participant_id"]
+    ]
+    room = next(
+        item
+        for item in client.get("/api/rooms").json()["rooms"]
+        if item["conversation_id"] == "room-one"
+    )
+    assert room["participant_count"] == 2
+    assert room["current_participant_count"] == 1
+    assert client.get("/api/rooms/room-one/messages").json()["messages"][0][
+        "sender_participant_id"
+    ] == sender["participant_id"]
 
 
 def test_sse_helpers_use_monotonic_ids_and_json_only() -> None:
