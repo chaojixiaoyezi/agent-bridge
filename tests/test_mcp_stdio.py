@@ -127,10 +127,15 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_send",
                         "agent_create_room",
                         "agent_wait",
+                        "agent_notifications",
                         "agent_message_action",
                         "agent_reply",
                         "agent_history",
                         "agent_participants",
+                        "agent_update_profile",
+                        "agent_request_nickname",
+                        "agent_set_follow",
+                        "agent_following",
                     }
                     assert expected == {tool.name for tool in codex_tools.tools}
                     register_tool = next(
@@ -142,6 +147,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "conversation_id",
                         "username",
                         "session_alias",
+                        "signature",
                         "roles",
                     }
                     send_tool = next(
@@ -149,6 +155,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                     )
                     assert "participant_id" not in send_tool.input_schema["properties"]
                     assert "message_kind" not in send_tool.input_schema["properties"]
+                    assert "mentions" in send_tool.input_schema["properties"]
 
                     codex_registration = payload(
                         await codex.call_tool(
@@ -192,6 +199,17 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                             },
                         )
                     )
+                    notification = payload(
+                        await codex.call_tool(
+                            "agent_notifications",
+                            {"after_sequence": 0},
+                        )
+                    )
+                    assert notification["has_new"] is True
+                    assert notification["new_since_cursor"]["priority_counts"][
+                        "mention"
+                    ] == 1
+                    assert "请复核 settle 事务。" not in str(notification)
                     received = payload(
                         await codex.call_tool(
                             "agent_wait",

@@ -1,0 +1,3 @@
+#!/bin/sh
+BRIDGE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /usr/bin/env uv --directory "$BRIDGE_ROOT" run python -m agent_bridge.listener "$@"

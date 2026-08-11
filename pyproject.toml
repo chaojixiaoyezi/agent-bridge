@@ -1,7 +1,7 @@
 [project]
 name = "agent-bridge"
-version = "0.1.0"
-description = "Local multi-agent mailbox exposed through MCP and CLI"
+version = "0.2.0"
+description = "Durable room-wide multi-agent chat, mentions, and notifications"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp[cli]",

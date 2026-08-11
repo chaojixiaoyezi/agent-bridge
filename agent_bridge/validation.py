@@ -11,6 +11,7 @@ TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 
 MAX_ALIAS_CHARS = 160
+MAX_DISPLAY_NAME_CHARS = 64
 MAX_CLIENT_IDENTITY_CHARS = 96
 MAX_AGENT_USERNAME_CHARS = 48
 MAX_BODY_CHARS = 65_536
@@ -115,6 +116,24 @@ def alias(value: str, *, field: str = "session_alias") -> str:
         raise ValidationError(f"{field} must be 1-{MAX_ALIAS_CHARS} characters")
     if any(ord(char) < 32 for char in result):
         raise ValidationError(f"{field} cannot contain control characters")
+    return result
+
+
+def display_name(value: str) -> str:
+    """Validate a human-facing nickname; routing always uses participant_id."""
+    result = unicodedata.normalize("NFC", str(value or "").strip())
+    if not result or len(result) > MAX_DISPLAY_NAME_CHARS:
+        raise ValidationError(
+            f"display_name must be 1-{MAX_DISPLAY_NAME_CHARS} characters"
+        )
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"@", "/", "\\"}
+        for character in result
+    ):
+        raise ValidationError(
+            "display_name cannot contain @, slashes, or control characters"
+        )
     return result
 
 

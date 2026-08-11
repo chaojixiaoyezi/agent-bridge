@@ -9,7 +9,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
-from agent_bridge.viewer import WEB_ROOT, create_app
+from agent_bridge.viewer import WEB_ROOT, _event_cursor, _sse_event, create_app
 from agent_bridge.viewer_store import ViewerRepository
 
 
@@ -69,6 +69,9 @@ def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None
     index = client.get("/")
     assert index.status_code == 200
     assert "Agent Bridge" in index.text
+    assert "开启通知" in index.text
+    assert "昵称审批" in index.text
+    assert "清理失效" in index.text
     assert "default-src 'self'" in index.headers["content-security-policy"]
     assert "form-action 'self'" in index.headers["content-security-policy"]
     assert index.headers["cache-control"] == "no-store"
@@ -114,9 +117,31 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert malicious not in client.get("/").text
     payload = client.get("/api/rooms/room-one/messages").json()
     assert payload["messages"][-1]["body"] == malicious
+    incremental = client.get(
+        f"/api/rooms/room-one/messages?after_sequence={payload['messages'][0]['sequence']}"
+    ).json()
+    assert [item["body"] for item in incremental["messages"]] == [malicious]
+    assert incremental["has_more"] is False
+    event_snapshot = ViewerRepository(database).event_snapshot(
+        after_sequence=payload["messages"][0]["sequence"]
+    )
+    assert event_snapshot["changed_rooms"] == [
+        {
+            "conversation_id": "room-one",
+            "message_count": 1,
+            "first_sequence": payload["messages"][1]["sequence"],
+            "last_sequence": payload["messages"][1]["sequence"],
+        }
+    ]
+    assert malicious not in str(event_snapshot)
     javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
     assert "innerHTML" not in javascript
     assert ".textContent" in javascript
+    assert "setInterval" not in javascript
+    assert "new EventSource" in javascript
+    assert "captureTimelineAnchor" in javascript
+    assert "after_sequence" in javascript
+    assert "/api/sessions/cleanup" in javascript
 
     repository = ViewerRepository(database)
     with repository._connection() as connection:
@@ -137,6 +162,84 @@ def test_dashboard_rejects_invalid_room_ids_and_limits(tmp_path: Path) -> None:
     assert health["owner_message_enabled"] is True
     assert health["open_registration_enabled"] is True
     assert health["counts"]["messages"] == 1
+
+
+def test_local_owner_can_clear_expired_sessions_from_dashboard(tmp_path: Path) -> None:
+    database = tmp_path / "bridge.db"
+    store, sender, receiver = seed(database)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ? WHERE session_id = ?",
+            (time.time() - 1, sender["session_id"]),
+        )
+    client = TestClient(
+        create_app(database),
+        base_url="http://127.0.0.1:8765",
+    )
+
+    before = client.get("/api/sessions").json()
+    assert before["stats"] == {"active_count": 1, "clearable_count": 1}
+    assert client.post("/api/sessions/cleanup").status_code == 403
+    cleaned = client.post(
+        "/api/sessions/cleanup",
+        headers={
+            "Origin": "http://127.0.0.1:8765",
+            "X-Agent-Bridge-Intent": "clear-inactive-sessions",
+        },
+    )
+    assert cleaned.status_code == 200
+    assert cleaned.json()["cleared_count"] == 1
+    after = client.get("/api/sessions").json()
+    assert after["stats"] == {"active_count": 1, "clearable_count": 0}
+    assert [item["session_id"] for item in after["sessions"]] == [
+        receiver["session_id"]
+    ]
+
+
+def test_sse_helpers_use_monotonic_ids_and_json_only() -> None:
+    assert _event_cursor(None) == 0
+    assert _event_cursor("42") == 42
+    with pytest.raises(ValueError, match="non-negative"):
+        _event_cursor("-1")
+    encoded = _sse_event(
+        "message_available",
+        {"pending_count": 2, "body_included": False},
+        event_id=42,
+    )
+    assert encoded == (
+        b'id: 42\nevent: message_available\n'
+        b'data: {"pending_count":2,"body_included":false}\n\n'
+    )
+
+
+def test_owner_event_revision_ignores_sliding_keepalives_and_clamps_cursor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store, sender, _ = seed(database)
+    repository = ViewerRepository(database)
+    initial = repository.event_snapshot(after_sequence=0)
+    assert initial["cursor"] == 1
+
+    # Session renewal updates last_seen/expires_at frequently. Those writes do
+    # not change anything visible on the dashboard, so they must not trigger a
+    # full UI refresh every listener keepalive.
+    store.authenticate_session(sender["access_token"])
+    after_keepalive = repository.event_snapshot(after_sequence=initial["cursor"])
+    assert after_keepalive["state_revision"] == initial["state_revision"]
+    assert after_keepalive["changed_rooms"] == []
+
+    clamped = repository.event_snapshot(after_sequence=999_999_999)
+    assert clamped["cursor"] == initial["cursor"]
+    assert clamped["changed_rooms"] == []
+
+    store.update_profile(
+        participant_id=sender["participant_id"],
+        authorized_session_id=sender["session_id"],
+        signature="页面应该只在真实资料变化后刷新。",
+    )
+    after_profile = repository.event_snapshot(after_sequence=initial["cursor"])
+    assert after_profile["state_revision"] != initial["state_revision"]
 
 
 def test_same_origin_browser_user_can_create_room_without_agent_membership(
@@ -255,8 +358,42 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     assert registered.status_code == 201
     registration = registered.json()
     assert registration["client_type"] == "codex-小团子"
+    assert registration["display_name"] == "codex-小团子"
+    assert registration["signature"] == "群聊气氛助手"
     access_token = registration["access_token"]
     auth = {"Authorization": f"Bearer {access_token}"}
+
+    profile = client.post(
+        "/agent/profile",
+        json={"signature": "喜欢把复杂协作讲清楚。"},
+        headers=auth,
+    )
+    assert profile.status_code == 200
+    assert profile.json()["signature"] == "喜欢把复杂协作讲清楚。"
+    nickname = client.post(
+        "/agent/nickname/request",
+        json={"display_name": "小团子"},
+        headers=auth,
+    )
+    assert nickname.status_code == 200
+    request_id = nickname.json()["request_id"]
+    listed = client.get("/api/nickname-requests").json()["requests"]
+    assert [item["request_id"] for item in listed] == [request_id]
+    reviewed = client.post(
+        f"/api/nickname-requests/{request_id}/review",
+        json={"action": "approve"},
+        headers={
+            "Origin": "http://testserver",
+            "X-Agent-Bridge-Intent": "review-nickname",
+        },
+    )
+    assert reviewed.status_code == 200
+    assert reviewed.json()["request"]["current_display_name"] == "小团子"
+    assert client.post(
+        "/agent/nickname/request",
+        json={"display_name": "一天内第二次"},
+        headers=auth,
+    ).status_code == 429
 
     assert client.post(
         "/agent/send",
@@ -277,7 +414,10 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     }
     owner_sent = client.post(
         "/api/rooms/%E5%A4%A7%E5%AE%B6%E6%B2%9F%E9%80%9A%E7%BE%A4/messages",
-        json={"body": "你好，我是网页用户。"},
+        json={
+            "body": "你好，@小团子，我是网页用户。",
+            "mentions": [registration["participant_id"]],
+        },
         headers=owner_headers,
     )
     assert owner_sent.status_code == 201
@@ -285,6 +425,20 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
         owner_sent.json()["message"]["sender_participant_id"]
         == "participant_web_owner"
     )
+    notification = client.post(
+        "/agent/notifications",
+        json={"after_sequence": 0},
+        headers=auth,
+    )
+    assert notification.status_code == 200
+    assert notification.json()["has_new"] is True
+    assert notification.json()["backlog"]["pending_count"] == 1
+    assert "你好，@小团子，我是网页用户。" not in notification.text
+    assert client.get("/agent/events").status_code == 401
+    assert client.get(
+        "/agent/events",
+        headers={**auth, "Last-Event-ID": "not-a-number"},
+    ).status_code == 400
     owner_history = client.get(
         "/api/rooms/%E5%A4%A7%E5%AE%B6%E6%B2%9F%E9%80%9A%E7%BE%A4/messages"
     ).json()["messages"]
@@ -305,6 +459,12 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     assert delivered_owner_message.json()["messages"][0]["message_id"] == owner_sent.json()[
         "message"
     ]["message_id"]
+    assert delivered_owner_message.json()["messages"][0]["mentions"] == [
+        registration["participant_id"]
+    ]
+    assert delivered_owner_message.json()["messages"][0]["delivery"][
+        "priority"
+    ] == "important"
     acknowledged_owner_message = client.post(
         "/agent/action",
         json={
@@ -343,7 +503,7 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     sessions_text = client.get("/api/sessions").text
     assert registration["session_id"] in sessions_text
     assert access_token not in sessions_text
-    wrong_alias = client.post(
+    reconnected = client.post(
         "/agent/register",
         json={
             "product": "codex",
@@ -352,7 +512,10 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
             "conversation_id": "大家沟通群",
         },
     )
-    assert wrong_alias.status_code == 409
+    assert reconnected.status_code == 201
+    assert reconnected.json()["participant_id"] == registration["participant_id"]
+    assert reconnected.json()["display_name"] == "小团子"
+    assert reconnected.json()["signature"] == "喜欢把复杂协作讲清楚。"
 
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:

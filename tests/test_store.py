@@ -14,10 +14,12 @@ from agent_bridge.store import (
     AuthenticationError,
     BridgeStore,
     ConflictError,
+    NicknameRateLimitError,
     NotFoundError,
     RateLimitError,
 )
 from agent_bridge.validation import ValidationError, product_username
+from agent_bridge.viewer_store import ViewerRepository
 
 
 def make_store(tmp_path: Path) -> BridgeStore:
@@ -147,6 +149,234 @@ def test_room_delivery_has_independent_receipts(tmp_path: Path) -> None:
         )["messages"] == []
 
 
+def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="被关注者")
+    follower = register(store, client="codex", name="关注者")
+    mentioned = register(store, client="opencode", name="被提及者")
+    observer = register(store, client="hermes", name="普通成员")
+
+    followed = store.set_follow(
+        participant_id=follower["participant_id"],
+        authorized_session_id=follower["session_id"],
+        conversation_id="tools-room",
+        followed_participant_id=sender["participant_id"],
+    )
+    assert followed["following"] is True
+    assert store.following(
+        participant_id=follower["participant_id"],
+        authorized_session_id=follower["session_id"],
+        conversation_id="tools-room",
+    )["following"][0]["followed_participant_id"] == sender["participant_id"]
+
+    room_message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="正文里的 @文字 不参与路由；结构化提及才参与。",
+        audience_kind="room",
+        mentions=[mentioned["participant_id"]],
+    )
+    follower_message = store.wait_messages(
+        participant_id=follower["participant_id"],
+        authorized_session_id=follower["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    mentioned_message = store.wait_messages(
+        participant_id=mentioned["participant_id"],
+        authorized_session_id=mentioned["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    observer_message = store.wait_messages(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    assert follower_message["message_id"] == room_message["message_id"]
+    assert follower_message["delivery"]["reasons"] == [
+        "room_activity",
+        "audience:room",
+        "follow",
+    ]
+    assert follower_message["delivery"]["priority"] == "important"
+    assert follower_message["delivery"]["actionable"] is False
+    assert mentioned_message["mentions"] == [mentioned["participant_id"]]
+    assert mentioned_message["delivery"]["reasons"] == [
+        "room_activity",
+        "audience:room",
+        "mention",
+    ]
+    assert mentioned_message["delivery"]["actionable"] is False
+    assert observer_message["delivery"] == {
+        "state": "delivered",
+        "reasons": ["room_activity", "audience:room"],
+        "priority": "normal",
+        "actionable": False,
+        "first_delivered_at": observer_message["delivery"]["first_delivered_at"],
+        "last_delivered_at": observer_message["delivery"]["last_delivered_at"],
+        "acked_at": None,
+        "attempt_count": 1,
+    }
+    for participant in (follower, mentioned, observer):
+        store.message_action(
+            participant_id=participant["participant_id"],
+            message_id=room_message["message_id"],
+            action="ack",
+            authorized_session_id=participant["session_id"],
+        )
+
+    expire_sender_cooldown(
+        store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    direct = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="这是群内公开消息，目标与额外 @ 成员收到加强通知。",
+        audience_kind="participant",
+        audience_value=mentioned["participant_id"],
+        mentions=[follower["participant_id"]],
+    )
+    follower_direct = store.wait_messages(
+        participant_id=follower["participant_id"],
+        authorized_session_id=follower["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    direct_received = store.wait_messages(
+        participant_id=mentioned["participant_id"],
+        authorized_session_id=mentioned["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    observer_direct = store.wait_messages(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    assert direct_received["message_id"] == direct["message_id"]
+    assert direct_received["delivery"]["priority"] == "mention"
+    assert direct_received["delivery"]["actionable"] is True
+    assert follower_direct["message_id"] == direct["message_id"]
+    assert follower_direct["delivery"]["priority"] == "important"
+    assert follower_direct["delivery"]["actionable"] is False
+    assert observer_direct["message_id"] == direct["message_id"]
+    assert observer_direct["delivery"]["reasons"] == ["room_activity"]
+    assert observer_direct["delivery"]["priority"] == "normal"
+    assert observer_direct["delivery"]["actionable"] is False
+    with pytest.raises(ConflictError, match="not an actionable @ recipient"):
+        store.message_action(
+            participant_id=observer["participant_id"],
+            message_id=direct["message_id"],
+            action="claim",
+        )
+    follower_history_ids = {
+        item["message_id"]
+        for item in store.history(
+            participant_id=follower["participant_id"],
+            authorized_session_id=follower["session_id"],
+            conversation_id="tools-room",
+        )["messages"]
+    }
+    assert room_message["message_id"] in follower_history_ids
+    assert direct["message_id"] in follower_history_ids
+
+
+def test_month_scale_backlog_is_durable_indexed_and_paginated(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="长期发送者")
+    receiver = register(store, client="codex", name="积压接收者")
+    old_start = time.time() - 90 * 24 * 60 * 60
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE memberships SET joined_at = ?, updated_at = ? "
+            "WHERE conversation_id = 'tools-room' AND participant_id = ?",
+            (
+                old_start - 1,
+                old_start - 1,
+                receiver["participant_id"],
+            ),
+        )
+        for index in range(240):
+            created_at = old_start + index * (MESSAGE_COOLDOWN_SECONDS + 1)
+            message_id = f"msg_backlog_{index:04d}"
+            connection.execute(
+                """
+                INSERT INTO messages
+                    (message_id, conversation_id, sender_participant_id,
+                     audience_kind, audience_value, message_kind, body,
+                     refs_json, mentions_json, status, authorized_session_id,
+                     created_at, updated_at)
+                VALUES (?, 'tools-room', ?, 'room', 'tools-room', 'message', ?,
+                        '[]', '[]', 'open', ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    sender["participant_id"],
+                    f"历史消息 {index}",
+                    sender["session_id"],
+                    created_at,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            store._create_message_deliveries_locked(connection, row)
+
+    reopened = BridgeStore(tmp_path / "bridge.db", poll_interval_seconds=0.05)
+    resumed = reopened.register_agent_session(
+        product="codex",
+        username="积压接收者",
+        signature="重新连接后继续读取。",
+        conversation_id="tools-room",
+    )
+    assert resumed["participant_id"] == receiver["participant_id"]
+    first_batch = reopened.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=resumed["session_id"],
+        wait_seconds=0,
+        limit=100,
+    )
+    assert first_batch["count"] == 100
+    assert first_batch["pending_count"] == 240
+    assert first_batch["has_more"] is True
+    assert first_batch["backlog"]["priority_counts"] == {
+        "mention": 0,
+        "important": 0,
+        "normal": 240,
+    }
+    assert first_batch["messages"][0]["body"] == "历史消息 0"
+    assert first_batch["messages"][-1]["body"] == "历史消息 99"
+
+    first_history = reopened.history(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=resumed["session_id"],
+        conversation_id="tools-room",
+        after_sequence=0,
+        limit=80,
+    )
+    assert first_history["count"] == 80
+    assert first_history["has_more"] is True
+    second_history = reopened.history(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=resumed["session_id"],
+        conversation_id="tools-room",
+        after_sequence=first_history["last_sequence"],
+        limit=80,
+    )
+    assert second_history["messages"][0]["body"] == "历史消息 80"
+    with reopened._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 240
+        assert (
+            connection.execute("SELECT COUNT(*) FROM message_deliveries").fetchone()[0]
+            == 240
+        )
+
+
 def test_room_message_reply_does_not_hide_it_from_other_members(
     tmp_path: Path,
 ) -> None:
@@ -162,7 +392,7 @@ def test_room_message_reply_does_not_hide_it_from_other_members(
         audience_kind="room",
     )
 
-    store.reply(
+    reply = store.reply(
         authorized_session_id=first["session_id"],
         participant_id=first["participant_id"],
         message_id=question["message_id"],
@@ -172,8 +402,10 @@ def test_room_message_reply_does_not_hide_it_from_other_members(
         participant_id=second["participant_id"], wait_seconds=0
     )["messages"]
     assert [item["message_id"] for item in pending_for_second] == [
-        question["message_id"]
+        question["message_id"],
+        reply["reply"]["message_id"],
     ]
+    assert pending_for_second[1]["delivery"]["priority"] == "normal"
     with pytest.raises(ConflictError):
         store.message_action(
             participant_id=second["participant_id"],
@@ -212,6 +444,7 @@ def test_role_question_is_claimed_by_only_one_worker(tmp_path: Path) -> None:
     sender = register(store, client="claude-code", name="开发")
     first = register(store, client="codex", name="审计一", roles=["reviewer"])
     second = register(store, client="opencode", name="审计二", roles=["reviewer"])
+    observer = register(store, client="hermes", name="旁观者")
     question = store.send(
         authorized_session_id=sender["session_id"],
         sender_participant_id=sender["participant_id"],
@@ -229,6 +462,12 @@ def test_role_question_is_claimed_by_only_one_worker(tmp_path: Path) -> None:
     assert store.wait_messages(
         participant_id=second["participant_id"], wait_seconds=0
     )["messages"] == []
+    observed = store.wait_messages(
+        participant_id=observer["participant_id"], wait_seconds=0
+    )["messages"][0]
+    assert observed["message_id"] == question["message_id"]
+    assert observed["delivery"]["priority"] == "normal"
+    assert observed["delivery"]["actionable"] is False
 
 
 def test_role_claim_is_atomic_under_concurrent_waiters(tmp_path: Path) -> None:
@@ -273,15 +512,29 @@ def test_role_claim_is_atomic_under_concurrent_waiters(tmp_path: Path) -> None:
         for participant in (first, second)
         if participant["participant_id"] == deliveries[0]["claimed_by"]
     )
-    store.reply(
+    reply = store.reply(
         authorized_session_id=responder["session_id"],
         participant_id=responder["participant_id"],
         message_id=question["message_id"],
         body_text="我来审查。",
     )
-    assert store.wait_messages(
-        participant_id=second["participant_id"], wait_seconds=0
-    )["messages"] == []
+    loser = next(
+        participant
+        for participant in (first, second)
+        if participant["participant_id"] != responder["participant_id"]
+    )
+    loser_messages = store.wait_messages(
+        participant_id=loser["participant_id"], wait_seconds=0
+    )["messages"]
+    assert {item["message_id"] for item in loser_messages} == {
+        question["message_id"],
+        reply["reply"]["message_id"],
+    }
+    resolved_question = next(
+        item for item in loser_messages if item["message_id"] == question["message_id"]
+    )
+    assert resolved_question["delivery"]["priority"] == "important"
+    assert resolved_question["delivery"]["actionable"] is False
 
 
 def test_wait_unblocks_when_another_store_sends(tmp_path: Path) -> None:
@@ -312,6 +565,112 @@ def test_wait_unblocks_when_another_store_sends(tmp_path: Path) -> None:
     assert time.monotonic() - started < 1.5
 
 
+def test_notification_wait_is_metadata_only_and_reconnect_safe(tmp_path: Path) -> None:
+    first_store = make_store(tmp_path)
+    second_store = BridgeStore(tmp_path / "bridge.db", poll_interval_seconds=0.05)
+    receiver = register(first_store, client="codex", name="远端监听者")
+    sender = register(first_store, client="claude-code", name="通知发送者")
+
+    initial = second_store.notification_snapshot(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        after_sequence=0,
+    )
+    assert initial["has_new"] is False
+    assert initial["has_room_activity"] is False
+    assert initial["cursor"] == 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            second_store.wait_for_notification,
+            participant_id=receiver["participant_id"],
+            authorized_session_id=receiver["session_id"],
+            after_sequence=initial["cursor"],
+            wait_seconds=2,
+        )
+        time.sleep(0.1)
+        sent = first_store.send(
+            authorized_session_id=sender["session_id"],
+            sender_participant_id=sender["participant_id"],
+            conversation_id="tools-room",
+            body_text="正文不进入唤醒事件。",
+            audience_kind="participant",
+            audience_value=receiver["participant_id"],
+        )
+        notification = future.result(timeout=3)
+
+    assert notification["timed_out"] is False
+    assert notification["has_new"] is True
+    assert notification["has_room_activity"] is True
+    assert notification["cursor"] == sent["sequence"]
+    assert notification["new_since_cursor"]["pending_count"] == 1
+    assert notification["new_since_cursor"]["priority_counts"]["mention"] == 1
+    assert "正文不进入唤醒事件" not in str(notification)
+    with first_store._connection() as connection:
+        delivery = connection.execute(
+            "SELECT state, attempt_count FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (sent["message_id"], receiver["participant_id"]),
+        ).fetchone()
+    assert delivery["state"] == "pending"
+    assert delivery["attempt_count"] == 0
+
+    reconnected = BridgeStore(tmp_path / "bridge.db")
+    replay = reconnected.notification_snapshot(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        after_sequence=notification["cursor"],
+    )
+    assert replay["has_new"] is False
+    assert replay["has_room_activity"] is False
+    assert replay["backlog"]["pending_count"] == 1
+
+    # A corrupt persisted cursor must be clamped to a sequence the server has
+    # actually issued; otherwise one typo could suppress notifications forever.
+    clamped = reconnected.notification_snapshot(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        after_sequence=999_999_999,
+    )
+    assert clamped["cursor"] == sent["sequence"]
+    expire_sender_cooldown(
+        first_store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    later = first_store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="损坏游标后仍能收到下一条。",
+        audience_kind="room",
+    )
+    after_clamp = reconnected.notification_snapshot(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        after_sequence=clamped["cursor"],
+    )
+    assert after_clamp["has_new"] is True
+    assert after_clamp["has_room_activity"] is True
+    assert after_clamp["cursor"] == later["sequence"]
+
+    first_store.message_action(
+        participant_id=receiver["participant_id"],
+        message_id=later["message_id"],
+        action="ack",
+        authorized_session_id=receiver["session_id"],
+    )
+    already_processed = reconnected.notification_snapshot(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        after_sequence=sent["sequence"],
+    )
+    assert already_processed["has_room_activity"] is True
+    assert already_processed["room_activity_since_cursor"]["activity_count"] == 1
+    assert already_processed["has_new"] is False
+    assert already_processed["new_since_cursor"]["pending_count"] == 0
+
+
 def test_data_persists_across_store_instances(tmp_path: Path) -> None:
     first_store = make_store(tmp_path)
     sender = register(first_store, client="codex", name="发送者")
@@ -332,6 +691,89 @@ def test_data_persists_across_store_instances(tmp_path: Path) -> None:
     )
     assert result["messages"][0]["message_id"] == message["message_id"]
     assert result["messages"][0]["refs"][0]["path"] == "/not/read/by/bridge"
+
+
+def test_delivery_migration_keeps_group_history_without_false_old_backlog(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database, poll_interval_seconds=0.05)
+    sender = register(store, client="claude-code", name="旧发送者")
+    target = register(store, client="codex", name="旧目标")
+    observer = register(store, client="opencode", name="旧旁观者")
+    resolved = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="旧版定向消息现在是公开 @。",
+        audience_kind="participant",
+        audience_value=target["participant_id"],
+    )
+    store.message_action(
+        participant_id=target["participant_id"],
+        message_id=resolved["message_id"],
+        action="ack",
+        authorized_session_id=target["session_id"],
+    )
+    unresolved = store.send(
+        authorized_session_id=target["session_id"],
+        sender_participant_id=target["participant_id"],
+        conversation_id="tools-room",
+        body_text="升级时仍未处理的群消息。",
+        audience_kind="room",
+    )
+
+    # Simulate a pre-delivery-ledger database while preserving all durable
+    # source rows.  Initializing the upgraded store must only add projections.
+    with store._transaction() as connection:
+        before_counts = {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("participants", "memberships", "messages", "receipts")
+        }
+        connection.execute("DROP TABLE message_deliveries")
+        connection.execute("PRAGMA user_version = 6")
+
+    migrated = BridgeStore(database, poll_interval_seconds=0.05)
+    with migrated._connection() as connection:
+        after_counts = {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in ("participants", "memberships", "messages", "receipts")
+        }
+        resolved_deliveries = connection.execute(
+            "SELECT participant_id, state, actionable FROM message_deliveries "
+            "WHERE message_id = ? ORDER BY participant_id",
+            (resolved["message_id"],),
+        ).fetchall()
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    assert after_counts == before_counts
+    assert version == 9
+    assert len(resolved_deliveries) == 2
+    assert {row["state"] for row in resolved_deliveries} == {"acked"}
+    assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
+
+    observer_history = migrated.history(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        conversation_id="tools-room",
+    )
+    assert [item["message_id"] for item in observer_history["messages"]] == [
+        resolved["message_id"],
+        unresolved["message_id"],
+    ]
+    observer_backlog = migrated.notification_snapshot(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        after_sequence=0,
+    )["backlog"]
+    assert observer_backlog["pending_count"] == 1
+    assert observer_backlog["newest_sequence"] == unresolved["sequence"]
+
+    dashboard_messages = ViewerRepository(database).messages("tools-room")
+    resolved_view = next(
+        item for item in dashboard_messages if item["message_id"] == resolved["message_id"]
+    )
+    assert resolved_view["ack_count"] == 1
+    assert resolved_view["receipt_count"] == 2
 
 
 def test_resume_preserves_id_and_rejects_client_type_change(tmp_path: Path) -> None:
@@ -414,7 +856,7 @@ def test_open_registration_requires_existing_room_and_stores_only_token_hash(
     assert invite_table is None
 
 
-def test_new_registration_session_revokes_old_token_for_same_fixed_identity(
+def test_same_fixed_identity_keeps_sessions_and_renews_them_sliding(
     tmp_path: Path,
 ) -> None:
     store = make_store(tmp_path)
@@ -426,11 +868,144 @@ def test_new_registration_session_revokes_old_token_for_same_fixed_identity(
         conversation_id="tools-room",
     )
     assert second["participant_id"] == first["participant_id"]
-    with pytest.raises(AuthenticationError, match="revoked"):
-        store.authenticate_session(first["access_token"])
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ?, ttl_seconds = 600 "
+            "WHERE session_id = ?",
+            (time.time() + 1, first["session_id"]),
+        )
+    renewed = store.authenticate_session(first["access_token"])
+    assert renewed["expires_at"] > time.time() + 590
+    assert renewed["renewal_mode"] == "sliding"
     assert store.authenticate_session(second["access_token"])["session_id"] == second[
         "session_id"
     ]
+    legacy_reconnect = store.register_agent_session(
+        product="codex",
+        username="固定身份",
+        session_alias="旧客户端换了会话用途",
+        conversation_id="tools-room",
+    )
+    assert legacy_reconnect["participant_id"] == first["participant_id"]
+    assert legacy_reconnect["session_alias"] == first["session_alias"]
+    assert legacy_reconnect["signature"] == first["signature"]
+
+
+def test_inactive_sessions_can_be_cleared_without_deleting_audit_links(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    expired = register(store, client="codex", name="会过期")
+    active = register(store, client="opencode", name="仍在线")
+    nickname = store.request_nickname(
+        participant_id=expired["participant_id"],
+        authorized_session_id=expired["session_id"],
+        requested_display_name="旧会话申请的昵称",
+    )
+    now = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ? WHERE session_id = ?",
+            (now - 1, expired["session_id"]),
+        )
+
+    cleared = store.clear_inactive_sessions(now=now)
+    assert cleared == {
+        "cleared_count": 1,
+        "cleared_at": now,
+        "mode": "logical",
+        "audit_links_preserved": True,
+    }
+    assert store.clear_inactive_sessions(now=now + 1)["cleared_count"] == 0
+    with store._connection() as connection:
+        expired_row = connection.execute(
+            "SELECT cleared_at FROM agent_sessions WHERE session_id = ?",
+            (expired["session_id"],),
+        ).fetchone()
+        nickname_row = connection.execute(
+            "SELECT requested_session_id FROM nickname_requests WHERE request_id = ?",
+            (nickname["request_id"],),
+        ).fetchone()
+    assert expired_row["cleared_at"] == now
+    assert nickname_row["requested_session_id"] == expired["session_id"]
+    with pytest.raises(AuthenticationError, match="cleared"):
+        store.authenticate_session(expired["access_token"])
+    assert store.authenticate_session(active["access_token"])["session_id"] == active[
+        "session_id"
+    ]
+    repository = ViewerRepository(tmp_path / "bridge.db")
+    assert [item["session_id"] for item in repository.sessions()] == [
+        active["session_id"]
+    ]
+    assert repository.session_stats() == {
+        "active_count": 1,
+        "clearable_count": 0,
+    }
+
+
+def test_signature_and_owner_approved_nickname_are_separate_from_identity(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    store.create_user_room("profile-room")
+    registered = store.register_agent_session(
+        product="codex",
+        username="固定身份",
+        signature="喜欢把复杂系统说清楚。",
+        conversation_id="profile-room",
+    )
+    assert registered["client_type"] == "codex-固定身份"
+    assert registered["display_name"] == "codex-固定身份"
+    assert registered["signature"] == "喜欢把复杂系统说清楚。"
+
+    request = store.request_nickname(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        requested_display_name="小团子",
+    )
+    assert request["status"] == "pending"
+    assert request["current_display_name"] == "codex-固定身份"
+    with pytest.raises(ConflictError, match="still pending"):
+        store.request_nickname(
+            participant_id=registered["participant_id"],
+            authorized_session_id=registered["session_id"],
+            requested_display_name="另一昵称",
+        )
+
+    approved = store.review_nickname_request(
+        request_id=request["request_id"],
+        action="approve",
+    )
+    assert approved["status"] == "approved"
+    assert approved["current_display_name"] == "小团子"
+    participants = store.participants(
+        participant_id=registered["participant_id"],
+        conversation_id="profile-room",
+        authorized_session_id=registered["session_id"],
+    )["participants"]
+    assert participants[0]["display_name"] == "小团子"
+
+    updated = store.update_profile(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        signature="更喜欢底层单一权威。",
+    )
+    assert updated["signature"] == "更喜欢底层单一权威。"
+    assert updated["display_name"] == "小团子"
+    with pytest.raises(NicknameRateLimitError):
+        store.request_nickname(
+            participant_id=registered["participant_id"],
+            authorized_session_id=registered["session_id"],
+            requested_display_name="今天不能再换",
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="NICKNAME_APPROVAL_REQUIRED"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE participants SET display_name = '绕过审批' "
+                "WHERE participant_id = ?",
+                (registered["participant_id"],),
+            )
 
 
 def test_database_rejects_message_without_live_mcp_session(tmp_path: Path) -> None:
@@ -1154,7 +1729,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 5
+    assert version == 9
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -1265,6 +1840,10 @@ def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
         foreign_key_errors = migrated.execute("PRAGMA foreign_key_check").fetchall()
     assert "invite_id" not in columns
     assert "registered_conversation_id" in columns
+    assert "ttl_seconds" in columns
     assert invite_table is None
     assert room["registered_conversation_id"] == "旧聊天室"
+    assert authenticated["display_name"] == "codex-旧成员"
+    assert authenticated["signature"] == "旧会话"
+    assert authenticated["renewal_mode"] == "sliding"
     assert foreign_key_errors == []

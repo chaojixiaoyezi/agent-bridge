@@ -48,6 +48,9 @@ class ViewerRepository:
                     "messages",
                     "receipts",
                     "agent_sessions",
+                    "nickname_requests",
+                    "follows",
+                    "message_deliveries",
                 )
             }
             room_states = {
@@ -78,10 +81,12 @@ class ViewerRepository:
             rows = connection.execute(
                 """
                 SELECT session.*, participant.client_type,
-                       participant.session_alias
+                       participant.session_alias, participant.display_name,
+                       participant.signature
                 FROM agent_sessions AS session
                 JOIN participants AS participant
                   ON participant.participant_id = session.participant_id
+                WHERE session.cleared_at IS NULL
                 ORDER BY session.created_at DESC
                 LIMIT ?
                 """,
@@ -101,11 +106,15 @@ class ViewerRepository:
                     "participant_id": str(row["participant_id"]),
                     "client_type": str(row["client_type"]),
                     "session_alias": str(row["session_alias"]),
+                    "display_name": str(row["display_name"]),
+                    "signature": str(row["signature"]),
                     "conversation_id": str(row["registered_conversation_id"]),
                     "transport": str(row["transport"]),
                     "status": status,
                     "created_at": float(row["created_at"]),
                     "expires_at": float(row["expires_at"]),
+                    "ttl_seconds": float(row["ttl_seconds"]),
+                    "renewal_mode": "sliding",
                     "last_seen": float(row["last_seen"]),
                     "revoked_at": (
                         float(row["revoked_at"])
@@ -113,9 +122,34 @@ class ViewerRepository:
                         else None
                     ),
                     "revoked_reason": str(row["revoked_reason"] or ""),
+                    "cleared_at": None,
                 }
             )
         return result
+
+    def session_stats(self) -> dict[str, int]:
+        now = time.time()
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    SUM(
+                        CASE WHEN revoked_at IS NULL AND expires_at > ?
+                             THEN 1 ELSE 0 END
+                    ) AS active_count,
+                    SUM(
+                        CASE WHEN revoked_at IS NOT NULL OR expires_at <= ?
+                             THEN 1 ELSE 0 END
+                    ) AS clearable_count
+                FROM agent_sessions
+                WHERE cleared_at IS NULL
+                """,
+                (now, now),
+            ).fetchone()
+        return {
+            "active_count": int(row["active_count"] or 0),
+            "clearable_count": int(row["clearable_count"] or 0),
+        }
 
     def rooms(self, *, limit: int = 200) -> list[dict[str, Any]]:
         normalized_limit = max(1, min(int(limit), 500))
@@ -166,8 +200,10 @@ class ViewerRepository:
                     latest.created_at AS latest_created_at,
                     sender.session_alias AS latest_sender_alias,
                     sender.client_type AS latest_sender_client_type,
+                    sender.display_name AS latest_sender_display_name,
                     creator.client_type AS creator_client_type,
-                    creator.session_alias AS creator_session_alias
+                    creator.session_alias AS creator_session_alias,
+                    creator.display_name AS creator_display_name
                 FROM rooms AS room
                 LEFT JOIN membership_stats AS ms
                   ON ms.conversation_id = room.conversation_id
@@ -199,6 +235,7 @@ class ViewerRepository:
                 ),
                 "creator_client_type": str(row["creator_client_type"] or ""),
                 "creator_session_alias": str(row["creator_session_alias"] or ""),
+                "creator_display_name": str(row["creator_display_name"] or ""),
                 "participant_count": int(row["participant_count"] or 0),
                 "active_participant_count": int(
                     row["active_participant_count"] or 0
@@ -219,6 +256,9 @@ class ViewerRepository:
                 "latest_sender_alias": str(row["latest_sender_alias"] or ""),
                 "latest_sender_client_type": str(
                     row["latest_sender_client_type"] or ""
+                ),
+                "latest_sender_display_name": str(
+                    row["latest_sender_display_name"] or ""
                 ),
                 "created_at": float(row["created_at"]),
                 "last_activity_at": float(row["last_activity_at"]),
@@ -246,14 +286,24 @@ class ViewerRepository:
         *,
         limit: int = 300,
         before_sequence: int | None = None,
+        after_sequence: int | None = None,
     ) -> list[dict[str, Any]]:
         conversation = validate_conversation_id(conversation_id)
-        normalized_limit = max(1, min(int(limit), 500))
+        normalized_limit = max(1, min(int(limit), 501))
+        if before_sequence is not None and after_sequence is not None:
+            raise ValueError(
+                "before_sequence and after_sequence cannot be used together"
+            )
         parameters: list[Any] = [conversation]
-        before_clause = ""
+        sequence_clause = ""
+        order = "DESC"
         if before_sequence is not None:
-            before_clause = "AND m.sequence < ?"
+            sequence_clause = "AND m.sequence < ?"
             parameters.append(int(before_sequence))
+        elif after_sequence is not None:
+            sequence_clause = "AND m.sequence > ?"
+            parameters.append(int(after_sequence))
+            order = "ASC"
         parameters.append(normalized_limit)
         with self._connection() as connection:
             rows = connection.execute(
@@ -262,28 +312,138 @@ class ViewerRepository:
                     m.*,
                     sender.session_alias AS sender_alias,
                     sender.client_type AS sender_client_type,
+                    sender.display_name AS sender_display_name,
+                    sender.signature AS sender_signature,
                     claimant.session_alias AS claimant_alias,
+                    claimant.display_name AS claimant_display_name,
                     (
                         SELECT COUNT(*) FROM receipts AS r
                         WHERE r.message_id = m.message_id AND r.state = 'acked'
                     ) AS ack_count,
                     (
-                        SELECT COUNT(*) FROM receipts AS r
-                        WHERE r.message_id = m.message_id
+                        SELECT COUNT(*) FROM message_deliveries AS d
+                        WHERE d.message_id = m.message_id
                     ) AS receipt_count
                 FROM messages AS m
                 JOIN participants AS sender
                   ON sender.participant_id = m.sender_participant_id
                 LEFT JOIN participants AS claimant
                   ON claimant.participant_id = m.claimed_by
-                WHERE m.conversation_id = ? {before_clause}
-                ORDER BY m.sequence DESC
+                WHERE m.conversation_id = ? {sequence_clause}
+                ORDER BY m.sequence {order}
                 LIMIT ?
                 """,
                 parameters,
             ).fetchall()
-        result = [self._message_payload(row) for row in reversed(rows)]
+        ordered_rows = rows if after_sequence is not None else reversed(rows)
+        result = [self._message_payload(row) for row in ordered_rows]
         return result
+
+    def event_snapshot(self, *, after_sequence: int = 0) -> dict[str, Any]:
+        requested_cursor = max(0, int(after_sequence))
+        now = time.time()
+        with self._connection() as connection:
+            global_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM messages"
+                ).fetchone()[0]
+            )
+            cursor = min(requested_cursor, global_sequence)
+            changed_rooms = [
+                {
+                    "conversation_id": str(row["conversation_id"]),
+                    "message_count": int(row["message_count"]),
+                    "first_sequence": int(row["first_sequence"]),
+                    "last_sequence": int(row["last_sequence"]),
+                }
+                for row in connection.execute(
+                    """
+                    SELECT conversation_id, COUNT(*) AS message_count,
+                           MIN(sequence) AS first_sequence,
+                           MAX(sequence) AS last_sequence
+                    FROM messages
+                    WHERE sequence > ?
+                    GROUP BY conversation_id
+                    ORDER BY first_sequence
+                    """,
+                    (cursor,),
+                ).fetchall()
+            ]
+            pending_nicknames = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM nickname_requests WHERE status = 'pending'"
+                ).fetchone()[0]
+            )
+            nickname_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(MAX(requested_at, "
+                    "COALESCE(reviewed_at, 0))), 0) FROM nickname_requests"
+                ).fetchone()[0]
+            )
+            participant_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(profile_updated_at), 0) FROM participants"
+                ).fetchone()[0]
+            )
+            membership_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(updated_at), 0) FROM memberships"
+                ).fetchone()[0]
+            )
+            online_revision = str(
+                connection.execute(
+                    "SELECT COALESCE(GROUP_CONCAT(participant_id, '|'), '') "
+                    "FROM (SELECT participant_id FROM participants "
+                    "WHERE status = 'online' AND last_seen >= ? "
+                    "ORDER BY participant_id)",
+                    (now - 90.0,),
+                ).fetchone()[0]
+            )
+            active_session_revision = str(
+                connection.execute(
+                    "SELECT COALESCE(GROUP_CONCAT(session_id, '|'), '') "
+                    "FROM (SELECT session_id FROM agent_sessions "
+                    "WHERE cleared_at IS NULL AND revoked_at IS NULL "
+                    "AND expires_at > ? "
+                    "ORDER BY session_id)",
+                    (now,),
+                ).fetchone()[0]
+            )
+            session_revocation_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(COALESCE(revoked_at, 0)), 0) "
+                    "FROM agent_sessions"
+                ).fetchone()[0]
+            )
+            session_clear_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(COALESCE(cleared_at, 0)), 0) "
+                    "FROM agent_sessions"
+                ).fetchone()[0]
+            )
+            room_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(MAX(last_activity_at, "
+                    "COALESCE(abandoned_at, 0))), 0) FROM rooms"
+                ).fetchone()[0]
+            )
+        return {
+            "cursor": max(cursor, global_sequence),
+            "changed_rooms": changed_rooms,
+            "pending_nickname_requests": pending_nicknames,
+            "state_revision": [
+                global_sequence,
+                nickname_revision,
+                participant_revision,
+                membership_revision,
+                online_revision,
+                active_session_revision,
+                session_revocation_revision,
+                session_clear_revision,
+                room_revision,
+            ],
+            "server_time": now,
+        }
 
     def participants(self, conversation_id: str) -> list[dict[str, Any]]:
         conversation = validate_conversation_id(conversation_id)
@@ -301,6 +461,7 @@ class ViewerRepository:
                     (
                         SELECT COUNT(*) FROM agent_sessions AS session
                         WHERE session.participant_id = p.participant_id
+                          AND session.cleared_at IS NULL
                           AND session.revoked_at IS NULL
                           AND session.expires_at > ?
                     ) AS active_session_count
@@ -318,7 +479,7 @@ class ViewerRepository:
                          AND p.last_seen >= ? THEN 0
                         ELSE 1
                     END,
-                    p.session_alias,
+                    p.display_name,
                     p.participant_id
                 """,
                 (now, conversation, online_after),
@@ -328,6 +489,8 @@ class ViewerRepository:
                 "participant_id": str(row["participant_id"]),
                 "client_type": str(row["client_type"]),
                 "session_alias": str(row["session_alias"]),
+                "display_name": str(row["display_name"]),
+                "signature": str(row["signature"]),
                 "roles": json.loads(str(row["roles_json"])),
                 "capabilities": json.loads(str(row["capabilities_json"])),
                 "status": (
@@ -356,14 +519,18 @@ class ViewerRepository:
             "sender_participant_id": str(row["sender_participant_id"]),
             "sender_alias": str(row["sender_alias"]),
             "sender_client_type": str(row["sender_client_type"]),
+            "sender_display_name": str(row["sender_display_name"]),
+            "sender_signature": str(row["sender_signature"]),
             "audience_kind": str(row["audience_kind"]),
             "audience_value": str(row["audience_value"]),
             "body": str(row["body"]),
             "refs": json.loads(str(row["refs_json"])),
+            "mentions": json.loads(str(row["mentions_json"] or "[]")),
             "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
             "status": str(row["status"]),
             "claimed_by": str(row["claimed_by"]) if row["claimed_by"] else None,
             "claimant_alias": str(row["claimant_alias"] or ""),
+            "claimant_display_name": str(row["claimant_display_name"] or ""),
             "claim_until": (
                 float(row["claim_until"]) if row["claim_until"] else None
             ),

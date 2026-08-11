@@ -4,13 +4,14 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 import uvicorn
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .config import BridgeConfig
@@ -18,6 +19,7 @@ from .store import (
     AuthenticationError,
     BridgeStore,
     ConflictError,
+    NicknameRateLimitError,
     NotFoundError,
     RateLimitError,
 )
@@ -102,7 +104,25 @@ def create_app(database: str | Path) -> Starlette:
         )
 
     async def list_sessions(_: Request) -> Response:
-        return _json_call(lambda: {"sessions": repository.sessions(limit=200)})
+        return _json_call(
+            lambda: {
+                "sessions": repository.sessions(limit=200),
+                "stats": repository.session_stats(),
+            }
+        )
+
+    async def clear_inactive_sessions(request: Request) -> Response:
+        if not _is_owner_ui_request(request, intent="clear-inactive-sessions"):
+            return JSONResponse(
+                {"error": "session cleanup is only accepted from the local owner page"},
+                status_code=403,
+            )
+        if not _is_loopback_request(request):
+            return JSONResponse(
+                {"error": "open this page through 127.0.0.1 to clean sessions"},
+                status_code=403,
+            )
+        return _json_call(store.clear_inactive_sessions)
 
     async def revoke_session(request: Request) -> Response:
         if not _is_owner_ui_request(request, intent="revoke-session"):
@@ -130,13 +150,13 @@ def create_app(database: str | Path) -> Starlette:
                 required={
                     "product",
                     "username",
-                    "session_alias",
                     "conversation_id",
                 },
                 allowed={
                     "product",
                     "username",
                     "session_alias",
+                    "signature",
                     "conversation_id",
                     "roles",
                     "capabilities",
@@ -148,7 +168,8 @@ def create_app(database: str | Path) -> Starlette:
             lambda: store.register_agent_session(
                 product=payload["product"],
                 username=payload["username"],
-                session_alias=payload["session_alias"],
+                session_alias=payload.get("session_alias"),
+                signature=payload.get("signature"),
                 conversation_id=payload["conversation_id"],
                 roles=payload.get("roles"),
                 capabilities=payload.get("capabilities"),
@@ -169,6 +190,65 @@ def create_app(database: str | Path) -> Starlette:
             ),
         )
 
+    async def agent_update_profile(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"signature"},
+            allowed={"signature"},
+            operation=lambda auth, payload: store.update_profile(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                signature=payload["signature"],
+            ),
+        )
+
+    async def agent_request_nickname(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"display_name"},
+            allowed={"display_name"},
+            operation=lambda auth, payload: store.request_nickname(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                requested_display_name=payload["display_name"],
+            ),
+        )
+
+    async def agent_set_follow(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"conversation_id", "followed_participant_id"},
+            allowed={
+                "conversation_id",
+                "followed_participant_id",
+                "following",
+            },
+            operation=lambda auth, payload: store.set_follow(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                conversation_id=payload["conversation_id"],
+                followed_participant_id=payload["followed_participant_id"],
+                following=payload.get("following", True),
+            ),
+        )
+
+    async def agent_following(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"conversation_id"},
+            allowed={"conversation_id", "include_inactive"},
+            operation=lambda auth, payload: store.following(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                conversation_id=payload["conversation_id"],
+                include_inactive=payload.get("include_inactive", False),
+            ),
+        )
+
     async def agent_send(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -181,6 +261,7 @@ def create_app(database: str | Path) -> Starlette:
                 "audience_value",
                 "reply_to",
                 "refs",
+                "mentions",
             },
             operation=lambda auth, payload: store.send(
                 authorized_session_id=auth["session_id"],
@@ -191,6 +272,7 @@ def create_app(database: str | Path) -> Starlette:
                 audience_value=payload.get("audience_value", "*"),
                 reply_to=payload.get("reply_to"),
                 refs=payload.get("refs"),
+                mentions=payload.get("mentions"),
             ),
         )
 
@@ -227,6 +309,70 @@ def create_app(database: str | Path) -> Starlette:
         except Exception as exc:
             return _json_error(exc)
 
+    async def agent_notifications(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required=set(),
+            allowed={"after_sequence"},
+            operation=lambda auth, payload: store.notification_snapshot(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                after_sequence=payload.get("after_sequence"),
+            ),
+        )
+
+    async def agent_events(request: Request) -> Response:
+        try:
+            auth = _authenticate_request(request, store)
+            cursor = _event_cursor(request.headers.get("last-event-id"))
+        except Exception as exc:
+            return _json_error(exc)
+
+        async def stream():
+            nonlocal cursor
+            try:
+                snapshot = await asyncio.to_thread(
+                    store.notification_snapshot,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    after_sequence=cursor,
+                )
+                cursor = int(snapshot["cursor"])
+                yield _sse_event("backlog", snapshot, event_id=cursor)
+                while not await request.is_disconnected():
+                    snapshot = await asyncio.to_thread(
+                        store.wait_for_notification,
+                        participant_id=auth["participant_id"],
+                        authorized_session_id=auth["session_id"],
+                        after_sequence=cursor,
+                        wait_seconds=20,
+                    )
+                    if snapshot["has_room_activity"]:
+                        cursor = int(snapshot["cursor"])
+                        yield _sse_event(
+                            "message_available",
+                            snapshot,
+                            event_id=cursor,
+                        )
+                    else:
+                        yield f": keepalive {int(time.time())}\n\n".encode("utf-8")
+            except (AuthenticationError, ConflictError, NotFoundError) as exc:
+                yield _sse_event(
+                    "session_closed",
+                    {"error": str(exc)},
+                    event_id=cursor,
+                )
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     async def agent_action(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -247,13 +393,14 @@ def create_app(database: str | Path) -> Starlette:
             request,
             store,
             required={"message_id", "body"},
-            allowed={"message_id", "body", "refs"},
+            allowed={"message_id", "body", "refs", "mentions"},
             operation=lambda auth, payload: store.reply(
                 authorized_session_id=auth["session_id"],
                 participant_id=auth["participant_id"],
                 message_id=payload["message_id"],
                 body_text=payload["body"],
                 refs=payload.get("refs"),
+                mentions=payload.get("mentions"),
             ),
         )
 
@@ -262,12 +409,18 @@ def create_app(database: str | Path) -> Starlette:
             request,
             store,
             required={"conversation_id"},
-            allowed={"conversation_id", "limit", "before_sequence"},
+            allowed={
+                "conversation_id",
+                "limit",
+                "before_sequence",
+                "after_sequence",
+            },
             operation=lambda auth, payload: store.history(
                 participant_id=auth["participant_id"],
                 conversation_id=payload["conversation_id"],
                 limit=payload.get("limit", 50),
                 before_sequence=payload.get("before_sequence"),
+                after_sequence=payload.get("after_sequence"),
                 authorized_session_id=auth["session_id"],
             ),
         )
@@ -288,14 +441,32 @@ def create_app(database: str | Path) -> Starlette:
 
     async def messages(request: Request) -> Response:
         before = request.query_params.get("before_sequence")
+        after = request.query_params.get("after_sequence")
+        if before is not None and after is not None:
+            return JSONResponse(
+                {"error": "before_sequence and after_sequence cannot be combined"},
+                status_code=400,
+            )
+        limit = _int_query(request, "limit", default=300, maximum=500)
+        try:
+            page = repository.messages(
+                request.path_params["conversation_id"],
+                limit=limit + 1,
+                before_sequence=int(before) if before is not None else None,
+                after_sequence=int(after) if after is not None else None,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+        has_more = len(page) > limit
+        if has_more:
+            page = page[:limit] if after is not None else page[-limit:]
         return _json_call(
             lambda: {
                 "conversation_id": request.path_params["conversation_id"],
-                "messages": repository.messages(
-                    request.path_params["conversation_id"],
-                    limit=_int_query(request, "limit", default=300, maximum=500),
-                    before_sequence=int(before) if before is not None else None,
-                ),
+                "messages": page,
+                "first_sequence": page[0]["sequence"] if page else None,
+                "last_sequence": page[-1]["sequence"] if page else None,
+                "has_more": has_more,
             }
         )
 
@@ -309,7 +480,7 @@ def create_app(database: str | Path) -> Starlette:
             payload = await _json_body(
                 request,
                 required={"body"},
-                allowed={"body"},
+                allowed={"body", "mentions"},
             )
         except HttpInputError as exc:
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
@@ -318,6 +489,7 @@ def create_app(database: str | Path) -> Starlette:
                 "message": store.send_owner_message(
                     conversation_id=request.path_params["conversation_id"],
                     body_text=payload["body"],
+                    mentions=payload.get("mentions"),
                 )
             },
             success_status=201,
@@ -333,6 +505,85 @@ def create_app(database: str | Path) -> Starlette:
             }
         )
 
+    async def nickname_requests(request: Request) -> Response:
+        if not _is_loopback_request(request):
+            return JSONResponse(
+                {"error": "nickname approvals are only visible on 127.0.0.1"},
+                status_code=403,
+            )
+        status = request.query_params.get("status", "pending")
+        return _json_call(
+            lambda: {
+                "requests": store.list_nickname_requests(
+                    status=status,
+                    limit=_int_query(request, "limit", default=200, maximum=500),
+                )
+            }
+        )
+
+    async def review_nickname_request(request: Request) -> Response:
+        if not _is_loopback_request(request) or not _is_owner_ui_request(
+            request,
+            intent="review-nickname",
+        ):
+            return JSONResponse(
+                {"error": "nickname review is only accepted from the local owner page"},
+                status_code=403,
+            )
+        try:
+            payload = await _json_body(
+                request,
+                required={"action"},
+                allowed={"action", "review_note"},
+            )
+        except HttpInputError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
+        return _json_call(
+            lambda: {
+                "request": store.review_nickname_request(
+                    request_id=request.path_params["request_id"],
+                    action=payload["action"],
+                    review_note=payload.get("review_note"),
+                )
+            }
+        )
+
+    async def owner_events(request: Request) -> Response:
+        try:
+            cursor = _event_cursor(request.headers.get("last-event-id"))
+        except Exception as exc:
+            return _json_error(exc)
+
+        async def stream():
+            nonlocal cursor
+            previous_revision: list[object] | None = None
+            last_output = time.monotonic()
+            while not await request.is_disconnected():
+                snapshot = await asyncio.to_thread(
+                    repository.event_snapshot,
+                    after_sequence=cursor,
+                )
+                revision = list(snapshot["state_revision"])
+                if previous_revision is None or revision != previous_revision:
+                    event = "state" if previous_revision is None else "state_changed"
+                    cursor = int(snapshot["cursor"])
+                    yield _sse_event(event, snapshot, event_id=cursor)
+                    previous_revision = revision
+                    last_output = time.monotonic()
+                elif time.monotonic() - last_output >= 20:
+                    yield f": keepalive {int(time.time())}\n\n".encode("utf-8")
+                    last_output = time.monotonic()
+                await asyncio.sleep(1)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     app = Starlette(
         debug=False,
         routes=[
@@ -344,15 +595,31 @@ def create_app(database: str | Path) -> Starlette:
             Route("/api/rooms", create_room, methods=["POST"]),
             Route("/api/sessions", list_sessions, methods=["GET"]),
             Route(
+                "/api/sessions/cleanup",
+                clear_inactive_sessions,
+                methods=["POST"],
+            ),
+            Route("/api/events", owner_events, methods=["GET"]),
+            Route(
                 "/api/sessions/{session_id:str}/revoke",
                 revoke_session,
                 methods=["POST"],
             ),
             Route("/agent/register", register_agent, methods=["POST"]),
             Route("/agent/heartbeat", agent_heartbeat, methods=["POST"]),
+            Route("/agent/profile", agent_update_profile, methods=["POST"]),
+            Route(
+                "/agent/nickname/request",
+                agent_request_nickname,
+                methods=["POST"],
+            ),
+            Route("/agent/follow", agent_set_follow, methods=["POST"]),
+            Route("/agent/following", agent_following, methods=["POST"]),
             Route("/agent/send", agent_send, methods=["POST"]),
             Route("/agent/rooms/create", agent_create_room, methods=["POST"]),
             Route("/agent/wait", agent_wait, methods=["POST"]),
+            Route("/agent/notifications", agent_notifications, methods=["POST"]),
+            Route("/agent/events", agent_events, methods=["GET"]),
             Route("/agent/action", agent_action, methods=["POST"]),
             Route("/agent/reply", agent_reply, methods=["POST"]),
             Route("/agent/history", agent_history, methods=["POST"]),
@@ -372,6 +639,12 @@ def create_app(database: str | Path) -> Starlette:
                 participants,
                 methods=["GET"],
             ),
+            Route("/api/nickname-requests", nickname_requests, methods=["GET"]),
+            Route(
+                "/api/nickname-requests/{request_id:str}/review",
+                review_nickname_request,
+                methods=["POST"],
+            ),
         ],
     )
     app.add_middleware(SecurityHeadersMiddleware)
@@ -390,7 +663,7 @@ def _json_call(
         return JSONResponse(callable_(), status_code=success_status)
     except AuthenticationError as exc:
         return JSONResponse({"error": str(exc)}, status_code=401)
-    except RateLimitError as exc:
+    except (RateLimitError, NicknameRateLimitError) as exc:
         return JSONResponse(
             {
                 "error": str(exc),
@@ -453,6 +726,35 @@ def _authenticate_request(request: Request, store: BridgeStore) -> dict:
     return store.authenticate_session(token)
 
 
+def _event_cursor(value: str | None) -> int:
+    if value is None or not value.strip():
+        return 0
+    try:
+        cursor = int(value)
+    except ValueError as exc:
+        raise HttpInputError("Last-Event-ID must be a non-negative integer") from exc
+    if cursor < 0:
+        raise HttpInputError("Last-Event-ID must be a non-negative integer")
+    return cursor
+
+
+def _sse_event(
+    event: str,
+    payload: dict,
+    *,
+    event_id: int | None = None,
+) -> bytes:
+    lines: list[str] = []
+    if event_id is not None:
+        lines.append(f"id: {int(event_id)}")
+    lines.append(f"event: {event}")
+    lines.append(
+        "data: "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
 async def _agent_json_call(
     request: Request,
     store: BridgeStore,
@@ -474,7 +776,7 @@ def _json_error(exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
     if isinstance(exc, AuthenticationError):
         return JSONResponse({"error": str(exc)}, status_code=401)
-    if isinstance(exc, RateLimitError):
+    if isinstance(exc, (RateLimitError, NicknameRateLimitError)):
         return JSONResponse(
             {
                 "error": str(exc),

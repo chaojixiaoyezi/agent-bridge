@@ -38,21 +38,26 @@ class BridgeHttpClient:
         *,
         product: str,
         username: str,
-        session_alias: str,
+        session_alias: str | None = None,
+        signature: str | None = None,
         conversation_id: str,
         roles: list[str] | None = None,
         capabilities: list[str] | None = None,
     ) -> dict[str, Any]:
+        registration = {
+            "product": product,
+            "username": username,
+            "conversation_id": conversation_id,
+            "roles": roles or [],
+            "capabilities": capabilities or [],
+        }
+        if session_alias:
+            registration["session_alias"] = session_alias
+        if signature:
+            registration["signature"] = signature
         payload = self._post(
             "/agent/register",
-            {
-                "product": product,
-                "username": username,
-                "session_alias": session_alias,
-                "conversation_id": conversation_id,
-                "roles": roles or [],
-                "capabilities": capabilities or [],
-            },
+            registration,
             authenticated=False,
         )
         token = str(payload.pop("access_token", ""))

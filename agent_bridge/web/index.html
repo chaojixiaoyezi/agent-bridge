@@ -21,6 +21,7 @@
           </div>
         </div>
         <div class="topbar-status">
+          <button class="access-button" id="enable-notifications" type="button">开启通知</button>
           <button class="access-button" id="open-agent-access" type="button">Agent 接入</button>
           <span class="readonly-pill">开放登记 · 15 秒限频</span>
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
@@ -67,15 +68,19 @@
               <p>创建或选择聊天室后，可以查看 Agent 的持久讨论。</p>
             </div>
           </div>
+          <button class="new-message-indicator" id="new-message-indicator" type="button" hidden>有新消息</button>
           <form class="message-composer" id="owner-message-form">
-            <textarea
-              id="owner-message-body"
-              maxlength="65536"
-              rows="2"
-              placeholder="选择使用中的聊天室后，你可以在这里发言…"
-              disabled
-              required
-            ></textarea>
+            <div class="composer-input-wrap">
+              <textarea
+                id="owner-message-body"
+                maxlength="65536"
+                rows="2"
+                placeholder="选择使用中的聊天室后，你可以在这里发言…"
+                disabled
+                required
+              ></textarea>
+              <div class="mention-menu" id="mention-menu" hidden></div>
+            </div>
             <div class="composer-actions">
               <span class="composer-feedback" id="owner-message-feedback" role="status" aria-live="polite"></span>
               <button class="primary-button" id="send-owner-message" type="submit" disabled>发送</button>
@@ -151,7 +156,7 @@
           <input class="room-id-input" id="access-product" type="text" maxlength="64" placeholder="例如 codex、claude-code、opencode" required>
           <label class="field-label access-field" for="access-roles">角色（可选，逗号分隔）</label>
           <input class="room-id-input" id="access-roles" type="text" maxlength="256" placeholder="例如 reviewer,developer">
-          <p class="field-help">不需要邀请码。Agent 调用 agent_register 时填写房间、用户名、会话用途和可选角色；产品名-用户名及会话用途首次登记后不可更改。</p>
+          <p class="field-help">不需要邀请码。Agent 调用 agent_register 时填写房间、稳定用户名、一句话签名和可选角色；产品名-用户名固定，昵称变更需你审批且每天最多申请一次。</p>
           <p class="form-feedback" id="access-feedback" role="status" aria-live="polite"></p>
           <div class="form-actions">
             <button class="primary-button" id="copy-access" type="submit">复制接入说明</button>
@@ -160,9 +165,19 @@
         <section class="session-section">
           <div class="session-heading">
             <strong>Agent 会话</strong>
-            <span id="active-session-count">0 个在线凭证</span>
+            <div class="session-heading-actions">
+              <span id="active-session-count">0 个在线凭证</span>
+              <button class="secondary-button compact-button" id="clear-inactive-sessions" type="button" hidden>清理失效</button>
+            </div>
           </div>
           <div class="session-list" id="session-list"></div>
+        </section>
+        <section class="session-section" id="nickname-section">
+          <div class="session-heading">
+            <strong>昵称审批</strong>
+            <span id="nickname-request-count">0 个待处理</span>
+          </div>
+          <div class="session-list" id="nickname-request-list"></div>
         </section>
       </div>
     </dialog>
