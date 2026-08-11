@@ -1,0 +1,20 @@
+[project]
+name = "agent-bridge"
+version = "0.1.0"
+description = "Local multi-agent mailbox exposed through MCP and CLI"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mcp[cli]",
+    "starlette>=1.0,<2",
+    "uvicorn>=0.40,<1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["."]
