@@ -18,7 +18,13 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from .config import BridgeConfig
-from .connector import adapter_kind_for_product
+from .connector import adapter_kind_for_product, configure_resident_connector
+from .resident_health import (
+    configure_existing_connector_from_disk,
+    local_resident_snapshot,
+    repair_known_identity_services,
+    split_supported_identity,
+)
 from .store import (
     AuthenticationError,
     AuthorizationError,
@@ -58,7 +64,12 @@ class SecurityHeadersMiddleware:
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
-                headers["Cache-Control"] = "no-store"
+                path = str(scope.get("path") or "")
+                headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                    if path.startswith("/assets/")
+                    else "no-store"
+                )
                 headers["Content-Security-Policy"] = (
                     "default-src 'self'; script-src 'self'; style-src 'self'; "
                     "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
@@ -77,6 +88,7 @@ def create_app(
     *,
     registration_secret: str | None = None,
     captcha_generator: Callable[[], str] | None = None,
+    enable_resident_repair: bool = False,
 ) -> Starlette:
     # Read projections stay query_only. Web and Agent writes both go through the
     # same BridgeStore authority used by MCP and CLI.
@@ -112,18 +124,51 @@ def create_app(
                 # permanently disable the next lifecycle sweep.
                 continue
 
+    async def resident_maintenance() -> None:
+        while True:
+            try:
+                snapshot = await asyncio.to_thread(
+                    local_resident_snapshot,
+                    force=True,
+                )
+                for client_type, detail in snapshot.items():
+                    if detail.get("resident_status") != "online":
+                        await asyncio.to_thread(
+                            repair_known_identity_services,
+                            client_type,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Keep chat serving even if launchd/systemd is transiently busy.
+                pass
+            await asyncio.sleep(30)
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         maintenance = asyncio.create_task(
             lifecycle_maintenance(),
             name="agent-bridge-lifecycle-maintenance",
         )
+        resident_repair = (
+            asyncio.create_task(
+                resident_maintenance(),
+                name="agent-bridge-resident-maintenance",
+            )
+            if enable_resident_repair
+            else None
+        )
         try:
             yield
         finally:
             maintenance.cancel()
+            if resident_repair is not None:
+                resident_repair.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance
+            if resident_repair is not None:
+                with suppress(asyncio.CancelledError):
+                    await resident_repair
 
     def authenticated_web_user(
         request: Request,
@@ -1127,12 +1172,185 @@ def create_app(
     async def participants(request: Request) -> Response:
         try:
             authenticated_web_user(request)
+            projected = repository.participants(
+                request.path_params["conversation_id"]
+            )
+            local_residents = await asyncio.to_thread(local_resident_snapshot)
+            for participant in projected:
+                local = local_residents.get(str(participant["client_type"]))
+                if local is None:
+                    continue
+                participant["local_resident"] = local
+                if local["resident_status"] == "online":
+                    participant["resident_status"] = "online"
+                    participant["connector_adapter_kind"] = str(
+                        local["adapter_kind"]
+                    )
             return JSONResponse(
                 {
                     "conversation_id": request.path_params["conversation_id"],
-                    "participants": repository.participants(
-                        request.path_params["conversation_id"]
+                    "participants": projected,
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def repair_room_residents(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="repair-room-residents")
+            web_identity = authenticated_admin(request)
+            conversation = validate_conversation_id(
+                request.path_params["conversation_id"]
+            )
+            projected = repository.participants(conversation)
+            repaired: list[dict[str, object]] = []
+            unavailable: list[dict[str, str]] = []
+            for participant in projected:
+                client_type = str(participant["client_type"])
+                if split_supported_identity(client_type) is None:
+                    continue
+                local = await asyncio.to_thread(
+                    repair_known_identity_services,
+                    client_type,
+                    enable_disabled=True,
+                )
+                configured = None
+                if local is None:
+                    connector_id = str(participant.get("connector_id") or "")
+                    if not connector_id and enable_resident_repair:
+                        product_and_username = split_supported_identity(client_type)
+                        if product_and_username is not None:
+                            product, username = product_and_username
+                            try:
+                                invitation = await asyncio.to_thread(
+                                    store.create_agent_invitation,
+                                    conversation_id=conversation,
+                                    product=product,
+                                    requested_mode="resident",
+                                    adapter_kind=adapter_kind_for_product(product),
+                                    created_by_web_user_id=str(
+                                        web_identity["user_id"]
+                                    ),
+                                )
+                                invitation_token = str(
+                                    invitation.pop("invitation_token")
+                                )
+                                registration = await asyncio.to_thread(
+                                    store.accept_agent_invitation,
+                                    invitation_token=invitation_token,
+                                    product=product,
+                                    username=username,
+                                    signature=str(participant["signature"]),
+                                    roles=list(participant.get("roles") or []),
+                                    capabilities=list(
+                                        participant.get("capabilities") or []
+                                    ),
+                                )
+                                local_port = int(
+                                    os.environ.get(
+                                        "AGENT_BRIDGE_VIEWER_PORT",
+                                        "8765",
+                                    )
+                                )
+                                setup = await asyncio.to_thread(
+                                    configure_resident_connector,
+                                    connector_id=str(registration["connector_id"]),
+                                    enrollment_token=str(
+                                        registration["enrollment_token"]
+                                    ),
+                                    bridge_url=f"http://127.0.0.1:{local_port}",
+                                    product=product,
+                                    username=username,
+                                    signature=str(participant["signature"]),
+                                    conversation_id=conversation,
+                                    adapter_kind=adapter_kind_for_product(product),
+                                    requested_mode="resident",
+                                    roles=list(participant.get("roles") or []),
+                                    capabilities=list(
+                                        participant.get("capabilities") or []
+                                    ),
+                                    workspace_path=str(PROJECT_ROOT),
+                                    activate=True,
+                                )
+                                configured = setup.public_payload()
+                                await asyncio.to_thread(
+                                    store.report_agent_connector_setup,
+                                    participant_id=str(
+                                        registration["participant_id"]
+                                    ),
+                                    authorized_session_id=str(
+                                        registration["session_id"]
+                                    ),
+                                    connector_id=str(
+                                        registration["connector_id"]
+                                    ),
+                                    setup_status=setup.status,
+                                    detail=setup.public_payload(),
+                                )
+                                local = await asyncio.to_thread(
+                                    repair_known_identity_services,
+                                    client_type,
+                                )
+                            except Exception as exc:
+                                unavailable.append(
+                                    {
+                                        "participant_id": str(
+                                            participant["participant_id"]
+                                        ),
+                                        "display_name": str(
+                                            participant["display_name"]
+                                        ),
+                                        "reason": f"自动补建值守失败：{exc}",
+                                    }
+                                )
+                                continue
+                    if not connector_id and local is None:
+                        unavailable.append(
+                            {
+                                "participant_id": str(participant["participant_id"]),
+                                "display_name": str(participant["display_name"]),
+                                "reason": "旧式手动会话没有私有 connector，需重新接受值守邀请",
+                            }
+                        )
+                        continue
+                    if local is None:
+                        configured = await asyncio.to_thread(
+                            configure_existing_connector_from_disk,
+                            client_type,
+                        )
+                        local = await asyncio.to_thread(
+                            repair_known_identity_services,
+                            client_type,
+                        )
+                if local is None:
+                    unavailable.append(
+                        {
+                            "participant_id": str(participant["participant_id"]),
+                            "display_name": str(participant["display_name"]),
+                            "reason": "本机没有这个 Agent 的私有值守配置，需重新邀请接入",
+                        }
+                    )
+                    continue
+                repaired.append(
+                    {
+                        "participant_id": str(participant["participant_id"]),
+                        "display_name": str(participant["display_name"]),
+                        "resident_status": str(local["resident_status"]),
+                        "repaired_services": list(
+                            local.get("repaired_services") or []
+                        ),
+                        "configured": configured is not None,
+                    }
+                )
+            return JSONResponse(
+                {
+                    "conversation_id": conversation,
+                    "checked_count": len(repaired) + len(unavailable),
+                    "online_count": sum(
+                        item["resident_status"] == "online" for item in repaired
                     ),
+                    "repaired": repaired,
+                    "unavailable": unavailable,
                 }
             )
         except Exception as exc:
@@ -1543,6 +1761,11 @@ def create_app(
                 participants,
                 methods=["GET"],
             ),
+            Route(
+                "/api/rooms/{conversation_id:str}/residents/repair",
+                repair_room_residents,
+                methods=["POST"],
+            ),
             Route("/api/nickname-requests", nickname_requests, methods=["GET"]),
             Route(
                 "/api/nickname-requests/{request_id:str}/review",
@@ -1765,6 +1988,7 @@ def main() -> None:
         create_app(
             config.database,
             registration_secret=config.registration_secret,
+            enable_resident_repair=True,
         ),
         host=host,
         port=port,

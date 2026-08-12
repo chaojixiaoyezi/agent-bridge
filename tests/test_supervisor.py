@@ -10,7 +10,12 @@ import agent_bridge.codex_adapter as codex_adapter
 import agent_bridge.supervisor as supervisor
 from agent_bridge.claude_adapter import _tool_evidence
 from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
-from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence, _finish_turn
+from agent_bridge.codex_worker import (
+    CodexRpcError,
+    CodexThreadHost,
+    TurnEvidence,
+    _finish_turn,
+)
 from agent_bridge.supervisor import (
     SupervisorError,
     attach_adapter_run,
@@ -213,7 +218,7 @@ def test_supervisor_recovers_inflight_events_after_owner_restart(
     assert status["counts"]["inflight"] == 0
 
 
-def test_codex_adapter_uses_metadata_wake_and_structured_admin_authority_prompt(
+def test_codex_adapter_uses_metadata_wake_and_freezes_chat_authority_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -262,8 +267,8 @@ def test_codex_adapter_uses_metadata_wake_and_structured_admin_authority_prompt(
     prompt = captured["input"]
     assert "唤醒信号" in prompt
     assert "message.authorization" in prompt
-    assert "最小必要" in prompt
-    assert "推送、部署" in prompt
+    assert "授权功能已冻结" in prompt
+    assert "单独的 TUI" in prompt
     assert "本批事件数=3" in prompt
     assert "最新事件序号=72" in prompt
     assert "body" not in prompt
@@ -469,6 +474,108 @@ def test_resident_codex_worker_sends_protocol_read_only_mode(
         params for method, params in resumed_rpc.requests if method == "thread/resume"
     )
     assert resume_params["sandbox"] == "read-only"
+
+
+def test_resident_codex_worker_replaces_only_legacy_incompatible_thread_pointer(
+    tmp_path: Path,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    legacy_thread_id = "019f0000-0000-7000-8000-000000000001"
+    replacement_thread_id = "019f0000-0000-7000-8000-000000000002"
+    state_file = tmp_path / "thread-id"
+    state_file.write_text(f"{legacy_thread_id}\n", encoding="utf-8")
+
+    class FakeRpc:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, dict]] = []
+
+        def start(self) -> None:
+            return None
+
+        def request(self, method: str, params: dict, **_kwargs):
+            self.requests.append((method, params))
+            if method == "thread/resume":
+                raise CodexRpcError(
+                    method,
+                    {
+                        "message": (
+                            "Invalid request: unknown variant `workspaceWrite`, "
+                            "expected one of `read-only`, `workspace-write`, "
+                            "`danger-full-access`"
+                        )
+                    },
+                )
+            if method == "thread/start":
+                return {"thread": {"id": replacement_thread_id}}
+            return {}
+
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=state_file,
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="chat only",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("tool-review",),
+    )
+    fake_rpc = FakeRpc()
+    host.rpc = fake_rpc
+
+    host.start()
+
+    assert [method for method, _ in fake_rpc.requests] == [
+        "thread/resume",
+        "thread/start",
+        "thread/name/set",
+    ]
+    assert host.thread_id == replacement_thread_id
+    assert state_file.read_text(encoding="utf-8") == f"{replacement_thread_id}\n"
+
+
+def test_resident_codex_worker_does_not_hide_other_resume_failures(
+    tmp_path: Path,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    thread_id = "019f0000-0000-7000-8000-000000000001"
+    state_file = tmp_path / "thread-id"
+    state_file.write_text(f"{thread_id}\n", encoding="utf-8")
+
+    class FakeRpc:
+        @staticmethod
+        def start() -> None:
+            return None
+
+        @staticmethod
+        def request(method: str, _params: dict, **_kwargs):
+            raise CodexRpcError(method, {"message": "authentication failed"})
+
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=state_file,
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="chat only",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("tool-review",),
+    )
+    host.rpc = FakeRpc()
+
+    with pytest.raises(CodexRpcError, match="authentication failed"):
+        host.start()
+
+    assert state_file.read_text(encoding="utf-8") == f"{thread_id}\n"
 
 
 def test_resident_codex_worker_deterministically_acks_only_optional_messages(

@@ -634,7 +634,6 @@ class ViewerRepository:
                     JOIN agent_invitations AS recent_invitation
                       ON recent_invitation.invitation_id = recent.invitation_id
                     WHERE recent.accepted_participant_id = p.participant_id
-                      AND recent.conversation_id = m.conversation_id
                       AND recent_invitation.status != 'revoked'
                       AND recent.revoked_at IS NULL
                     ORDER BY recent.updated_at DESC

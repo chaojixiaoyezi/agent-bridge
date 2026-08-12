@@ -34,6 +34,10 @@ const state = {
   memberRooms: [],
   memberSelections: new Map(),
   roomPermissionUsers: [],
+  theme: "aurora",
+  messageRenderSignature: "",
+  participantRenderSignature: "",
+  timelineScrollFrame: null,
 };
 
 const elements = {
@@ -65,7 +69,9 @@ const elements = {
   openAccount: document.querySelector("#open-account"),
   inviteAgent: document.querySelector("#invite-agent"),
   manageMembers: document.querySelector("#manage-members"),
+  repairResidents: document.querySelector("#repair-residents"),
   renameRoom: document.querySelector("#rename-room"),
+  themeSelect: document.querySelector("#theme-select"),
   openCreateRoom: document.querySelector("#open-create-room"),
   createRoomDialog: document.querySelector("#create-room-dialog"),
   createRoomForm: document.querySelector("#create-room-form"),
@@ -186,6 +192,28 @@ function makeElement(tag, className, text) {
   if (text !== undefined && text !== null) element.textContent = String(text);
   return element;
 }
+
+const THEMES = new Set(["aurora", "ocean", "violet", "ember"]);
+
+try {
+  state.theme = window.localStorage.getItem("agentBridgeTheme") || "aurora";
+} catch (error) {
+  state.theme = "aurora";
+}
+
+function applyTheme(theme) {
+  const selected = THEMES.has(theme) ? theme : "aurora";
+  state.theme = selected;
+  document.documentElement.dataset.theme = selected;
+  elements.themeSelect.value = selected;
+  try {
+    window.localStorage.setItem("agentBridgeTheme", selected);
+  } catch (error) {
+    // Private browsing or a hardened WebView may disable persistent storage.
+  }
+}
+
+applyTheme(state.theme);
 
 function shortTime(timestamp) {
   if (!timestamp) return "—";
@@ -340,6 +368,7 @@ function applyUserPermissions() {
   elements.renameRoom.hidden = !(admin && activeRoom);
   elements.inviteAgent.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.manageMembers.hidden = !(admin && activeRoom && activeRoom.status === "active");
+  elements.repairResidents.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.wakeAllAgents.hidden = !(activeRoom?.can_wake_all && activeRoom.status === "active");
   elements.openAccount.textContent = `${state.currentUser.display_name}${admin ? " · 管理员" : ""}`;
   const agentGlobal = state.messageRateLimits?.agent_global_cooldown_seconds ?? 15;
@@ -373,8 +402,8 @@ async function enterApplication() {
   if (elements.authDialog.open) elements.authDialog.close();
   if (elements.passwordDialog.open) elements.passwordDialog.close();
   applyUserPermissions();
-  await refresh({ fullRoom: true });
   elements.appShell.hidden = false;
+  await refresh({ fullRoom: true });
   connectOwnerEvents();
 }
 
@@ -521,12 +550,7 @@ function createMessageElement(message) {
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
   if (message.authorization) {
-    const active = message.authorization.status === "active";
-    senderLine.append(makeElement(
-      "span",
-      `authorization-badge${active ? "" : " revoked"}`,
-      active ? "ADMIN 授权来源" : "授权已撤销",
-    ));
+    senderLine.append(makeElement("span", "authorization-badge revoked", "授权待提交"));
   }
   head.append(senderLine);
   head.append(makeElement("time", "message-time", fullTime(message.created_at)));
@@ -547,38 +571,19 @@ function createMessageElement(message) {
     article.append(makeElement("p", "claim-label", `由 ${message.claimant_display_name || message.claimant_alias} 领取`));
   }
   if (message.authorization) {
-    const authorization = message.authorization;
-    const targetLabel = authorization.target_kind === "participants"
-      ? authorization.target_participant_ids.map(participantName).join("、")
-      : authorization.target_kind === "reply_author"
-        ? `被回复的 Agent（${authorization.target_participant_ids.map(participantName).join("、")}）`
-        : "当前聊天室 Agent";
-    const statusLabel = authorization.status === "active"
-      ? `经服务端验证的 admin 自然语言授权来源 · 适用于 ${targetLabel}`
-      : `该 admin 授权来源已撤销${authorization.revocation_reason ? ` · ${authorization.revocation_reason}` : ""}`;
-    article.append(makeElement("p", `authorization-label${authorization.status === "active" ? "" : " revoked"}`, statusLabel));
-    if (authorization.status === "active" && isAdmin()) {
-      const revokeButton = makeElement("button", "message-reply-button authorization-revoke", "撤销授权");
-      revokeButton.type = "button";
-      revokeButton.addEventListener("click", async () => {
-        if (!window.confirm("撤销后，Agent 不得再以这条消息作为新操作的授权来源。继续吗？")) return;
-        revokeButton.disabled = true;
-        try {
-          await fetchJson(`/api/messages/${encodeURIComponent(message.message_id)}/authorization/revoke`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Agent-Bridge-Intent": "revoke-chat-authorization",
-            },
-            body: JSON.stringify({}),
-          });
-          await refresh();
-        } catch (error) {
-          window.alert(error.message);
-          revokeButton.disabled = false;
-        }
+    article.append(makeElement(
+      "p",
+      "authorization-label revoked",
+      "当前按普通聊天处理；授权功能暂未开放。",
+    ));
+    if (isAdmin()) {
+      const submitButton = makeElement("button", "message-reply-button authorization-submit", "提交授权");
+      submitButton.type = "button";
+      submitButton.title = "授权功能暂未开放，当前只保留入口";
+      submitButton.addEventListener("click", () => {
+        window.alert("授权功能暂未开放；当前聊天室消息仍按普通讨论处理。这里只预留提交入口。");
       });
-      article.append(revokeButton);
+      article.append(submitButton);
     }
   }
   article.append(makeElement("p", "receipt-label", `#${message.sequence} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
@@ -613,14 +618,24 @@ function updateNewMessageIndicator() {
 }
 
 function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) {
-  const wasNearBottom = isNearTimelineBottom();
+  const hadRenderedMessages = Boolean(
+    elements.timeline.querySelector("article[data-message-id]"),
+  );
+  const wasNearBottom = hadRenderedMessages ? isNearTimelineBottom() : true;
   const anchor = !wasNearBottom && !forceBottom ? captureTimelineAnchor() : null;
-  elements.timeline.replaceChildren();
+  const signature = `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.updated_at || item.ack_count || 0}:${item.ack_count || 0}`).join("|")}`;
+  if (!forceBottom && addedCount === 0 && signature === state.messageRenderSignature) {
+    updateNewMessageIndicator();
+    return;
+  }
+  state.messageRenderSignature = signature;
+  const fragment = document.createDocumentFragment();
   if (!messages.length) {
     const empty = makeElement("div", "empty-state");
     empty.append(makeElement("h3", "", "房间里还没有消息"));
     empty.append(makeElement("p", "", "你或 Agent 发出的第一条讨论会自动出现在这里。"));
-    elements.timeline.append(empty);
+    fragment.append(empty);
+    elements.timeline.replaceChildren(fragment);
     state.unreadMessages = 0;
     updateNewMessageIndicator();
     return;
@@ -630,7 +645,7 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     const loadEarlier = makeElement("button", "load-earlier-button", "加载更早消息");
     loadEarlier.type = "button";
     loadEarlier.addEventListener("click", loadEarlierMessages);
-    elements.timeline.append(loadEarlier);
+    fragment.append(loadEarlier);
   }
 
   let activeDay = "";
@@ -638,10 +653,11 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     const nextDay = dayLabel(message.created_at);
     if (nextDay !== activeDay) {
       activeDay = nextDay;
-      elements.timeline.append(makeElement("div", "day-divider", activeDay));
+      fragment.append(makeElement("div", "day-divider", activeDay));
     }
-    elements.timeline.append(createMessageElement(message));
+    fragment.append(createMessageElement(message));
   }
+  elements.timeline.replaceChildren(fragment);
 
   if (forceBottom || wasNearBottom) {
     elements.timeline.scrollTop = elements.timeline.scrollHeight;
@@ -660,6 +676,9 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
 
 function renderParticipants(participants) {
   state.participants = participants;
+  const signature = participants.map((item) => `${item.participant_id}:${item.status}:${item.membership_active}:${item.resident_status}:${item.display_name}:${item.signature}`).join("|");
+  if (signature === state.participantRenderSignature) return;
+  state.participantRenderSignature = signature;
   elements.peopleList.replaceChildren();
   elements.participantCount.textContent = String(participants.length);
   if (!participants.length) {
@@ -711,6 +730,8 @@ function renderParticipants(participants) {
       authLabel = "网页用户";
     } else if (person.resident_status === "online") {
       authLabel = `自动值守在线 · ${person.connector_adapter_kind}`;
+    } else if (person.resident_status === "degraded") {
+      authLabel = `本机值守异常 · 可点“修复值守”自愈 · ${person.connector_adapter_kind}`;
     } else if (person.resident_status === "offline") {
       authLabel = `已配置自动值守 · 当前离线 · ${person.connector_adapter_kind}`;
     } else if (person.resident_status === "failed") {
@@ -1079,6 +1100,8 @@ function selectedMentionIds(bodyText) {
 async function selectRoom(roomId) {
   state.selectedRoom = roomId;
   state.loadedRoom = null;
+  state.messageRenderSignature = "";
+  state.participantRenderSignature = "";
   state.messages = [];
   state.participants = [];
   state.hasEarlierMessages = false;
@@ -1132,9 +1155,9 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   const lastLoadedSequence = state.messages[state.messages.length - 1]?.sequence || 0;
   const hasServerUpdates = Number(activeRoom?.last_sequence || 0) > lastLoadedSequence;
   const messageRequest = initialLoad
-    ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=300`)
+    ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=120`)
     : hasServerUpdates
-      ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=300&after_sequence=${encodeURIComponent(lastLoadedSequence)}`)
+      ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=200&after_sequence=${encodeURIComponent(lastLoadedSequence)}`)
       : Promise.resolve(null);
   const [messagePayload, participantPayload] = await Promise.all([
     messageRequest,
@@ -1534,7 +1557,7 @@ function renderMemberRooms() {
     card.append(heading);
     const list = makeElement("div", "member-agent-list");
     if (!agents.length) {
-      list.append(makeElement("p", "member-empty", "没有可迁移的 Agent。"));
+      list.append(makeElement("p", "member-empty", "没有可复制加入的 Agent。"));
     }
     for (const agent of agents) {
       const row = makeElement("div", "member-agent-row");
@@ -1891,6 +1914,32 @@ elements.messageRateSearchForm.addEventListener("submit", async (event) => {
   }
 });
 elements.manageMembers.addEventListener("click", openMemberManagementDialog);
+elements.repairResidents.addEventListener("click", async () => {
+  if (!isAdmin() || !state.selectedRoom) return;
+  const room = state.selectedRoom;
+  elements.repairResidents.disabled = true;
+  elements.repairResidents.textContent = "修复中…";
+  try {
+    const payload = await fetchJson(`/api/rooms/${encodeURIComponent(room)}/residents/repair`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "repair-room-residents",
+      },
+      body: JSON.stringify({}),
+    });
+    await refreshActiveRoom(false, false);
+    const unavailable = payload.unavailable?.length || 0;
+    window.alert(unavailable
+      ? `值守检查完成：${payload.online_count} 个在线，${unavailable} 个本机无私有配置，需重新邀请。`
+      : `值守检查完成：${payload.online_count} 个已在线。`);
+  } catch (error) {
+    window.alert(`值守修复失败：${error.message}`);
+  } finally {
+    elements.repairResidents.disabled = false;
+    elements.repairResidents.textContent = "修复值守";
+  }
+});
 elements.closeMemberManagement.addEventListener("click", () => elements.memberManagementDialog.close());
 elements.memberManagementDialog.addEventListener("click", (event) => {
   if (event.target === elements.memberManagementDialog) elements.memberManagementDialog.close();
@@ -1946,10 +1995,10 @@ elements.memberMigrationForm.addEventListener("submit", async (event) => {
     updateMemberSelectionCount();
     return;
   }
-  if (!window.confirm(`确认把所选 ${selectionCount} 个成员资格迁移到“${target}”？`)) return;
+  if (!window.confirm(`确认把所选 ${selectionCount} 个 Agent 复制加入“${target}”？来源聊天室会完整保留。`)) return;
   elements.migrateMembers.disabled = true;
   elements.memberManagementFeedback.classList.remove("error", "success");
-  elements.memberManagementFeedback.textContent = "正在原子迁移所选 Agent…";
+  elements.memberManagementFeedback.textContent = "正在复制加入目标聊天室…";
   try {
     const payload = await fetchJson("/api/room-memberships/migrate", {
       method: "POST",
@@ -1966,7 +2015,7 @@ elements.memberMigrationForm.addEventListener("submit", async (event) => {
     await refresh({ fullRoom: true });
     await loadMemberManagementData();
     elements.memberManagementFeedback.classList.add("success");
-    elements.memberManagementFeedback.textContent = `已将 ${payload.migration.membership_count} 个成员资格迁移到 ${target}。`;
+    elements.memberManagementFeedback.textContent = `已将 ${payload.migration.membership_count} 个成员资格复制加入 ${target}，来源聊天室保持不变。`;
   } catch (error) {
     elements.memberManagementFeedback.classList.add("error");
     elements.memberManagementFeedback.textContent = error.message;
@@ -2341,13 +2390,19 @@ elements.timeline.addEventListener("scroll", () => {
   if (isNearTimelineBottom()) {
     state.unreadMessages = 0;
   }
-  updateNewMessageIndicator();
-});
+  if (!state.timelineScrollFrame) {
+    state.timelineScrollFrame = window.requestAnimationFrame(() => {
+      state.timelineScrollFrame = null;
+      updateNewMessageIndicator();
+    });
+  }
+}, { passive: true });
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.currentUser) refresh({});
 });
 window.addEventListener("pagehide", () => state.ownerEvents?.close());
 
+elements.themeSelect.addEventListener("change", () => applyTheme(elements.themeSelect.value));
 updateNotificationButton();
 bootstrapAuthentication();

@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+import json
+import os
+import platform
+import plistlib
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from .connector import configure_resident_connector
+from .validation import client_identity
+
+
+_CACHE_LOCK = threading.Lock()
+_CACHE_AT = 0.0
+_CACHE_VALUE: dict[str, dict[str, Any]] = {}
+_CACHE_SECONDS = 3.0
+
+
+def split_supported_identity(value: str) -> tuple[str, str] | None:
+    identity = client_identity(value)
+    for product in ("claude-code", "codex"):
+        prefix = f"{product}-"
+        if identity.startswith(prefix) and len(identity) > len(prefix):
+            return product, identity[len(prefix) :]
+    return None
+
+
+def _launchd_state(label: str) -> str:
+    try:
+        completed = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            shell=False,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    if completed.returncode != 0:
+        return "missing"
+    return "running" if "state = running" in completed.stdout else "loaded"
+
+
+def _launchd_disabled_labels() -> set[str]:
+    try:
+        completed = subprocess.run(
+            ["launchctl", "print-disabled", f"gui/{os.getuid()}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            shell=False,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # If launchd itself is unavailable, avoid overriding an operator's
+        # possible maintenance pause until the next successful health scan.
+        return set()
+    if completed.returncode != 0:
+        return set()
+    return {
+        match.group(1)
+        for match in re.finditer(
+            r'"([^"\n]+)"\s*=>\s*(?:disabled|true|1)',
+            completed.stdout,
+            flags=re.IGNORECASE,
+        )
+    }
+
+
+def _launchd_services(home: Path) -> dict[str, dict[str, Any]]:
+    launch_agents = home / "Library" / "LaunchAgents"
+    services: dict[str, dict[str, Any]] = {}
+    if not launch_agents.is_dir():
+        return services
+    disabled_labels = _launchd_disabled_labels()
+    for plist_path in sorted(launch_agents.glob("*.plist")):
+        try:
+            payload = plistlib.loads(plist_path.read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            continue
+        environment = payload.get("EnvironmentVariables")
+        arguments = payload.get("ProgramArguments")
+        label = str(payload.get("Label") or "").strip()
+        if not isinstance(environment, dict) or not isinstance(arguments, list) or not label:
+            continue
+        product = str(environment.get("AGENT_BRIDGE_PRODUCT") or "").strip()
+        username = str(environment.get("AGENT_BRIDGE_USERNAME") or "").strip()
+        if not product or not username or not environment.get("AGENT_BRIDGE_URL"):
+            continue
+        command = " ".join(str(item) for item in arguments)
+        if "agent-bridge" not in command and "agent_bridge" not in command:
+            continue
+        try:
+            identity = client_identity(f"{product}-{username}")
+        except ValueError:
+            continue
+        executable = Path(str(arguments[0])).name if arguments else ""
+        kind = (
+            "listener"
+            if executable in {"agent-bridge-listen", "agent_bridge.listener"}
+            or "agent_bridge.listener" in command
+            else "worker"
+        )
+        launchd_state = _launchd_state(label)
+        service = {
+            "label": label,
+            "path": str(plist_path),
+            "kind": kind,
+            "state": "disabled" if label in disabled_labels else launchd_state,
+            "launchd_state": launchd_state,
+        }
+        entry = services.setdefault(
+            identity,
+            {
+                "client_type": identity,
+                "adapter_kind": product,
+                "services": [],
+            },
+        )
+        entry["services"].append(service)
+    return services
+
+
+def local_resident_snapshot(
+    *,
+    home: Path | None = None,
+    system_name: str | None = None,
+    force: bool = False,
+) -> dict[str, dict[str, Any]]:
+    global _CACHE_AT, _CACHE_VALUE
+    current_home = (home or Path.home()).expanduser().resolve()
+    host_system = system_name or platform.system()
+    now = time.monotonic()
+    cacheable = home is None and system_name is None
+    with _CACHE_LOCK:
+        if cacheable and not force and now - _CACHE_AT < _CACHE_SECONDS:
+            return {key: dict(value) for key, value in _CACHE_VALUE.items()}
+    raw = _launchd_services(current_home) if host_system == "Darwin" else {}
+    snapshot: dict[str, dict[str, Any]] = {}
+    for identity, detail in raw.items():
+        services = list(detail["services"])
+        listeners = [item for item in services if item["kind"] == "listener"]
+        workers = [item for item in services if item["kind"] == "worker"]
+        listener_running = any(item["state"] == "running" for item in listeners)
+        worker_running = any(item["state"] == "running" for item in workers)
+        snapshot[identity] = {
+            **detail,
+            "listener_running": listener_running,
+            "worker_running": worker_running,
+            "resident_status": (
+                "online"
+                if listener_running and worker_running
+                else "degraded"
+                if listeners or workers
+                else "none"
+            ),
+        }
+    if cacheable:
+        with _CACHE_LOCK:
+            _CACHE_AT = now
+            _CACHE_VALUE = snapshot
+    return {key: dict(value) for key, value in snapshot.items()}
+
+
+def _run_launchctl(command: list[str], *, description: str) -> None:
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{description}失败") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(f"{description}失败")
+
+
+def repair_known_identity_services(
+    client_type: str,
+    *,
+    home: Path | None = None,
+    system_name: str | None = None,
+    enable_disabled: bool = False,
+) -> dict[str, Any] | None:
+    current_home = (home or Path.home()).expanduser().resolve()
+    host_system = system_name or platform.system()
+    before = local_resident_snapshot(
+        home=current_home,
+        system_name=host_system,
+        force=True,
+    ).get(client_type)
+    if before is None:
+        return None
+    if host_system != "Darwin":
+        return before
+    domain = f"gui/{os.getuid()}"
+    repaired: list[str] = []
+    for service in before["services"]:
+        if service["state"] == "running":
+            continue
+        label = str(service["label"])
+        state = str(service["state"])
+        if state == "disabled":
+            if not enable_disabled:
+                continue
+            _run_launchctl(
+                ["launchctl", "enable", f"{domain}/{label}"],
+                description=f"启用值守服务 {label}",
+            )
+            state = str(service.get("launchd_state") or "missing")
+        if state == "running":
+            repaired.append(label)
+            continue
+        if state == "missing":
+            _run_launchctl(
+                ["launchctl", "bootstrap", domain, str(service["path"])],
+                description=f"启动值守服务 {label}",
+            )
+        else:
+            _run_launchctl(
+                ["launchctl", "kickstart", "-k", f"{domain}/{label}"],
+                description=f"恢复值守服务 {label}",
+            )
+        repaired.append(label)
+    time.sleep(0.15)
+    after = local_resident_snapshot(
+        home=current_home,
+        system_name=host_system,
+        force=True,
+    ).get(client_type, before)
+    return {**after, "repaired_services": repaired}
+
+
+def configure_existing_connector_from_disk(
+    client_type: str,
+    *,
+    home: Path | None = None,
+    system_name: str | None = None,
+) -> dict[str, Any] | None:
+    current_home = (home or Path.home()).expanduser().resolve()
+    host_system = system_name or platform.system()
+    if host_system == "Darwin":
+        connector_root = (
+            current_home / "Library" / "Application Support" / "AgentBridge" / "connectors"
+        )
+    else:
+        connector_root = current_home / ".local" / "state" / "agent-bridge" / "connectors"
+    if not connector_root.is_dir():
+        return None
+    for manifest_path in sorted(connector_root.glob("connector_*/connector.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_identity = client_identity(
+                f"{manifest['product']}-{manifest['username']}"
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if manifest_identity != client_type:
+            continue
+        enrollment_file = manifest_path.parent / "enrollment.token"
+        try:
+            enrollment_token = enrollment_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        result = configure_resident_connector(
+            connector_id=str(manifest["connector_id"]),
+            enrollment_token=enrollment_token,
+            bridge_url=str(manifest["bridge_url"]),
+            product=str(manifest["product"]),
+            username=str(manifest["username"]),
+            signature=str(manifest["signature"]),
+            conversation_id=str(manifest["conversation_id"]),
+            adapter_kind=str(manifest["adapter_kind"]),
+            requested_mode=str(manifest["requested_mode"]),
+            roles=list(manifest.get("roles") or []),
+            capabilities=list(manifest.get("capabilities") or []),
+            workspace_path=str(manifest.get("workspace_path") or ""),
+            home=current_home,
+            system_name=host_system,
+            activate=True,
+        )
+        local_resident_snapshot(force=True)
+        return result.public_payload()
+    return None

@@ -238,7 +238,7 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -468,6 +468,69 @@ def test_reply_wakes_original_agent_without_making_reply_mandatory(
         if item["message_id"] == reply["message_id"]
     )["delivery"]
     assert observer_delivery["priority"] == "normal"
+
+
+def test_human_mentions_require_reply_but_agent_mentions_only_wake(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    human = register_web_identity(auth, username="human-mentioner")
+    first_agent = register(store, client="codex", name="人类艾特目标")
+    second_agent = register(store, client="claude-code", name="Agent艾特目标")
+
+    human_message = store.send_web_message(
+        authorized_session_id=str(human["session_id"]),
+        participant_id=str(human["participant_id"]),
+        conversation_id="tools-room",
+        body_text="请确认这个人类发出的个人 @。",
+        mentions=[first_agent["participant_id"]],
+    )
+    human_notification = store.notification_snapshot(
+        participant_id=first_agent["participant_id"],
+        authorized_session_id=first_agent["session_id"],
+        after_sequence=0,
+    )
+    assert human_notification["backlog"]["required_reply_count"] == 1
+    human_delivery = next(
+        item
+        for item in store.wait_messages(
+            participant_id=first_agent["participant_id"],
+            authorized_session_id=first_agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == human_message["message_id"]
+    )["delivery"]
+    assert human_delivery["priority"] == "mention"
+    assert "mention" in human_delivery["reasons"]
+    assert "agent_mention" not in human_delivery["reasons"]
+
+    agent_message = store.send(
+        authorized_session_id=first_agent["session_id"],
+        sender_participant_id=first_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="这是 Agent 发出的高优先级 @，无需机械回执。",
+        mentions=[second_agent["participant_id"]],
+    )
+    agent_notification = store.notification_snapshot(
+        participant_id=second_agent["participant_id"],
+        authorized_session_id=second_agent["session_id"],
+        after_sequence=human_message["sequence"],
+    )
+    assert agent_notification["new_since_cursor"]["priority_counts"]["mention"] == 1
+    assert agent_notification["new_since_cursor"]["required_reply_count"] == 0
+    agent_delivery = next(
+        item
+        for item in store.wait_messages(
+            participant_id=second_agent["participant_id"],
+            authorized_session_id=second_agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == agent_message["message_id"]
+    )["delivery"]
+    assert agent_delivery["priority"] == "mention"
+    assert "agent_mention" in agent_delivery["reasons"]
+    assert "mention" not in agent_delivery["reasons"]
 
 
 def test_history_search_finds_old_context_without_consuming_backlog(
@@ -780,7 +843,7 @@ def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority
     assert mentioned_message["delivery"]["reasons"] == [
         "room_activity",
         "audience:room",
-        "mention",
+        "agent_mention",
     ]
     assert mentioned_message["delivery"]["priority"] == "mention"
     assert mentioned_message["delivery"]["actionable"] is False
@@ -1293,9 +1356,10 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 18
+    assert version == 19
     assert raw["priority"] == "direct"
-    assert "mention" in raw["reasons_json"]
+    assert "agent_mention" in raw["reasons_json"]
+    assert '"mention"' not in raw["reasons_json"]
     delivered = migrated.wait_messages(
         participant_id=receiver["participant_id"],
         authorized_session_id=receiver["session_id"],
@@ -1392,7 +1456,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 18
+    assert version == 19
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -2584,7 +2648,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -2639,7 +2703,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 18
+    assert version == 19
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -2979,7 +3043,10 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
         migrated_by_web_user_id=admin_id,
     )
     assert migrated["membership_count"] == 3
+    assert migrated["copied_membership_count"] == 3
     assert migrated["agent_count"] == 3
+    assert migrated["source_memberships_preserved"] is True
+    assert migrated["sessions_rebound"] is False
     with store._connection() as connection:
         for registration, source in (
             (from_a, "来源-A"),
@@ -3006,43 +3073,43 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
                 "WHERE connector_id = ?",
                 (registration["connector_id"],),
             ).fetchone()[0]
-            assert source_membership["active"] == 0
+            assert source_membership["active"] == 1
             assert target_membership["active"] == 1
-            assert session_room == "目标-B"
-            assert connector_room == "目标-B"
+            assert session_room == source
+            assert connector_room == source
 
     moved_message = store.send(
         authorized_session_id=from_a["session_id"],
         sender_participant_id=from_a["participant_id"],
         conversation_id="目标-B",
-        body_text="迁移后原会话可以直接在目标群发言。",
+        body_text="复制加入后原会话可以直接在目标群发言。",
     )
     assert moved_message["conversation_id"] == "目标-B"
-    with pytest.raises(ConflictError, match="not in conversation"):
-        store.send(
-            authorized_session_id=from_a["session_id"],
-            sender_participant_id=from_a["participant_id"],
-            conversation_id="来源-A",
-            body_text="不能再回来源群发言。",
-        )
+    source_message = store.send(
+        authorized_session_id=from_a["session_id"],
+        sender_participant_id=from_a["participant_id"],
+        conversation_id="来源-A",
+        body_text="原聊天室仍可继续发言。",
+    )
+    assert source_message["conversation_id"] == "来源-A"
     renewed = store.register_agent_session_from_enrollment(
         enrollment_token=from_c_one["enrollment_token"],
         product="codex",
         username="from-c-one",
-        signature="迁移后 enrollment 续到目标群。",
+        signature="复制加入后 enrollment 仍续到原登记群。",
     )
-    assert renewed["conversation_id"] == "目标-B"
+    assert renewed["conversation_id"] == "来源-C"
 
     with pytest.raises(ConflictError, match="not active"):
         store.migrate_agents(
-            target_conversation_id="回滚-D",
+            target_conversation_id="来源-C",
             selections=[
                 {
                     "source_conversation_id": "目标-B",
                     "participant_ids": [from_a["participant_id"]],
                 },
                 {
-                    "source_conversation_id": "来源-C",
+                    "source_conversation_id": "回滚-D",
                     "participant_ids": [from_a["participant_id"]],
                 },
             ],
@@ -3055,7 +3122,7 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
             (from_a["participant_id"],),
         ).fetchone()[0] == 1
         assert connection.execute(
-            "SELECT COUNT(*) FROM memberships WHERE conversation_id = '回滚-D' "
+            "SELECT COUNT(*) FROM memberships WHERE conversation_id = '来源-C' "
             "AND participant_id = ? AND active = 1",
             (from_a["participant_id"],),
         ).fetchone()[0] == 0
@@ -3119,7 +3186,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 18
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

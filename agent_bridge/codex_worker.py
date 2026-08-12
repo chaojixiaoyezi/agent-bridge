@@ -466,30 +466,9 @@ class CodexThreadHost:
         existing_thread = self._read_thread_id()
         instructions = self._developer_instructions()
         if existing_thread is None:
-            response = self.rpc.request(
-                "thread/start",
-                {
-                    "cwd": str(self.cwd),
-                    "approvalPolicy": "never",
-                    "sandbox": "read-only",
-                    "serviceName": "agent-bridge-resident-reviewer",
-                    "developerInstructions": instructions,
-                },
-                timeout=60,
-            )
-            thread = response.get("thread")
-            if not isinstance(thread, dict):
-                raise CodexWorkerError("thread/start omitted thread metadata")
-            self.thread_id = self._validated_thread_id(thread.get("id"))
-            self._write_thread_id(self.thread_id)
-            try:
-                self.rpc.request(
-                    "thread/name/set",
-                    {"threadId": self.thread_id, "name": self.thread_name},
-                )
-            except CodexRpcError:
-                pass
-        else:
+            self._start_new_thread(instructions)
+            return
+        try:
             response = self.rpc.request(
                 "thread/resume",
                 {
@@ -502,21 +481,70 @@ class CodexThreadHost:
                 },
                 timeout=60,
             )
-            thread = response.get("thread")
-            if not isinstance(thread, dict):
-                raise CodexWorkerError("thread/resume omitted thread metadata")
-            self.thread_id = self._validated_thread_id(thread.get("id"))
-            turns = thread.get("turns")
-            if isinstance(turns, list):
-                for turn in reversed(turns):
-                    if isinstance(turn, dict) and turn.get("status") == "inProgress":
-                        self.active_turn_id = str(turn.get("id") or "") or None
-                        if self.active_turn_id:
-                            self._turn_evidence.setdefault(
-                                self.active_turn_id,
-                                TurnEvidence(),
-                            )
-                        break
+        except CodexRpcError as exc:
+            if not self._legacy_thread_is_incompatible(exc):
+                raise
+            # Older Codex releases persisted camelCase sandbox-policy variants
+            # in the rollout.  Current app-server versions reject that history
+            # during resume.  Keep the old rollout intact, replace only this
+            # worker's pointer, and recover conversation context from Bridge's
+            # durable queue/history tools in the fresh thread.
+            self._start_new_thread(instructions)
+            return
+        thread = response.get("thread")
+        if not isinstance(thread, dict):
+            raise CodexWorkerError("thread/resume omitted thread metadata")
+        self.thread_id = self._validated_thread_id(thread.get("id"))
+        turns = thread.get("turns")
+        if isinstance(turns, list):
+            for turn in reversed(turns):
+                if isinstance(turn, dict) and turn.get("status") == "inProgress":
+                    self.active_turn_id = str(turn.get("id") or "") or None
+                    if self.active_turn_id:
+                        self._turn_evidence.setdefault(
+                            self.active_turn_id,
+                            TurnEvidence(),
+                        )
+                    break
+
+    def _start_new_thread(self, instructions: str) -> None:
+        response = self.rpc.request(
+            "thread/start",
+            {
+                "cwd": str(self.cwd),
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "serviceName": "agent-bridge-resident-reviewer",
+                "developerInstructions": instructions,
+            },
+            timeout=60,
+        )
+        thread = response.get("thread")
+        if not isinstance(thread, dict):
+            raise CodexWorkerError("thread/start omitted thread metadata")
+        self.thread_id = self._validated_thread_id(thread.get("id"))
+        self._write_thread_id(self.thread_id)
+        try:
+            self.rpc.request(
+                "thread/name/set",
+                {"threadId": self.thread_id, "name": self.thread_name},
+            )
+        except CodexRpcError:
+            pass
+
+    @staticmethod
+    def _legacy_thread_is_incompatible(exc: CodexRpcError) -> bool:
+        if exc.method != "thread/resume":
+            return False
+        detail = str(exc).casefold()
+        legacy_variants = (
+            "`workspacewrite`",
+            "`readonly`",
+            "`dangerfullaccess`",
+        )
+        return "unknown variant" in detail and any(
+            variant in detail for variant in legacy_variants
+        )
 
     def submit(self, batch: dict[str, Any]) -> str:
         if self.thread_id is None:
@@ -773,8 +801,12 @@ class CodexThreadHost:
             f"{identity}。连接器会在第一次 Agent Bridge 工具调用时自动登记固定身份。"
             "每次收到结构化唤醒后，立即调用 "
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
-            "先处理 delivery.reasons 含 mention 的个人 @；这类消息必须逐条用 agent_reply "
-            "引用回复。wake_all 或 reply_wake 只要求唤醒并阅读，不强制回复。普通消息可以"
+            "先处理 delivery.reasons 含 mention 的人类个人 @；这类消息必须逐条用 agent_reply "
+            "引用回复。agent_mention 是另一个 Agent 发出的高优先级 @，应阅读但可按内容决定"
+            "是否回复；若只是收到、采纳、确认或复述边界，不要再回执，避免 Agent 间回声。"
+            "wake_all 要求唤醒并阅读；如果管理员面向全员提问、要求确认或记住、"
+            "征求意见、分派任务，应按自身身份和能力回复，纯公告不强制机械回复。reply_wake "
+            "只要求阅读，不强制回复。普通消息可以"
             "积压到本次唤醒后按兴趣回应，可逐条引用，也可合并回答。无需为未回复的可选消息"
             "机械调用 ack，连接器会在成功回合结束后确定性收口；若 backlog.has_more，可继续"
             "读取下一批，每轮最多五批共 100 条。需要前因后果时按 sequence "
@@ -805,7 +837,7 @@ class CodexThreadHost:
             f"批次事件数={int(batch.get('event_count') or 0)}；"
             f"最高优先级={str(batch.get('wake_priority') or '')}；"
             f"高优先级唤醒事件数={mention_count}；"
-            f"必须回复的个人@数={required_reply_count}；"
+            f"唤醒快照待核对的人类个人@数={required_reply_count}；"
             f"最新事件序号={batch.get('last_event_id')}。"
         )
 

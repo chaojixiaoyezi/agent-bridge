@@ -9,6 +9,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
+from agent_bridge import viewer as viewer_module
 from agent_bridge.viewer import WEB_ROOT, _event_cursor, _sse_event, create_app
 from agent_bridge.viewer_store import ViewerRepository
 
@@ -330,6 +331,59 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert "/api/sessions/cleanup" in javascript
     assert 'lastIndexOf("@")' in javascript
     assert "message-rates/participants/search" in javascript
+    assert 'id="theme-select"' in (WEB_ROOT / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert "requestAnimationFrame" in javascript
+    assert "limit=120" in javascript
+    assert "hadRenderedMessages ? isNearTimelineBottom() : true" in javascript
+
+    stylesheet_response = client.get("/assets/app.css")
+    assert stylesheet_response.headers["cache-control"] == (
+        "public, max-age=31536000, immutable"
+    )
+
+
+def test_admin_can_repair_known_room_residents_without_changing_chat_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "bridge.db"
+    _store, _sender, _receiver = seed(database)
+    client = TestClient(make_app(database))
+    login_admin(client)
+    repaired: list[str] = []
+
+    monkeypatch.setattr(
+        viewer_module,
+        "repair_known_identity_services",
+        lambda client_type, **_kwargs: repaired.append(client_type)
+        or {
+            "resident_status": "online",
+            "repaired_services": ["worker"],
+        },
+    )
+    monkeypatch.setattr(
+        viewer_module,
+        "configure_existing_connector_from_disk",
+        lambda _client_type: None,
+    )
+    with BridgeStore(database)._connection() as connection:
+        before_count = int(
+            connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+    response = client.post(
+        "/api/rooms/room-one/residents/repair",
+        headers=intent_headers(client, "repair-room-residents"),
+        json={},
+    )
+    assert response.status_code == 200
+    assert response.json()["online_count"] == 2
+    assert sorted(repaired) == ["claude-code-小鲸鱼娘", "codex-小可爱"]
+    with BridgeStore(database)._connection() as connection:
+        assert int(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]) == (
+            before_count
+        )
 
     repository = ViewerRepository(database)
     with repository._connection() as connection:
@@ -1715,6 +1769,7 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     )
     assert migrated.status_code == 200
     assert migrated.json()["migration"]["membership_count"] == 2
+    assert migrated.json()["migration"]["source_memberships_preserved"] is True
     target_participants = admin_client.get(
         "/api/rooms/api-target-b/participants"
     ).json()["participants"]
@@ -1730,7 +1785,11 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert 'id="new-message-indicator"' in html
     assert 'd="M12 4v14m-6-6 6 6 6-6"' in html
     assert 'id="member-management-dialog"' in html
+    assert 'id="repair-residents"' in html
+    assert "复制加入目标群" in html
     assert "state.messages.length > 0 && !isNearTimelineBottom()" in javascript
     assert 'behavior: "smooth"' in javascript
     assert "/api/room-memberships/migrate" in javascript
     assert ".new-message-indicator svg" in stylesheet
+    assert ':root[data-theme="ocean"]' in stylesheet
+    assert "content-visibility: auto" in stylesheet

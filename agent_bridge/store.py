@@ -975,6 +975,7 @@ class BridgeStore:
             conn.executescript(INVITATION_SCHEMA)
             conn.executescript(AGENT_LIFECYCLE_SCHEMA)
             self._backfill_agent_lifecycle_states(conn)
+            self._restore_legacy_migrated_memberships(conn)
             nickname_columns = {
                 str(row["name"])
                 for row in conn.execute(
@@ -1006,6 +1007,8 @@ class BridgeStore:
             conn.executescript(AUTHORIZATION_SCHEMA)
             conn.executescript(CHAT_AUTHORIZATION_SCHEMA)
             self._backfill_admin_chat_authorization_grants(conn)
+            if schema_version < 19:
+                self._migrate_agent_mentions_to_optional(conn)
             reconcile_deliveries = (
                 schema_version < 8
                 or not delivery_table_existed
@@ -1031,10 +1034,11 @@ class BridgeStore:
                 conn.execute(
                     "UPDATE message_deliveries SET priority = 'direct' "
                     "WHERE priority = 'important' "
-                    "AND instr(reasons_json, '\"mention\"') > 0"
+                    "AND (instr(reasons_json, '\"mention\"') > 0 "
+                    "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 18")
+            conn.execute("PRAGMA user_version = 19")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1285,6 +1289,57 @@ class BridgeStore:
                 "agent connector room migration would leave "
                 f"{missing} connector(s) without a room"
             )
+
+    @staticmethod
+    def _restore_legacy_migrated_memberships(conn: sqlite3.Connection) -> None:
+        """Restore source-room membership removed by the old move semantics.
+
+        Migration is now additive: one resident connector can serve every active
+        room its participant has joined.  Older releases deactivated the source
+        membership and recorded a ``migrated`` block.  Reactivate only memberships
+        whose source room is still active; abandoned-room history remains untouched.
+        """
+
+        conn.execute(
+            """
+            UPDATE memberships
+            SET active = 1,
+                updated_at = MAX(
+                    updated_at,
+                    COALESCE((
+                        SELECT block.blocked_at
+                        FROM agent_room_blocks AS block
+                        WHERE block.conversation_id = memberships.conversation_id
+                          AND block.participant_id = memberships.participant_id
+                          AND block.reason = 'migrated'
+                    ), updated_at)
+                )
+            WHERE active = 0
+              AND EXISTS (
+                  SELECT 1 FROM rooms AS room
+                  WHERE room.conversation_id = memberships.conversation_id
+                    AND room.status = 'active'
+              )
+              AND EXISTS (
+                  SELECT 1 FROM agent_room_blocks AS block
+                  WHERE block.conversation_id = memberships.conversation_id
+                    AND block.participant_id = memberships.participant_id
+                    AND block.reason = 'migrated'
+              )
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM agent_room_blocks
+            WHERE reason = 'migrated'
+              AND EXISTS (
+                  SELECT 1 FROM memberships AS membership
+                  WHERE membership.conversation_id = agent_room_blocks.conversation_id
+                    AND membership.participant_id = agent_room_blocks.participant_id
+                    AND membership.active = 1
+              )
+            """
+        )
 
     @staticmethod
     def _backfill_agent_lifecycle_states(conn: sqlite3.Connection) -> None:
@@ -1560,6 +1615,11 @@ class BridgeStore:
         created_at = float(message["created_at"])
         mention_ids = set(json.loads(str(message["mentions_json"] or "[]")))
         wake_all_agents = bool(message["wake_all_agents"])
+        sender_is_web_user = conn.execute(
+            "SELECT 1 FROM web_users WHERE participant_id = ?",
+            (sender,),
+        ).fetchone() is not None
+        sender_is_human = sender_is_web_user or sender == OWNER_PARTICIPANT_ID
         reply_target = None
         if message["reply_to"] is not None:
             replied = conn.execute(
@@ -1606,7 +1666,10 @@ class BridgeStore:
             if primary_recipient:
                 reasons.append(f"audience:{audience_kind}")
             if participant in mention_ids:
-                reasons.append("mention")
+                # Agent mentions remain high-priority wakes, but only a human's
+                # explicit @ requires a reply. This prevents acknowledgement
+                # loops without muting useful Agent-to-Agent conversation.
+                reasons.append("mention" if sender_is_human else "agent_mention")
             if include_optional_wakes and wake_all_agents and is_agent:
                 reasons.append("wake_all")
             if include_optional_wakes and reply_target == participant and is_agent:
@@ -1636,6 +1699,30 @@ class BridgeStore:
                 }
             )
         return candidates
+
+    @staticmethod
+    def _migrate_agent_mentions_to_optional(conn: sqlite3.Connection) -> None:
+        """Decouple historical Agent mentions from mandatory reply semantics."""
+        conn.execute(
+            """
+            UPDATE message_deliveries
+            SET reasons_json = replace(
+                reasons_json,
+                '"mention"',
+                '"agent_mention"'
+            )
+            WHERE instr(reasons_json, '"mention"') > 0
+              AND message_id IN (
+                  SELECT message.message_id
+                  FROM messages AS message
+                  LEFT JOIN web_users AS web_user
+                    ON web_user.participant_id = message.sender_participant_id
+                  WHERE web_user.user_id IS NULL
+                    AND message.sender_participant_id != ?
+              )
+            """,
+            (OWNER_PARTICIPANT_ID,),
+        )
 
     @classmethod
     def _create_message_deliveries_locked(
@@ -3299,42 +3386,6 @@ class BridgeStore:
                     participant_roles[participant].update(
                         json.loads(str(target_membership["roles_json"] or "[]"))
                     )
-                for source in source_rooms:
-                    conn.execute(
-                        "UPDATE memberships SET active = 0, updated_at = ? "
-                        "WHERE conversation_id = ? AND participant_id = ?",
-                        (now, source, participant),
-                    )
-                    conn.execute(
-                        """
-                        INSERT INTO agent_room_blocks
-                            (conversation_id, participant_id, reason, blocked_at,
-                             blocked_by_web_user_id)
-                        VALUES (?, ?, 'migrated', ?, ?)
-                        ON CONFLICT(conversation_id, participant_id) DO UPDATE SET
-                            reason = 'migrated', blocked_at = excluded.blocked_at,
-                            blocked_by_web_user_id = excluded.blocked_by_web_user_id
-                        """,
-                        (source, participant, now, administrator),
-                    )
-                    self._cancel_agent_room_deliveries_locked(
-                        conn,
-                        participant_id=participant,
-                        conversation_id=source,
-                    )
-                placeholders = ",".join("?" for _ in source_rooms)
-                conn.execute(
-                    "UPDATE agent_sessions SET registered_conversation_id = ? "
-                    f"WHERE participant_id = ? AND registered_conversation_id IN ({placeholders}) "
-                    "AND cleared_at IS NULL AND revoked_at IS NULL",
-                    (target, participant, *source_rooms),
-                )
-                conn.execute(
-                    "UPDATE agent_connectors SET conversation_id = ?, updated_at = ? "
-                    f"WHERE accepted_participant_id = ? AND conversation_id IN ({placeholders}) "
-                    "AND revoked_at IS NULL",
-                    (target, now, participant, *source_rooms),
-                )
                 roles = sorted(participant_roles[participant])
                 conn.execute(
                     """
@@ -3361,6 +3412,7 @@ class BridgeStore:
             "target_conversation_id": target,
             "migrated_at": now,
             "membership_count": selected_count,
+            "copied_membership_count": selected_count,
             "agent_count": len(participant_sources),
             "agents": [
                 {
@@ -3371,6 +3423,8 @@ class BridgeStore:
                 for participant, source_rooms in participant_sources.items()
             ],
             "history_preserved": True,
+            "source_memberships_preserved": True,
+            "sessions_rebound": False,
         }
 
     @staticmethod
