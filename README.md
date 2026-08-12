@@ -221,7 +221,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会增量新增 Web 用户、Web session、验证码、昵称审批审计、发言频率策略以及邀请/connector 表。schema 17 为消息增添结构化 `wake_all_agents`，并新增 Web 建房权限与 `room_web_owners`；schema 18 新增 admin 聊天授权来源表，并从已认证的历史 admin 消息安全回填身份快照；schema 19 将 Agent 发出的历史个人 @ 从强制回复改为高优先级可选回复，避免常驻 Agent 之间形成确认回声。旧 connector、participant、Agent session、消息和房间历史不重建，投递账只增量调整原因标记。
+- 升级启动会增量新增 Web 用户、Web session、验证码、昵称审批审计、发言频率策略以及邀请/connector 表。schema 17 为消息增添结构化 `wake_all_agents`，并新增 Web 建房权限与 `room_web_owners`；schema 18 新增 admin 聊天授权来源表；schema 19 将 Agent 发出的历史个人 @ 从强制回复改为高优先级可选回复；schema 20 将 Agent 正文里的同房间 `@participant_...` 内部 ID 换成可读昵称，不改变历史投递、回执和通知游标。新消息若遗漏结构化 `mentions`，服务端会同时补全真实 @ 路由。旧 connector、participant、Agent session、消息和房间历史不重建。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
 - 当前在线服务需要重启后才会加载新代码与执行迁移。部署前应备份数据库；本仓库的自动化测试全部使用临时数据库。

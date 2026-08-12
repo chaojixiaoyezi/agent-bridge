@@ -238,7 +238,7 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -784,6 +784,76 @@ def test_visible_at_alias_is_inferred_at_start_middle_and_end(
             audience_kind="room",
         )
         assert sent["mentions"] == [receiver["participant_id"]]
+
+
+def test_internal_participant_ids_become_visible_names_and_real_mentions(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="内部路由发送者")
+    first = register(store, client="codex", name="第一位接收者")
+    second = register(store, client="opencode", name="第二位接收者")
+    observer = register(store, client="hermes", name="普通旁观者")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text=(
+            f"@{first['participant_id']} 请先看；中间再请"
+            f"@{second['participant_id']}复核，最后仍是@{first['participant_id']}"
+        ),
+        audience_kind="room",
+    )
+
+    assert "@participant_" not in sent["body"]
+    assert sent["body"] == (
+        f"@{first['display_name']} 请先看；中间再请"
+        f"@{second['display_name']}复核，最后仍是@{first['display_name']}"
+    )
+    assert sent["mentions"] == [
+        first["participant_id"],
+        second["participant_id"],
+    ]
+    for recipient in (first, second):
+        delivered = store.wait_messages(
+            participant_id=recipient["participant_id"],
+            authorized_session_id=recipient["session_id"],
+            wait_seconds=0,
+        )["messages"][0]
+        assert delivered["delivery"]["priority"] == "mention"
+        assert "agent_mention" in delivered["delivery"]["reasons"]
+    observed = store.wait_messages(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    assert observed["delivery"]["priority"] == "normal"
+
+
+def test_unknown_internal_looking_id_is_hidden_without_routing(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="未知路由发送者")
+    observer = register(store, client="codex", name="未知路由旁观者")
+    unknown = "participant_00000000000000000000000000000000"
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text=f"调试记录里出现 @{unknown}，但它不是本群成员的 @。",
+        audience_kind="room",
+    )
+
+    assert sent["body"] == "调试记录里出现 成员（已离开或不可用），但它不是本群成员的 @。"
+    assert "participant_" not in sent["body"]
+    assert sent["mentions"] == []
+    delivered = store.wait_messages(
+        participant_id=observer["participant_id"],
+        authorized_session_id=observer["session_id"],
+        wait_seconds=0,
+    )["messages"][0]
+    assert delivered["delivery"]["priority"] == "normal"
 
 
 def test_all_room_members_see_messages_while_mentions_and_follows_raise_priority(
@@ -1356,7 +1426,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 19
+    assert version == 20
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -1366,6 +1436,74 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
         wait_seconds=0,
     )["messages"]
     assert delivered[0]["delivery"]["priority"] == "mention"
+
+
+def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    store.create_user_room("opaque-mention-migration")
+    sender = register(
+        store,
+        client="claude-code",
+        name="旧版发送者",
+        room="opaque-mention-migration",
+    )
+    receiver = register(
+        store,
+        client="codex",
+        name="旧版接收者",
+        room="opaque-mention-migration",
+    )
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="opaque-mention-migration",
+        body_text="这是一条旧版普通消息。",
+        audience_kind="room",
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET body = ?, mentions_json = '[]' "
+            "WHERE message_id = ?",
+            (
+                f"请 @{receiver['participant_id']} 看一下旧消息。",
+                message["message_id"],
+            ),
+        )
+        before_delivery = tuple(
+            connection.execute(
+                "SELECT participant_id, state, reasons_json, priority, "
+                "actionable, attempt_count FROM message_deliveries "
+                "WHERE message_id = ? ORDER BY participant_id",
+                (message["message_id"],),
+            ).fetchall()
+        )
+        connection.execute("PRAGMA user_version = 19")
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        row = connection.execute(
+            "SELECT body, mentions_json FROM messages WHERE message_id = ?",
+            (message["message_id"],),
+        ).fetchone()
+        after_delivery = tuple(
+            connection.execute(
+                "SELECT participant_id, state, reasons_json, priority, "
+                "actionable, attempt_count FROM message_deliveries "
+                "WHERE message_id = ? ORDER BY participant_id",
+                (message["message_id"],),
+            ).fetchall()
+        )
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    assert version == 20
+    assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
+    assert row["mentions_json"] == "[]"
+    assert [tuple(item) for item in after_delivery] == [
+        tuple(item) for item in before_delivery
+    ]
 
 
 def test_data_persists_across_store_instances(tmp_path: Path) -> None:
@@ -1456,7 +1594,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 19
+    assert version == 20
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -2648,7 +2786,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 20
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -2703,7 +2841,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 19
+    assert version == 20
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -3186,7 +3324,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

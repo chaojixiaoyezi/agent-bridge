@@ -1009,6 +1009,8 @@ class BridgeStore:
             self._backfill_admin_chat_authorization_grants(conn)
             if schema_version < 19:
                 self._migrate_agent_mentions_to_optional(conn)
+            if schema_version < 20:
+                self._migrate_internal_participant_mentions_to_display_names(conn)
             reconcile_deliveries = (
                 schema_version < 8
                 or not delivery_table_existed
@@ -1038,7 +1040,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 19")
+            conn.execute("PRAGMA user_version = 20")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1584,6 +1586,125 @@ class BridgeStore:
             if re.search(pattern, body_text, flags=re.IGNORECASE):
                 inferred.append(next(iter(targets)))
         return sorted(set(inferred))
+
+    @staticmethod
+    def _rewrite_internal_text_mentions_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        body_text: str,
+        include_inactive: bool = False,
+    ) -> tuple[str, list[str]]:
+        """Keep opaque participant IDs out of user-visible message bodies.
+
+        MCP routing uses participant IDs, but visible chat text must use the
+        member's current display name.  Some models copied an ID returned by
+        ``agent_participants`` into ``@participant_...`` text and omitted the
+        structured ``mentions`` argument.  Resolve only exact IDs belonging to
+        the same room, so unrelated prose and unknown identifiers are left
+        untouched.  The returned IDs let new messages retain real mention
+        delivery semantics after the visible text is rewritten.
+        """
+
+        membership_filter = "" if include_inactive else "AND membership.active = 1"
+        rows = conn.execute(
+            """
+            SELECT participant.participant_id,
+                   participant.client_type,
+                   participant.display_name
+            FROM memberships AS membership
+            JOIN participants AS participant
+              ON participant.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND participant.participant_id != ?
+            """
+            f" {membership_filter}",
+            (conversation_id, sender_participant_id),
+        ).fetchall()
+        visible_names = {
+            str(row["participant_id"]): str(
+                row["display_name"] or row["client_type"]
+            ).strip()
+            for row in rows
+        }
+        if "@participant_" not in body_text:
+            return body_text, []
+
+        # Match known IDs rather than a broad participant-looking token.  The
+        # negative lookahead permits Chinese text directly after an ID while
+        # preventing a shorter ID from matching inside a longer opaque token.
+        mentioned: list[str] = []
+        rewritten = body_text
+        if visible_names:
+            alternatives = "|".join(
+                re.escape(participant_id)
+                for participant_id in sorted(visible_names, key=len, reverse=True)
+            )
+            pattern = re.compile(
+                rf"@(?P<participant_id>{alternatives})(?![A-Za-z0-9._:-])"
+            )
+
+            def replace(match: re.Match[str]) -> str:
+                participant_id = match.group("participant_id")
+                if participant_id not in mentioned:
+                    mentioned.append(participant_id)
+                return f"@{visible_names[participant_id]}"
+
+            rewritten = pattern.sub(replace, rewritten)
+
+        # Never leak an unresolved opaque mention into user-visible chat.  It
+        # may refer to a removed member or stale model context; keep the prose
+        # readable but deliberately do not create a delivery for it.
+        unresolved_pattern = re.compile(
+            r"@participant_[A-Za-z0-9._:-]+(?![A-Za-z0-9._:-])"
+        )
+        rewritten = unresolved_pattern.sub("成员（已离开或不可用）", rewritten)
+        return rewritten, mentioned
+
+    @classmethod
+    def _migrate_internal_participant_mentions_to_display_names(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Rewrite legacy Agent-authored opaque @ IDs without replaying them.
+
+        This intentionally changes only body text.  Existing mention metadata,
+        delivery priority, receipts, and notification cursors stay untouched,
+        so opening an upgraded database cannot wake Agents for old messages.
+        Web-authored messages are excluded to preserve the exact body hash of
+        any historical admin authorization snapshot.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT message.message_id,
+                   message.conversation_id,
+                   message.sender_participant_id,
+                   message.body
+            FROM messages AS message
+            LEFT JOIN web_users AS web_user
+              ON web_user.participant_id = message.sender_participant_id
+            WHERE instr(message.body, '@participant_') > 0
+              AND web_user.user_id IS NULL
+              AND message.sender_participant_id != ?
+            ORDER BY message.sequence
+            """,
+            (OWNER_PARTICIPANT_ID,),
+        ).fetchall()
+        for row in rows:
+            rewritten, _mentioned = cls._rewrite_internal_text_mentions_locked(
+                conn,
+                conversation_id=str(row["conversation_id"]),
+                sender_participant_id=str(row["sender_participant_id"]),
+                body_text=str(row["body"]),
+                include_inactive=True,
+            )
+            if rewritten != str(row["body"]):
+                conn.execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    (rewritten, str(row["message_id"])),
+                )
 
     @staticmethod
     def _backfill_implicit_participant_mentions(conn: sqlite3.Connection) -> None:
@@ -5587,6 +5708,20 @@ class BridgeStore:
                 )
                 if normalized_wake_all:
                     raise AuthorizationError("Agent 不能发起结构化 @全员")
+            normalized_body, internal_mentions = (
+                self._rewrite_internal_text_mentions_locked(
+                    conn,
+                    conversation_id=conversation,
+                    sender_participant_id=sender,
+                    body_text=normalized_body,
+                )
+            )
+            # A display name can be longer than its opaque ID, so enforce the
+            # body limit again after the user-visible rewrite.
+            normalized_body = body(normalized_body)
+            for inferred in internal_mentions:
+                if inferred not in normalized_mentions:
+                    normalized_mentions.append(inferred)
             for inferred in self._infer_text_mentions_locked(
                 conn,
                 conversation_id=conversation,
