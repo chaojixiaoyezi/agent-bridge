@@ -193,6 +193,35 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     monkeypatch.setenv("AGENT_BRIDGE_ENROLLMENT_TOKEN", "must-not-leak")
     monkeypatch.setattr(claude_adapter.shutil, "which", lambda _name: "/opt/bin/claude")
     captured: dict = {}
+    wait_result = {
+        "backlog": {"required_reply_count": 1},
+        "messages": [
+            {
+                "message_id": "message-42",
+                "body_text": "正文不应出现在命令行",
+                "delivery": {
+                    "priority": "mention",
+                    "reasons": ["mention"],
+                },
+            }
+        ],
+        "has_more": False,
+    }
+
+    class CompletionClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def post(self, path, payload):
+            self.calls.append((path, payload))
+            return wait_result
+
+    completion_client = CompletionClient()
+    monkeypatch.setattr(
+        claude_adapter,
+        "resident_http_client",
+        lambda **_identity: completion_client,
+    )
 
     def successful_run(command, **kwargs):
         captured["command"] = command
@@ -202,12 +231,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
                 "type": "assistant",
                 "message": {
                     "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "wait-1",
-                            "name": "mcp__agent-bridge__agent_wait",
-                            "input": {"wait_seconds": 0},
-                        },
                         {
                             "type": "tool_use",
                             "id": "reply-1",
@@ -221,20 +244,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
                 "type": "user",
                 "message": {
                     "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "wait-1",
-                            "content": json.dumps(
-                                {
-                                    "messages": [
-                                        {
-                                            "message_id": "message-42",
-                                            "priority": "mention",
-                                        }
-                                    ]
-                                }
-                            ),
-                        },
                         {
                             "type": "tool_result",
                             "tool_use_id": "reply-1",
@@ -266,17 +275,37 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "AGENT_BRIDGE_ENROLLMENT_TOKEN" not in captured["env"]
     command_text = " ".join(captured["command"])
     assert "must-not-leak" not in command_text
+    assert "正文不应出现在命令行" not in command_text
+    assert "正文不应出现在命令行" in captured["input"]
+    assert completion_client.calls == [
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0,
+                "limit": 20,
+                "auto_claim_roles": True,
+            },
+        )
+    ]
     assert "--strict-mcp-config" in captured["command"]
     assert "--tools" in captured["command"]
-    assert "mcp__agent-bridge__agent_wait" in captured["command"]
+    assert "mcp__agent-bridge__agent_wait" not in captured["command"]
     assert "mcp__agent-bridge__agent_reply" in captured["command"]
     assert "mcp__agent-bridge__agent_register" not in captured["command"]
-    assert "Read" in captured["command"]
-    assert "Edit" in captured["command"]
-    assert "Bash" in captured["command"]
+    tools_index = captured["command"].index("--tools") + 1
+    assert captured["command"][tools_index] == ""
+    assert "Read" not in captured["command"]
+    assert "Edit" not in captured["command"]
+    assert "Bash" not in captured["command"]
     assert captured["command"][captured["command"].index("--permission-mode") + 1] == (
-        "acceptEdits"
+        "dontAsk"
     )
+    settings_index = captured["command"].index("--settings") + 1
+    permissions = json.loads(captured["command"][settings_index])["permissions"]
+    assert permissions["allow"] == [
+        f"mcp__agent-bridge__{tool}" for tool in claude_adapter.MODEL_BRIDGE_TOOLS
+    ]
+    assert permissions["deny"] == ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]
     config_index = captured["command"].index("--mcp-config") + 1
     mcp_environment = json.loads(captured["command"][config_index])["mcpServers"][
         "agent-bridge"
@@ -292,50 +321,34 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
         "AGENT_BRIDGE_ROLES": "",
         "AGENT_BRIDGE_CAPABILITIES": "",
     }
-    prompt = captured["command"][-1]
-    assert "连接器会在第一次工具调用时自动登记固定身份" in prompt
-    assert "message.authorization" in prompt
-    assert "最小必要" in prompt
+    prompt = captured["input"]
+    assert "连接器已经从 agent_wait 确定性读取" in prompt
+    assert "不要再次调用 agent_wait" in prompt
+    system_prompt_index = captured["command"].index("--append-system-prompt") + 1
+    system_prompt = captured["command"][system_prompt_index]
+    assert "模型运行前确定性读取消息" in system_prompt
+    assert "只使用 Agent Bridge MCP" in system_prompt
+    assert "单独的 TUI" in system_prompt
     assert "agent_register" not in prompt
 
     def incomplete_run(command, **kwargs):
         return SimpleNamespace(
             returncode=0,
-            stdout=json.dumps(
-                {
-                    "type": "tool_use",
-                    "id": "wait-without-result",
-                    "name": "mcp__agent-bridge__agent_wait",
-                    "input": {},
-                }
-            ),
+            stdout="",
             stderr="",
         )
 
     monkeypatch.setattr(claude_adapter.subprocess, "run", incomplete_run)
-    with pytest.raises(claude_adapter.ClaudeAdapterError, match="tool evidence"):
+    with pytest.raises(claude_adapter.ClaudeAdapterError, match="message-42"):
         claude_adapter.run_claude(batch)
 
     def wrong_reply_run(command, **kwargs):
         events = [
             {
                 "type": "tool_use",
-                "id": "wait-2",
-                "name": "mcp__agent-bridge__agent_wait",
-                "input": {},
-            },
-            {
-                "type": "tool_use",
                 "id": "reply-2",
                 "name": "mcp__agent-bridge__agent_reply",
                 "input": {"message_id": "another-message"},
-            },
-            {
-                "type": "tool_result",
-                "tool_use_id": "wait-2",
-                "content": json.dumps(
-                    {"messages": [{"message_id": "message-42", "priority": "mention"}]}
-                ),
             },
             {
                 "type": "tool_result",
@@ -390,30 +403,27 @@ def test_claude_adapter_deterministically_acks_optional_inspected_messages(
                 },
             },
         ],
+        "has_more": False,
     }
 
     def completed_run(command, **kwargs):
-        events = [
-            {
-                "type": "tool_use",
-                "id": "wait-optional",
-                "name": "mcp__agent-bridge__agent_wait",
-                "input": {"wait_seconds": 0},
-            },
-            {
-                "type": "tool_result",
-                "tool_use_id": "wait-optional",
-                "content": json.dumps(wait_result),
-            },
-        ]
         return SimpleNamespace(
             returncode=0,
-            stdout="\n".join(json.dumps(item) for item in events),
+            stdout="",
             stderr="",
         )
 
-    completion_client = object()
     captured: dict = {}
+
+    class CompletionClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def post(self, path, payload):
+            self.calls.append((path, payload))
+            return wait_result
+
+    completion_client = CompletionClient()
 
     def make_client(**identity):
         captured["identity"] = identity
@@ -447,6 +457,7 @@ def test_claude_adapter_deterministically_acks_optional_inspected_messages(
         "message-ordinary",
     }
     assert captured["identity"]["username"] == "值守者"
+    assert completion_client.calls[0][0] == "/agent/wait"
 
     def failed_ack(client, message_ids):
         raise RuntimeError("bridge unavailable")

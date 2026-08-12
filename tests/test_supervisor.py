@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent_bridge.codex_adapter as codex_adapter
+import agent_bridge.supervisor as supervisor
 from agent_bridge.claude_adapter import _tool_evidence
 from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
 from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence, _finish_turn
@@ -17,6 +18,7 @@ from agent_bridge.supervisor import (
     enqueue_event,
     process_once,
     queue_status,
+    recover_inflight,
 )
 
 
@@ -183,6 +185,32 @@ def test_supervisor_retries_adapter_failure_without_losing_event(
     status = queue_status(database)
     assert status["counts"]["pending"] == 1
     assert status["counts"]["handled"] == 0
+    with supervisor.closing(supervisor._connect(database)) as connection:
+        retry = connection.execute(
+            "SELECT available_at - 20 AS delay FROM wake_events"
+        ).fetchone()
+    assert retry["delay"] <= supervisor.MAX_RETRY_DELAY_SECONDS
+
+
+def test_supervisor_recovers_inflight_events_after_owner_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wake-queue.db"
+    enqueue_event(database, wake_event(event_id=61, priority="mention"), now=10)
+    rows = claim_batch(
+        database,
+        wake_policy="mention",
+        debounce=0,
+        claim_owner="old-owner",
+        now=20,
+    )
+    assert len(rows) == 1
+    assert queue_status(database)["counts"]["inflight"] == 1
+
+    assert recover_inflight(database, reason="worker restarted", now=21) == 1
+    status = queue_status(database)
+    assert status["counts"]["pending"] == 1
+    assert status["counts"]["inflight"] == 0
 
 
 def test_codex_adapter_uses_metadata_wake_and_structured_admin_authority_prompt(
@@ -356,7 +384,7 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     assert evidence.replied_message_ids == {mention_id}
 
 
-def test_resident_codex_worker_uses_workspace_sandbox_and_admin_authority_rules(
+def test_resident_codex_worker_uses_read_only_sandbox_and_chat_only_rules(
     tmp_path: Path,
 ) -> None:
     mcp_command = tmp_path / "agent-bridge-mcp"
@@ -376,13 +404,71 @@ def test_resident_codex_worker_uses_workspace_sandbox_and_admin_authority_rules(
         capabilities=("implementation",),
     )
     sandbox = host._workspace_sandbox()
-    assert sandbox["type"] == "workspaceWrite"
-    assert sandbox["writableRoots"] == [str(tmp_path)]
+    assert sandbox == {"type": "readOnly", "networkAccess": True}
     instructions = host._developer_instructions()
-    assert "message.authorization" in instructions
-    assert "status=active" in instructions
-    assert "推送、部署" in instructions
-    assert "授权不等于立即执行" in instructions
+    assert "固定使用只读沙箱" in instructions
+    assert "单独的 Codex TUI 任务" in instructions
+    assert "不得在常驻连接器中实施修改" in instructions
+
+
+def test_resident_codex_worker_sends_protocol_read_only_mode(
+    tmp_path: Path,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    thread_id = "019f0000-0000-7000-8000-000000000001"
+
+    class FakeRpc:
+        def __init__(self, *, resumed: bool) -> None:
+            self.resumed = resumed
+            self.requests: list[tuple[str, dict]] = []
+
+        def start(self) -> None:
+            return None
+
+        def request(self, method: str, params: dict, **_kwargs):
+            self.requests.append((method, params))
+            if method == "thread/start":
+                return {"thread": {"id": thread_id}}
+            if method == "thread/resume":
+                return {"thread": {"id": thread_id, "turns": []}}
+            return {}
+
+    def make_host(state_file: Path) -> CodexThreadHost:
+        return CodexThreadHost(
+            codex_binary="true",
+            cwd=tmp_path,
+            thread_state_file=state_file,
+            thread_name="room worker",
+            bridge_mcp_command=mcp_command,
+            bridge_url="http://127.0.0.1:8765",
+            product="codex",
+            username="reviewer",
+            signature="chat only",
+            conversation="tools-room",
+            roles=("reviewer",),
+            capabilities=("tool-review",),
+        )
+
+    new_host = make_host(tmp_path / "new-thread-id")
+    new_rpc = FakeRpc(resumed=False)
+    new_host.rpc = new_rpc
+    new_host.start()
+    start_params = next(
+        params for method, params in new_rpc.requests if method == "thread/start"
+    )
+    assert start_params["sandbox"] == "read-only"
+
+    state_file = tmp_path / "existing-thread-id"
+    state_file.write_text(f"{thread_id}\n", encoding="utf-8")
+    resumed_host = make_host(state_file)
+    resumed_rpc = FakeRpc(resumed=True)
+    resumed_host.rpc = resumed_rpc
+    resumed_host.start()
+    resume_params = next(
+        params for method, params in resumed_rpc.requests if method == "thread/resume"
+    )
+    assert resume_params["sandbox"] == "read-only"
 
 
 def test_resident_codex_worker_deterministically_acks_only_optional_messages(

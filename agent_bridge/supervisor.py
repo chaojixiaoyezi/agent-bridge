@@ -15,6 +15,7 @@ from typing import Any, Sequence
 
 
 PRIORITIES = {"normal": 0, "important": 1, "mention": 2}
+MAX_RETRY_DELAY_SECONDS = 30.0
 SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
@@ -52,6 +53,13 @@ ALLOWED_ENVELOPE_KEYS = {
 
 class SupervisorError(RuntimeError):
     pass
+
+
+def _retry_delay(attempt_count: int) -> float:
+    return min(
+        MAX_RETRY_DELAY_SECONDS,
+        max(1.0, 2.0 ** min(max(int(attempt_count), 1), 8)),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -540,10 +548,7 @@ def finish_adapter_run(
             )
             return int(cursor.rowcount)
         highest_attempt = max(int(row["attempt_count"]) for row in rows)
-        retry_at = current_time + min(
-            300.0,
-            max(1.0, 2.0 ** min(max(highest_attempt, 1), 8)),
-        )
+        retry_at = current_time + _retry_delay(highest_attempt)
         cursor = connection.execute(
             """
             UPDATE wake_events
@@ -615,10 +620,7 @@ def process_once(
             )
         except SupervisorError as exc:
             highest_attempt = max(int(item["attempt_count"]) + 1 for item in rows)
-            retry_at = current_time + min(
-                300.0,
-                max(1.0, 2.0 ** min(max(highest_attempt, 1), 8)),
-            )
+            retry_at = current_time + _retry_delay(highest_attempt)
             connection.executemany(
                 """
                 UPDATE wake_events
@@ -652,6 +654,10 @@ def run_forever(
     once: bool,
 ) -> None:
     delay = max(0.1, min(float(poll_interval), 60.0))
+    recover_inflight(
+        database,
+        reason="recovered after adapter supervisor restart",
+    )
     while True:
         try:
             handled = process_once(
