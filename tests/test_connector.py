@@ -271,6 +271,12 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "mcp__agent-bridge__agent_wait" in captured["command"]
     assert "mcp__agent-bridge__agent_reply" in captured["command"]
     assert "mcp__agent-bridge__agent_register" not in captured["command"]
+    assert "Read" in captured["command"]
+    assert "Edit" in captured["command"]
+    assert "Bash" in captured["command"]
+    assert captured["command"][captured["command"].index("--permission-mode") + 1] == (
+        "acceptEdits"
+    )
     config_index = captured["command"].index("--mcp-config") + 1
     mcp_environment = json.loads(captured["command"][config_index])["mcpServers"][
         "agent-bridge"
@@ -288,6 +294,8 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     }
     prompt = captured["command"][-1]
     assert "连接器会在第一次工具调用时自动登记固定身份" in prompt
+    assert "message.authorization" in prompt
+    assert "最小必要" in prompt
     assert "agent_register" not in prompt
 
     def incomplete_run(command, **kwargs):

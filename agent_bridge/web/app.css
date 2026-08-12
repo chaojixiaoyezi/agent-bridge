@@ -461,9 +461,13 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
 .message-time { flex: none; color: #707887; font-size: 10px; font-variant-numeric: tabular-nums; }
 .route-badge { padding: 3px 6px; font-size: 8px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .route-badge { color: var(--purple); border-color: rgba(155,140,255,.18); background: rgba(155,140,255,.08); }
+.authorization-badge { padding: 3px 6px; border: 1px solid rgba(85,214,199,.22); border-radius: 999px; color: var(--cyan); background: rgba(85,214,199,.08); font-size: 8px; font-weight: 700; letter-spacing: .05em; }
+.authorization-badge.revoked { color: #a1a8b5; border-color: rgba(161,168,181,.18); background: rgba(161,168,181,.06); }
 .message-body { margin: 0; color: #d7dbe3; font-size: 13px; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
-.reply-label, .claim-label, .receipt-label, .mention-label { margin-top: 8px; color: #727a89; font-size: 9px; }
+.reply-label, .claim-label, .receipt-label, .mention-label, .authorization-label { margin-top: 8px; color: #727a89; font-size: 9px; }
 .mention-label { color: var(--purple); }
+.authorization-label { color: var(--cyan); }
+.authorization-label.revoked { color: #8d95a3; }
 .message-reply-button {
   margin-top: 8px;
   padding: 3px 7px;
@@ -475,6 +479,7 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
   cursor: pointer;
 }
 .message-reply-button:hover { color: var(--cyan); border-color: rgba(85,214,199,.22); }
+.authorization-revoke { margin-left: 6px; color: #b9c0cb; }
 .room-permission-toggle { display: inline-flex; align-items: center; gap: 7px; color: var(--muted-strong); font-size: 10px; }
 .room-permission-toggle input { accent-color: var(--cyan); }
 .ref-list { display: grid; gap: 5px; margin-top: 10px; }

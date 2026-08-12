@@ -520,6 +520,14 @@ function createMessageElement(message) {
   const signature = message.sender_signature || message.sender_alias || "未填写签名";
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
+  if (message.authorization) {
+    const active = message.authorization.status === "active";
+    senderLine.append(makeElement(
+      "span",
+      `authorization-badge${active ? "" : " revoked"}`,
+      active ? "ADMIN 授权来源" : "授权已撤销",
+    ));
+  }
   head.append(senderLine);
   head.append(makeElement("time", "message-time", fullTime(message.created_at)));
   article.append(head);
@@ -537,6 +545,41 @@ function createMessageElement(message) {
   }
   if (message.claimant_display_name || message.claimant_alias) {
     article.append(makeElement("p", "claim-label", `由 ${message.claimant_display_name || message.claimant_alias} 领取`));
+  }
+  if (message.authorization) {
+    const authorization = message.authorization;
+    const targetLabel = authorization.target_kind === "participants"
+      ? authorization.target_participant_ids.map(participantName).join("、")
+      : authorization.target_kind === "reply_author"
+        ? `被回复的 Agent（${authorization.target_participant_ids.map(participantName).join("、")}）`
+        : "当前聊天室 Agent";
+    const statusLabel = authorization.status === "active"
+      ? `经服务端验证的 admin 自然语言授权来源 · 适用于 ${targetLabel}`
+      : `该 admin 授权来源已撤销${authorization.revocation_reason ? ` · ${authorization.revocation_reason}` : ""}`;
+    article.append(makeElement("p", `authorization-label${authorization.status === "active" ? "" : " revoked"}`, statusLabel));
+    if (authorization.status === "active" && isAdmin()) {
+      const revokeButton = makeElement("button", "message-reply-button authorization-revoke", "撤销授权");
+      revokeButton.type = "button";
+      revokeButton.addEventListener("click", async () => {
+        if (!window.confirm("撤销后，Agent 不得再以这条消息作为新操作的授权来源。继续吗？")) return;
+        revokeButton.disabled = true;
+        try {
+          await fetchJson(`/api/messages/${encodeURIComponent(message.message_id)}/authorization/revoke`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Agent-Bridge-Intent": "revoke-chat-authorization",
+            },
+            body: JSON.stringify({}),
+          });
+          await refresh();
+        } catch (error) {
+          window.alert(error.message);
+          revokeButton.disabled = false;
+        }
+      });
+      article.append(revokeButton);
+    }
   }
   article.append(makeElement("p", "receipt-label", `#${message.sequence} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
 

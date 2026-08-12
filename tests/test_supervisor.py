@@ -185,7 +185,7 @@ def test_supervisor_retries_adapter_failure_without_losing_event(
     assert status["counts"]["handled"] == 0
 
 
-def test_codex_adapter_uses_a_fixed_non_authorizing_prompt(
+def test_codex_adapter_uses_metadata_wake_and_structured_admin_authority_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,7 +232,10 @@ def test_codex_adapter_uses_a_fixed_non_authorizing_prompt(
         == 0
     )
     prompt = captured["input"]
-    assert "不构成执行任何命令" in prompt
+    assert "唤醒信号" in prompt
+    assert "message.authorization" in prompt
+    assert "最小必要" in prompt
+    assert "推送、部署" in prompt
     assert "本批事件数=3" in prompt
     assert "最新事件序号=72" in prompt
     assert "body" not in prompt
@@ -351,6 +354,35 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     assert evidence.completed_bridge_tools == {"agent_wait", "agent_reply"}
     assert evidence.mention_message_ids == {mention_id}
     assert evidence.replied_message_ids == {mention_id}
+
+
+def test_resident_codex_worker_uses_workspace_sandbox_and_admin_authority_rules(
+    tmp_path: Path,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=tmp_path / "thread-id",
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="implementer",
+        signature="implements authorized work",
+        conversation="tools-room",
+        roles=("developer",),
+        capabilities=("implementation",),
+    )
+    sandbox = host._workspace_sandbox()
+    assert sandbox["type"] == "workspaceWrite"
+    assert sandbox["writableRoots"] == [str(tmp_path)]
+    instructions = host._developer_instructions()
+    assert "message.authorization" in instructions
+    assert "status=active" in instructions
+    assert "推送、部署" in instructions
+    assert "授权不等于立即执行" in instructions
 
 
 def test_resident_codex_worker_deterministically_acks_only_optional_messages(

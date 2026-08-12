@@ -834,6 +834,40 @@ END;
 """
 
 
+CHAT_AUTHORIZATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_authorization_grants (
+    source_message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    issuer_web_user_id TEXT NOT NULL,
+    issuer_username_snapshot TEXT NOT NULL,
+    issuer_role_snapshot TEXT NOT NULL
+        CHECK (issuer_role_snapshot = 'admin'),
+    issuer_participant_id TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    target_kind TEXT NOT NULL
+        CHECK (target_kind IN ('participants', 'room_agents', 'reply_author')),
+    target_participant_ids_json TEXT NOT NULL DEFAULT '[]',
+    authority_kind TEXT NOT NULL DEFAULT 'admin_chat',
+    created_at REAL NOT NULL,
+    revoked_at REAL,
+    revoked_by_web_user_id TEXT,
+    revocation_reason TEXT,
+    FOREIGN KEY (source_message_id) REFERENCES messages(message_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (issuer_web_user_id) REFERENCES web_users(user_id),
+    FOREIGN KEY (issuer_participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (revoked_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_authorization_grants_room_created
+    ON chat_authorization_grants(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_authorization_grants_issuer
+    ON chat_authorization_grants(issuer_web_user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_authorization_grants_active
+    ON chat_authorization_grants(revoked_at, conversation_id, created_at DESC);
+"""
+
+
 class BridgeStore:
     def __init__(
         self,
@@ -970,6 +1004,8 @@ class BridgeStore:
                     "NOT NULL DEFAULT 0 CHECK (actionable IN (0, 1))"
                 )
             conn.executescript(AUTHORIZATION_SCHEMA)
+            conn.executescript(CHAT_AUTHORIZATION_SCHEMA)
+            self._backfill_admin_chat_authorization_grants(conn)
             reconcile_deliveries = (
                 schema_version < 8
                 or not delivery_table_existed
@@ -998,7 +1034,7 @@ class BridgeStore:
                     "AND instr(reasons_json, '\"mention\"') > 0"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 17")
+            conn.execute("PRAGMA user_version = 18")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1293,6 +1329,46 @@ class BridgeStore:
             """,
             (OWNER_PARTICIPANT_ID,),
         )
+
+    @classmethod
+    def _backfill_admin_chat_authorization_grants(
+        cls,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Snapshot historical authenticated admin messages as authority sources.
+
+        The snapshot records who was an active administrator when the message was
+        written. Later role or session changes cannot manufacture authority for
+        ordinary messages, and revocation remains a separate durable state.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT message.*, web_user.user_id AS issuer_web_user_id,
+                   web_user.username AS issuer_username,
+                   web_user.role AS issuer_role
+            FROM messages AS message
+            JOIN web_sessions AS web_session
+              ON web_session.session_id = message.authorized_session_id
+            JOIN web_users AS web_user
+              ON web_user.user_id = web_session.user_id
+             AND web_user.participant_id = message.sender_participant_id
+            WHERE web_user.role = 'admin'
+              AND NOT EXISTS (
+                  SELECT 1 FROM chat_authorization_grants AS grant_record
+                  WHERE grant_record.source_message_id = message.message_id
+              )
+            ORDER BY message.sequence
+            """
+        ).fetchall()
+        for row in rows:
+            cls._insert_admin_chat_authorization_grant_locked(
+                conn,
+                message=row,
+                issuer_web_user_id=str(row["issuer_web_user_id"]),
+                issuer_username=str(row["issuer_username"]),
+                issuer_role=str(row["issuer_role"]),
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -1593,6 +1669,145 @@ class BridgeStore:
                     float(message["created_at"]),
                 ),
             )
+
+    @classmethod
+    def _admin_chat_authorization_targets_locked(
+        cls,
+        conn: sqlite3.Connection,
+        message: sqlite3.Row,
+    ) -> tuple[str, list[str]] | None:
+        conversation_id = str(message["conversation_id"])
+        mentioned = list(json.loads(str(message["mentions_json"] or "[]")))
+        if bool(message["wake_all_agents"]):
+            targets = cls._room_agent_ids_locked(
+                conn,
+                conversation_id=conversation_id,
+                created_at=float(message["created_at"]),
+            )
+            return ("room_agents", targets) if targets else None
+
+        agent_targets: list[str] = []
+        for participant_id in mentioned:
+            target = conn.execute(
+                """
+                SELECT participant.participant_id
+                FROM memberships AS membership
+                JOIN participants AS participant
+                  ON participant.participant_id = membership.participant_id
+                LEFT JOIN web_users AS web_user
+                  ON web_user.participant_id = participant.participant_id
+                WHERE membership.conversation_id = ?
+                  AND membership.participant_id = ?
+                  AND membership.active = 1
+                  AND web_user.user_id IS NULL
+                  AND participant.participant_id != ?
+                """,
+                (conversation_id, participant_id, OWNER_PARTICIPANT_ID),
+            ).fetchone()
+            if target is not None:
+                agent_targets.append(str(target["participant_id"]))
+        if agent_targets:
+            return "participants", sorted(set(agent_targets))
+        if mentioned:
+            # Explicit @ targets that are only Web users must not spill authority
+            # over to unrelated Agents in the same public room.
+            return None
+
+        if message["reply_to"] is not None:
+            reply_author = conn.execute(
+                """
+                SELECT original.sender_participant_id
+                FROM messages AS original
+                LEFT JOIN web_users AS web_user
+                  ON web_user.participant_id = original.sender_participant_id
+                WHERE original.message_id = ?
+                  AND original.conversation_id = ?
+                  AND web_user.user_id IS NULL
+                  AND original.sender_participant_id != ?
+                """,
+                (
+                    str(message["reply_to"]),
+                    conversation_id,
+                    OWNER_PARTICIPANT_ID,
+                ),
+            ).fetchone()
+            if reply_author is not None:
+                return "reply_author", [str(reply_author["sender_participant_id"])]
+            return None
+
+        # An authenticated admin message without a narrower addressee applies
+        # to Agents already in the room when it was sent. It does not wake them.
+        targets = cls._room_agent_ids_locked(
+            conn,
+            conversation_id=conversation_id,
+            created_at=float(message["created_at"]),
+        )
+        return ("room_agents", targets) if targets else None
+
+    @staticmethod
+    def _room_agent_ids_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        created_at: float,
+    ) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT membership.participant_id
+            FROM memberships AS membership
+            LEFT JOIN web_users AS web_user
+              ON web_user.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND membership.joined_at <= ?
+              AND membership.active = 1
+              AND web_user.user_id IS NULL
+              AND membership.participant_id != ?
+            ORDER BY membership.participant_id
+            """,
+            (conversation_id, created_at, OWNER_PARTICIPANT_ID),
+        ).fetchall()
+        return [str(row["participant_id"]) for row in rows]
+
+    @classmethod
+    def _insert_admin_chat_authorization_grant_locked(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        message: sqlite3.Row,
+        issuer_web_user_id: str,
+        issuer_username: str,
+        issuer_role: str,
+    ) -> None:
+        if issuer_role != "admin":
+            return
+        target = cls._admin_chat_authorization_targets_locked(
+            conn,
+            message,
+        )
+        if target is None:
+            return
+        target_kind, targets = target
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO chat_authorization_grants
+                (source_message_id, conversation_id, issuer_web_user_id,
+                 issuer_username_snapshot, issuer_role_snapshot,
+                 issuer_participant_id, body_sha256, target_kind,
+                 target_participant_ids_json, authority_kind, created_at)
+            VALUES (?, ?, ?, ?, 'admin', ?, ?, ?, ?, 'admin_chat', ?)
+            """,
+            (
+                str(message["message_id"]),
+                str(message["conversation_id"]),
+                issuer_web_user_id,
+                issuer_username,
+                str(message["sender_participant_id"]),
+                hashlib.sha256(str(message["body"]).encode("utf-8")).hexdigest(),
+                target_kind,
+                compact_json(targets),
+                float(message["created_at"]),
+            ),
+        )
 
     @classmethod
     def _backfill_message_deliveries(
@@ -4340,6 +4555,7 @@ class BridgeStore:
                 "agent_connectors",
                 "agent_room_blocks",
                 "room_web_owners",
+                "chat_authorization_grants",
             ):
                 column = (
                     "registered_conversation_id"
@@ -5409,8 +5625,24 @@ class BridgeStore:
                 "SELECT * FROM messages WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
+            if _web_user and str(web_identity["role"]) == "admin":
+                self._insert_admin_chat_authorization_grant_locked(
+                    conn,
+                    message=row,
+                    issuer_web_user_id=str(web_identity["user_id"]),
+                    issuer_username=str(web_identity["username"]),
+                    issuer_role=str(web_identity["role"]),
+                )
             self._create_message_deliveries_locked(conn, row)
-        return self._message_payload(row)
+            payload = self._message_payload(
+                row,
+                authorization=self._chat_authorization_for_message_locked(
+                    conn,
+                    message_id=message_id,
+                    recipient_participant_id=None,
+                ),
+            )
+        return payload
 
     def send_owner_message(
         self,
@@ -5460,6 +5692,141 @@ class BridgeStore:
             reply_to=reply_to,
             _web_user=True,
         )
+
+    @staticmethod
+    def _chat_authorization_applies_locked(
+        conn: sqlite3.Connection,
+        grant: sqlite3.Row,
+        *,
+        recipient_participant_id: str | None,
+    ) -> bool:
+        if recipient_participant_id is None:
+            return True
+        recipient = str(recipient_participant_id)
+        target_kind = str(grant["target_kind"])
+        targets = set(
+            json.loads(str(grant["target_participant_ids_json"] or "[]"))
+        )
+        if target_kind in {"participants", "reply_author"}:
+            return recipient in targets
+        if target_kind != "room_agents":
+            return False
+        if recipient not in targets:
+            return False
+        membership = conn.execute(
+            """
+            SELECT 1
+            FROM memberships AS membership
+            LEFT JOIN web_users AS web_user
+              ON web_user.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND membership.participant_id = ?
+              AND membership.active = 1
+              AND web_user.user_id IS NULL
+              AND membership.participant_id != ?
+            """,
+            (
+                str(grant["conversation_id"]),
+                recipient,
+                OWNER_PARTICIPANT_ID,
+            ),
+        ).fetchone()
+        return membership is not None
+
+    @classmethod
+    def _chat_authorization_for_message_locked(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        message_id: str,
+        recipient_participant_id: str | None,
+    ) -> dict[str, Any] | None:
+        grant = conn.execute(
+            "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
+            (message_id,),
+        ).fetchone()
+        if grant is None or not cls._chat_authorization_applies_locked(
+            conn,
+            grant,
+            recipient_participant_id=recipient_participant_id,
+        ):
+            return None
+        revoked_at = (
+            float(grant["revoked_at"])
+            if grant["revoked_at"] is not None
+            else None
+        )
+        return {
+            "kind": str(grant["authority_kind"]),
+            "source_message_id": str(grant["source_message_id"]),
+            "issuer_user_id": str(grant["issuer_web_user_id"]),
+            "issuer_username": str(grant["issuer_username_snapshot"]),
+            "issuer_role_at_send": str(grant["issuer_role_snapshot"]),
+            "issuer_participant_id": str(grant["issuer_participant_id"]),
+            "body_sha256": str(grant["body_sha256"]),
+            "target_kind": str(grant["target_kind"]),
+            "target_participant_ids": json.loads(
+                str(grant["target_participant_ids_json"] or "[]")
+            ),
+            "issued_at": float(grant["created_at"]),
+            "applies_to_recipient": True,
+            "status": "revoked" if revoked_at is not None else "active",
+            "revoked_at": revoked_at,
+            "revoked_by_web_user_id": (
+                str(grant["revoked_by_web_user_id"])
+                if grant["revoked_by_web_user_id"] is not None
+                else None
+            ),
+            "revocation_reason": (
+                str(grant["revocation_reason"])
+                if grant["revocation_reason"] is not None
+                else None
+            ),
+            "semantics": "natural_language_minimum_necessary",
+        }
+
+    def revoke_chat_authorization(
+        self,
+        *,
+        source_message_id: str,
+        revoked_by_web_user_id: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        message_id = opaque_id(source_message_id, field="source_message_id")
+        administrator = opaque_id(
+            revoked_by_web_user_id,
+            field="revoked_by_web_user_id",
+        )
+        normalized_reason = (
+            alias(reason, field="revocation_reason") if reason else None
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, administrator)
+            grant = conn.execute(
+                "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if grant is None:
+                raise NotFoundError(
+                    f"message {message_id} is not an admin chat authority source"
+                )
+            if grant["revoked_at"] is None:
+                conn.execute(
+                    """
+                    UPDATE chat_authorization_grants
+                    SET revoked_at = ?, revoked_by_web_user_id = ?,
+                        revocation_reason = ?
+                    WHERE source_message_id = ?
+                    """,
+                    (now, administrator, normalized_reason, message_id),
+                )
+            payload = self._chat_authorization_for_message_locked(
+                conn,
+                message_id=message_id,
+                recipient_participant_id=None,
+            )
+        return payload or {}
 
     def wait_messages(
         self,
@@ -5805,7 +6172,18 @@ class BridgeStore:
             ordered_rows = sorted(rows, key=lambda row: int(row["sequence"]))
         else:
             ordered_rows = rows if after_sequence is not None else list(reversed(rows))
-        messages = [self._message_payload(row) for row in ordered_rows]
+        with self._connection() as conn:
+            messages = [
+                self._message_payload(
+                    row,
+                    authorization=self._chat_authorization_for_message_locked(
+                        conn,
+                        message_id=str(row["message_id"]),
+                        recipient_participant_id=participant,
+                    ),
+                )
+                for row in ordered_rows
+            ]
         first_sequence = messages[0]["sequence"] if messages else None
         last_sequence = messages[-1]["sequence"] if messages else None
         with self._connection() as conn:
@@ -5990,7 +6368,19 @@ class BridgeStore:
                 parameters,
             ).fetchall()
 
-        results = [self._history_search_payload(row, terms=terms) for row in rows]
+        with self._connection() as conn:
+            results = [
+                self._history_search_payload(
+                    row,
+                    terms=terms,
+                    authorization=self._chat_authorization_for_message_locked(
+                        conn,
+                        message_id=str(row["message_id"]),
+                        recipient_participant_id=participant,
+                    ),
+                )
+                for row in rows
+            ]
         return {
             "conversation_id": conversation,
             "query": normalized_query,
@@ -6268,7 +6658,18 @@ class BridgeStore:
                 ).fetchone()
                 if delivered is not None:
                     delivered_rows.append(delivered)
-        return [self._message_payload(row) for row in delivered_rows]
+        with self._connection() as conn:
+            return [
+                self._message_payload(
+                    row,
+                    authorization=self._chat_authorization_for_message_locked(
+                        conn,
+                        message_id=str(row["message_id"]),
+                        recipient_participant_id=participant_id,
+                    ),
+                )
+                for row in delivered_rows
+            ]
 
     def _pending_manifest(
         self,
@@ -6835,6 +7236,7 @@ class BridgeStore:
         row: sqlite3.Row,
         *,
         terms: Sequence[str],
+        authorization: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body_text = str(row["body"])
         folded = body_text.casefold()
@@ -6847,7 +7249,7 @@ class BridgeStore:
             snippet = "…" + snippet
         if end < len(body_text):
             snippet += "…"
-        return {
+        payload = {
             "message_id": str(row["message_id"]),
             "sequence": int(row["sequence"]),
             "sender_participant_id": str(row["sender_participant_id"]),
@@ -6870,6 +7272,9 @@ class BridgeStore:
                 else None
             ),
         }
+        if authorization is not None:
+            payload["authorization"] = authorization
+        return payload
 
     @staticmethod
     def _secret_hash(secret: str) -> str:
@@ -6968,7 +7373,11 @@ class BridgeStore:
         }
 
     @staticmethod
-    def _message_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+    def _message_payload(
+        row: sqlite3.Row | None,
+        *,
+        authorization: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if row is None:
             raise NotFoundError("message row disappeared")
         payload = {
@@ -6989,6 +7398,8 @@ class BridgeStore:
             "created_at": float(row["created_at"]),
         }
         keys = set(row.keys())
+        if authorization is not None:
+            payload["authorization"] = authorization
         if "delivery_state" in keys:
             reasons = json.loads(str(row["delivery_reasons_json"] or "[]"))
             payload["delivery"] = {

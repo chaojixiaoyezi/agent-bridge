@@ -670,6 +670,65 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         ).fetchone()[0] == 2
 
 
+def test_dashboard_projects_and_revokes_admin_chat_authority(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    client = TestClient(make_app(database))
+    login_admin(client)
+    assert client.post(
+        "/api/rooms",
+        headers=intent_headers(client, "create-room"),
+        json={"conversation_id": "授权聊天室"},
+    ).status_code == 201
+    agent = client.post(
+        "/agent/register",
+        json={
+            "product": "codex",
+            "username": "authority-target",
+            "signature": "验证授权来源。",
+            "conversation_id": "授权聊天室",
+        },
+    ).json()
+
+    sent = client.post(
+        "/api/rooms/%E6%8E%88%E6%9D%83%E8%81%8A%E5%A4%A9%E5%AE%A4/messages",
+        headers=intent_headers(client, "send-message"),
+        json={
+            "body": "请实现这一需求并运行测试。",
+            "mentions": [agent["participant_id"]],
+        },
+    )
+    assert sent.status_code == 201
+    message = sent.json()["message"]
+    assert message["authorization"]["status"] == "active"
+
+    projected = client.get(
+        "/api/rooms/%E6%8E%88%E6%9D%83%E8%81%8A%E5%A4%A9%E5%AE%A4/messages"
+    )
+    assert projected.status_code == 200
+    dashboard_message = projected.json()["messages"][-1]
+    assert dashboard_message["authorization"]["issuer_username"] == "admin"
+
+    revoked = client.post(
+        f"/api/messages/{message['message_id']}/authorization/revoke",
+        headers=intent_headers(client, "revoke-chat-authorization"),
+        json={"reason": "方案取消"},
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["authorization"]["status"] == "revoked"
+
+    agent_auth = {"Authorization": f"Bearer {agent['access_token']}"}
+    history = client.post(
+        "/agent/history",
+        headers=agent_auth,
+        json={"conversation_id": "授权聊天室"},
+    )
+    authority = history.json()["messages"][-1]["authorization"]
+    assert authority["status"] == "revoked"
+    assert authority["revocation_reason"] == "方案取消"
+
+
 def test_dashboard_separates_abandoned_rooms_and_retains_history(
     tmp_path: Path,
 ) -> None:

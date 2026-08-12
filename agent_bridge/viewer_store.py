@@ -58,6 +58,7 @@ class ViewerRepository:
                     "agent_connectors",
                     "agent_lifecycle_states",
                     "agent_room_blocks",
+                    "chat_authorization_grants",
                 )
             }
             room_states = {
@@ -406,6 +407,22 @@ class ViewerRepository:
                     sender.signature AS sender_signature,
                     claimant.session_alias AS claimant_alias,
                     claimant.display_name AS claimant_display_name,
+                    grant.authority_kind AS authorization_kind,
+                    grant.issuer_web_user_id AS authorization_issuer_user_id,
+                    grant.issuer_username_snapshot
+                        AS authorization_issuer_username,
+                    grant.issuer_role_snapshot AS authorization_issuer_role,
+                    grant.issuer_participant_id
+                        AS authorization_issuer_participant_id,
+                    grant.body_sha256 AS authorization_body_sha256,
+                    grant.target_kind AS authorization_target_kind,
+                    grant.target_participant_ids_json
+                        AS authorization_target_participant_ids_json,
+                    grant.created_at AS authorization_issued_at,
+                    grant.revoked_at AS authorization_revoked_at,
+                    grant.revoked_by_web_user_id
+                        AS authorization_revoked_by_web_user_id,
+                    grant.revocation_reason AS authorization_revocation_reason,
                     (
                         SELECT COUNT(*) FROM receipts AS r
                         WHERE r.message_id = m.message_id AND r.state = 'acked'
@@ -419,6 +436,8 @@ class ViewerRepository:
                   ON sender.participant_id = m.sender_participant_id
                 LEFT JOIN participants AS claimant
                   ON claimant.participant_id = m.claimed_by
+                LEFT JOIN chat_authorization_grants AS grant
+                  ON grant.source_message_id = m.message_id
                 WHERE m.conversation_id = ? {sequence_clause}
                 ORDER BY m.sequence {order}
                 LIMIT ?
@@ -720,7 +739,7 @@ class ViewerRepository:
 
     @staticmethod
     def _message_payload(row: sqlite3.Row) -> dict[str, Any]:
-        return {
+        payload = {
             "sequence": int(row["sequence"]),
             "message_id": str(row["message_id"]),
             "conversation_id": str(row["conversation_id"]),
@@ -747,3 +766,39 @@ class ViewerRepository:
             "receipt_count": int(row["receipt_count"] or 0),
             "created_at": float(row["created_at"]),
         }
+        if row["authorization_kind"] is not None:
+            revoked_at = (
+                float(row["authorization_revoked_at"])
+                if row["authorization_revoked_at"] is not None
+                else None
+            )
+            payload["authorization"] = {
+                "kind": str(row["authorization_kind"]),
+                "source_message_id": str(row["message_id"]),
+                "issuer_user_id": str(row["authorization_issuer_user_id"]),
+                "issuer_username": str(row["authorization_issuer_username"]),
+                "issuer_role_at_send": str(row["authorization_issuer_role"]),
+                "issuer_participant_id": str(
+                    row["authorization_issuer_participant_id"]
+                ),
+                "body_sha256": str(row["authorization_body_sha256"]),
+                "target_kind": str(row["authorization_target_kind"]),
+                "target_participant_ids": json.loads(
+                    str(row["authorization_target_participant_ids_json"] or "[]")
+                ),
+                "issued_at": float(row["authorization_issued_at"]),
+                "status": "revoked" if revoked_at is not None else "active",
+                "revoked_at": revoked_at,
+                "revoked_by_web_user_id": (
+                    str(row["authorization_revoked_by_web_user_id"])
+                    if row["authorization_revoked_by_web_user_id"] is not None
+                    else None
+                ),
+                "revocation_reason": (
+                    str(row["authorization_revocation_reason"])
+                    if row["authorization_revocation_reason"] is not None
+                    else None
+                ),
+                "semantics": "natural_language_minimum_necessary",
+            }
+        return payload

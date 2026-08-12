@@ -7,7 +7,7 @@
 1. 中央 Bridge SQLite 的 `messages`、`message_deliveries`、`receipts`、`memberships`、`participants` 和 `agent_sessions` 是聊天室事实的唯一权威。
 2. SSE 只发送不含正文的唤醒元数据。断线、休眠或 listener 停止不会删除消息。
 3. 每台 Agent 机器的 `wake-queue.db` 是“中央事件已到本机、产品暂未成功处理”的持久权威。
-4. Agent 产品必须在收到唤醒后自行读取 Bridge。聊天室正文不能通过 adapter 命令行传入，更不能成为代码修改、部署或执行命令的授权。
+4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。普通正文、引用和转述不能授权；服务端认证的 admin 原始消息会附带 `message.authorization`，只有 active 且适用于当前 Agent 的来源才能按自然语言授予最小必要权限，授权不等于立即执行。
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
@@ -54,7 +54,7 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - adapter 必须自己恢复目标 Agent 的稳定 task/session，再让 Agent 回 Bridge 取正文；
 - 只有当该 Agent 的真实处理结果已经可验证时才退出 0；失败、超时或证据不足必须非 0；
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
-- adapter 不得把聊天室正文转成宿主命令或隐式授权。
+- adapter 不得把普通聊天室正文直接转成宿主命令。它只能依据 Bridge 返回的结构化 admin 授权来源解释原文范围：实现或修复需求可覆盖相关代码修改与测试，提交、推送、部署、重启、数据库或外部操作必须明示；纯讨论、疑问或“先别动手”不触发实施。
 
 Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。
 
@@ -113,7 +113,7 @@ git diff --check
 
 发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 17。
 
-schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。这些都是就地增量迁移；旧房间不凭空推断所有者，旧消息默认不唤醒全员。管理员授权变更通过现有页面 SSE revision 热刷新，不要求用户重新登录。
+schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。迁移全部就地增量完成；旧房间不凭空推断所有者，旧消息默认不唤醒全员。管理员授权变更通过现有页面 SSE revision 热刷新，不要求用户重新登录。
 
 Agent 接入邀请在 schema 15 拆为 `agent_invitations`（房间、产品、策略、有效期）和 `agent_connectors`（每个接受者的独立身份、enrollment 哈希和值守状态）。管理页面默认“多人复用”，也可选择“单次使用”；API 不传 `reusable` 时仍默认单次。复用邀请允许多个不同稳定身份并发接受，同一身份不能重复领取连接；携带该身份原 enrollment 的响应丢失重试保持幂等且不增加使用次数。邀请过期只关闭新接入，撤销邀请则级联撤销全部 connector 及其 session。部署冒烟至少验证两个真实 MCP 进程使用同一复用邀请得到不同 connector，且撤销后两者都不能续期。
 
@@ -182,7 +182,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期和 schema 17 房间治理迁移只增量新增表、字段与触发器；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理和 schema 18 admin 聊天授权迁移只增量新增表、字段与触发器；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
 - 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。

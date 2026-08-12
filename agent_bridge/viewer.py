@@ -1103,6 +1103,27 @@ def create_app(
         except Exception as exc:
             return _json_error(exc)
 
+    async def revoke_chat_authorization(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="revoke-chat-authorization")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required=set(),
+                allowed={"reason"},
+            )
+            return JSONResponse(
+                {
+                    "authorization": store.revoke_chat_authorization(
+                        source_message_id=request.path_params["message_id"],
+                        revoked_by_web_user_id=str(identity["user_id"]),
+                        reason=payload.get("reason"),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def participants(request: Request) -> Response:
         try:
             authenticated_web_user(request)
@@ -1510,6 +1531,11 @@ def create_app(
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 web_send_message,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/messages/{message_id:str}/authorization/revoke",
+                revoke_chat_authorization,
                 methods=["POST"],
             ),
             Route(
