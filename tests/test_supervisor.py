@@ -9,9 +9,11 @@ import pytest
 import agent_bridge.codex_adapter as codex_adapter
 from agent_bridge.claude_adapter import _tool_evidence
 from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
-from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence
+from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence, _finish_turn
 from agent_bridge.supervisor import (
     SupervisorError,
+    attach_adapter_run,
+    claim_batch,
     enqueue_event,
     process_once,
     queue_status,
@@ -349,6 +351,107 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     assert evidence.completed_bridge_tools == {"agent_wait", "agent_reply"}
     assert evidence.mention_message_ids == {mention_id}
     assert evidence.replied_message_ids == {mention_id}
+
+
+def test_resident_codex_worker_deterministically_acks_only_optional_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=tmp_path / "thread-id",
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="reads the real call chain",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("tool-review",),
+    )
+    evidence = TurnEvidence(
+        inspected_message_ids={"msg-mentioned", "msg-optional", "msg-resolved"},
+        resolved_message_ids={"msg-mentioned", "msg-resolved"},
+        mention_message_ids={"msg-mentioned"},
+        replied_message_ids={"msg-mentioned"},
+    )
+    completion_client = object()
+    captured: dict = {}
+
+    def make_client(**identity):
+        captured["identity"] = identity
+        return completion_client
+
+    def acknowledge(client, message_ids):
+        captured["client"] = client
+        captured["message_ids"] = set(message_ids)
+        return frozenset(message_ids)
+
+    monkeypatch.setattr("agent_bridge.codex_worker.resident_http_client", make_client)
+    monkeypatch.setattr("agent_bridge.codex_worker.acknowledge_messages", acknowledge)
+
+    assert host.acknowledge_optional_messages(evidence) == frozenset({"msg-optional"})
+    assert evidence.resolved_message_ids == {
+        "msg-mentioned",
+        "msg-optional",
+        "msg-resolved",
+    }
+    assert captured["client"] is completion_client
+    assert captured["message_ids"] == {"msg-optional"}
+    assert captured["identity"]["conversation_id"] == "tools-room"
+
+
+def test_resident_codex_worker_retries_when_deterministic_optional_ack_fails(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wake-queue.db"
+    enqueue_event(database, wake_event(event_id=81, priority="mention"), now=10)
+    rows = claim_batch(
+        database,
+        wake_policy="mention",
+        debounce=0,
+        claim_owner="test-worker",
+        now=20,
+    )
+    attach_adapter_run(
+        database,
+        idempotency_keys=[str(row["idempotency_key"]) for row in rows],
+        claim_owner="test-worker",
+        adapter_run_id="turn-ack-failure",
+    )
+
+    class FailingHost:
+        @staticmethod
+        def acknowledge_optional_messages(evidence):
+            raise RuntimeError("bridge unavailable")
+
+    successful, completion_error = _finish_turn(
+        database,
+        host=FailingHost(),
+        run_id="turn-ack-failure",
+        status="completed",
+        error=None,
+        evidence=TurnEvidence(
+            completed_bridge_tools={"agent_wait", "agent_reply"},
+            inspected_message_ids={"msg-mentioned", "msg-optional"},
+            resolved_message_ids={"msg-mentioned"},
+            mention_message_ids={"msg-mentioned"},
+            replied_message_ids={"msg-mentioned"},
+            required_reply_count_observed=1,
+        ),
+        batch_required_reply=True,
+    )
+
+    assert successful is False
+    assert completion_error is not None
+    assert "optional-message ack failed" in completion_error
+    status = queue_status(database)
+    assert status["counts"]["pending"] == 1
+    assert status["counts"]["handled"] == 0
 
 
 def test_worker_evidence_distinguishes_optional_wakes_and_tracks_ack() -> None:

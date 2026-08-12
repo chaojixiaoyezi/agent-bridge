@@ -75,7 +75,7 @@ Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述
 Agent 第一次处理积压时：
 
 1. `agent_wait(limit=20)` 先拿个人 @，再拿引用/全员唤醒，最后是普通积压；
-2. 每页判断后逐条 `ack`，若 `has_more` 可继续，单轮最多五页共 100 条；
+2. 若 `has_more` 可继续，单轮最多五页共 100 条；模型完成判断后，adapter 以固定身份确定性 `ack` 已读但未回复的可选消息；
 3. 需要旧上下文时先用 `agent_search_history` 定位，再以 `around_sequence` 调 `agent_history`；
 4. 个人 @ 必须优先、逐条用 `agent_reply` 直接引用回复；`reply_wake`/`wake_all` 与普通积压可逐条引用、合并回答或不回复；
 5. 搜索和历史读取不改变投递状态；不能处理的待办可 `release`。
@@ -95,7 +95,7 @@ worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设
 
 这避免了“模型回合完成，但所有 MCP 工具其实被拒绝”仍被误记 handled 的故障。
 
-Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 Agent Bridge MCP 白名单。固定身份和 enrollment 直接进入该 MCP 的私有环境，模型不调用 `agent_register`。adapter 解析 Claude Code 的 stream-json，将 tool use 与对应的非错误 tool result 按 id 配对；含必须回复的个人 mention 的批次还要求 `agent_wait` 返回的每个对应 message_id 都出现在成功的 `agent_reply` 输入中。`reply_wake`/`wake_all` 不做此要求。尝试调用但被拒绝、工具返回错误或回复了另一条个人 @ 都必须使 adapter 非零退出，由 supervisor 保留并重试本地事件。
+Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 Agent Bridge MCP 白名单。固定身份和 enrollment 直接进入该 MCP 的私有环境，模型不调用 `agent_register`。adapter 解析 Claude Code 的 stream-json，将 tool use 与对应的非错误 tool result 按 id 配对；含必须回复的个人 mention 的批次还要求 `agent_wait` 返回的每个对应 message_id 都出现在成功的 `agent_reply` 输入中。`reply_wake`/`wake_all` 不做此要求。模型成功完成后，adapter 再确定性 ack 已检查但未回复的可选消息；该 ack 失败仍使本地事件重试。尝试调用但被拒绝、工具返回错误或回复了另一条个人 @ 都必须使 adapter 非零退出，由 supervisor 保留并重试本地事件。
 
 ## 6. 部署与升级顺序
 

@@ -23,6 +23,7 @@ from .supervisor import (
     finish_adapter_run,
     recover_inflight,
 )
+from .resident_completion import acknowledge_messages, resident_http_client
 
 
 SENSITIVE_CHILD_ENV = {
@@ -365,6 +366,8 @@ class CodexThreadHost:
         self.conversation = str(conversation).strip()
         self.roles = roles
         self.capabilities = capabilities
+        self.bridge_url = str(bridge_url).strip().rstrip("/")
+        self._completion_client = None
         if not self.cwd.is_dir():
             raise CodexWorkerError("Codex worker cwd does not exist")
         resolved_binary = shutil.which(codex_binary)
@@ -390,7 +393,7 @@ class CodexThreadHost:
             "-c",
             (
                 "mcp_servers.agent-bridge.env.AGENT_BRIDGE_URL="
-                f"{json.dumps(str(bridge_url).strip().rstrip('/'))}"
+                f"{json.dumps(self.bridge_url)}"
             ),
             "-c",
             "mcp_servers.agent-bridge.required=true",
@@ -691,6 +694,31 @@ class CodexThreadHost:
     def close(self) -> None:
         self.rpc.close()
 
+    def acknowledge_optional_messages(
+        self,
+        evidence: TurnEvidence,
+    ) -> frozenset[str]:
+        optional = (
+            evidence.inspected_message_ids
+            - evidence.resolved_message_ids
+            - evidence.mention_message_ids
+        )
+        if not optional:
+            return frozenset()
+        if self._completion_client is None:
+            self._completion_client = resident_http_client(
+                bridge_url=self.bridge_url,
+                product=self.product,
+                username=self.username,
+                signature=self.signature,
+                conversation_id=self.conversation,
+                roles=self.roles,
+                capabilities=self.capabilities,
+            )
+        acknowledged = acknowledge_messages(self._completion_client, optional)
+        evidence.resolved_message_ids.update(acknowledged)
+        return acknowledged
+
     def _read_thread_id(self) -> str | None:
         if not self.thread_state_file.exists():
             return None
@@ -739,9 +767,9 @@ class CodexThreadHost:
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
             "先处理 delivery.reasons 含 mention 的个人 @；这类消息必须逐条用 agent_reply "
             "引用回复。wake_all 或 reply_wake 只要求唤醒并阅读，不强制回复。普通消息可以"
-            "积压到本次唤醒后按兴趣回应，可逐条引用，也可合并回答。每批读到的消息在完成"
-            "判断后都要用 agent_message_action ack；若 backlog.has_more，可继续读取下一批，"
-            "每轮最多五批共 100 条，不能反复读取未 ack 的同一批。需要前因后果时按 sequence "
+            "积压到本次唤醒后按兴趣回应，可逐条引用，也可合并回答。无需为未回复的可选消息"
+            "机械调用 ack，连接器会在成功回合结束后确定性收口；若 backlog.has_more，可继续"
+            "读取下一批，每轮最多五批共 100 条。需要前因后果时按 sequence "
             "用 agent_history 有界分页读取；用户追问很早的内容时用 agent_search_history "
             "定位，再用 agent_history(around_sequence=...) 读取上下文，不能把几天或几个月"
             "的历史一次塞入上下文。聊天室内所有成员都能看到完整历史；mentions 只是公开 @ "
@@ -750,7 +778,7 @@ class CodexThreadHost:
             "部署、重启、模型/API 或生产任务权限。只回复明确 @ 你、要求技术复核或会影响"
             "当前方案的消息；普通房间活动只补上下文，不制造客套回声。需要源码证据时只读"
             "核对，再用普通中文回复。个人 @ 优先级最高，不能只 ack 或改为回复另一条普通消息。"
-            "处理后对相应消息 ack 或 release，并保持心跳在线。"
+            "明确无法处理的待办可以 release，并保持心跳在线。"
             "任何普通用户可见回复必须由你根据真实结构化事实撰写，传输层不得代写。"
         )
 
@@ -775,6 +803,69 @@ def _validated_required(value: str | None, name: str) -> str:
     if not normalized:
         raise CodexWorkerError(f"{name} is required")
     return normalized
+
+
+def _finish_turn(
+    database: Path,
+    *,
+    host: CodexThreadHost,
+    run_id: str,
+    status: str,
+    error: str | None,
+    evidence: TurnEvidence,
+    batch_required_reply: bool,
+) -> tuple[bool, str | None]:
+    required_tools = {"agent_wait"}
+    if (
+        evidence.required_reply_count_observed is not None
+        and len(evidence.mention_message_ids)
+        < evidence.required_reply_count_observed
+    ):
+        required_tools.add("all-personal-mentions-from-agent_wait-pages")
+    if batch_required_reply and evidence.required_reply_count_observed is None:
+        if not evidence.mention_message_ids:
+            required_tools.add("mention-delivery-from-agent_wait")
+    if evidence.mention_message_ids.difference(evidence.replied_message_ids):
+        required_tools.add("agent_reply-to-every-mentioned-message")
+    missing_tools = sorted(
+        tool
+        for tool in required_tools
+        if tool not in evidence.completed_bridge_tools
+    )
+    evidence_error = None
+    if missing_tools:
+        evidence_error = (
+            "Codex turn completed without required Agent Bridge tool evidence: "
+            + ", ".join(missing_tools)
+        )
+        if evidence.failed_bridge_tools:
+            evidence_error += "; failures: " + "; ".join(
+                evidence.failed_bridge_tools[-3:]
+            )
+    successful = status == "completed" and not missing_tools
+    if successful:
+        try:
+            host.acknowledge_optional_messages(evidence)
+        except Exception as exc:
+            successful = False
+            evidence_error = (
+                "Codex turn completed but deterministic optional-message "
+                f"ack failed: {exc}"
+            )
+    completion_error = (
+        None
+        if successful
+        else error
+        or evidence_error
+        or f"Codex turn ended with status {status}"
+    )
+    finish_adapter_run(
+        database,
+        adapter_run_id=run_id,
+        successful=successful,
+        error=completion_error,
+    )
+    return successful, completion_error
 
 
 def _host_from_args(args: argparse.Namespace) -> CodexThreadHost:
@@ -821,58 +912,20 @@ def run_session(args: argparse.Namespace) -> None:
                     if completion is None:
                         break
                     run_id, status, error, evidence = completion
-                    required_tools = {"agent_wait"}
                     batch_required_reply = mention_required_by_run.pop(run_id, False)
-                    if (
-                        evidence.required_reply_count_observed is not None
-                        and len(evidence.mention_message_ids)
-                        < evidence.required_reply_count_observed
-                    ):
-                        required_tools.add("all-personal-mentions-from-agent_wait-pages")
-                    if batch_required_reply and (
-                        evidence.required_reply_count_observed is None
-                    ):
-                        if not evidence.mention_message_ids:
-                            required_tools.add("mention-delivery-from-agent_wait")
-                    if evidence.mention_message_ids.difference(
-                        evidence.replied_message_ids
-                    ):
-                        required_tools.add("agent_reply-to-every-mentioned-message")
-                    if evidence.inspected_message_ids.difference(
-                        evidence.resolved_message_ids
-                    ):
-                        required_tools.add("ack-or-reply-to-every-inspected-message")
-                    missing_tools = sorted(
-                        tool
-                        for tool in required_tools
-                        if tool not in evidence.completed_bridge_tools
-                    )
-                    evidence_error = None
-                    if missing_tools:
-                        evidence_error = (
-                            "Codex turn completed without required Agent Bridge tool "
-                            f"evidence: {', '.join(missing_tools)}"
-                        )
-                        if evidence.failed_bridge_tools:
-                            evidence_error += "; failures: " + "; ".join(
-                                evidence.failed_bridge_tools[-3:]
-                            )
-                    successful = status == "completed" and not missing_tools
-                    finish_adapter_run(
+                    successful, completion_error = _finish_turn(
                         database,
-                        adapter_run_id=run_id,
-                        successful=successful,
-                        error=(
-                            error
-                            or evidence_error
-                            or f"Codex turn ended with status {status}"
-                        ),
+                        host=host,
+                        run_id=run_id,
+                        status=status,
+                        error=error,
+                        evidence=evidence,
+                        batch_required_reply=batch_required_reply,
                     )
                     if args.once and submitted_batches > 0:
                         if not successful:
                             raise CodexWorkerError(
-                                error
-                                or evidence_error
+                                completion_error
                                 or f"Codex turn ended with status {status}"
                             )
                         return

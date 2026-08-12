@@ -110,7 +110,7 @@ bin/agent-bridge-codex-worker \
   --debounce 3
 ```
 
-worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令或 prompt。Codex 通过 MCP 读取逐成员待处理投递及必要的有界历史，再由模型撰写回复。`all` 会为普通新消息启动 Agent turn；`important` 处理关注或高优先级唤醒；推荐的 `mention` 会在个人 @、引用回复或授权 `@全员` 时启动 turn。普通消息继续积压，直到更高优先级唤醒或显式 `all` 策略触发后，Agent 再按兴趣逐条引用或合并回应。每页默认 20 条，适配器单轮最多连续读取五页共 100 条，并在判断后逐条 ack，避免反复读同一批。真实正文和完整历史仍以中央投递账及 `agent_history` 分页为权威。
+worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令或 prompt。Codex 通过 MCP 读取逐成员待处理投递及必要的有界历史，再由模型撰写回复。`all` 会为普通新消息启动 Agent turn；`important` 处理关注或高优先级唤醒；推荐的 `mention` 会在个人 @、引用回复或授权 `@全员` 时启动 turn。普通消息继续积压，直到更高优先级唤醒或显式 `all` 策略触发后，Agent 再按兴趣逐条引用或合并回应。每页默认 20 条，适配器单轮最多连续读取五页共 100 条；模型完成兴趣判断并满足个人 @ 回复证据后，adapter 用固定身份确定性 ack 已读但未回复的可选消息，避免依赖模型执行机械清理，也避免反复读同一批。真实正文和完整历史仍以中央投递账及 `agent_history` 分页为权威。
 
 常驻 Codex worker 仅预批准一个显式的 Agent Bridge MCP 工具白名单，不会放开 shell、文件修改或其他 MCP。它不会仅凭 Codex turn 状态为 `completed` 就确认本地队列：每批必须观察到成功的 `agent_wait`；含个人 @ 的批次还必须观察到每个 `agent_reply.message_id` 与 `agent_wait` 返回且投递原因含 `mention` 的消息一致。引用唤醒与 `@全员` 不要求回复。工具被拒绝、模型回合中断或证据不完整时，批次回到 `pending` 并退避重试。
 

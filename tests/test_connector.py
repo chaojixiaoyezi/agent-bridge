@@ -344,3 +344,116 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     monkeypatch.setattr(claude_adapter.subprocess, "run", wrong_reply_run)
     with pytest.raises(claude_adapter.ClaudeAdapterError, match="message-42"):
         claude_adapter.run_claude(batch)
+
+
+def test_claude_adapter_deterministically_acks_optional_inspected_messages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    enrollment_file = tmp_path / "enrollment.token"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    enrollment_file.write_text("enroll_private\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_BRIDGE_URL", "https://bridge.example.test")
+    monkeypatch.setenv("AGENT_BRIDGE_PRODUCT", "claude-code")
+    monkeypatch.setenv("AGENT_BRIDGE_USERNAME", "值守者")
+    monkeypatch.setenv("AGENT_BRIDGE_SIGNATURE", "只处理通知。")
+    monkeypatch.setenv("AGENT_BRIDGE_CONVERSATION_ID", "测试群")
+    monkeypatch.setenv("AGENT_BRIDGE_MCP_COMMAND", str(mcp_command))
+    monkeypatch.setenv("AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE", str(enrollment_file))
+    monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_CWD", str(tmp_path))
+    monkeypatch.setattr(claude_adapter.shutil, "which", lambda _name: "/opt/bin/claude")
+
+    wait_result = {
+        "backlog": {"required_reply_count": 0},
+        "messages": [
+            {
+                "message_id": "message-optional",
+                "delivery": {
+                    "priority": "mention",
+                    "reasons": ["room_activity", "wake_all"],
+                },
+            },
+            {
+                "message_id": "message-ordinary",
+                "delivery": {
+                    "priority": "normal",
+                    "reasons": ["room_activity"],
+                },
+            },
+        ],
+    }
+
+    def completed_run(command, **kwargs):
+        events = [
+            {
+                "type": "tool_use",
+                "id": "wait-optional",
+                "name": "mcp__agent-bridge__agent_wait",
+                "input": {"wait_seconds": 0},
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "wait-optional",
+                "content": json.dumps(wait_result),
+            },
+        ]
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(json.dumps(item) for item in events),
+            stderr="",
+        )
+
+    completion_client = object()
+    captured: dict = {}
+
+    def make_client(**identity):
+        captured["identity"] = identity
+        return completion_client
+
+    def acknowledge(client, message_ids):
+        captured["client"] = client
+        captured["message_ids"] = set(message_ids)
+        return frozenset(message_ids)
+
+    monkeypatch.setattr(claude_adapter.subprocess, "run", completed_run)
+    monkeypatch.setattr(claude_adapter, "resident_http_client", make_client)
+    monkeypatch.setattr(claude_adapter, "acknowledge_messages", acknowledge)
+
+    claude_adapter.run_claude(
+        {
+            "schema_version": 1,
+            "source": "agent-bridge-supervisor",
+            "event": "wake_batch",
+            "event_count": 1,
+            "wake_priority": "mention",
+            "required_reply_count": 0,
+            "priority_counts": {"mention": 1},
+            "last_event_id": 52,
+        }
+    )
+
+    assert captured["client"] is completion_client
+    assert captured["message_ids"] == {
+        "message-optional",
+        "message-ordinary",
+    }
+    assert captured["identity"]["username"] == "值守者"
+
+    def failed_ack(client, message_ids):
+        raise RuntimeError("bridge unavailable")
+
+    monkeypatch.setattr(claude_adapter, "acknowledge_messages", failed_ack)
+    with pytest.raises(claude_adapter.ClaudeAdapterError, match="optional-message ack"):
+        claude_adapter.run_claude(
+            {
+                "schema_version": 1,
+                "source": "agent-bridge-supervisor",
+                "event": "wake_batch",
+                "event_count": 1,
+                "wake_priority": "mention",
+                "required_reply_count": 0,
+                "priority_counts": {"mention": 1},
+                "last_event_id": 53,
+            }
+        )
