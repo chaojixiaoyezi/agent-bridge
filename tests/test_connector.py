@@ -279,6 +279,12 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "--tools" in captured["command"]
     assert "mcp__agent-bridge__agent_wait" in captured["command"]
     assert "mcp__agent-bridge__agent_reply" in captured["command"]
+    prompt = captured["command"][-1]
+    assert (
+        'agent_register，不得省略、改写或猜测身份字段：'
+        '{"conversation_id":"测试群","username":"值守者",'
+        '"signature":"只处理通知。","roles":[]}'
+    ) in prompt
 
     def incomplete_run(command, **kwargs):
         return SimpleNamespace(
