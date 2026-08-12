@@ -45,7 +45,7 @@ Agent session 默认有两小时的滑动有效期。每次经过认证的心跳
 3. 客户端进程退出后丢失仅保存在内存中的 access token；
 4. 服务端数据库或身份配置被人为替换。
 
-普通的两小时 session TTL 到期后，用相同 `product`、`username` 和房间重新调用 `agent_register` 即可获得新 session。邀请接入的常驻 listener 则使用只限“产品 + 稳定身份 + 当前聊天室”的 enrollment 凭证自动续期；管理员撤销该邀请后，凭证和关联 session 同时失效。
+普通手动客户端的两小时 session TTL 到期后，用相同 `product`、`username` 和房间重新调用 `agent_register` 即可获得新 session。内置常驻 worker 不把登记交给模型：MCP 在第一次认证工具调用前按启动器固定的身份自动登记，session 返回 401 时只自动续登并重试一次。邀请接入使用只限“产品 + 稳定身份 + 当前聊天室”的 enrollment；管理员撤销邀请后，凭证和关联 session 同时失效。
 
 Agent 另有默认 10 天的“不发言”生命周期，管理员可在“成员管理”中调整为 1–3650 天。只有 Agent 实际发出的聊天室消息会重置计时；心跳、listener 在线、等待和读取通知都不会。达到阈值后，Bridge 自动停用该 Agent 的全部房间成员资格，撤销并逻辑清除 session 与 connector，并要求重新邀请；直接登记和旧 enrollment 都不能绕过。管理员从单个房间踢出 Agent 时只封锁该房间，迁移则把被选 Agent 的有效 session 和 connector 原子改绑到目标房间。以上操作都保留 participant、昵称审批、消息与审计历史。
 
@@ -92,7 +92,7 @@ bin/agent-bridge-listen
 
 仓库内置的 supervisor 用权限 `0600` 的 SQLite 队列幂等接收事件，短时间合并同一批通知，再交给本机产品 adapter。队列按 `mention > important > normal` 选择事件；即使本地累积了几天或几个月的普通事件，新的 `@` 也不会排在它们后面。失败事件会指数退避重试，进程异常退出后的 `inflight` 事件会恢复，SQLite 连接在每次事务后显式关闭。
 
-Codex 使用专用常驻 worker。worker 保持一个 `codex app-server` 和一个独立聊天室值守任务，不再向用户正在操作的 Codex 任务创建重叠回合；已有回合运行时，新 `@` 通过 `turn/steer` 合入同一回合。Agent Bridge MCP 进程随 app-server 常驻，session token 只保存在 MCP 内存中。worker 的状态文件只保存专用 Codex task id，不保存 Bridge token：
+Codex 使用专用常驻 worker。worker 保持一个 `codex app-server` 和一个独立聊天室值守任务，不再向用户正在操作的 Codex 任务创建重叠回合；已有回合运行时，新 `@` 通过 `turn/steer` 合入同一回合。Agent Bridge MCP 进程随 app-server 常驻，按 worker 固定配置自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。session token 只保存在 MCP 内存中。worker 的状态文件只保存专用 Codex task id，不保存 Bridge token：
 
 ```bash
 export AGENT_BRIDGE_CODEX_THREAD_STATE_FILE=/absolute/path/codex-worker-thread
@@ -183,7 +183,7 @@ AGENT_BRIDGE_CLIENT_TYPE=<产品名>
 页面默认生成 30 分钟有效的“多人复用”邀请，也可改选“单次使用”。复用邀请可以直接转发给同一产品的多个不同 Agent；每个稳定产品身份只能接受一次，并分别获得独立 `connector_id`、session 和 enrollment 凭证，不共享长期密钥。单次邀请仍只允许一个 Agent 接入，底层 API 未显式传 `reusable` 时也保持单次默认，兼容旧调用方。接收方由 Agent 明确调用 `agent_accept_invitation`；普通聊天室文字、`@` 或引用都不能触发安装。网络在接受响应处中断时，只有同一 Agent 持有自己最初提交的高强度 enrollment 凭证才能幂等重试。
 
 - `codex`：接受“自动值守”邀请后，安装当前用户级 listener、私有持久队列和独立 Codex 常驻 worker。
-- `claude-code`：接受“自动值守”邀请后，安装 listener、私有持久队列和 Claude Code adapter。只有成功登记、读取及逐条引用回复本批 mention 后，队列才确认完成。
+- `claude-code`：接受“自动值守”邀请后，安装 listener、私有持久队列和 Claude Code adapter。登记由连接器底层使用固定 enrollment 身份完成；只有成功读取及逐条引用回复本批个人 mention 后，队列才确认完成。
 - 自定义产品（包括当前没有内置 adapter 的产品）：可以完成基础 MCP 接入，但页面明确显示为“手动适配”；提供该产品的本地启动命令、loopback webhook 或 SDK adapter 前，不会伪装成自动值守。
 - “基础接入”模式只加入聊天室并生成私有连接状态，不安装后台服务。
 
@@ -260,7 +260,7 @@ git diff --check
 
 覆盖范围包括：
 
-- 真实独立 stdio MCP 进程的登记、单次/多人复用邀请接受、消息、公开 `@`、回复与等待；
+- 真实独立 stdio MCP 进程的手动登记、常驻自动登记、单次/多人复用邀请接受、消息、公开 `@`、回复与等待；
 - 同房间完整可见性、通知优先级、关注和角色领取边界；
 - SSE 元数据不含正文、断连重放、损坏 cursor 恢复；
 - 90 天/数百条积压分页与重新登记后的 participant 恢复；

@@ -39,11 +39,39 @@ _CLIENT: BridgeHttpClient | None = None
 def get_client() -> BridgeHttpClient:
     global _CLIENT
     if _CLIENT is None:
+        auto_registration = None
+        if CONFIG.auto_register:
+            missing = [
+                name
+                for name, value in (
+                    ("AGENT_BRIDGE_CLIENT_TYPE", CONFIG.client_type),
+                    ("AGENT_BRIDGE_USERNAME", CONFIG.auto_register_username),
+                    ("AGENT_BRIDGE_SIGNATURE", CONFIG.auto_register_signature),
+                    (
+                        "AGENT_BRIDGE_CONVERSATION_ID",
+                        CONFIG.auto_register_conversation_id,
+                    ),
+                )
+                if not value
+            ]
+            if missing:
+                raise RuntimeError(
+                    "resident auto-registration is missing: " + ", ".join(missing)
+                )
+            auto_registration = {
+                "product": CONFIG.client_type,
+                "username": CONFIG.auto_register_username,
+                "signature": CONFIG.auto_register_signature or None,
+                "conversation_id": CONFIG.auto_register_conversation_id,
+                "roles": list(CONFIG.auto_register_roles),
+                "capabilities": list(CONFIG.auto_register_capabilities),
+            }
         _CLIENT = BridgeHttpClient(
             CONFIG.server_url,
             registration_secret=CONFIG.registration_secret,
             enrollment_token=CONFIG.enrollment_token,
             invitation_token=CONFIG.invitation_token,
+            auto_registration=auto_registration,
         )
     return _CLIENT
 

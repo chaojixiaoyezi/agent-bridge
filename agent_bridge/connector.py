@@ -137,6 +137,7 @@ def _common_environment(
 ) -> dict[str, str]:
     return {
         "PYTHONUNBUFFERED": "1",
+        "AGENT_BRIDGE_AUTO_REGISTER": "1",
         "AGENT_BRIDGE_URL": bridge_url,
         "AGENT_BRIDGE_PRODUCT": product,
         "AGENT_BRIDGE_CLIENT_TYPE": product,

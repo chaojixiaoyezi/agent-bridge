@@ -258,6 +258,121 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
     asyncio.run(scenario())
 
 
+def test_real_stdio_residents_auto_register_for_open_and_enrolled_identity(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "bridge.db"
+        store = BridgeStore(database)
+        WebAuthStore(database)
+        store.create_user_room("中央值守群")
+        store.create_user_room("受邀值守群")
+        with store._connection() as connection:
+            admin_id = str(
+                connection.execute(
+                    "SELECT user_id FROM web_users WHERE username = 'admin'"
+                ).fetchone()[0]
+            )
+        invitation = store.create_agent_invitation(
+            conversation_id="受邀值守群",
+            product="claude-code",
+            requested_mode="resident",
+            adapter_kind="claude-code",
+            created_by_web_user_id=admin_id,
+        )
+        enrollment_token = "enroll_" + ("a" * 48)
+        accepted = store.accept_agent_invitation(
+            invitation_token=str(invitation["invitation_token"]),
+            product="claude-code",
+            username="受邀值守者",
+            signature="只按固定身份处理通知。",
+            roles=["reviewer"],
+            capabilities=["history"],
+            enrollment_token=enrollment_token,
+        )
+        sender = store.register_agent_session(
+            product="sender",
+            username="提醒者",
+            signature="发送测试提醒。",
+            conversation_id="受邀值守群",
+        )
+        sent = store.send(
+            authorized_session_id=str(sender["session_id"]),
+            sender_participant_id=str(sender["participant_id"]),
+            conversation_id="受邀值守群",
+            body_text="请检查自动登记是否绑定到正确 Agent。",
+            audience_kind="participant",
+            audience_value=str(accepted["participant_id"]),
+        )
+        enrollment_file = tmp_path / "enrollment.token"
+        enrollment_file.write_text(enrollment_token + "\n", encoding="utf-8")
+        enrollment_file.chmod(0o600)
+
+        no_secret_environment = {
+            "AGENT_BRIDGE_AUTO_REGISTER": "1",
+            "AGENT_BRIDGE_USERNAME": "中央值守者",
+            "AGENT_BRIDGE_SIGNATURE": "中央开放注册身份。",
+            "AGENT_BRIDGE_CONVERSATION_ID": "中央值守群",
+            "AGENT_BRIDGE_ROLES": "reviewer",
+            "AGENT_BRIDGE_CAPABILITIES": "history",
+            "AGENT_BRIDGE_ENROLLMENT_TOKEN": "",
+            "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": "",
+            "AGENT_BRIDGE_REGISTRATION_SECRET": "",
+            "AGENT_BRIDGE_REGISTRATION_SECRET_FILE": "",
+        }
+        with bridge_server(database) as server_url:
+            async with mcp_client(
+                server_url,
+                "codex",
+                extra_env=no_secret_environment,
+            ) as central:
+                central_wait = payload(
+                    await central.call_tool(
+                        "agent_wait",
+                        {"wait_seconds": 0},
+                    )
+                )
+                assert central_wait["messages"] == []
+
+            async with mcp_client(
+                server_url,
+                "claude-code",
+                extra_env={
+                    **no_secret_environment,
+                    "AGENT_BRIDGE_USERNAME": "受邀值守者",
+                    "AGENT_BRIDGE_SIGNATURE": "只按固定身份处理通知。",
+                    # Enrollment remains authoritative after a room rename, even
+                    # while an older local service still carries the former name.
+                    "AGENT_BRIDGE_CONVERSATION_ID": "本地旧聊天室名",
+                    "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
+                },
+            ) as resident:
+                received = payload(
+                    await resident.call_tool(
+                        "agent_wait",
+                        {"wait_seconds": 0},
+                    )
+                )
+                assert received["messages"][0]["message_id"] == sent["message_id"]
+
+        with store._connection() as connection:
+            central_identity = connection.execute(
+                "SELECT participant_id FROM participants WHERE client_type = ?",
+                ("codex-中央值守者",),
+            ).fetchone()
+            connector_sessions = connection.execute(
+                "SELECT participant_id FROM agent_sessions WHERE connector_id = ?",
+                (accepted["connector_id"],),
+            ).fetchall()
+        assert central_identity is not None
+        assert len(connector_sessions) == 2
+        assert {str(row["participant_id"]) for row in connector_sessions} == {
+            str(accepted["participant_id"])
+        }
+
+    asyncio.run(scenario())
+
+
 def test_real_stdio_mcp_reuses_basic_invitation_and_keeps_secrets_private(
     tmp_path: Path,
 ) -> None:

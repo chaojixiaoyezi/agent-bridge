@@ -16,6 +16,12 @@ class BridgeConfig:
     registration_secret: str | None
     invitation_token: str | None
     enrollment_token: str | None
+    auto_register: bool
+    auto_register_username: str
+    auto_register_signature: str
+    auto_register_conversation_id: str
+    auto_register_roles: tuple[str, ...]
+    auto_register_capabilities: tuple[str, ...]
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -50,6 +56,23 @@ class BridgeConfig:
             registration_secret=read_registration_secret(),
             invitation_token=read_invitation_token(),
             enrollment_token=read_enrollment_token(),
+            auto_register=_truthy(os.environ.get("AGENT_BRIDGE_AUTO_REGISTER")),
+            auto_register_username=os.environ.get(
+                "AGENT_BRIDGE_USERNAME",
+                "",
+            ).strip(),
+            auto_register_signature=os.environ.get(
+                "AGENT_BRIDGE_SIGNATURE",
+                "",
+            ).strip(),
+            auto_register_conversation_id=os.environ.get(
+                "AGENT_BRIDGE_CONVERSATION_ID",
+                "",
+            ).strip(),
+            auto_register_roles=_split_tokens(os.environ.get("AGENT_BRIDGE_ROLES")),
+            auto_register_capabilities=_split_tokens(
+                os.environ.get("AGENT_BRIDGE_CAPABILITIES")
+            ),
         )
 
 
@@ -114,3 +137,11 @@ def _bounded_float(
     except (TypeError, ValueError):
         parsed = default
     return min(max(parsed, minimum), maximum)
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _split_tokens(value: str | None) -> tuple[str, ...]:
+    return tuple(item.strip() for item in str(value or "").split(",") if item.strip())

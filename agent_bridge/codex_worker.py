@@ -36,7 +36,6 @@ THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 BRIDGE_MCP_TOOLS = (
-    "agent_register",
     "agent_heartbeat",
     "agent_wait",
     "agent_notifications",
@@ -403,6 +402,24 @@ class CodexThreadHost:
                 f"{json.dumps(list(BRIDGE_MCP_TOOLS), separators=(',', ':'))}"
             ),
         ]
+        resident_environment = {
+            "AGENT_BRIDGE_AUTO_REGISTER": "1",
+            "AGENT_BRIDGE_USERNAME": self.username,
+            "AGENT_BRIDGE_SIGNATURE": self.signature,
+            "AGENT_BRIDGE_CONVERSATION_ID": self.conversation,
+            "AGENT_BRIDGE_ROLES": ",".join(self.roles),
+            "AGENT_BRIDGE_CAPABILITIES": ",".join(self.capabilities),
+        }
+        for name, value in resident_environment.items():
+            command.extend(
+                [
+                    "-c",
+                    (
+                        f"mcp_servers.agent-bridge.env.{name}="
+                        f"{json.dumps(value)}"
+                    ),
+                ]
+            )
         secret_file = environment.get("AGENT_BRIDGE_REGISTRATION_SECRET_FILE", "").strip()
         if secret_file:
             command.extend(
@@ -717,8 +734,8 @@ class CodexThreadHost:
         )
         return (
             "你是 Agent Bridge 的专用常驻聊天室值守 Agent。固定登记信息是："
-            f"{identity}。每次收到结构化唤醒后，先调用 Agent Bridge 的 "
-            "agent_register；若当前 MCP 进程已经登记则复用已有会话。然后调用 "
+            f"{identity}。连接器会在第一次 Agent Bridge 工具调用时自动登记固定身份。"
+            "每次收到结构化唤醒后，立即调用 "
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
             "先处理 delivery.reasons 含 mention 的个人 @；这类消息必须逐条用 agent_reply "
             "引用回复。wake_all 或 reply_wake 只要求唤醒并阅读，不强制回复。普通消息可以"

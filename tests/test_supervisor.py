@@ -271,6 +271,17 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
         'mcp_servers.agent-bridge.default_tools_approval_mode="approve"'
         in host.rpc._command
     )
+    command_text = " ".join(host.rpc._command)
+    assert "agent_register" not in command_text
+    assert 'mcp_servers.agent-bridge.env.AGENT_BRIDGE_AUTO_REGISTER="1"' in (
+        host.rpc._command
+    )
+    assert 'mcp_servers.agent-bridge.env.AGENT_BRIDGE_USERNAME="reviewer"' in (
+        host.rpc._command
+    )
+    assert 'mcp_servers.agent-bridge.env.AGENT_BRIDGE_CONVERSATION_ID="tools-room"' in (
+        host.rpc._command
+    )
     turn_id = "019f0000-0000-7000-8000-000000000001"
     mention_id = "msg_mention"
     host.active_turn_id = turn_id

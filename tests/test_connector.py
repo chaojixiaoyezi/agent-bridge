@@ -82,7 +82,9 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert listener["EnvironmentVariables"][
         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE"
     ] == str(enrollment_file)
+    assert listener["EnvironmentVariables"]["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert listener["EnvironmentVariables"]["AGENT_BRIDGE_WAKE_POLICY"] == "all"
+    assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AGENT_WAKE_POLICY"] == (
         "mention"
     )
@@ -202,12 +204,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
                     "content": [
                         {
                             "type": "tool_use",
-                            "id": "register-1",
-                            "name": "mcp__agent-bridge__agent_register",
-                            "input": {},
-                        },
-                        {
-                            "type": "tool_use",
                             "id": "wait-1",
                             "name": "mcp__agent-bridge__agent_wait",
                             "input": {"wait_seconds": 0},
@@ -225,11 +221,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
                 "type": "user",
                 "message": {
                     "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "register-1",
-                            "content": "{}",
-                        },
                         {
                             "type": "tool_result",
                             "tool_use_id": "wait-1",
@@ -279,12 +270,25 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "--tools" in captured["command"]
     assert "mcp__agent-bridge__agent_wait" in captured["command"]
     assert "mcp__agent-bridge__agent_reply" in captured["command"]
+    assert "mcp__agent-bridge__agent_register" not in captured["command"]
+    config_index = captured["command"].index("--mcp-config") + 1
+    mcp_environment = json.loads(captured["command"][config_index])["mcpServers"][
+        "agent-bridge"
+    ]["env"]
+    assert mcp_environment == {
+        "AGENT_BRIDGE_URL": "https://bridge.example.test",
+        "AGENT_BRIDGE_CLIENT_TYPE": "claude-code",
+        "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
+        "AGENT_BRIDGE_AUTO_REGISTER": "1",
+        "AGENT_BRIDGE_USERNAME": "值守者",
+        "AGENT_BRIDGE_SIGNATURE": "只处理通知。",
+        "AGENT_BRIDGE_CONVERSATION_ID": "测试群",
+        "AGENT_BRIDGE_ROLES": "",
+        "AGENT_BRIDGE_CAPABILITIES": "",
+    }
     prompt = captured["command"][-1]
-    assert (
-        'agent_register，不得省略、改写或猜测身份字段：'
-        '{"conversation_id":"测试群","username":"值守者",'
-        '"signature":"只处理通知。","roles":[]}'
-    ) in prompt
+    assert "连接器会在第一次工具调用时自动登记固定身份" in prompt
+    assert "agent_register" not in prompt
 
     def incomplete_run(command, **kwargs):
         return SimpleNamespace(
@@ -308,12 +312,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
         events = [
             {
                 "type": "tool_use",
-                "id": "register-2",
-                "name": "mcp__agent-bridge__agent_register",
-                "input": {},
-            },
-            {
-                "type": "tool_use",
                 "id": "wait-2",
                 "name": "mcp__agent-bridge__agent_wait",
                 "input": {},
@@ -323,11 +321,6 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
                 "id": "reply-2",
                 "name": "mcp__agent-bridge__agent_reply",
                 "input": {"message_id": "another-message"},
-            },
-            {
-                "type": "tool_result",
-                "tool_use_id": "register-2",
-                "content": "{}",
             },
             {
                 "type": "tool_result",

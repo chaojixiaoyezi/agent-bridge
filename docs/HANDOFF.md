@@ -84,7 +84,7 @@ Agent 第一次处理积压时：
 
 Codex worker 使用独立 task，不 resume 用户正在操作的任务。一个 `codex app-server` 和 Agent Bridge MCP 长驻；有活动 turn 时新唤醒通过 `turn/steer` 合入，避免并发重入。
 
-worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设置 `default_tools_approval_mode=approve`。这项预批准只覆盖 Bridge 登记、读取、回复、ack、心跳和历史工具；shell、文件修改、其他 MCP 与生产操作没有被批准。
+worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设置 `default_tools_approval_mode=approve`。身份登记由 MCP 底层按启动器固定字段自动完成，`agent_register` 不在模型白名单；预批准只覆盖读取、回复、ack、心跳和历史工具，shell、文件修改、其他 MCP 与生产操作没有被批准。
 
 本地批次的成功条件：
 
@@ -95,7 +95,7 @@ worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设
 
 这避免了“模型回合完成，但所有 MCP 工具其实被拒绝”仍被误记 handled 的故障。
 
-Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 Agent Bridge MCP 白名单。它解析 Claude Code 的 stream-json，将 tool use 与对应的非错误 tool result 按 id 配对；含必须回复的个人 mention 的批次还要求 `agent_wait` 返回的每个对应 message_id 都出现在成功的 `agent_reply` 输入中。`reply_wake`/`wake_all` 不做此要求。尝试调用但被拒绝、工具返回错误或回复了另一条个人 @ 都必须使 adapter 非零退出，由 supervisor 保留并重试本地事件。
+Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 Agent Bridge MCP 白名单。固定身份和 enrollment 直接进入该 MCP 的私有环境，模型不调用 `agent_register`。adapter 解析 Claude Code 的 stream-json，将 tool use 与对应的非错误 tool result 按 id 配对；含必须回复的个人 mention 的批次还要求 `agent_wait` 返回的每个对应 message_id 都出现在成功的 `agent_reply` 输入中。`reply_wake`/`wake_all` 不做此要求。尝试调用但被拒绝、工具返回错误或回复了另一条个人 @ 都必须使 adapter 非零退出，由 supervisor 保留并重试本地事件。
 
 ## 6. 部署与升级顺序
 
@@ -149,7 +149,7 @@ launchctl print gui/$(id -u)/com.example.agent-bridge-supervisor
 2. listener 与 worker 都由守护进程保持运行；
 3. 用户在真实房间发送一条结构化 @；
 4. 本地队列先出现 `pending/inflight`，最终变成 `handled`；
-5. 专用 Agent task 中 `agent_register`、`agent_wait`、`agent_reply` 成功；
+5. 固定 participant 自动登记成功，专用 Agent task 中 `agent_wait`、`agent_reply` 成功，且模型工具记录中没有 `agent_register`；
 6. 聊天室出现引用该 @ 的真实回复；
 7. 重启 listener/worker 后没有丢消息，队列没有永久 `inflight`。
 8. 新邀请只在接受后创建 connector，页面能区分 session 有效、resident 在线、resident 离线和手动适配；撤销后旧 enrollment 返回 401。
@@ -168,7 +168,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - `user rejected MCP tool call`：确认运行的是新 Codex worker，并检查命令含 Bridge MCP 白名单和 `default_tools_approval_mode="approve"`。
 - `required MCP servers failed to initialize` 或 launchd 日志出现 `uv: No such file or directory`：守护进程不能依赖交互 shell 的 PATH；仓库 `bin/agent-bridge-mcp` 应直接使用项目 `.venv/bin/python`。
 - 连续 `sampling request timed out`：是模型连接延迟；消息仍在 inflight/pending。不要手工改成 handled。
-- 401/session 失效：旧式 listener/MCP 用相同稳定身份重新 `agent_register`；邀请型 connector 使用 enrollment 自动登记。若 enrollment 也返回 401，检查管理员是否已撤销邀请；不要回退到全局登记密钥绕过撤销。participant、历史、关注和未 ack 投递不丢。
+- 401/session 失效：手动旧客户端用相同稳定身份重新 `agent_register`；内置常驻 MCP 会按固定身份自动续登一次，邀请型 connector 使用 enrollment。若 enrollment 也返回 401，检查管理员是否已撤销邀请；不要回退到全局登记密钥绕过撤销。participant、历史、关注和未 ack 投递不丢。
 - Web 页面 401：Cookie 缺失、过期或已注销，重新登录；初始管理员登录后若 `/api/rooms` 返回 403，先完成强制改密。
 - 普通 Web 用户建房返回 403：先检查管理员是否授权及配额；改名、踢人、迁移、查看 Agent session 或审批昵称返回 403 仍是角色边界，不要通过放宽同源校验绕过。
 - Web 用户或 Agent 429：先在管理员“发言频率”页面核对整体值、单独值和当前生效值。规则按“同一发送者、同一房间”隔离，整体与单独设置取时间较短者；管理员 Web 用户始终不限频。

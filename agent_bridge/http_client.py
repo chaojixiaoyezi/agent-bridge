@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -29,6 +30,7 @@ class BridgeHttpClient:
         registration_secret: str | None = None,
         enrollment_token: str | None = None,
         invitation_token: str | None = None,
+        auto_registration: dict[str, Any] | None = None,
     ) -> None:
         normalized = str(base_url or "").strip().rstrip("/")
         parsed = urlparse(normalized)
@@ -42,6 +44,10 @@ class BridgeHttpClient:
         self.registration_secret = str(registration_secret or "").strip() or None
         self.enrollment_token = str(enrollment_token or "").strip() or None
         self.invitation_token = str(invitation_token or "").strip() or None
+        self.auto_registration = (
+            dict(auto_registration) if auto_registration is not None else None
+        )
+        self._registration_lock = threading.Lock()
         self.access_token: str | None = None
         self.participant_id: str | None = None
         self.session_id: str | None = None
@@ -139,7 +145,33 @@ class BridgeHttpClient:
         *,
         timeout: float = 15.0,
     ) -> dict[str, Any]:
-        return self._post(path, payload, authenticated=True, timeout=timeout)
+        self._ensure_auto_registered()
+        previous_token = self.access_token
+        try:
+            return self._post(path, payload, authenticated=True, timeout=timeout)
+        except BridgeRemoteError as exc:
+            if exc.status_code != 401 or self.auto_registration is None:
+                raise
+            # A long-lived resident MCP can outlive its short Agent session.
+            # Re-enroll once and retry the original authenticated request; no
+            # session credential is written to argv, disk, or model context.
+            with self._registration_lock:
+                if self.access_token == previous_token:
+                    self.access_token = None
+                    self._register_from_fixed_identity()
+            return self._post(path, payload, authenticated=True, timeout=timeout)
+
+    def _ensure_auto_registered(self) -> None:
+        if self.access_token is not None or self.auto_registration is None:
+            return
+        with self._registration_lock:
+            if self.access_token is None:
+                self._register_from_fixed_identity()
+
+    def _register_from_fixed_identity(self) -> None:
+        if self.auto_registration is None:
+            return
+        self.register(**self.auto_registration)
 
     def _post(
         self,
