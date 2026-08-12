@@ -34,6 +34,8 @@ DEFAULT_ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
 DEFAULT_ADMIN_PARTICIPANT_ID = "participant_web_owner"
 DEFAULT_ADMIN_CLIENT_TYPE = "web-user"
+DEFAULT_WEB_USER_ROOM_LIMIT = 2
+MAX_WEB_USER_ROOM_LIMIT = 100
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$")
 CAPTCHA_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -85,6 +87,10 @@ CREATE TABLE IF NOT EXISTS web_users (
     must_change_password INTEGER NOT NULL DEFAULT 0
         CHECK (must_change_password IN (0, 1)),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    can_create_rooms INTEGER NOT NULL DEFAULT 0
+        CHECK (can_create_rooms IN (0, 1)),
+    room_limit INTEGER NOT NULL DEFAULT 2
+        CHECK (room_limit BETWEEN 1 AND 100),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     password_changed_at REAL,
@@ -284,6 +290,7 @@ class WebAuthStore:
     def _initialize(self) -> None:
         with self._connection() as connection:
             connection.executescript(WEB_AUTH_SCHEMA)
+            self._migrate_room_permissions_locked(connection)
         now = time.time()
         with self._transaction() as connection:
             existing = connection.execute(
@@ -336,6 +343,24 @@ class WebAuthStore:
                     signature=signature,
                     now=now,
                 )
+
+    @staticmethod
+    def _migrate_room_permissions_locked(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(web_users)").fetchall()
+        }
+        if "can_create_rooms" not in columns:
+            connection.execute(
+                "ALTER TABLE web_users ADD COLUMN can_create_rooms INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (can_create_rooms IN (0, 1))"
+            )
+        if "room_limit" not in columns:
+            connection.execute(
+                "ALTER TABLE web_users ADD COLUMN room_limit INTEGER "
+                f"NOT NULL DEFAULT {DEFAULT_WEB_USER_ROOM_LIMIT} "
+                f"CHECK (room_limit BETWEEN 1 AND {MAX_WEB_USER_ROOM_LIMIT})"
+            )
 
     @staticmethod
     def _insert_participant_locked(
@@ -519,7 +544,8 @@ class WebAuthStore:
                 """
                 SELECT session.*, user.username, user.role, user.participant_id,
                        user.display_name, user.signature, user.must_change_password,
-                       user.active, user.created_at AS user_created_at,
+                       user.active, user.can_create_rooms, user.room_limit,
+                       user.created_at AS user_created_at,
                        user.password_changed_at, user.last_login_at
                 FROM web_sessions AS session
                 JOIN web_users AS user ON user.user_id = session.user_id
@@ -777,6 +803,12 @@ class WebAuthStore:
             "display_name": str(row["display_name"]),
             "signature": str(row["signature"]),
             "must_change_password": bool(row["must_change_password"]),
+            "can_create_rooms": (
+                True
+                if str(row["role"]) == "admin"
+                else bool(row["can_create_rooms"])
+            ),
+            "room_limit": int(row["room_limit"]),
             "created_at": float(
                 row["user_created_at"]
                 if "user_created_at" in keys

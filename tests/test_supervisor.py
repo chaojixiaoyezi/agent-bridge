@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent_bridge.codex_adapter as codex_adapter
+from agent_bridge.claude_adapter import _tool_evidence
 from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
 from agent_bridge.codex_worker import CodexThreadHost, TurnEvidence
 from agent_bridge.supervisor import (
@@ -20,7 +21,12 @@ from agent_bridge.supervisor import (
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 
 
-def wake_event(*, event_id: int, priority: str = "normal") -> bytes:
+def wake_event(
+    *,
+    event_id: int,
+    priority: str = "normal",
+    required_reply_count: int = 0,
+) -> bytes:
     return json.dumps(
         {
             "schema_version": 1,
@@ -30,6 +36,7 @@ def wake_event(*, event_id: int, priority: str = "normal") -> bytes:
             "participant_id": "participant_receiver",
             "cursor": event_id,
             "wake_priority": priority,
+            "required_reply_count": required_reply_count,
             "has_new": True,
             "has_room_activity": True,
             "backlog": {
@@ -116,7 +123,45 @@ def test_supervisor_defers_normal_then_coalesces_it_with_a_mention(
         "important": 0,
         "mention": 1,
     }
+    assert batch["required_reply_count"] == 0
     assert queue_status(database)["counts"]["handled"] == 2
+
+
+def test_supervisor_uses_largest_mandatory_backlog_snapshot(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wake-queue.db"
+    captured = tmp_path / "batch.json"
+    writer = (
+        str(BRIDGE_ROOT / ".venv" / "bin" / "python"),
+        "-c",
+        (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        ),
+        str(captured),
+    )
+    enqueue_event(
+        database,
+        wake_event(event_id=52, priority="mention", required_reply_count=2),
+        now=10,
+    )
+    enqueue_event(
+        database,
+        wake_event(event_id=53, priority="mention", required_reply_count=3),
+        now=11,
+    )
+
+    assert process_once(
+        database,
+        adapter_command=writer,
+        wake_policy="mention",
+        debounce=0,
+        adapter_timeout=5,
+        now=20,
+    ) == 2
+    batch = json.loads(captured.read_text(encoding="utf-8"))
+    assert batch["required_reply_count"] == 3
 
 
 def test_supervisor_retries_adapter_failure_without_losing_event(
@@ -293,3 +338,68 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     assert evidence.completed_bridge_tools == {"agent_wait", "agent_reply"}
     assert evidence.mention_message_ids == {mention_id}
     assert evidence.replied_message_ids == {mention_id}
+
+
+def test_worker_evidence_distinguishes_optional_wakes_and_tracks_ack() -> None:
+    optional_id = "msg_optional_wake"
+    ordinary_id = "msg_ordinary"
+    events = [
+        {
+            "type": "tool_use",
+            "id": "wait-optional",
+            "name": "mcp__agent-bridge__agent_wait",
+            "input": {"wait_seconds": 0},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "wait-optional",
+            "content": json.dumps(
+                {
+                    "backlog": {"required_reply_count": 0},
+                    "messages": [
+                        {
+                            "message_id": optional_id,
+                            "delivery": {
+                                "priority": "mention",
+                                "reasons": ["room_activity", "wake_all"],
+                            },
+                        },
+                        {
+                            "message_id": ordinary_id,
+                            "delivery": {
+                                "priority": "normal",
+                                "reasons": ["room_activity"],
+                            },
+                        },
+                    ],
+                }
+            ),
+        },
+        {
+            "type": "tool_use",
+            "id": "ack-optional",
+            "name": "mcp__agent-bridge__agent_message_action",
+            "input": {"message_id": optional_id, "action": "ack"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "ack-optional",
+            "content": "{}",
+        },
+        {
+            "type": "tool_use",
+            "id": "ack-ordinary",
+            "name": "mcp__agent-bridge__agent_message_action",
+            "input": {"message_id": ordinary_id, "action": "ack"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "ack-ordinary",
+            "content": "{}",
+        },
+    ]
+    evidence = _tool_evidence("\n".join(json.dumps(item) for item in events))
+    assert evidence.awaited_mentions == frozenset()
+    assert evidence.inspected_messages == {optional_id, ordinary_id}
+    assert evidence.resolved_messages == {optional_id, ordinary_id}
+    assert evidence.required_reply_count_observed == 0

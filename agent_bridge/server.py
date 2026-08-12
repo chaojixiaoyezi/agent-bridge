@@ -343,8 +343,9 @@ def agent_history(
     limit: int = 50,
     before_sequence: int | None = None,
     after_sequence: int | None = None,
+    around_sequence: int | None = None,
 ) -> dict[str, Any]:
-    """Read bounded history for a room this session has joined."""
+    """Read bounded joined-room history, optionally centered on one sequence."""
     return get_client().post(
         "/agent/history",
         {
@@ -352,6 +353,39 @@ def agent_history(
             "limit": limit,
             "before_sequence": before_sequence,
             "after_sequence": after_sequence,
+            "around_sequence": around_sequence,
+        },
+    )
+
+
+@MCP.tool()
+def agent_search_history(
+    conversation_id: str,
+    query: str = "",
+    message_id: str | None = None,
+    sequence: int | None = None,
+    sender_participant_id: str | None = None,
+    created_after: float | None = None,
+    created_before: float | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Search messages in a joined room without changing unread state.
+
+    Use query for local text terms or exact message/sequence, sender, and Unix-time
+    filters. Results are newest first, default to 10, and are capped at 20. Use
+    agent_history(around_sequence=result.sequence) for nearby context.
+    """
+    return get_client().post(
+        "/agent/history/search",
+        {
+            "conversation_id": conversation_id,
+            "query": query,
+            "message_id": message_id,
+            "sequence": sequence,
+            "sender_participant_id": sender_participant_id,
+            "created_after": created_after,
+            "created_before": created_before,
+            "limit": limit,
         },
     )
 

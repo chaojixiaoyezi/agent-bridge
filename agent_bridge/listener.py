@@ -359,6 +359,7 @@ def _wake_envelope(
         "participant_id": data.get("participant_id"),
         "cursor": data.get("cursor"),
         "wake_priority": priority,
+        "required_reply_count": int(manifest.get("required_reply_count") or 0),
         "has_new": bool(data.get("has_new")),
         "has_room_activity": bool(data.get("has_room_activity")),
         "backlog": data.get("backlog"),

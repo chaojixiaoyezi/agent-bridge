@@ -277,6 +277,9 @@ class ViewerRepository:
                     creator.client_type AS creator_client_type,
                     creator.session_alias AS creator_session_alias,
                     creator.display_name AS creator_display_name
+                    , ownership.web_user_id AS owner_web_user_id
+                    , owner.username AS owner_username
+                    , owner.display_name AS owner_display_name
                 FROM rooms AS room
                 LEFT JOIN membership_stats AS ms
                   ON ms.conversation_id = room.conversation_id
@@ -288,6 +291,10 @@ class ViewerRepository:
                   ON sender.participant_id = latest.sender_participant_id
                 LEFT JOIN participants AS creator
                   ON creator.participant_id = room.creator_participant_id
+                LEFT JOIN room_web_owners AS ownership
+                  ON ownership.conversation_id = room.conversation_id
+                LEFT JOIN web_users AS owner
+                  ON owner.user_id = ownership.web_user_id
                 ORDER BY
                     CASE WHEN room.status = 'active' THEN 0 ELSE 1 END,
                     room.last_activity_at DESC,
@@ -309,6 +316,13 @@ class ViewerRepository:
                 "creator_client_type": str(row["creator_client_type"] or ""),
                 "creator_session_alias": str(row["creator_session_alias"] or ""),
                 "creator_display_name": str(row["creator_display_name"] or ""),
+                "owner_web_user_id": (
+                    str(row["owner_web_user_id"])
+                    if row["owner_web_user_id"] is not None
+                    else None
+                ),
+                "owner_username": str(row["owner_username"] or ""),
+                "owner_display_name": str(row["owner_display_name"] or ""),
                 "participant_count": int(row["participant_count"] or 0),
                 "active_participant_count": int(
                     row["active_participant_count"] or 0
@@ -528,6 +542,11 @@ class ViewerRepository:
                     "SELECT revision FROM message_rate_state WHERE singleton = 1"
                 ).fetchone()[0]
             )
+            web_user_permission_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(updated_at), 0) FROM web_users"
+                ).fetchone()[0]
+            )
         return {
             "cursor": max(cursor, global_sequence),
             "changed_rooms": changed_rooms,
@@ -543,6 +562,7 @@ class ViewerRepository:
                 session_clear_revision,
                 room_revision,
                 connector_revision,
+                web_user_permission_revision,
                 rate_revision,
             ],
             "server_time": now,
@@ -714,6 +734,7 @@ class ViewerRepository:
             "body": str(row["body"]),
             "refs": json.loads(str(row["refs_json"])),
             "mentions": json.loads(str(row["mentions_json"] or "[]")),
+            "wake_all_agents": bool(row["wake_all_agents"]),
             "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
             "status": str(row["status"]),
             "claimed_by": str(row["claimed_by"]) if row["claimed_by"] else None,

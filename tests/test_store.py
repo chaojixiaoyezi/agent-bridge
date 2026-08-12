@@ -12,6 +12,7 @@ from agent_bridge.store import (
     MESSAGE_COOLDOWN_SECONDS,
     ROOM_ABANDON_AFTER_SECONDS,
     AuthenticationError,
+    AuthorizationError,
     BridgeStore,
     ConflictError,
     NicknameRateLimitError,
@@ -109,6 +110,235 @@ def expire_sender_cooldown(
                 "WHERE message_id = ?",
                 (MESSAGE_COOLDOWN_SECONDS + 1.0, latest["message_id"]),
             )
+
+
+def register_web_identity(
+    auth: WebAuthStore,
+    *,
+    username: str,
+) -> dict:
+    captcha = auth.create_captcha()
+    identity, _token = auth.register(
+        username=username,
+        password="MemberSecure1!",
+        captcha_id=str(captcha["captcha_id"]),
+        captcha_answer="ABCDE",
+    )
+    return identity
+
+
+def test_web_room_owner_permission_limit_and_optional_wake_all(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(
+        store.database,
+        captcha_generator=lambda: "ABCDE",
+    )
+    owner = register_web_identity(auth, username="room-owner")
+    outsider = register_web_identity(auth, username="room-outsider")
+    admin_id = admin_web_user_id(store)
+
+    with pytest.raises(AuthorizationError, match="创建聊天室"):
+        store.create_web_user_room(
+            authorized_session_id=str(owner["session_id"]),
+            web_user_id=str(owner["user_id"]),
+            participant_id=str(owner["participant_id"]),
+            conversation_id="所有者聊天室",
+        )
+
+    permission = store.update_web_user_room_permission(
+        requesting_web_user_id=admin_id,
+        target_web_user_id=str(owner["user_id"]),
+        can_create_rooms=True,
+        room_limit=1,
+    )
+    assert permission["can_create_rooms"] is True
+    assert permission["room_limit"] == 1
+    created = store.create_web_user_room(
+        authorized_session_id=str(owner["session_id"]),
+        web_user_id=str(owner["user_id"]),
+        participant_id=str(owner["participant_id"]),
+        conversation_id="所有者聊天室",
+    )
+    assert created["is_room_owner"] is True
+    with pytest.raises(ConflictError, match="maximum of 1"):
+        store.create_web_user_room(
+            authorized_session_id=str(owner["session_id"]),
+            web_user_id=str(owner["user_id"]),
+            participant_id=str(owner["participant_id"]),
+            conversation_id="超过上限聊天室",
+        )
+
+    first_agent = register(
+        store,
+        client="codex",
+        name="全员甲",
+        room="所有者聊天室",
+    )
+    second_agent = register(
+        store,
+        client="claude-code",
+        name="全员乙",
+        room="所有者聊天室",
+    )
+    wake = store.send_web_message(
+        authorized_session_id=str(owner["session_id"]),
+        participant_id=str(owner["participant_id"]),
+        conversation_id="所有者聊天室",
+        body_text="请大家查看当前议题。",
+        wake_all_agents=True,
+    )
+    assert wake["wake_all_agents"] is True
+    for agent in (first_agent, second_agent):
+        notification = store.notification_snapshot(
+            participant_id=agent["participant_id"],
+            authorized_session_id=agent["session_id"],
+            after_sequence=0,
+        )
+        assert notification["backlog"]["required_reply_count"] == 0
+        delivered = store.wait_messages(
+            participant_id=agent["participant_id"],
+            authorized_session_id=agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        wake_delivery = next(
+            item for item in delivered if item["message_id"] == wake["message_id"]
+        )["delivery"]
+        assert wake_delivery["priority"] == "mention"
+        assert "wake_all" in wake_delivery["reasons"]
+        assert "mention" not in wake_delivery["reasons"]
+
+    with pytest.raises(AuthorizationError, match="聊天室创建者"):
+        store.send_web_message(
+            authorized_session_id=str(outsider["session_id"]),
+            participant_id=str(outsider["participant_id"]),
+            conversation_id="所有者聊天室",
+            body_text="无权限的结构化全员通知。",
+            wake_all_agents=True,
+        )
+    with pytest.raises(AuthorizationError, match="Agent"):
+        store.send(
+            authorized_session_id=first_agent["session_id"],
+            sender_participant_id=first_agent["participant_id"],
+            conversation_id="所有者聊天室",
+            body_text="Agent 不能主动结构化全员。",
+            wake_all_agents=True,
+        )
+
+
+def test_reply_wakes_original_agent_without_making_reply_mandatory(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    original_agent = register(store, client="codex", name="原消息者")
+    replying_agent = register(store, client="claude-code", name="引用者")
+    observer = register(store, client="opencode", name="旁观者")
+    original = store.send(
+        authorized_session_id=original_agent["session_id"],
+        sender_participant_id=original_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="这是一个普通群聊话题。",
+    )
+    reply = store.send(
+        authorized_session_id=replying_agent["session_id"],
+        sender_participant_id=replying_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="我引用这条继续讨论。",
+        reply_to=original["message_id"],
+    )
+
+    notification = store.notification_snapshot(
+        participant_id=original_agent["participant_id"],
+        authorized_session_id=original_agent["session_id"],
+        after_sequence=original["sequence"],
+    )
+    assert notification["new_since_cursor"]["priority_counts"]["mention"] == 1
+    assert notification["new_since_cursor"]["required_reply_count"] == 0
+    delivered = store.wait_messages(
+        participant_id=original_agent["participant_id"],
+        authorized_session_id=original_agent["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    reply_delivery = next(
+        item for item in delivered if item["message_id"] == reply["message_id"]
+    )["delivery"]
+    assert reply_delivery["reasons"] == [
+        "room_activity",
+        "audience:room",
+        "reply_wake",
+    ]
+    assert reply_delivery["priority"] == "mention"
+    observer_delivery = next(
+        item
+        for item in store.wait_messages(
+            participant_id=observer["participant_id"],
+            authorized_session_id=observer["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == reply["message_id"]
+    )["delivery"]
+    assert observer_delivery["priority"] == "normal"
+
+
+def test_history_search_finds_old_context_without_consuming_backlog(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="历史发送者")
+    reader = register(store, client="codex", name="历史检索者")
+    sent_messages = []
+    for index in range(25):
+        sent_messages.append(
+            store.send(
+                authorized_session_id=sender["session_id"],
+                sender_participant_id=sender["participant_id"],
+                conversation_id="tools-room",
+                body_text=(
+                    f"第 {index} 条普通历史；需要检索的青色事务边界。"
+                    if index == 3
+                    else f"第 {index} 条普通历史。"
+                ),
+            )
+        )
+        expire_sender_cooldown(
+            store,
+            participant_id=sender["participant_id"],
+            conversation_id="tools-room",
+        )
+
+    before = store.notification_snapshot(
+        participant_id=reader["participant_id"],
+        authorized_session_id=reader["session_id"],
+        after_sequence=0,
+    )["backlog"]
+    found = store.search_history(
+        participant_id=reader["participant_id"],
+        authorized_session_id=reader["session_id"],
+        conversation_id="tools-room",
+        query="青色 事务边界",
+    )
+    assert found["count"] == 1
+    assert found["results"][0]["message_id"] == sent_messages[3]["message_id"]
+    assert "青色事务边界" in found["results"][0]["snippet"]
+    assert found["state_changed"] is False
+    around = store.history(
+        participant_id=reader["participant_id"],
+        authorized_session_id=reader["session_id"],
+        conversation_id="tools-room",
+        around_sequence=sent_messages[3]["sequence"],
+        limit=7,
+    )
+    assert sent_messages[3]["message_id"] in {
+        item["message_id"] for item in around["messages"]
+    }
+    after = store.notification_snapshot(
+        participant_id=reader["participant_id"],
+        authorized_session_id=reader["session_id"],
+        after_sequence=0,
+    )["backlog"]
+    assert after["pending_count"] == before["pending_count"] == 25
+    assert after["oldest_sequence"] == before["oldest_sequence"]
 
 
 def test_direct_message_reply_and_ack(tmp_path: Path) -> None:
@@ -243,6 +473,35 @@ def test_visible_unique_at_alias_is_normalized_for_legacy_agent_clients(
     )["messages"]
     assert received[0]["delivery"]["priority"] == "mention"
     assert observed[0]["delivery"]["priority"] == "normal"
+
+
+def test_plain_text_at_everyone_is_reserved_and_stays_ordinary(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="普通发送者")
+    receiver = register(store, client="codex", name="全员")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="@全员 这只是没有结构化权限的普通消息。",
+        audience_kind="room",
+    )
+
+    assert sent["mentions"] == []
+    assert sent["wake_all_agents"] is False
+    received = store.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    delivery = next(
+        item for item in received if item["message_id"] == sent["message_id"]
+    )["delivery"]
+    assert delivery["priority"] == "normal"
+    assert delivery["reasons"] == ["room_activity", "audience:room"]
 
 
 def test_visible_at_alias_is_inferred_at_start_middle_and_end(
@@ -468,7 +727,7 @@ def test_month_scale_backlog_is_durable_indexed_and_paginated(tmp_path: Path) ->
         wait_seconds=0,
         limit=100,
     )
-    assert first_batch["count"] == 100
+    assert first_batch["count"] == 20
     assert first_batch["pending_count"] == 240
     assert first_batch["has_more"] is True
     assert first_batch["backlog"]["priority_counts"] == {
@@ -477,7 +736,7 @@ def test_month_scale_backlog_is_durable_indexed_and_paginated(tmp_path: Path) ->
         "normal": 240,
     }
     assert first_batch["messages"][0]["body"] == "历史消息 0"
-    assert first_batch["messages"][-1]["body"] == "历史消息 99"
+    assert first_batch["messages"][-1]["body"] == "历史消息 19"
 
     first_history = reopened.history(
         participant_id=receiver["participant_id"],
@@ -845,7 +1104,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 16
+    assert version == 17
     assert raw["priority"] == "direct"
     assert "mention" in raw["reasons_json"]
     delivered = migrated.wait_messages(
@@ -907,6 +1166,14 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         body_text="升级时仍未处理的群消息。",
         audience_kind="room",
     )
+    historical_reply = store.send(
+        authorized_session_id=observer["session_id"],
+        sender_participant_id=observer["participant_id"],
+        conversation_id="tools-room",
+        body_text="这是升级前已经存在的历史引用。",
+        audience_kind="room",
+        reply_to=unresolved["message_id"],
+    )
 
     # Simulate a pre-delivery-ledger database while preserving all durable
     # source rows.  Initializing the upgraded store must only add projections.
@@ -929,12 +1196,19 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
             "WHERE message_id = ? ORDER BY participant_id",
             (resolved["message_id"],),
         ).fetchall()
+        historical_reply_delivery = connection.execute(
+            "SELECT priority, reasons_json FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (historical_reply["message_id"], target["participant_id"]),
+        ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 16
+    assert version == 17
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
+    assert historical_reply_delivery["priority"] == "normal"
+    assert "reply_wake" not in historical_reply_delivery["reasons_json"]
 
     observer_history = migrated.history(
         participant_id=observer["participant_id"],
@@ -944,6 +1218,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
     assert [item["message_id"] for item in observer_history["messages"]] == [
         resolved["message_id"],
         unresolved["message_id"],
+        historical_reply["message_id"],
     ]
     observer_backlog = migrated.notification_snapshot(
         participant_id=observer["participant_id"],
@@ -2120,7 +2395,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -2175,7 +2450,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 16
+    assert version == 17
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -2655,7 +2930,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 16
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

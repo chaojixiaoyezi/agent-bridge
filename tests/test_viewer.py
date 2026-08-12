@@ -477,7 +477,9 @@ def test_same_origin_browser_user_can_create_room_without_agent_membership(
         if room["conversation_id"] == "大家沟通群"
     )
     assert room["status"] == "active"
-    assert room["participant_count"] == 0
+    assert room["participant_count"] == 1
+    assert room["is_room_owner"] is True
+    assert room["can_wake_all"] is True
     assert room["message_count"] == 0
 
     duplicate = client.post(

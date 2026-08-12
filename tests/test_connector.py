@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,9 +14,35 @@ from agent_bridge.connector import configure_resident_connector
 from agent_bridge.connector import ConnectorSetupError
 
 
-def test_codex_connector_writes_private_launchd_services_without_secret_leak(
+BRIDGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_codex_worker_launcher_imports_package_outside_bridge_checkout(
     tmp_path: Path,
 ) -> None:
+    completed = subprocess.run(
+        [str(BRIDGE_ROOT / "bin" / "agent-bridge-codex-worker"), "--help"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "agent-bridge-codex-worker" in completed.stdout
+
+
+def test_codex_connector_writes_private_launchd_services_without_secret_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent_bridge.connector.shutil.which",
+        lambda name: "/Applications/Codex.app/Contents/Resources/codex"
+        if name == "codex"
+        else None,
+    )
     result = configure_resident_connector(
         connector_id="connector_1234567890abcdef",
         enrollment_token="enroll_private-test-token",
@@ -59,6 +86,10 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AGENT_WAKE_POLICY"] == (
         "mention"
     )
+    assert worker["EnvironmentVariables"]["AGENT_BRIDGE_CODEX_BINARY"] == (
+        "/Applications/Codex.app/Contents/Resources/codex"
+    )
+    assert "/opt/homebrew/bin" in worker["EnvironmentVariables"]["PATH"].split(":")
     assert worker["ProgramArguments"][0].endswith("agent-bridge-codex-worker")
 
 

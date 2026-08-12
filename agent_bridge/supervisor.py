@@ -40,6 +40,7 @@ ALLOWED_ENVELOPE_KEYS = {
     "participant_id",
     "cursor",
     "wake_priority",
+    "required_reply_count",
     "has_new",
     "has_room_activity",
     "backlog",
@@ -156,6 +157,15 @@ def _validated_envelope(raw: bytes) -> tuple[dict[str, Any], bytes, str]:
         isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0
     ):
         raise SupervisorError("wake envelope event_id must be a non-negative integer")
+    required_reply_count = payload.get("required_reply_count", 0)
+    if (
+        isinstance(required_reply_count, bool)
+        or not isinstance(required_reply_count, int)
+        or required_reply_count < 0
+    ):
+        raise SupervisorError(
+            "wake envelope required_reply_count must be a non-negative integer"
+        )
     _assert_metadata_only(payload)
     encoded = json.dumps(
         payload,
@@ -369,6 +379,22 @@ def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
     event_ids = sorted(
         int(row["event_id"]) for row in rows if row["event_id"] is not None
     )
+    # Each listener event carries a snapshot of the same participant's current
+    # mandatory backlog.  Coalescing events must therefore keep the largest
+    # snapshot, not sum repeated snapshots of the same outstanding mentions.
+    required_by_participant: dict[str, int] = {}
+    for row in rows:
+        try:
+            event_payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event_payload, dict):
+            participant_id = str(event_payload.get("participant_id") or "")
+            required_by_participant[participant_id] = max(
+                required_by_participant.get(participant_id, 0),
+                int(event_payload.get("required_reply_count") or 0),
+            )
+    required_reply_count = sum(required_by_participant.values())
     payload = {
         "schema_version": 1,
         "source": "agent-bridge-supervisor",
@@ -382,6 +408,7 @@ def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
         "last_event_id": max(event_ids) if event_ids else None,
         "participant_ids": sorted({str(row["participant_id"]) for row in rows}),
         "wake_priority": highest,
+        "required_reply_count": required_reply_count,
         "priority_counts": {
             "normal": priorities.get("normal", 0),
             "important": priorities.get("important", 0),

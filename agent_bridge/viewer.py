@@ -21,6 +21,7 @@ from .config import BridgeConfig
 from .connector import adapter_kind_for_product
 from .store import (
     AuthenticationError,
+    AuthorizationError,
     BridgeStore,
     ConflictError,
     NicknameRateLimitError,
@@ -319,6 +320,9 @@ def create_app(
         def payload() -> dict:
             result = repository.health()
             result.update(public_health)
+            result["current_user"] = _public_web_identity(
+                web_auth.authenticate(request.cookies.get(WEB_SESSION_COOKIE))
+            )
             result["message_rate_limits"] = store.message_rate_summary(
                 web_participant_id=str(identity["participant_id"]),
                 web_role=str(identity["role"]),
@@ -329,30 +333,77 @@ def create_app(
 
     async def rooms(request: Request) -> Response:
         try:
-            authenticated_web_user(request)
+            identity = authenticated_web_user(request)
         except Exception as exc:
             return _json_error(exc)
-        return _json_call(
-            lambda: {
-                "rooms": repository.rooms(
-                    limit=_int_query(request, "limit", default=200, maximum=500)
-                )
-            },
-            before=store.archive_stale_rooms,
-        )
+
+        def payload() -> dict:
+            projected = repository.rooms(
+                limit=_int_query(request, "limit", default=200, maximum=500)
+            )
+            user_id = str(identity["user_id"])
+            admin = bool(identity["is_admin"])
+            for room in projected:
+                room["is_room_owner"] = room.get("owner_web_user_id") == user_id
+                room["can_wake_all"] = admin or bool(room["is_room_owner"])
+            return {"rooms": projected}
+
+        return _json_call(payload, before=store.archive_stale_rooms)
 
     async def create_room(request: Request) -> Response:
         try:
             require_web_intent(request, intent="create-room")
-            authenticated_admin(request)
+            identity = authenticated_web_user(request)
             payload = await _json_body(
                 request,
                 required={"conversation_id"},
                 allowed={"conversation_id"},
             )
             return JSONResponse(
-                {"room": store.create_user_room(payload["conversation_id"])},
+                {
+                    "room": store.create_web_user_room(
+                        authorized_session_id=str(identity["session_id"]),
+                        web_user_id=str(identity["user_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        conversation_id=payload["conversation_id"],
+                    )
+                },
                 status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def web_user_room_permissions(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                store.search_web_user_room_permissions(
+                    requesting_web_user_id=str(identity["user_id"]),
+                    query=str(request.query_params.get("query") or ""),
+                    limit=_int_query(request, "limit", default=50, maximum=100),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def update_web_user_room_permission(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="manage-room-permission")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required={"can_create_rooms", "room_limit"},
+                allowed={"can_create_rooms", "room_limit"},
+            )
+            return JSONResponse(
+                {
+                    "user": store.update_web_user_room_permission(
+                        requesting_web_user_id=str(identity["user_id"]),
+                        target_web_user_id=request.path_params["user_id"],
+                        can_create_rooms=payload["can_create_rooms"],
+                        room_limit=payload["room_limit"],
+                    )
+                }
             )
         except Exception as exc:
             return _json_error(exc)
@@ -935,6 +986,7 @@ def create_app(
                 "limit",
                 "before_sequence",
                 "after_sequence",
+                "around_sequence",
             },
             operation=lambda auth, payload: store.history(
                 participant_id=auth["participant_id"],
@@ -942,7 +994,37 @@ def create_app(
                 limit=payload.get("limit", 50),
                 before_sequence=payload.get("before_sequence"),
                 after_sequence=payload.get("after_sequence"),
+                around_sequence=payload.get("around_sequence"),
                 authorized_session_id=auth["session_id"],
+            ),
+        )
+
+    async def agent_search_history(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"conversation_id"},
+            allowed={
+                "conversation_id",
+                "query",
+                "message_id",
+                "sequence",
+                "sender_participant_id",
+                "created_after",
+                "created_before",
+                "limit",
+            },
+            operation=lambda auth, payload: store.search_history(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                conversation_id=payload["conversation_id"],
+                query=payload.get("query", ""),
+                message_id=payload.get("message_id"),
+                sequence=payload.get("sequence"),
+                sender_participant_id=payload.get("sender_participant_id"),
+                created_after=payload.get("created_after"),
+                created_before=payload.get("created_before"),
+                limit=payload.get("limit", 10),
             ),
         )
 
@@ -1002,7 +1084,7 @@ def create_app(
             payload = await _json_body(
                 request,
                 required={"body"},
-                allowed={"body", "mentions"},
+                allowed={"body", "mentions", "reply_to", "wake_all_agents"},
             )
             return JSONResponse(
                 {
@@ -1012,6 +1094,8 @@ def create_app(
                         conversation_id=request.path_params["conversation_id"],
                         body_text=payload["body"],
                         mentions=payload.get("mentions"),
+                        reply_to=payload.get("reply_to"),
+                        wake_all_agents=payload.get("wake_all_agents", False),
                     )
                 },
                 status_code=201,
@@ -1300,6 +1384,16 @@ def create_app(
             Route("/api/rooms", rooms, methods=["GET"]),
             Route("/api/rooms", create_room, methods=["POST"]),
             Route(
+                "/api/admin/web-users/room-permissions",
+                web_user_room_permissions,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/web-users/{user_id:str}/room-permission",
+                update_web_user_room_permission,
+                methods=["PATCH"],
+            ),
+            Route(
                 "/api/rooms/{conversation_id:str}",
                 rename_room,
                 methods=["PATCH"],
@@ -1402,6 +1496,11 @@ def create_app(
             Route("/agent/action", agent_action, methods=["POST"]),
             Route("/agent/reply", agent_reply, methods=["POST"]),
             Route("/agent/history", agent_history, methods=["POST"]),
+            Route(
+                "/agent/history/search",
+                agent_search_history,
+                methods=["POST"],
+            ),
             Route("/agent/participants", agent_participants, methods=["POST"]),
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
@@ -1440,6 +1539,8 @@ def _public_web_identity(identity: dict[str, object]) -> dict[str, object]:
         "display_name",
         "signature",
         "must_change_password",
+        "can_create_rooms",
+        "room_limit",
         "created_at",
         "password_changed_at",
         "last_login_at",
@@ -1459,7 +1560,7 @@ def _json_call(
         return JSONResponse(callable_(), status_code=success_status)
     except (AuthenticationError, WebAuthenticationError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=401)
-    except WebAuthorizationError as exc:
+    except (AuthorizationError, WebAuthorizationError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=403)
     except (RateLimitError, NicknameRateLimitError) as exc:
         return JSONResponse(
@@ -1574,7 +1675,7 @@ def _json_error(exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
     if isinstance(exc, (AuthenticationError, WebAuthenticationError)):
         return JSONResponse({"error": str(exc)}, status_code=401)
-    if isinstance(exc, WebAuthorizationError):
+    if isinstance(exc, (AuthorizationError, WebAuthorizationError)):
         return JSONResponse({"error": str(exc)}, status_code=403)
     if isinstance(exc, (RateLimitError, NicknameRateLimitError)):
         return JSONResponse(

@@ -24,6 +24,7 @@
           <button class="access-button" id="enable-notifications" type="button">开启通知</button>
           <button class="access-button" id="open-agent-access" type="button">Agent 接入</button>
           <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
+          <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
           <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
           <span id="connection-label">正在连接</span>
@@ -84,6 +85,13 @@
             <span id="new-message-count" hidden></span>
           </button>
           <form class="message-composer" id="owner-message-form">
+            <div class="composer-context" id="composer-context" hidden>
+              <div>
+                <strong id="composer-context-title"></strong>
+                <span id="composer-context-body"></span>
+              </div>
+              <button id="cancel-composer-context" type="button" aria-label="取消回复或全员通知">×</button>
+            </div>
             <div class="composer-input-wrap">
               <textarea
                 id="owner-message-body"
@@ -97,7 +105,10 @@
             </div>
             <div class="composer-actions">
               <span class="composer-feedback" id="owner-message-feedback" role="status" aria-live="polite"></span>
-              <button class="primary-button" id="send-owner-message" type="submit" disabled>发送</button>
+              <div class="composer-action-buttons">
+                <button class="secondary-button compact-button" id="wake-all-agents" type="button" hidden>@全员</button>
+                <button class="primary-button" id="send-owner-message" type="submit" disabled>发送</button>
+              </div>
             </div>
           </form>
         </section>
@@ -209,7 +220,7 @@
       <form class="room-form" id="create-room-form">
         <div class="dialog-heading">
           <div>
-            <p class="section-kicker">ADMIN ROOM</p>
+            <p class="section-kicker">WEB USER ROOM</p>
             <h2 id="create-room-title">创建聊天室</h2>
           </div>
           <button class="dialog-close" id="close-create-room" type="button" aria-label="关闭">×</button>
@@ -226,13 +237,32 @@
           required
         >
         <p class="field-help">支持中文、英文、数字、空格和常用符号，不能包含 /、\、?、#、%。创建后把完整名称告诉需要加入的 Agent。</p>
-        <p class="field-help">这是管理员创建的房间，不占任何 Agent 会话的两个建房名额。</p>
+        <p class="field-help" id="create-room-policy">管理员创建房间不限数量；获授权的普通用户默认最多创建 2 个自己的房间。</p>
         <p class="form-feedback" id="create-room-feedback" role="status" aria-live="polite"></p>
         <div class="form-actions">
           <button class="secondary-button" id="cancel-create-room" type="button">取消</button>
           <button class="primary-button" id="submit-create-room" type="submit">创建房间</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="room-dialog rate-dialog" id="room-permission-dialog" aria-labelledby="room-permission-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ADMIN ROOM POLICY</p>
+            <h2 id="room-permission-title">普通用户建房权限</h2>
+          </div>
+          <button class="dialog-close" id="close-room-permissions" type="button" aria-label="关闭">×</button>
+        </div>
+        <form class="rate-search-form" id="room-permission-search-form">
+          <input class="room-id-input" id="room-permission-search" type="search" maxlength="64" placeholder="按用户名、昵称或签名搜索" autocomplete="off">
+          <button class="secondary-button" id="search-room-permissions" type="submit">搜索</button>
+        </form>
+        <p class="field-help">授权后，用户创建的聊天室由其担任聊天室管理员，只能在自己的房间使用 @全员；重命名、踢人、迁移等仍限全局管理员。</p>
+        <p class="form-feedback" id="room-permission-feedback" role="status" aria-live="polite"></p>
+        <div class="rate-result-list" id="room-permission-results"></div>
+      </div>
     </dialog>
 
     <dialog class="room-dialog" id="rename-room-dialog" aria-labelledby="rename-room-title">

@@ -21,6 +21,8 @@ const state = {
   hasEarlierMessages: false,
   unreadMessages: 0,
   composerMentions: new Map(),
+  composerReplyTo: null,
+  composerWakeAll: false,
   ownerEvents: null,
   fallbackRefreshTimer: null,
   refreshQueued: false,
@@ -31,6 +33,7 @@ const state = {
   agentLifecycle: null,
   memberRooms: [],
   memberSelections: new Map(),
+  roomPermissionUsers: [],
 };
 
 const elements = {
@@ -42,6 +45,11 @@ const elements = {
   ownerMessageForm: document.querySelector("#owner-message-form"),
   ownerMessageBody: document.querySelector("#owner-message-body"),
   ownerMessageFeedback: document.querySelector("#owner-message-feedback"),
+  composerContext: document.querySelector("#composer-context"),
+  composerContextTitle: document.querySelector("#composer-context-title"),
+  composerContextBody: document.querySelector("#composer-context-body"),
+  cancelComposerContext: document.querySelector("#cancel-composer-context"),
+  wakeAllAgents: document.querySelector("#wake-all-agents"),
   sendOwnerMessage: document.querySelector("#send-owner-message"),
   roomTitle: document.querySelector("#active-room-title"),
   roomRoute: document.querySelector("#room-route"),
@@ -63,6 +71,7 @@ const elements = {
   createRoomForm: document.querySelector("#create-room-form"),
   newRoomId: document.querySelector("#new-room-id"),
   createRoomFeedback: document.querySelector("#create-room-feedback"),
+  createRoomPolicy: document.querySelector("#create-room-policy"),
   submitCreateRoom: document.querySelector("#submit-create-room"),
   closeCreateRoom: document.querySelector("#close-create-room"),
   cancelCreateRoom: document.querySelector("#cancel-create-room"),
@@ -74,6 +83,14 @@ const elements = {
   closeRenameRoom: document.querySelector("#close-rename-room"),
   cancelRenameRoom: document.querySelector("#cancel-rename-room"),
   openMessageRates: document.querySelector("#open-message-rates"),
+  openRoomPermissions: document.querySelector("#open-room-permissions"),
+  roomPermissionDialog: document.querySelector("#room-permission-dialog"),
+  closeRoomPermissions: document.querySelector("#close-room-permissions"),
+  roomPermissionSearchForm: document.querySelector("#room-permission-search-form"),
+  roomPermissionSearch: document.querySelector("#room-permission-search"),
+  searchRoomPermissions: document.querySelector("#search-room-permissions"),
+  roomPermissionFeedback: document.querySelector("#room-permission-feedback"),
+  roomPermissionResults: document.querySelector("#room-permission-results"),
   messageRateDialog: document.querySelector("#message-rate-dialog"),
   closeMessageRates: document.querySelector("#close-message-rates"),
   messageRateGlobalForm: document.querySelector("#message-rate-global-form"),
@@ -313,8 +330,9 @@ function handleAuthenticationLost() {
 function applyUserPermissions() {
   const admin = isAdmin();
   const activeRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
-  elements.openCreateRoom.hidden = !admin;
+  elements.openCreateRoom.hidden = !(admin || state.currentUser?.can_create_rooms);
   elements.openMessageRates.hidden = !admin;
+  elements.openRoomPermissions.hidden = !admin;
   elements.openAgentAccess.hidden = !admin;
   elements.agentInvitationSection.hidden = !admin;
   elements.agentSessionSection.hidden = !admin;
@@ -322,6 +340,7 @@ function applyUserPermissions() {
   elements.renameRoom.hidden = !(admin && activeRoom);
   elements.inviteAgent.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.manageMembers.hidden = !(admin && activeRoom && activeRoom.status === "active");
+  elements.wakeAllAgents.hidden = !(activeRoom?.can_wake_all && activeRoom.status === "active");
   elements.openAccount.textContent = `${state.currentUser.display_name}${admin ? " · 管理员" : ""}`;
   const agentGlobal = state.messageRateLimits?.agent_global_cooldown_seconds ?? 15;
   const webGlobal = state.messageRateLimits?.web_user_global_cooldown_seconds ?? 60;
@@ -480,6 +499,7 @@ function captureTimelineAnchor() {
 }
 
 function routeLabel(message) {
+  if (message.wake_all_agents) return "@全员 · 唤醒 Agent";
   if (message.audience_kind === "participant") return "@成员";
   if (message.audience_kind === "role") return `@角色 · ${message.audience_value}`;
   if (message.audience_kind === "broadcast") return "房间广播";
@@ -508,7 +528,13 @@ function createMessageElement(message) {
   if (message.mentions?.length) {
     article.append(makeElement("p", "mention-label", `特别通知：${message.mentions.map(participantName).join("、")}`));
   }
-  if (message.reply_to) article.append(makeElement("p", "reply-label", `回复 ${message.reply_to}`));
+  if (message.reply_to) {
+    const original = state.messages.find((item) => item.message_id === message.reply_to);
+    const replyLabel = original
+      ? `回复 ${original.sender_display_name || original.sender_client_type}：${original.body.slice(0, 90)}`
+      : `回复消息 ${message.reply_to}`;
+    article.append(makeElement("p", "reply-label", replyLabel));
+  }
   if (message.claimant_display_name || message.claimant_alias) {
     article.append(makeElement("p", "claim-label", `由 ${message.claimant_display_name || message.claimant_alias} 领取`));
   }
@@ -521,6 +547,13 @@ function createMessageElement(message) {
       refs.append(makeElement("div", "ref-item", `${label}${ref.path}${ref.sha256 ? ` · sha256:${ref.sha256}` : ""}`));
     }
     article.append(refs);
+  }
+  const selectedRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
+  if (!message.reply_to && selectedRoom?.status === "active") {
+    const replyButton = makeElement("button", "message-reply-button", "回复");
+    replyButton.type = "button";
+    replyButton.addEventListener("click", () => startComposerReply(message));
+    article.append(replyButton);
   }
   return article;
 }
@@ -876,6 +909,7 @@ async function clearInactiveSessions() {
 }
 
 function roomCreator(room) {
+  if (room.owner_display_name) return `${room.owner_display_name} 创建`;
   if (room.creator_kind === "user") return "管理员创建";
   if (room.creator_kind === "legacy") return "历史房间";
   return `${room.creator_client_type || room.creator_participant_id || "Agent"} 创建`;
@@ -886,10 +920,46 @@ function updateComposer(room) {
   const effectiveCooldown = state.messageRateLimits?.current_user_effective_cooldown_seconds ?? 60;
   elements.ownerMessageBody.disabled = !canSpeak;
   elements.sendOwnerMessage.disabled = !canSpeak;
+  elements.wakeAllAgents.hidden = !(canSpeak && room?.can_wake_all);
   elements.ownerMessageBody.placeholder = canSpeak
     ? `${state.currentUser?.display_name || "Web 用户"}发言（${isAdmin() ? "不限频" : `每个房间间隔 ${formatCooldown(effectiveCooldown)}`}）；Enter 发送，Shift+Enter 换行…`
     : room ? "废弃聊天室仅保留历史，不能继续发言。" : "先选择一个使用中的聊天室。";
   if (!canSpeak) elements.ownerMessageFeedback.textContent = "";
+  updateComposerContext();
+}
+
+function updateComposerContext() {
+  const replied = state.composerReplyTo
+    ? state.messages.find((message) => message.message_id === state.composerReplyTo)
+    : null;
+  if (replied) {
+    elements.composerContext.hidden = false;
+    elements.composerContextTitle.textContent = `回复 ${replied.sender_display_name || replied.sender_client_type}`;
+    elements.composerContextBody.textContent = replied.body.slice(0, 140);
+  } else if (state.composerWakeAll) {
+    elements.composerContext.hidden = false;
+    elements.composerContextTitle.textContent = "@全员：唤醒本聊天室所有 Agent";
+    elements.composerContextBody.textContent = "Agent 会全部收到唤醒，但可以根据兴趣选择是否回复。";
+  } else {
+    elements.composerContext.hidden = true;
+    elements.composerContextTitle.textContent = "";
+    elements.composerContextBody.textContent = "";
+  }
+  elements.wakeAllAgents?.classList.toggle("active", state.composerWakeAll);
+}
+
+function clearComposerContext() {
+  state.composerReplyTo = null;
+  state.composerWakeAll = false;
+  updateComposerContext();
+}
+
+function startComposerReply(message) {
+  if (!message || message.reply_to) return;
+  state.composerReplyTo = message.message_id;
+  state.composerWakeAll = false;
+  updateComposerContext();
+  elements.ownerMessageBody.focus();
 }
 
 function hideMentionMenu() {
@@ -971,6 +1041,7 @@ async function selectRoom(roomId) {
   state.hasEarlierMessages = false;
   state.unreadMessages = 0;
   state.composerMentions.clear();
+  clearComposerContext();
   hideMentionMenu();
   updateNewMessageIndicator();
   window.localStorage.setItem("agentBridgeSelectedRoom", roomId);
@@ -1087,6 +1158,7 @@ async function refresh(options = {}) {
       invitationRequest,
     ]);
     state.messageRateLimits = healthPayload.message_rate_limits || null;
+    if (healthPayload.current_user) state.currentUser = healthPayload.current_user;
     state.rooms = roomPayload.rooms;
     state.sessions = sessionPayload.sessions;
     state.sessionStats = sessionPayload.stats || { active_count: 0, clearable_count: 0 };
@@ -1279,6 +1351,107 @@ async function openMessageRateDialog() {
   } catch (error) {
     elements.messageRateSearchFeedback.classList.add("error");
     elements.messageRateSearchFeedback.textContent = error.message;
+  }
+}
+
+function renderRoomPermissionUsers() {
+  elements.roomPermissionResults.replaceChildren();
+  if (!state.roomPermissionUsers.length) {
+    elements.roomPermissionResults.append(makeElement("p", "muted-copy", "没有匹配的普通用户。"));
+    return;
+  }
+  for (const user of state.roomPermissionUsers) {
+    const card = makeElement("article", "rate-result-card");
+    const heading = makeElement("div", "rate-result-heading");
+    const identity = makeElement("div", "rate-result-identity");
+    identity.append(makeElement("strong", "", user.display_name));
+    identity.append(makeElement("span", "", `@${user.username} · 使用中 ${user.owned_active_room_count}/${user.room_limit} 个`));
+    if (user.signature) identity.append(makeElement("small", "", user.signature));
+    heading.append(identity);
+    heading.append(makeElement(
+      "span",
+      "rate-effective-badge",
+      user.can_create_rooms ? "已授权" : "未授权",
+    ));
+    card.append(heading);
+
+    const controls = makeElement("div", "rate-result-controls");
+    const permissionLabel = makeElement("label", "room-permission-toggle");
+    const permission = makeElement("input", "");
+    permission.type = "checkbox";
+    permission.checked = user.can_create_rooms;
+    permissionLabel.append(permission, makeElement("span", "", "允许创建聊天室"));
+    const limitWrap = makeElement("label", "rate-number-wrap rate-override-wrap");
+    const limit = makeElement("input", "rate-override-input");
+    limit.type = "number";
+    limit.min = "1";
+    limit.max = "100";
+    limit.step = "1";
+    limit.value = String(user.room_limit);
+    limit.setAttribute("aria-label", `${user.display_name}的聊天室上限`);
+    limitWrap.append(limit, makeElement("small", "", "个"));
+    const save = makeElement("button", "primary-button compact-button", "保存");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      if (!limit.reportValidity()) return;
+      permission.disabled = true;
+      limit.disabled = true;
+      save.disabled = true;
+      elements.roomPermissionFeedback.classList.remove("error", "success");
+      elements.roomPermissionFeedback.textContent = `正在保存 ${user.display_name} 的权限…`;
+      try {
+        await fetchJson(`/api/admin/web-users/${encodeURIComponent(user.user_id)}/room-permission`, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Agent-Bridge-Intent": "manage-room-permission",
+          },
+          body: JSON.stringify({
+            can_create_rooms: permission.checked,
+            room_limit: Number(limit.value),
+          }),
+        });
+        await searchRoomPermissionUsers();
+        elements.roomPermissionFeedback.classList.add("success");
+        elements.roomPermissionFeedback.textContent = `${user.display_name} 的建房权限已保存。`;
+      } catch (error) {
+        elements.roomPermissionFeedback.classList.add("error");
+        elements.roomPermissionFeedback.textContent = error.message;
+        permission.disabled = false;
+        limit.disabled = false;
+        save.disabled = false;
+      }
+    });
+    controls.append(permissionLabel, limitWrap, save);
+    card.append(controls);
+    elements.roomPermissionResults.append(card);
+  }
+}
+
+async function searchRoomPermissionUsers() {
+  const params = new URLSearchParams({
+    query: elements.roomPermissionSearch.value.trim(),
+    limit: "50",
+  });
+  const payload = await fetchJson(`/api/admin/web-users/room-permissions?${params.toString()}`);
+  state.roomPermissionUsers = payload.users;
+  renderRoomPermissionUsers();
+}
+
+async function openRoomPermissionDialog() {
+  if (!isAdmin()) return;
+  state.roomPermissionUsers = [];
+  elements.roomPermissionResults.replaceChildren();
+  elements.roomPermissionFeedback.classList.remove("error", "success");
+  elements.roomPermissionFeedback.textContent = "正在载入普通用户…";
+  elements.roomPermissionDialog.showModal();
+  try {
+    await searchRoomPermissionUsers();
+    elements.roomPermissionFeedback.textContent = "";
+    window.setTimeout(() => elements.roomPermissionSearch.focus(), 0);
+  } catch (error) {
+    elements.roomPermissionFeedback.classList.add("error");
+    elements.roomPermissionFeedback.textContent = error.message;
   }
 }
 
@@ -1597,6 +1770,27 @@ elements.search.addEventListener("input", (event) => {
 });
 elements.refreshButton.addEventListener("click", () => refresh({ fullRoom: true }));
 elements.openMessageRates.addEventListener("click", openMessageRateDialog);
+elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
+elements.closeRoomPermissions.addEventListener("click", () => elements.roomPermissionDialog.close());
+elements.roomPermissionDialog.addEventListener("click", (event) => {
+  if (event.target === elements.roomPermissionDialog) elements.roomPermissionDialog.close();
+});
+elements.roomPermissionSearchForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!isAdmin()) return;
+  elements.searchRoomPermissions.disabled = true;
+  elements.roomPermissionFeedback.classList.remove("error", "success");
+  elements.roomPermissionFeedback.textContent = "正在搜索…";
+  try {
+    await searchRoomPermissionUsers();
+    elements.roomPermissionFeedback.textContent = `找到 ${state.roomPermissionUsers.length} 个普通用户。`;
+  } catch (error) {
+    elements.roomPermissionFeedback.classList.add("error");
+    elements.roomPermissionFeedback.textContent = error.message;
+  } finally {
+    elements.searchRoomPermissions.disabled = false;
+  }
+});
 elements.closeMessageRates.addEventListener("click", () => elements.messageRateDialog.close());
 elements.messageRateDialog.addEventListener("click", (event) => {
   if (event.target === elements.messageRateDialog) elements.messageRateDialog.close();
@@ -1738,9 +1932,12 @@ elements.memberMigrationForm.addEventListener("submit", async (event) => {
   }
 });
 elements.openCreateRoom.addEventListener("click", () => {
-  if (!isAdmin()) return;
+  if (!(isAdmin() || state.currentUser?.can_create_rooms)) return;
   elements.createRoomFeedback.textContent = "";
   elements.createRoomForm.reset();
+  elements.createRoomPolicy.textContent = isAdmin()
+    ? "管理员创建房间不限数量。"
+    : `你已获创建权限，最多可同时拥有 ${state.currentUser.room_limit} 个使用中的聊天室；你将成为所建房间的聊天室管理员。`;
   elements.createRoomDialog.showModal();
   window.setTimeout(() => elements.newRoomId.focus(), 0);
 });
@@ -1855,10 +2052,13 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
       body: JSON.stringify({
         body: message,
         mentions: selectedMentionIds(message),
+        reply_to: state.composerReplyTo,
+        wake_all_agents: Boolean(state.composerWakeAll && activeRoom.can_wake_all),
       }),
     });
     elements.ownerMessageBody.value = "";
     state.composerMentions.clear();
+    clearComposerContext();
     hideMentionMenu();
     elements.ownerMessageFeedback.classList.add("success");
     elements.ownerMessageFeedback.textContent = "已发送";
@@ -1872,6 +2072,16 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
   } finally {
     updateComposer(state.rooms.find((room) => room.conversation_id === state.selectedRoom));
   }
+});
+
+elements.cancelComposerContext.addEventListener("click", clearComposerContext);
+elements.wakeAllAgents.addEventListener("click", () => {
+  const activeRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
+  if (!activeRoom?.can_wake_all || activeRoom.status !== "active") return;
+  state.composerWakeAll = !state.composerWakeAll;
+  if (state.composerWakeAll) state.composerReplyTo = null;
+  updateComposerContext();
+  elements.ownerMessageBody.focus();
 });
 
 elements.ownerMessageBody.addEventListener("keydown", (event) => {

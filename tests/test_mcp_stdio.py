@@ -141,6 +141,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_message_action",
                         "agent_reply",
                         "agent_history",
+                        "agent_search_history",
                         "agent_participants",
                         "agent_update_profile",
                         "agent_request_nickname",

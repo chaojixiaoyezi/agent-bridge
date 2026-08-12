@@ -28,7 +28,11 @@ from .validation import (
     string_tokens,
     token,
 )
-from .web_auth import WEB_AUTH_SCHEMA
+from .web_auth import (
+    DEFAULT_WEB_USER_ROOM_LIMIT,
+    MAX_WEB_USER_ROOM_LIMIT,
+    WEB_AUTH_SCHEMA,
+)
 
 
 AUDIENCE_KINDS = {"participant", "room", "role", "broadcast"}
@@ -44,6 +48,9 @@ ROOM_ABANDON_AFTER_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_SESSION_TTL_SECONDS = 2 * 60 * 60
 NICKNAME_REQUEST_COOLDOWN_SECONDS = 24 * 60 * 60
 MAX_MENTIONS_PER_MESSAGE = 64
+MAX_WAIT_MESSAGES_PAGE_SIZE = 20
+MAX_HISTORY_SEARCH_TERMS = 8
+MAX_HISTORY_SEARCH_QUERY_LENGTH = 256
 DEFAULT_INVITATION_TTL_SECONDS = 30 * 60
 MAX_INVITATION_TTL_SECONDS = 24 * 60 * 60
 CONNECTOR_ONLINE_WINDOW_SECONDS = 75.0
@@ -99,6 +106,10 @@ class NicknameRateLimitError(ConflictError):
 
 
 class AuthenticationError(BridgeError):
+    pass
+
+
+class AuthorizationError(BridgeError):
     pass
 
 
@@ -188,6 +199,8 @@ CREATE TABLE IF NOT EXISTS messages (
     body TEXT NOT NULL,
     refs_json TEXT NOT NULL DEFAULT '[]',
     mentions_json TEXT NOT NULL DEFAULT '[]',
+    wake_all_agents INTEGER NOT NULL DEFAULT 0
+        CHECK (wake_all_agents IN (0, 1)),
     reply_to TEXT,
     status TEXT NOT NULL DEFAULT 'open',
     claimed_by TEXT,
@@ -300,6 +313,20 @@ BEGIN
     SET last_activity_at = MAX(last_activity_at, NEW.created_at)
     WHERE conversation_id = NEW.conversation_id AND status = 'active';
 END;
+"""
+
+
+ROOM_GOVERNANCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS room_web_owners (
+    conversation_id TEXT PRIMARY KEY,
+    web_user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_web_owners_user
+    ON room_web_owners(web_user_id, created_at DESC);
 """
 
 
@@ -897,9 +924,16 @@ class BridgeStore:
                     "ALTER TABLE messages ADD COLUMN mentions_json TEXT "
                     "NOT NULL DEFAULT '[]'"
                 )
+            if "wake_all_agents" not in message_columns:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN wake_all_agents INTEGER "
+                    "NOT NULL DEFAULT 0 CHECK (wake_all_agents IN (0, 1))"
+                )
             if schema_version < 8 or mentions_column_added:
                 self._backfill_implicit_participant_mentions(conn)
             conn.executescript(WEB_AUTH_SCHEMA)
+            self._migrate_web_user_room_permissions(conn)
+            conn.executescript(ROOM_GOVERNANCE_SCHEMA)
             conn.executescript(RATE_LIMIT_SCHEMA)
             conn.executescript(PROFILE_SCHEMA)
             self._migrate_reusable_agent_invitations(conn)
@@ -944,7 +978,15 @@ class BridgeStore:
         with self._transaction() as conn:
             self._backfill_legacy_rooms(conn)
             if reconcile_deliveries:
-                self._backfill_message_deliveries(conn)
+                self._backfill_message_deliveries(
+                    conn,
+                    # Optional wake reasons were introduced in schema 17.
+                    # Rebuilding an older ledger must not turn historical
+                    # replies into fresh high-priority notifications.  A
+                    # schema-17 recovery, however, must faithfully recreate
+                    # the current delivery semantics.
+                    include_optional_wakes=schema_version >= 17,
+                )
             if schema_version < 11:
                 # v8-v10 stored explicit structured mentions as ``important``.
                 # Keep the existing CHECK-compatible ``direct`` storage value,
@@ -956,12 +998,30 @@ class BridgeStore:
                     "AND instr(reasons_json, '\"mention\"') > 0"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 16")
+            conn.execute("PRAGMA user_version = 17")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
         except OSError:
             pass
+
+    @staticmethod
+    def _migrate_web_user_room_permissions(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(web_users)").fetchall()
+        }
+        if "can_create_rooms" not in columns:
+            conn.execute(
+                "ALTER TABLE web_users ADD COLUMN can_create_rooms INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (can_create_rooms IN (0, 1))"
+            )
+        if "room_limit" not in columns:
+            conn.execute(
+                "ALTER TABLE web_users ADD COLUMN room_limit INTEGER "
+                f"NOT NULL DEFAULT {DEFAULT_WEB_USER_ROOM_LIMIT} "
+                f"CHECK (room_limit BETWEEN 1 AND {MAX_WEB_USER_ROOM_LIMIT})"
+            )
 
     @staticmethod
     def _migrate_invited_sessions(conn: sqlite3.Connection) -> None:
@@ -1377,6 +1437,12 @@ class BridgeStore:
             if len(targets) != 1:
                 continue
             visible = alias_display[folded]
+            # ``@全员`` is a reserved UI command.  Only the separately
+            # authorized wake_all_agents flag can activate it, so plain text
+            # must never become a personal mention merely because one Agent
+            # happens to use the display name "全员".
+            if visible.casefold() == "全员".casefold():
+                continue
             # A visible mention may appear at the beginning, in the middle, or
             # at the end of a sentence.  The right boundary still prevents a
             # short nickname from matching the prefix of a longer token.
@@ -1411,16 +1477,31 @@ class BridgeStore:
         message: sqlite3.Row,
         *,
         include_inactive_memberships: bool = False,
+        include_optional_wakes: bool = True,
     ) -> list[dict[str, Any]]:
         conversation = str(message["conversation_id"])
         sender = str(message["sender_participant_id"])
         created_at = float(message["created_at"])
         mention_ids = set(json.loads(str(message["mentions_json"] or "[]")))
+        wake_all_agents = bool(message["wake_all_agents"])
+        reply_target = None
+        if message["reply_to"] is not None:
+            replied = conn.execute(
+                "SELECT sender_participant_id FROM messages WHERE message_id = ?",
+                (str(message["reply_to"]),),
+            ).fetchone()
+            if replied is not None:
+                reply_target = str(replied["sender_participant_id"])
         membership_filter = "" if include_inactive_memberships else "AND active = 1"
         memberships = conn.execute(
-            "SELECT participant_id, roles_json, joined_at FROM memberships "
-            "WHERE conversation_id = ? "
-            f"{membership_filter} AND joined_at <= ?",
+            "SELECT membership.participant_id, membership.roles_json, "
+            "membership.joined_at, web_user.user_id AS web_user_id "
+            "FROM memberships AS membership "
+            "LEFT JOIN web_users AS web_user "
+            "ON web_user.participant_id = membership.participant_id "
+            "WHERE membership.conversation_id = ? "
+            f"{membership_filter.replace('active', 'membership.active')} "
+            "AND membership.joined_at <= ?",
             (conversation, created_at),
         ).fetchall()
         followers = {
@@ -1438,6 +1519,7 @@ class BridgeStore:
             participant = str(membership["participant_id"])
             if participant == sender:
                 continue
+            is_agent = membership["web_user_id"] is None
             roles = set(json.loads(str(membership["roles_json"])))
             primary_recipient = cls._eligible(
                 message,
@@ -1449,9 +1531,15 @@ class BridgeStore:
                 reasons.append(f"audience:{audience_kind}")
             if participant in mention_ids:
                 reasons.append("mention")
+            if include_optional_wakes and wake_all_agents and is_agent:
+                reasons.append("wake_all")
+            if include_optional_wakes and reply_target == participant and is_agent:
+                reasons.append("reply_wake")
             if participant in followers:
                 reasons.append("follow")
             if participant in mention_ids:
+                priority = "direct"
+            elif "wake_all" in reasons or "reply_wake" in reasons:
                 priority = "direct"
             elif (
                 "follow" in reasons
@@ -1507,7 +1595,12 @@ class BridgeStore:
             )
 
     @classmethod
-    def _backfill_message_deliveries(cls, conn: sqlite3.Connection) -> None:
+    def _backfill_message_deliveries(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        include_optional_wakes: bool = True,
+    ) -> None:
         """Build and reconcile the durable room-delivery ledger.
 
         Earlier Bridge versions treated ``audience_kind=participant`` as a
@@ -1533,6 +1626,7 @@ class BridgeStore:
                 conn,
                 message,
                 include_inactive_memberships=True,
+                include_optional_wakes=include_optional_wakes,
             )
             existing_deliveries = {
                 str(row["participant_id"]): row
@@ -3627,7 +3721,7 @@ class BridgeStore:
                     )
                 if existing_connector["revoked_at"] is not None:
                     raise ConflictError("Agent connector is revoked")
-                if not secrets.compare_digest(
+                if not self._constant_time_eq(
                     str(registration["identity"]),
                     str(existing_connector["client_type"]),
                 ):
@@ -3790,7 +3884,7 @@ class BridgeStore:
                 or invitation["connector_revoked_at"] is not None
             ):
                 raise AuthenticationError("invalid or revoked Agent enrollment")
-            if not secrets.compare_digest(
+            if not self._constant_time_eq(
                 normalized_identity,
                 str(invitation["client_type"]),
             ):
@@ -3971,6 +4065,208 @@ class BridgeStore:
             "last_activity_at": now,
         }
 
+    def create_web_user_room(
+        self,
+        *,
+        authorized_session_id: str,
+        web_user_id: str,
+        participant_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        """Create a Web-owned room under an authenticated account permission."""
+
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        user_id = opaque_id(web_user_id, field="web_user_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        conversation = validate_conversation_id(conversation_id)
+        now = time.time()
+        with self._transaction() as conn:
+            self._archive_stale_rooms_locked(conn, now=now)
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            if str(identity["user_id"]) != user_id:
+                raise AuthenticationError("web user session identity does not match")
+            is_admin = str(identity["role"]) == "admin"
+            can_create = is_admin or bool(identity["can_create_rooms"])
+            if not can_create:
+                raise AuthorizationError("管理员尚未授予你创建聊天室的权限")
+            existing = conn.execute(
+                "SELECT status FROM rooms WHERE conversation_id = ?",
+                (conversation,),
+            ).fetchone()
+            if existing is not None:
+                raise ConflictError(
+                    f"conversation {conversation} already exists with status "
+                    f"{existing['status']}"
+                )
+            owned_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM room_web_owners AS ownership "
+                    "JOIN rooms AS room "
+                    "ON room.conversation_id = ownership.conversation_id "
+                    "WHERE ownership.web_user_id = ? AND room.status = 'active'",
+                    (user_id,),
+                ).fetchone()[0]
+            )
+            room_limit = int(identity["room_limit"])
+            if not is_admin and owned_count >= room_limit:
+                raise ConflictError(
+                    "this web user already owns the maximum of "
+                    f"{room_limit} active rooms"
+                )
+            conn.execute(
+                "INSERT INTO rooms "
+                "(conversation_id, status, creator_kind, creator_participant_id, "
+                "created_at, last_activity_at) "
+                "VALUES (?, 'active', 'user', NULL, ?, ?)",
+                (conversation, now, now),
+            )
+            conn.execute(
+                "INSERT INTO room_web_owners "
+                "(conversation_id, web_user_id, created_at) VALUES (?, ?, ?)",
+                (conversation, user_id, now),
+            )
+            self._ensure_web_membership_locked(
+                conn,
+                conversation_id=conversation,
+                participant_id=participant,
+                display_name=str(identity["display_name"]),
+                signature=str(identity["signature"]),
+                role=str(identity["role"]),
+                now=now,
+            )
+            owned_count += 1
+        return {
+            "conversation_id": conversation,
+            "status": "active",
+            "creator_kind": "user",
+            "owner_web_user_id": user_id,
+            "creator_participant_id": participant,
+            "created_at": now,
+            "last_activity_at": now,
+            "owned_active_room_count": owned_count,
+            "owned_active_room_limit": None if is_admin else room_limit,
+            "is_room_owner": True,
+        }
+
+    def search_web_user_room_permissions(
+        self,
+        *,
+        requesting_web_user_id: str,
+        query: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        normalized_query = str(query or "").strip()
+        if len(normalized_query) > 64 or any(
+            ord(character) < 32 for character in normalized_query
+        ):
+            raise ValidationError("query must contain at most 64 visible characters")
+        normalized_limit = max(1, min(int(limit), 100))
+        escaped = (
+            normalized_query.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        with self._connection() as conn:
+            self._require_active_rate_admin_locked(conn, requester)
+            rows = conn.execute(
+                """
+                SELECT web_user.*,
+                       COUNT(CASE WHEN room.status = 'active' THEN 1 END)
+                           AS owned_active_room_count,
+                       COUNT(ownership.conversation_id) AS owned_room_count
+                FROM web_users AS web_user
+                LEFT JOIN room_web_owners AS ownership
+                  ON ownership.web_user_id = web_user.user_id
+                LEFT JOIN rooms AS room
+                  ON room.conversation_id = ownership.conversation_id
+                WHERE web_user.role = 'user' AND web_user.active = 1
+                  AND (? = '' OR web_user.username LIKE ? ESCAPE '\\'
+                       OR web_user.display_name LIKE ? ESCAPE '\\'
+                       OR web_user.signature LIKE ? ESCAPE '\\')
+                GROUP BY web_user.user_id
+                ORDER BY web_user.display_name COLLATE NOCASE, web_user.username
+                LIMIT ?
+                """,
+                (
+                    normalized_query,
+                    pattern,
+                    pattern,
+                    pattern,
+                    normalized_limit,
+                ),
+            ).fetchall()
+        users = [self._web_user_room_permission_payload(row) for row in rows]
+        return {"users": users, "count": len(users), "query": normalized_query}
+
+    def update_web_user_room_permission(
+        self,
+        *,
+        requesting_web_user_id: str,
+        target_web_user_id: str,
+        can_create_rooms: bool,
+        room_limit: int,
+    ) -> dict[str, Any]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        target = opaque_id(target_web_user_id, field="target_web_user_id")
+        if not isinstance(can_create_rooms, bool):
+            raise ValidationError("can_create_rooms must be a boolean")
+        if isinstance(room_limit, bool) or not isinstance(room_limit, int):
+            raise ValidationError("room_limit must be an integer")
+        normalized_limit = room_limit
+        if not 1 <= normalized_limit <= MAX_WEB_USER_ROOM_LIMIT:
+            raise ValidationError(
+                f"room_limit must be between 1 and {MAX_WEB_USER_ROOM_LIMIT}"
+            )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_rate_admin_locked(conn, requester)
+            row = conn.execute(
+                "SELECT * FROM web_users WHERE user_id = ? AND active = 1",
+                (target,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"unknown active web user: {target}")
+            if str(row["role"]) != "user":
+                raise ConflictError("administrator room creation is always enabled")
+            conn.execute(
+                "UPDATE web_users SET can_create_rooms = ?, room_limit = ?, "
+                "updated_at = ? WHERE user_id = ?",
+                (1 if can_create_rooms else 0, normalized_limit, now, target),
+            )
+            updated = conn.execute(
+                """
+                SELECT web_user.*,
+                       COUNT(CASE WHEN room.status = 'active' THEN 1 END)
+                           AS owned_active_room_count,
+                       COUNT(ownership.conversation_id) AS owned_room_count
+                FROM web_users AS web_user
+                LEFT JOIN room_web_owners AS ownership
+                  ON ownership.web_user_id = web_user.user_id
+                LEFT JOIN rooms AS room
+                  ON room.conversation_id = ownership.conversation_id
+                WHERE web_user.user_id = ?
+                GROUP BY web_user.user_id
+                """,
+                (target,),
+            ).fetchone()
+        return self._web_user_room_permission_payload(updated)
+
     def room(self, conversation_id: str) -> dict[str, Any]:
         """Return one room's authoritative identity and lifecycle state."""
 
@@ -4043,6 +4339,7 @@ class BridgeStore:
                 "agent_invitations",
                 "agent_connectors",
                 "agent_room_blocks",
+                "room_web_owners",
             ):
                 column = (
                     "registered_conversation_id"
@@ -4920,6 +5217,7 @@ class BridgeStore:
         reply_to: str | None = None,
         refs: Sequence[dict[str, Any]] | None = None,
         mentions: Sequence[str] | None = None,
+        wake_all_agents: bool = False,
         _owner_ui: bool = False,
         _web_user: bool = False,
     ) -> dict[str, Any]:
@@ -4935,9 +5233,14 @@ class BridgeStore:
             raise ValidationError(f"unsupported audience_kind: {normalized_audience}")
         normalized_refs = message_refs(refs)
         normalized_mentions = self._normalize_mentions(mentions)
+        if not isinstance(wake_all_agents, bool):
+            raise ValidationError("wake_all_agents must be a boolean")
+        normalized_wake_all = bool(wake_all_agents)
         normalized_reply = (
             opaque_id(reply_to, field="reply_to") if reply_to else None
         )
+        if normalized_wake_all and normalized_audience != "room":
+            raise ValidationError("wake_all_agents requires a room audience")
         normalized_target = self._normalize_audience_value(
             normalized_audience,
             audience_value,
@@ -4980,6 +5283,16 @@ class BridgeStore:
                     role=str(web_identity["role"]),
                     now=now,
                 )
+                if normalized_wake_all and str(web_identity["role"]) != "admin":
+                    ownership = conn.execute(
+                        "SELECT 1 FROM room_web_owners "
+                        "WHERE conversation_id = ? AND web_user_id = ?",
+                        (conversation, str(web_identity["user_id"])),
+                    ).fetchone()
+                    if ownership is None:
+                        raise AuthorizationError(
+                            "只有全局管理员或本聊天室创建者可以使用 @全员"
+                        )
                 cooldown_seconds = (
                     0.0
                     if str(web_identity["role"]) == "admin"
@@ -5002,6 +5315,8 @@ class BridgeStore:
                     participant_id=sender,
                     actor_kind="agent",
                 )
+                if normalized_wake_all:
+                    raise AuthorizationError("Agent 不能发起结构化 @全员")
             for inferred in self._infer_text_mentions_locked(
                 conn,
                 conversation_id=conversation,
@@ -5045,10 +5360,10 @@ class BridgeStore:
                     INSERT INTO messages
                         (message_id, conversation_id, sender_participant_id,
                          audience_kind, audience_value, message_kind, body,
-                         refs_json, mentions_json, reply_to, status,
+                         refs_json, mentions_json, wake_all_agents, reply_to, status,
                          authorized_session_id,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'message', ?, ?, ?, ?, 'open', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, 'message', ?, ?, ?, ?, ?, 'open', ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -5059,6 +5374,7 @@ class BridgeStore:
                         normalized_body,
                         compact_json(normalized_refs),
                         compact_json(normalized_mentions),
+                        1 if normalized_wake_all else 0,
                         normalized_reply,
                         session,
                         now,
@@ -5102,6 +5418,8 @@ class BridgeStore:
         conversation_id: str,
         body_text: str,
         mentions: Sequence[str] | None = None,
+        wake_all_agents: bool = False,
+        reply_to: str | None = None,
     ) -> dict[str, Any]:
         """Send one owner-authored room message through the local web authority."""
         return self.send(
@@ -5112,6 +5430,8 @@ class BridgeStore:
             audience_kind="room",
             audience_value="*",
             mentions=mentions,
+            wake_all_agents=wake_all_agents,
+            reply_to=reply_to,
             _owner_ui=True,
         )
 
@@ -5123,6 +5443,8 @@ class BridgeStore:
         conversation_id: str,
         body_text: str,
         mentions: Sequence[str] | None = None,
+        wake_all_agents: bool = False,
+        reply_to: str | None = None,
     ) -> dict[str, Any]:
         """Send one authenticated web user's room message under its own identity."""
 
@@ -5134,6 +5456,8 @@ class BridgeStore:
             audience_kind="room",
             audience_value="*",
             mentions=mentions,
+            wake_all_agents=wake_all_agents,
+            reply_to=reply_to,
             _web_user=True,
         )
 
@@ -5148,7 +5472,10 @@ class BridgeStore:
     ) -> dict[str, Any]:
         participant = opaque_id(participant_id, field="participant_id")
         wait_for = max(0.0, min(float(wait_seconds), 120.0))
-        normalized_limit = max(1, min(int(limit), 100))
+        # Keep each Agent context page small and predictable.  Callers can
+        # follow ``has_more`` for up to five pages (100 messages) per model
+        # turn without one request flooding the context window.
+        normalized_limit = max(1, min(int(limit), MAX_WAIT_MESSAGES_PAGE_SIZE))
         deadline = time.monotonic() + wait_for
         self.archive_stale_rooms()
 
@@ -5392,8 +5719,8 @@ class BridgeStore:
                 sender_participant_id=participant,
                 conversation_id=str(original["conversation_id"]),
                 body_text=body_text,
-                audience_kind="participant",
-                audience_value=str(original["sender_participant_id"]),
+                audience_kind="room",
+                audience_value="*",
                 reply_to=original_id,
                 refs=refs,
                 mentions=mentions,
@@ -5420,14 +5747,20 @@ class BridgeStore:
         limit: int = 50,
         before_sequence: int | None = None,
         after_sequence: int | None = None,
+        around_sequence: int | None = None,
         authorized_session_id: str | None = None,
     ) -> dict[str, Any]:
         participant = opaque_id(participant_id, field="participant_id")
         conversation = validate_conversation_id(conversation_id)
         normalized_limit = max(1, min(int(limit), 200))
-        if before_sequence is not None and after_sequence is not None:
+        supplied_cursors = sum(
+            value is not None
+            for value in (before_sequence, after_sequence, around_sequence)
+        )
+        if supplied_cursors > 1:
             raise ValidationError(
-                "before_sequence and after_sequence cannot be used together"
+                "before_sequence, after_sequence, and around_sequence cannot "
+                "be used together"
             )
         with self._transaction() as conn:
             now = time.time()
@@ -5449,6 +5782,13 @@ class BridgeStore:
                     "AND sequence > ? ORDER BY sequence LIMIT ?",
                     (conversation, int(after_sequence), normalized_limit),
                 ).fetchall()
+            elif around_sequence is not None:
+                center = max(0, int(around_sequence))
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE conversation_id = ? "
+                    "ORDER BY ABS(sequence - ?), sequence LIMIT ?",
+                    (conversation, center, normalized_limit),
+                ).fetchall()
             elif before_sequence is None:
                 rows = conn.execute(
                     "SELECT * FROM messages WHERE conversation_id = ? "
@@ -5461,12 +5801,33 @@ class BridgeStore:
                     "AND sequence < ? ORDER BY sequence DESC LIMIT ?",
                     (conversation, int(before_sequence), normalized_limit),
                 ).fetchall()
-        ordered_rows = rows if after_sequence is not None else list(reversed(rows))
+        if around_sequence is not None:
+            ordered_rows = sorted(rows, key=lambda row: int(row["sequence"]))
+        else:
+            ordered_rows = rows if after_sequence is not None else list(reversed(rows))
         messages = [self._message_payload(row) for row in ordered_rows]
         first_sequence = messages[0]["sequence"] if messages else None
         last_sequence = messages[-1]["sequence"] if messages else None
         with self._connection() as conn:
-            if after_sequence is not None:
+            if around_sequence is not None:
+                has_earlier = bool(
+                    first_sequence is not None
+                    and conn.execute(
+                        "SELECT 1 FROM messages WHERE conversation_id = ? "
+                        "AND sequence < ? LIMIT 1",
+                        (conversation, first_sequence),
+                    ).fetchone()
+                )
+                has_later = bool(
+                    last_sequence is not None
+                    and conn.execute(
+                        "SELECT 1 FROM messages WHERE conversation_id = ? "
+                        "AND sequence > ? LIMIT 1",
+                        (conversation, last_sequence),
+                    ).fetchone()
+                )
+                has_more = has_earlier or has_later
+            elif after_sequence is not None:
                 has_more = bool(
                     last_sequence is not None
                     and conn.execute(
@@ -5493,6 +5854,153 @@ class BridgeStore:
             "has_more": has_more,
             "next_after_sequence": (
                 last_sequence if after_sequence is not None and has_more else None
+            ),
+            "around_sequence": (
+                max(0, int(around_sequence))
+                if around_sequence is not None
+                else None
+            ),
+        }
+
+    def search_history(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        conversation_id: str,
+        query: str = "",
+        message_id: str | None = None,
+        sequence: int | None = None,
+        sender_participant_id: str | None = None,
+        created_after: float | None = None,
+        created_before: float | None = None,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Search joined-room history without consuming or acknowledging delivery."""
+
+        participant = opaque_id(participant_id, field="participant_id")
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        conversation = validate_conversation_id(conversation_id)
+        normalized_query = str(query or "").strip()
+        if len(normalized_query) > MAX_HISTORY_SEARCH_QUERY_LENGTH or any(
+            ord(character) < 32 and character not in "\t\n\r"
+            for character in normalized_query
+        ):
+            raise ValidationError(
+                "query must contain at most "
+                f"{MAX_HISTORY_SEARCH_QUERY_LENGTH} visible characters"
+            )
+        terms = normalized_query.split()
+        if len(terms) > MAX_HISTORY_SEARCH_TERMS:
+            raise ValidationError(
+                f"query cannot contain more than {MAX_HISTORY_SEARCH_TERMS} terms"
+            )
+        normalized_message_id = (
+            opaque_id(message_id, field="message_id") if message_id else None
+        )
+        if sequence is not None and isinstance(sequence, bool):
+            raise ValidationError("sequence must be an integer")
+        normalized_sequence = max(0, int(sequence)) if sequence is not None else None
+        normalized_sender = (
+            opaque_id(sender_participant_id, field="sender_participant_id")
+            if sender_participant_id
+            else None
+        )
+        normalized_after = self._finite_history_timestamp(
+            created_after,
+            field="created_after",
+        )
+        normalized_before = self._finite_history_timestamp(
+            created_before,
+            field="created_before",
+        )
+        if (
+            normalized_after is not None
+            and normalized_before is not None
+            and normalized_after > normalized_before
+        ):
+            raise ValidationError("created_after cannot be later than created_before")
+        if not any(
+            (
+                terms,
+                normalized_message_id,
+                normalized_sequence is not None,
+                normalized_sender,
+                normalized_after is not None,
+                normalized_before is not None,
+            )
+        ):
+            raise ValidationError("history search requires a query or exact filter")
+        normalized_limit = max(1, min(int(limit), 20))
+
+        conditions = ["message.conversation_id = ?"]
+        parameters: list[Any] = [conversation]
+        if normalized_message_id is not None:
+            conditions.append("message.message_id = ?")
+            parameters.append(normalized_message_id)
+        if normalized_sequence is not None:
+            conditions.append("message.sequence = ?")
+            parameters.append(normalized_sequence)
+        if normalized_sender is not None:
+            conditions.append("message.sender_participant_id = ?")
+            parameters.append(normalized_sender)
+        if normalized_after is not None:
+            conditions.append("message.created_at >= ?")
+            parameters.append(normalized_after)
+        if normalized_before is not None:
+            conditions.append("message.created_at <= ?")
+            parameters.append(normalized_before)
+        for term in terms:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conditions.append("message.body LIKE ? ESCAPE '\\'")
+            parameters.append(f"%{escaped}%")
+        parameters.append(normalized_limit)
+
+        now = time.time()
+        with self._connection() as conn:
+            self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            self._require_membership(conn, participant, conversation)
+            rows = conn.execute(
+                f"""
+                SELECT message.*,
+                       sender.display_name AS sender_display_name,
+                       sender.client_type AS sender_client_type,
+                       original.sequence AS replied_sequence,
+                       original.sender_participant_id AS replied_sender_participant_id,
+                       original_sender.display_name AS replied_sender_display_name
+                FROM messages AS message
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                LEFT JOIN messages AS original
+                  ON original.message_id = message.reply_to
+                LEFT JOIN participants AS original_sender
+                  ON original_sender.participant_id = original.sender_participant_id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY message.sequence DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+
+        results = [self._history_search_payload(row, terms=terms) for row in rows]
+        return {
+            "conversation_id": conversation,
+            "query": normalized_query,
+            "results": results,
+            "count": len(results),
+            "limit": normalized_limit,
+            "state_changed": False,
+            "context_hint": (
+                "Call agent_history with around_sequence set to a result sequence "
+                "to inspect nearby messages."
             ),
         }
 
@@ -5609,10 +6117,10 @@ class BridgeStore:
                   AND delivery.state IN ('pending', 'delivered')
                   AND message.sender_participant_id != ?
                 ORDER BY
-                    CASE delivery.priority
-                        WHEN 'direct' THEN 2
-                        WHEN 'mention' THEN 2
-                        WHEN 'important' THEN 1
+                    CASE
+                        WHEN instr(delivery.reasons_json, '"mention"') > 0 THEN 3
+                        WHEN delivery.priority IN ('direct', 'mention') THEN 2
+                        WHEN delivery.priority = 'important' THEN 1
                         ELSE 0
                     END DESC,
                     message.sequence
@@ -5786,6 +6294,8 @@ class BridgeStore:
                        MAX(message.created_at) AS newest_created_at,
                        SUM(CASE WHEN delivery.priority IN ('direct', 'mention')
                                 THEN 1 ELSE 0 END) AS mention_count,
+                       SUM(CASE WHEN instr(delivery.reasons_json, '"mention"') > 0
+                                THEN 1 ELSE 0 END) AS required_reply_count,
                        SUM(CASE WHEN delivery.priority = 'important' THEN 1 ELSE 0 END)
                            AS important_count,
                        SUM(CASE WHEN delivery.priority = 'normal' THEN 1 ELSE 0 END)
@@ -5829,6 +6339,7 @@ class BridgeStore:
                     "important": int(row["important_count"] or 0),
                     "normal": int(row["normal_count"] or 0),
                 },
+                "required_reply_count": int(row["required_reply_count"] or 0),
             }
             for row in rows
         ]
@@ -5839,8 +6350,12 @@ class BridgeStore:
             for priority in ("mention", "important", "normal")
         }
         pending_count = sum(int(item["pending_count"]) for item in conversations)
+        required_reply_count = sum(
+            int(item["required_reply_count"]) for item in conversations
+        )
         return {
             "pending_count": pending_count,
+            "required_reply_count": required_reply_count,
             "priority_counts": priority_counts,
             "oldest_sequence": (
                 min(item["oldest_sequence"] for item in conversations)
@@ -5871,6 +6386,8 @@ class BridgeStore:
                        MAX(message.sequence) AS newest_sequence,
                        SUM(CASE WHEN delivery.priority IN ('direct', 'mention')
                                 THEN 1 ELSE 0 END) AS mention_count,
+                       SUM(CASE WHEN instr(delivery.reasons_json, '"mention"') > 0
+                                THEN 1 ELSE 0 END) AS required_reply_count,
                        SUM(CASE WHEN delivery.priority = 'important' THEN 1 ELSE 0 END)
                            AS important_count,
                        SUM(CASE WHEN delivery.priority = 'normal' THEN 1 ELSE 0 END)
@@ -5909,6 +6426,7 @@ class BridgeStore:
                     "important": int(row["important_count"] or 0),
                     "normal": int(row["normal_count"] or 0),
                 },
+                "required_reply_count": int(row["required_reply_count"] or 0),
             }
             for row in rows
         ]
@@ -5921,6 +6439,9 @@ class BridgeStore:
         return {
             "activity_count": sum(
                 int(item["activity_count"]) for item in conversations
+            ),
+            "required_reply_count": sum(
+                int(item["required_reply_count"]) for item in conversations
             ),
             "priority_counts": priority_counts,
             "oldest_sequence": (
@@ -6257,7 +6778,8 @@ class BridgeStore:
             """
             SELECT web_session.*, web_user.username, web_user.role,
                    web_user.participant_id, web_user.display_name,
-                   web_user.signature
+                   web_user.signature, web_user.can_create_rooms,
+                   web_user.room_limit
             FROM web_sessions AS web_session
             JOIN web_users AS web_user ON web_user.user_id = web_session.user_id
             WHERE web_session.session_id = ?
@@ -6275,8 +6797,92 @@ class BridgeStore:
         return row
 
     @staticmethod
+    def _web_user_room_permission_payload(
+        row: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("web user row disappeared")
+        return {
+            "user_id": str(row["user_id"]),
+            "username": str(row["username"]),
+            "display_name": str(row["display_name"]),
+            "signature": str(row["signature"]),
+            "can_create_rooms": bool(row["can_create_rooms"]),
+            "room_limit": int(row["room_limit"]),
+            "owned_active_room_count": int(
+                row["owned_active_room_count"] or 0
+            ),
+            "owned_room_count": int(row["owned_room_count"] or 0),
+        }
+
+    @staticmethod
+    def _finite_history_timestamp(
+        value: float | None,
+        *,
+        field: str,
+    ) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValidationError(f"{field} must be a finite Unix timestamp")
+        normalized = float(value)
+        if not math.isfinite(normalized) or normalized < 0:
+            raise ValidationError(f"{field} must be a finite Unix timestamp")
+        return normalized
+
+    @staticmethod
+    def _history_search_payload(
+        row: sqlite3.Row,
+        *,
+        terms: Sequence[str],
+    ) -> dict[str, Any]:
+        body_text = str(row["body"])
+        folded = body_text.casefold()
+        offsets = [folded.find(term.casefold()) for term in terms if term]
+        offsets = [offset for offset in offsets if offset >= 0]
+        start = max(0, (min(offsets) if offsets else 0) - 70)
+        end = min(len(body_text), start + 240)
+        snippet = body_text[start:end]
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(body_text):
+            snippet += "…"
+        return {
+            "message_id": str(row["message_id"]),
+            "sequence": int(row["sequence"]),
+            "sender_participant_id": str(row["sender_participant_id"]),
+            "sender_display_name": str(row["sender_display_name"]),
+            "sender_client_type": str(row["sender_client_type"]),
+            "created_at": float(row["created_at"]),
+            "snippet": snippet,
+            "reply": (
+                {
+                    "message_id": str(row["reply_to"]),
+                    "sequence": int(row["replied_sequence"]),
+                    "sender_participant_id": str(
+                        row["replied_sender_participant_id"]
+                    ),
+                    "sender_display_name": str(
+                        row["replied_sender_display_name"] or ""
+                    ),
+                }
+                if row["reply_to"] is not None
+                else None
+            ),
+        }
+
+    @staticmethod
     def _secret_hash(secret: str) -> str:
         return hashlib.sha256(str(secret).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _constant_time_eq(left: str, right: str) -> bool:
+        # compare_digest only accepts ASCII str; encode so Unicode identities
+        # (e.g. claude-code-小鲸鱼娘) compare safely and in constant time.
+        return secrets.compare_digest(
+            str(left).encode("utf-8"),
+            str(right).encode("utf-8"),
+        )
 
     @staticmethod
     def _normalize_audience_value(
@@ -6375,6 +6981,7 @@ class BridgeStore:
             "body": str(row["body"]),
             "refs": json.loads(str(row["refs_json"])),
             "mentions": json.loads(str(row["mentions_json"] or "[]")),
+            "wake_all_agents": bool(row["wake_all_agents"]),
             "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
             "status": str(row["status"]),
             "claimed_by": str(row["claimed_by"]) if row["claimed_by"] else None,
@@ -6383,9 +6990,10 @@ class BridgeStore:
         }
         keys = set(row.keys())
         if "delivery_state" in keys:
+            reasons = json.loads(str(row["delivery_reasons_json"] or "[]"))
             payload["delivery"] = {
                 "state": str(row["delivery_state"]),
-                "reasons": json.loads(str(row["delivery_reasons_json"] or "[]")),
+                "reasons": reasons,
                 "priority": (
                     "mention"
                     if str(row["delivery_priority"]) == "direct"

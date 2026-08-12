@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import plistlib
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -374,6 +375,13 @@ def configure_resident_connector(
             "--database",
             str(queue_database),
         ]
+        # launchd 的默认 PATH 不包含 Homebrew 或用户本地 bin；优先把安装时
+        # 探测到的 Codex 绝对路径交给 worker，PATH 只作为可迁移的后备入口。
+        local_bin = str((user_home / ".local" / "bin").expanduser().resolve())
+        merged_path = os.pathsep.join(
+            [local_bin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        )
+        codex_binary = shutil.which("codex")
         worker_environment = {
             **common,
             "AGENT_BRIDGE_AGENT_WAKE_POLICY": "mention",
@@ -382,7 +390,10 @@ def configure_resident_connector(
             "AGENT_BRIDGE_CODEX_THREAD_STATE_FILE": str(thread_file),
             "AGENT_BRIDGE_CODEX_THREAD_NAME": f"Agent Bridge 值守：{conversation}",
             "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
+            "PATH": merged_path,
         }
+        if codex_binary:
+            worker_environment["AGENT_BRIDGE_CODEX_BINARY"] = codex_binary
     else:
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-supervisor"),
@@ -399,11 +410,22 @@ def configure_resident_connector(
             "--debounce",
             "3",
         ]
+        # launchd 默认 PATH 不含 ~/.local/bin，claude 常装在 ~/.local/bin。
+        # 显式把用户本地 bin 并入 PATH，并优先注入探测到的 claude 绝对路径，
+        # 避免 adapter 报 "Claude Code CLI was not found"。
+        local_bin = str((user_home / ".local" / "bin").expanduser().resolve())
+        merged_path = os.pathsep.join(
+            [local_bin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        )
+        claude_binary = shutil.which("claude")
         worker_environment = {
             **common,
             "AGENT_BRIDGE_CLAUDE_CWD": str(workspace),
             "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
+            "PATH": merged_path,
         }
+        if claude_binary:
+            worker_environment["AGENT_BRIDGE_CLAUDE_BINARY"] = claude_binary
 
     if host_system == "Darwin":
         launch_agents = user_home / "Library" / "LaunchAgents"
