@@ -21,8 +21,10 @@ from .config import BridgeConfig
 from .connector import adapter_kind_for_product, configure_resident_connector
 from .resident_health import (
     configure_existing_connector_from_disk,
+    local_connector_template,
     local_resident_snapshot,
     repair_known_identity_services,
+    room_resident_detail,
     split_supported_identity,
 )
 from .store import (
@@ -132,10 +134,21 @@ def create_app(
                     force=True,
                 )
                 for client_type, detail in snapshot.items():
-                    if detail.get("resident_status") != "online":
+                    connectors = detail.get("connectors") or {}
+                    if not connectors and detail.get("resident_status") != "online":
                         await asyncio.to_thread(
                             repair_known_identity_services,
                             client_type,
+                        )
+                        continue
+                    for connector in connectors.values():
+                        if connector.get("resident_status") == "online":
+                            continue
+                        await asyncio.to_thread(
+                            repair_known_identity_services,
+                            client_type,
+                            connector_id=connector.get("connector_id"),
+                            conversation_id=connector.get("conversation_id"),
                         )
             except asyncio.CancelledError:
                 raise
@@ -538,15 +551,22 @@ def create_app(
                 required={"target_conversation_id", "selections"},
                 allowed={"target_conversation_id", "selections"},
             )
-            return JSONResponse(
-                {
-                    "migration": store.migrate_agents(
-                        target_conversation_id=payload["target_conversation_id"],
-                        selections=payload["selections"],
-                        migrated_by_web_user_id=str(identity["user_id"]),
-                    )
-                }
+            migration = await asyncio.to_thread(
+                store.migrate_agents,
+                target_conversation_id=payload["target_conversation_id"],
+                selections=payload["selections"],
+                migrated_by_web_user_id=str(identity["user_id"]),
             )
+            seats = await provision_migrated_room_seats(
+                conversation_id=str(migration["target_conversation_id"]),
+                participant_ids=[
+                    str(agent["participant_id"])
+                    for agent in migration["agents"]
+                ],
+                web_identity=identity,
+            )
+            migration["room_seats"] = seats
+            return JSONResponse({"migration": migration})
         except Exception as exc:
             return _json_error(exc)
 
@@ -1148,6 +1168,30 @@ def create_app(
         except Exception as exc:
             return _json_error(exc)
 
+    async def forward_web_message(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="forward-message")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required={"target_conversation_id"},
+                allowed={"target_conversation_id", "note"},
+            )
+            return JSONResponse(
+                {
+                    "message": store.forward_web_message(
+                        authorized_session_id=str(identity["session_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        source_message_id=request.path_params["message_id"],
+                        target_conversation_id=payload["target_conversation_id"],
+                        note=payload.get("note"),
+                    )
+                },
+                status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def revoke_chat_authorization(request: Request) -> Response:
         try:
             require_web_intent(request, intent="revoke-chat-authorization")
@@ -1177,15 +1221,18 @@ def create_app(
             )
             local_residents = await asyncio.to_thread(local_resident_snapshot)
             for participant in projected:
-                local = local_residents.get(str(participant["client_type"]))
-                if local is None:
+                connector_id = str(participant.get("connector_id") or "")
+                room_local = room_resident_detail(
+                    local_residents,
+                    client_type=str(participant["client_type"]),
+                    connector_id=connector_id or None,
+                    conversation_id=request.path_params["conversation_id"],
+                )
+                if room_local is None:
                     continue
-                participant["local_resident"] = local
-                if local["resident_status"] == "online":
+                participant["local_resident"] = room_local
+                if room_local["resident_status"] == "online":
                     participant["resident_status"] = "online"
-                    participant["connector_adapter_kind"] = str(
-                        local["adapter_kind"]
-                    )
             return JSONResponse(
                 {
                     "conversation_id": request.path_params["conversation_id"],
@@ -1209,18 +1256,42 @@ def create_app(
                 client_type = str(participant["client_type"])
                 if split_supported_identity(client_type) is None:
                     continue
-                local = await asyncio.to_thread(
-                    repair_known_identity_services,
-                    client_type,
-                    enable_disabled=True,
-                )
+                connector_id = str(participant.get("connector_id") or "")
+                local = None
+                if connector_id:
+                    local = await asyncio.to_thread(
+                        repair_known_identity_services,
+                        client_type,
+                        connector_id=connector_id,
+                        conversation_id=conversation,
+                        enable_disabled=True,
+                    )
                 configured = None
                 if local is None:
-                    connector_id = str(participant.get("connector_id") or "")
                     if not connector_id and enable_resident_repair:
                         product_and_username = split_supported_identity(client_type)
                         if product_and_username is not None:
                             product, username = product_and_username
+                            template = await asyncio.to_thread(
+                                local_connector_template,
+                                client_type,
+                            )
+                            if template is None:
+                                unavailable.append(
+                                    {
+                                        "participant_id": str(
+                                            participant["participant_id"]
+                                        ),
+                                        "display_name": str(
+                                            participant["display_name"]
+                                        ),
+                                        "reason": (
+                                            "本机没有可安全复制的原值守工作区配置，"
+                                            "需重新邀请接入"
+                                        ),
+                                    }
+                                )
+                                continue
                             try:
                                 invitation = await asyncio.to_thread(
                                     store.create_agent_invitation,
@@ -1269,7 +1340,9 @@ def create_app(
                                     capabilities=list(
                                         participant.get("capabilities") or []
                                     ),
-                                    workspace_path=str(PROJECT_ROOT),
+                                    workspace_path=str(
+                                        template.get("workspace_path") or ""
+                                    ),
                                     activate=True,
                                 )
                                 configured = setup.public_payload()
@@ -1290,6 +1363,10 @@ def create_app(
                                 local = await asyncio.to_thread(
                                     repair_known_identity_services,
                                     client_type,
+                                    connector_id=str(
+                                        registration["connector_id"]
+                                    ),
+                                    conversation_id=conversation,
                                 )
                             except Exception as exc:
                                 unavailable.append(
@@ -1317,10 +1394,14 @@ def create_app(
                         configured = await asyncio.to_thread(
                             configure_existing_connector_from_disk,
                             client_type,
+                            connector_id=connector_id or None,
+                            conversation_id=conversation,
                         )
                         local = await asyncio.to_thread(
                             repair_known_identity_services,
                             client_type,
+                            connector_id=connector_id or None,
+                            conversation_id=conversation,
                         )
                 if local is None:
                     unavailable.append(
@@ -1355,6 +1436,127 @@ def create_app(
             )
         except Exception as exc:
             return _json_error(exc)
+
+    async def provision_migrated_room_seats(
+        *,
+        conversation_id: str,
+        participant_ids: list[str],
+        web_identity: dict[str, object],
+    ) -> dict[str, object]:
+        """Best-effort local provisioning after additive membership migration."""
+
+        projected = {
+            str(participant["participant_id"]): participant
+            for participant in repository.participants(conversation_id)
+        }
+        provisioned: list[dict[str, object]] = []
+        unavailable: list[dict[str, str]] = []
+        for participant_id in participant_ids:
+            participant = projected.get(participant_id)
+            if participant is None:
+                unavailable.append(
+                    {
+                        "participant_id": participant_id,
+                        "reason": "目标聊天室成员投影尚未建立",
+                    }
+                )
+                continue
+            if participant.get("connector_id"):
+                provisioned.append(
+                    {
+                        "participant_id": participant_id,
+                        "connector_id": str(participant["connector_id"]),
+                        "created": False,
+                    }
+                )
+                continue
+            identity = split_supported_identity(str(participant["client_type"]))
+            if identity is None or not enable_resident_repair:
+                unavailable.append(
+                    {
+                        "participant_id": participant_id,
+                        "reason": "该产品不能由本机自动创建独立值守席位",
+                    }
+                )
+                continue
+            product, username = identity
+            template = await asyncio.to_thread(
+                local_connector_template,
+                str(participant["client_type"]),
+            )
+            if template is None:
+                unavailable.append(
+                    {
+                        "participant_id": participant_id,
+                        "reason": "本机没有可安全复制的原值守工作区配置",
+                    }
+                )
+                continue
+            try:
+                invitation = await asyncio.to_thread(
+                    store.create_agent_invitation,
+                    conversation_id=conversation_id,
+                    product=product,
+                    requested_mode="resident",
+                    adapter_kind=adapter_kind_for_product(product),
+                    created_by_web_user_id=str(web_identity["user_id"]),
+                )
+                invitation_token = str(invitation.pop("invitation_token"))
+                registration = await asyncio.to_thread(
+                    store.accept_agent_invitation,
+                    invitation_token=invitation_token,
+                    product=product,
+                    username=username,
+                    signature=str(participant["signature"]),
+                    roles=list(participant.get("roles") or []),
+                    capabilities=list(participant.get("capabilities") or []),
+                )
+                local_port = int(os.environ.get("AGENT_BRIDGE_VIEWER_PORT", "8765"))
+                setup = await asyncio.to_thread(
+                    configure_resident_connector,
+                    connector_id=str(registration["connector_id"]),
+                    enrollment_token=str(registration["enrollment_token"]),
+                    bridge_url=f"http://127.0.0.1:{local_port}",
+                    product=product,
+                    username=username,
+                    signature=str(participant["signature"]),
+                    conversation_id=conversation_id,
+                    adapter_kind=adapter_kind_for_product(product),
+                    requested_mode="resident",
+                    roles=list(participant.get("roles") or []),
+                    capabilities=list(participant.get("capabilities") or []),
+                    workspace_path=str(template.get("workspace_path") or PROJECT_ROOT),
+                    activate=True,
+                )
+                await asyncio.to_thread(
+                    store.report_agent_connector_setup,
+                    participant_id=str(registration["participant_id"]),
+                    authorized_session_id=str(registration["session_id"]),
+                    connector_id=str(registration["connector_id"]),
+                    setup_status=setup.status,
+                    detail=setup.public_payload(),
+                )
+                provisioned.append(
+                    {
+                        "participant_id": participant_id,
+                        "connector_id": str(registration["connector_id"]),
+                        "created": True,
+                        "resident_status": setup.status,
+                    }
+                )
+            except Exception as exc:
+                unavailable.append(
+                    {
+                        "participant_id": participant_id,
+                        "reason": f"独立值守席位创建失败：{exc}",
+                    }
+                )
+        return {
+            "target_conversation_id": conversation_id,
+            "provisioned": provisioned,
+            "unavailable": unavailable,
+            "all_ready": not unavailable,
+        }
 
     async def nickname_requests(request: Request) -> Response:
         try:
@@ -1754,6 +1956,11 @@ def create_app(
             Route(
                 "/api/messages/{message_id:str}/authorization/revoke",
                 revoke_chat_authorization,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/messages/{message_id:str}/forward",
+                forward_web_message,
                 methods=["POST"],
             ),
             Route(

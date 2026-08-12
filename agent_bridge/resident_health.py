@@ -116,6 +116,12 @@ def _launchd_services(home: Path) -> dict[str, dict[str, Any]]:
             "label": label,
             "path": str(plist_path),
             "kind": kind,
+            "connector_id": str(
+                environment.get("AGENT_BRIDGE_CONNECTOR_ID") or ""
+            ).strip(),
+            "conversation_id": str(
+                environment.get("AGENT_BRIDGE_CONVERSATION_ID") or ""
+            ).strip(),
             "state": "disabled" if label in disabled_labels else launchd_state,
             "launchd_state": launchd_state,
         }
@@ -165,6 +171,41 @@ def local_resident_snapshot(
                 else "none"
             ),
         }
+        connectors: dict[str, dict[str, Any]] = {}
+        for service in services:
+            connector_id = str(service.get("connector_id") or "")
+            conversation_id = str(service.get("conversation_id") or "")
+            key = connector_id or f"legacy:{conversation_id or identity}"
+            connector = connectors.setdefault(
+                key,
+                {
+                    "connector_id": connector_id or None,
+                    "conversation_id": conversation_id or None,
+                    "services": [],
+                },
+            )
+            connector["services"].append(service)
+        for connector in connectors.values():
+            connector_listeners = [
+                item for item in connector["services"] if item["kind"] == "listener"
+            ]
+            connector_workers = [
+                item for item in connector["services"] if item["kind"] == "worker"
+            ]
+            connector["listener_running"] = any(
+                item["state"] == "running" for item in connector_listeners
+            )
+            connector["worker_running"] = any(
+                item["state"] == "running" for item in connector_workers
+            )
+            connector["resident_status"] = (
+                "online"
+                if connector["listener_running"] and connector["worker_running"]
+                else "degraded"
+                if connector_listeners or connector_workers
+                else "none"
+            )
+        snapshot[identity]["connectors"] = connectors
     if cacheable:
         with _CACHE_LOCK:
             _CACHE_AT = now
@@ -193,6 +234,8 @@ def _run_launchctl(command: list[str], *, description: str) -> None:
 def repair_known_identity_services(
     client_type: str,
     *,
+    connector_id: str | None = None,
+    conversation_id: str | None = None,
     home: Path | None = None,
     system_name: str | None = None,
     enable_disabled: bool = False,
@@ -206,11 +249,31 @@ def repair_known_identity_services(
     ).get(client_type)
     if before is None:
         return None
+    selected_services = list(before["services"])
+    if connector_id:
+        selected_services = [
+            service
+            for service in selected_services
+            if str(service.get("connector_id") or "") == connector_id
+        ]
+    if conversation_id:
+        selected_services = [
+            service
+            for service in selected_services
+            if str(service.get("conversation_id") or "") == conversation_id
+        ]
+    if not selected_services:
+        return None
     if host_system != "Darwin":
-        return before
+        return room_resident_detail(
+            {client_type: before},
+            client_type=client_type,
+            connector_id=connector_id,
+            conversation_id=conversation_id,
+        ) or before
     domain = f"gui/{os.getuid()}"
     repaired: list[str] = []
-    for service in before["services"]:
+    for service in selected_services:
         if service["state"] == "running":
             continue
         label = str(service["label"])
@@ -243,12 +306,104 @@ def repair_known_identity_services(
         system_name=host_system,
         force=True,
     ).get(client_type, before)
+    if connector_id:
+        selected = (after.get("connectors") or {}).get(connector_id)
+        if selected is not None:
+            return {**selected, "repaired_services": repaired}
+    if conversation_id:
+        selected = next(
+            (
+                detail
+                for detail in (after.get("connectors") or {}).values()
+                if detail.get("conversation_id") == conversation_id
+            ),
+            None,
+        )
+        if selected is not None:
+            return {**selected, "repaired_services": repaired}
+    if connector_id or conversation_id:
+        return None
     return {**after, "repaired_services": repaired}
+
+
+def room_resident_detail(
+    snapshot: dict[str, dict[str, Any]],
+    *,
+    client_type: str,
+    connector_id: str | None = None,
+    conversation_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Project one identity snapshot onto one connector/room seat."""
+
+    identity = snapshot.get(client_type)
+    if identity is None:
+        return None
+    connectors = identity.get("connectors") or {}
+    if connector_id:
+        detail = connectors.get(connector_id)
+        if detail is None:
+            return None
+        if conversation_id and detail.get("conversation_id") != conversation_id:
+            return None
+        return detail
+    if conversation_id:
+        for detail in connectors.values():
+            if detail.get("conversation_id") == conversation_id:
+                return detail
+    return None
+
+
+def local_connector_template(
+    client_type: str,
+    *,
+    home: Path | None = None,
+    system_name: str | None = None,
+) -> dict[str, Any] | None:
+    """Read non-secret local defaults for cloning one identity into another room."""
+
+    current_home = (home or Path.home()).expanduser().resolve()
+    host_system = system_name or platform.system()
+    connector_root = (
+        current_home / "Library" / "Application Support" / "AgentBridge" / "connectors"
+        if host_system == "Darwin"
+        else current_home / ".local" / "state" / "agent-bridge" / "connectors"
+    )
+    if not connector_root.is_dir():
+        return None
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for manifest_path in connector_root.glob("connector_*/connector.json"):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest_identity = client_identity(
+                f"{manifest['product']}-{manifest['username']}"
+            )
+            modified_at = manifest_path.stat().st_mtime
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if manifest_identity != client_type:
+            continue
+        candidates.append(
+            (
+                modified_at,
+                {
+                    "product": str(manifest["product"]),
+                    "username": str(manifest["username"]),
+                    "signature": str(manifest.get("signature") or ""),
+                    "roles": list(manifest.get("roles") or []),
+                    "capabilities": list(manifest.get("capabilities") or []),
+                    "workspace_path": str(manifest.get("workspace_path") or ""),
+                    "adapter_kind": str(manifest.get("adapter_kind") or ""),
+                },
+            )
+        )
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def configure_existing_connector_from_disk(
     client_type: str,
     *,
+    connector_id: str | None = None,
+    conversation_id: str | None = None,
     home: Path | None = None,
     system_name: str | None = None,
 ) -> dict[str, Any] | None:
@@ -271,6 +426,13 @@ def configure_existing_connector_from_disk(
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             continue
         if manifest_identity != client_type:
+            continue
+        if connector_id and str(manifest.get("connector_id") or "") != connector_id:
+            continue
+        if (
+            conversation_id
+            and str(manifest.get("conversation_id") or "") != conversation_id
+        ):
             continue
         enrollment_file = manifest_path.parent / "enrollment.token"
         try:

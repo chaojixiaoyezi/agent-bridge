@@ -238,7 +238,7 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -1426,7 +1426,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 20
+    assert version == 21
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -1498,7 +1498,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 20
+    assert version == 21
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -1594,7 +1594,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 20
+    assert version == 21
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -2173,8 +2173,14 @@ def test_message_cooldown_is_per_sender_and_per_room(tmp_path: Path) -> None:
         conversation_id="room-two",
         resume_participant_id=sender["participant_id"],
     )
+    room_two_session = store.register_agent_session(
+        product="codex",
+        username="限频发送者",
+        session_alias=sender["session_alias"],
+        conversation_id="room-two",
+    )
     another_room = store.send(
-        authorized_session_id=sender["session_id"],
+        authorized_session_id=room_two_session["session_id"],
         sender_participant_id=sender["participant_id"],
         conversation_id="room-two",
         body_text="同一个人在另一个房间可以说话",
@@ -2786,7 +2792,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 21
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -2841,7 +2847,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 20
+    assert version == 21
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -3216,13 +3222,13 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
             assert session_room == source
             assert connector_room == source
 
-    moved_message = store.send(
-        authorized_session_id=from_a["session_id"],
-        sender_participant_id=from_a["participant_id"],
-        conversation_id="目标-B",
-        body_text="复制加入后原会话可以直接在目标群发言。",
-    )
-    assert moved_message["conversation_id"] == "目标-B"
+    with pytest.raises(AuthorizationError, match="room-specific connector"):
+        store.send(
+            authorized_session_id=from_a["session_id"],
+            sender_participant_id=from_a["participant_id"],
+            conversation_id="目标-B",
+            body_text="原聊天室会话不能越界到目标群发言。",
+        )
     source_message = store.send(
         authorized_session_id=from_a["session_id"],
         sender_participant_id=from_a["participant_id"],
@@ -3264,6 +3270,154 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
             "AND participant_id = ? AND active = 1",
             (from_a["participant_id"],),
         ).fetchone()[0] == 0
+
+
+def test_agent_sessions_isolate_room_delivery_history_and_database_writes(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    for room in ("隔离-A", "隔离-B"):
+        store.create_user_room(room)
+    first = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="隔离-A",
+        username="same-identity",
+    )
+    second = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="隔离-B",
+        username="same-identity",
+    )
+    assert first["participant_id"] == second["participant_id"]
+
+    store.send_owner_message(conversation_id="隔离-A", body_text="只属于 A 的消息")
+    store.send_owner_message(conversation_id="隔离-B", body_text="只属于 B 的消息")
+    first_page = store.wait_messages(
+        participant_id=first["participant_id"],
+        authorized_session_id=first["session_id"],
+        wait_seconds=0,
+    )
+    second_page = store.wait_messages(
+        participant_id=second["participant_id"],
+        authorized_session_id=second["session_id"],
+        wait_seconds=0,
+    )
+    assert first_page["conversation_id"] == "隔离-A"
+    assert [message["body"] for message in first_page["messages"]] == [
+        "只属于 A 的消息"
+    ]
+    assert second_page["conversation_id"] == "隔离-B"
+    assert [message["body"] for message in second_page["messages"]] == [
+        "只属于 B 的消息"
+    ]
+
+    with pytest.raises(AuthorizationError, match="room-specific connector"):
+        store.history(
+            participant_id=first["participant_id"],
+            authorized_session_id=first["session_id"],
+            conversation_id="隔离-B",
+        )
+    with pytest.raises(AuthorizationError, match="room-specific connector"):
+        store.send(
+            authorized_session_id=first["session_id"],
+            sender_participant_id=first["participant_id"],
+            conversation_id="隔离-B",
+            body_text="不能串群",
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="AUTHORIZED_SENDER_REQUIRED"):
+        with store._transaction() as connection:
+            created_at = time.time()
+            connection.execute(
+                """
+                INSERT INTO messages
+                    (message_id, conversation_id, sender_participant_id,
+                     audience_kind, audience_value, message_kind, body,
+                     refs_json, mentions_json, status, authorized_session_id,
+                     created_at, updated_at)
+                VALUES ('msg_cross_room_bypass', '隔离-B', ?, 'room', '隔离-B',
+                        'message', '数据库也不能绕过', '[]', '[]', 'open', ?, ?, ?)
+                """,
+                (
+                    first["participant_id"],
+                    first["session_id"],
+                    created_at,
+                    created_at,
+                ),
+            )
+    sent_in_first_room = store.send(
+        authorized_session_id=first["session_id"],
+        sender_participant_id=first["participant_id"],
+        conversation_id="隔离-A",
+        body_text="合法写入 A",
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="MESSAGE_ROUTE_IMMUTABLE"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE messages SET conversation_id = '隔离-B' "
+                "WHERE message_id = ?",
+                (sent_in_first_room["message_id"],),
+            )
+
+
+def test_admin_explicit_cross_room_forward_preserves_provenance_without_authority(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    for room in ("转发源群", "转发目标群"):
+        store.create_user_room(room)
+    target_agent = invite_agent(
+        store,
+        admin_id=admin_web_user_id(store),
+        room="转发目标群",
+        username="forward-target",
+    )
+    source = store.send_owner_message(
+        conversation_id="转发源群",
+        body_text="@forward-target 这段内容只有显式转发才能进入目标群。",
+    )
+    captcha_challenge = auth.create_captcha()
+    admin, session_token = auth.login(
+        username="admin",
+        password="admin",
+        captcha_id=captcha_challenge["captcha_id"],
+        captcha_answer="ABCDE",
+    )
+    forwarded = store.forward_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        source_message_id=source["message_id"],
+        target_conversation_id="转发目标群",
+        note="请在目标群继续讨论",
+    )
+    assert session_token
+    assert forwarded["message_kind"] == "forward"
+    assert forwarded["forwarded_from_message_id"] == source["message_id"]
+    assert "来源「转发源群」" in forwarded["body"]
+    assert "请在目标群继续讨论" in forwarded["body"]
+    assert forwarded["mentions"] == []
+    target_wait = store.wait_messages(
+        participant_id=target_agent["participant_id"],
+        authorized_session_id=target_agent["session_id"],
+        wait_seconds=0,
+    )
+    target_forward = next(
+        message
+        for message in target_wait["messages"]
+        if message["message_id"] == forwarded["message_id"]
+    )
+    assert target_forward["delivery"]["priority"] == "normal"
+    BridgeStore(store.database)
+    with store._connection() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM chat_authorization_grants "
+            "WHERE source_message_id = ?",
+            (forwarded["message_id"],),
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
@@ -3324,7 +3478,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 20
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 21
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

@@ -336,7 +336,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
-    assert "hadRenderedMessages ? isNearTimelineBottom() : true" in javascript
+    assert "? isNearTimelineBottom()" in javascript
 
     stylesheet_response = client.get("/assets/app.css")
     assert stylesheet_response.headers["cache-control"] == (
@@ -378,8 +378,9 @@ def test_admin_can_repair_known_room_residents_without_changing_chat_state(
         json={},
     )
     assert response.status_code == 200
-    assert response.json()["online_count"] == 2
-    assert sorted(repaired) == ["claude-code-小鲸鱼娘", "codex-小可爱"]
+    assert response.json()["online_count"] == 0
+    assert repaired == []
+    assert len(response.json()["unavailable"]) == 2
     with BridgeStore(database)._connection() as connection:
         assert int(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]) == (
             before_count
@@ -446,9 +447,14 @@ def test_dashboard_auto_clears_expired_sessions_and_keeps_manual_cleanup(
     participants = client.get("/api/rooms/room-one/participants").json()[
         "participants"
     ]
-    assert [person["participant_id"] for person in participants] == [
-        receiver["participant_id"]
-    ]
+    assert {person["participant_id"] for person in participants} == {
+        sender["participant_id"],
+        receiver["participant_id"],
+    }
+    assert next(
+        person for person in participants
+        if person["participant_id"] == sender["participant_id"]
+    )["status"] == "offline"
     room = next(
         item
         for item in client.get("/api/rooms").json()["rooms"]
@@ -1792,4 +1798,5 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert "/api/room-memberships/migrate" in javascript
     assert ".new-message-indicator svg" in stylesheet
     assert ':root[data-theme="ocean"]' in stylesheet
-    assert "content-visibility: auto" in stylesheet
+    assert ".message {\n  position: relative;" in stylesheet
+    assert "contain-intrinsic-size: 120px" not in stylesheet

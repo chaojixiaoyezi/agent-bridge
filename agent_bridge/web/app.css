@@ -502,8 +502,6 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
   position: relative;
   padding: 0 0 22px 19px;
   border-left: 1px solid var(--line);
-  content-visibility: auto;
-  contain-intrinsic-size: 120px;
 }
 
 .message::before {
@@ -530,7 +528,11 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
 .authorization-badge { padding: 3px 6px; border: 1px solid rgba(85,214,199,.22); border-radius: 999px; color: var(--cyan); background: rgba(85,214,199,.08); font-size: 8px; font-weight: 700; letter-spacing: .05em; }
 .authorization-badge.revoked { color: #a1a8b5; border-color: rgba(161,168,181,.18); background: rgba(161,168,181,.06); }
 .message-body { margin: 0; color: #d7dbe3; font-size: 13px; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
-.reply-label, .claim-label, .receipt-label, .mention-label, .authorization-label { margin-top: 8px; color: #727a89; font-size: 9px; }
+.reply-label, .claim-label, .receipt-label, .mention-label, .authorization-label, .forward-label { margin-top: 8px; color: #727a89; font-size: 9px; }
+.forward-label { color: var(--amber); }
+.forward-button { margin-left: 6px; color: var(--amber); }
+.forward-source-preview { max-height: 110px; margin: -6px 0 18px; padding: 10px 11px; overflow-y: auto; border: 1px solid rgba(242,181,99,.16); border-radius: 10px; color: var(--muted-strong); background: rgba(242,181,99,.05); font-size: 10px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.forward-note { min-height: 92px; padding-top: 10px; resize: vertical; }
 .mention-label { color: var(--purple); }
 .authorization-label { color: var(--cyan); }
 .authorization-label.revoked { color: #8d95a3; }

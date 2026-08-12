@@ -206,11 +206,13 @@ CREATE TABLE IF NOT EXISTS messages (
     claimed_by TEXT,
     claim_until REAL,
     authorized_session_id TEXT,
+    forwarded_from_message_id TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
     FOREIGN KEY (sender_participant_id) REFERENCES participants(participant_id),
     FOREIGN KEY (reply_to) REFERENCES messages(message_id),
+    FOREIGN KEY (forwarded_from_message_id) REFERENCES messages(message_id),
     FOREIGN KEY (claimed_by) REFERENCES participants(participant_id)
 );
 
@@ -725,6 +727,8 @@ END;
 AUTHORIZATION_SCHEMA = f"""
 CREATE INDEX IF NOT EXISTS idx_messages_authorized_session
     ON messages(authorized_session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_messages_forwarded_from
+    ON messages(forwarded_from_message_id, sequence);
 
 DROP TRIGGER IF EXISTS trg_messages_require_live_mcp_session;
 DROP TRIGGER IF EXISTS trg_messages_require_authorized_sender;
@@ -822,6 +826,7 @@ WHEN NOT (
         FROM agent_sessions AS session
         WHERE session.session_id = NEW.authorized_session_id
           AND session.participant_id = NEW.sender_participant_id
+          AND session.registered_conversation_id = NEW.conversation_id
           AND session.transport = 'mcp'
           AND session.cleared_at IS NULL
           AND session.revoked_at IS NULL
@@ -830,6 +835,53 @@ WHEN NOT (
 )
 BEGIN
     SELECT RAISE(ABORT, 'AUTHORIZED_SENDER_REQUIRED');
+END;
+
+DROP TRIGGER IF EXISTS trg_messages_forward_requires_source;
+CREATE TRIGGER trg_messages_forward_requires_source
+BEFORE INSERT ON messages
+WHEN (
+    NEW.message_kind = 'forward'
+    AND (
+        NEW.forwarded_from_message_id IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM messages AS source
+            WHERE source.message_id = NEW.forwarded_from_message_id
+              AND source.conversation_id != NEW.conversation_id
+        )
+    )
+) OR (
+    NEW.message_kind != 'forward'
+    AND NEW.forwarded_from_message_id IS NOT NULL
+)
+BEGIN
+    SELECT RAISE(ABORT, 'INVALID_CROSS_ROOM_FORWARD');
+END;
+
+DROP TRIGGER IF EXISTS trg_messages_route_immutable;
+CREATE TRIGGER trg_messages_route_immutable
+BEFORE UPDATE OF conversation_id, sender_participant_id,
+                 authorized_session_id, message_kind,
+                 forwarded_from_message_id ON messages
+WHEN NEW.sender_participant_id IS NOT OLD.sender_participant_id
+  OR NEW.authorized_session_id IS NOT OLD.authorized_session_id
+  OR NEW.message_kind IS NOT OLD.message_kind
+  OR NEW.forwarded_from_message_id IS NOT OLD.forwarded_from_message_id
+  OR (
+      NEW.conversation_id IS NOT OLD.conversation_id
+      AND NOT (
+          NOT EXISTS (
+              SELECT 1 FROM rooms
+              WHERE conversation_id = OLD.conversation_id
+          )
+          AND EXISTS (
+              SELECT 1 FROM rooms
+              WHERE conversation_id = NEW.conversation_id
+          )
+      )
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'MESSAGE_ROUTE_IMMUTABLE');
 END;
 """
 
@@ -963,6 +1015,11 @@ class BridgeStore:
                     "ALTER TABLE messages ADD COLUMN wake_all_agents INTEGER "
                     "NOT NULL DEFAULT 0 CHECK (wake_all_agents IN (0, 1))"
                 )
+            if "forwarded_from_message_id" not in message_columns:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN forwarded_from_message_id TEXT "
+                    "REFERENCES messages(message_id)"
+                )
             if schema_version < 8 or mentions_column_added:
                 self._backfill_implicit_participant_mentions(conn)
             conn.executescript(WEB_AUTH_SCHEMA)
@@ -973,6 +1030,8 @@ class BridgeStore:
             self._migrate_reusable_agent_invitations(conn)
             self._migrate_agent_connector_conversations(conn)
             conn.executescript(INVITATION_SCHEMA)
+            if schema_version < 21:
+                self._repair_connector_room_bindings(conn)
             conn.executescript(AGENT_LIFECYCLE_SCHEMA)
             self._backfill_agent_lifecycle_states(conn)
             self._restore_legacy_migrated_memberships(conn)
@@ -1040,7 +1099,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 20")
+            conn.execute("PRAGMA user_version = 21")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1293,13 +1352,57 @@ class BridgeStore:
             )
 
     @staticmethod
+    def _repair_connector_room_bindings(conn: sqlite3.Connection) -> None:
+        """Repair pre-v21 connector/session room drift without moving memberships.
+
+        An invitation is the immutable authority that created a connector. Room
+        renames update both rows atomically, so a mismatch means an older
+        migration rebound only the central connector record while its local
+        resident configuration stayed in the invitation room.
+        """
+
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET conversation_id = (
+                    SELECT invitation.conversation_id
+                    FROM agent_invitations AS invitation
+                    WHERE invitation.invitation_id = agent_connectors.invitation_id
+                ),
+                updated_at = MAX(updated_at, CAST(strftime('%s', 'now') AS REAL))
+            WHERE EXISTS (
+                SELECT 1 FROM agent_invitations AS invitation
+                WHERE invitation.invitation_id = agent_connectors.invitation_id
+                  AND invitation.conversation_id != agent_connectors.conversation_id
+            )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE agent_sessions
+            SET registered_conversation_id = (
+                    SELECT connector.conversation_id
+                    FROM agent_connectors AS connector
+                    WHERE connector.connector_id = agent_sessions.connector_id
+                )
+            WHERE connector_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM agent_connectors AS connector
+                  WHERE connector.connector_id = agent_sessions.connector_id
+                    AND connector.conversation_id
+                        != agent_sessions.registered_conversation_id
+              )
+            """
+        )
+
+    @staticmethod
     def _restore_legacy_migrated_memberships(conn: sqlite3.Connection) -> None:
         """Restore source-room membership removed by the old move semantics.
 
-        Migration is now additive: one resident connector can serve every active
-        room its participant has joined.  Older releases deactivated the source
-        membership and recorded a ``migrated`` block.  Reactivate only memberships
-        whose source room is still active; abandoned-room history remains untouched.
+        Migration is additive, while each resident connector remains bound to one
+        room. Older releases deactivated the source membership and recorded a
+        ``migrated`` block. Reactivate only memberships whose source room is still
+        active; abandoned-room history remains untouched.
         """
 
         conn.execute(
@@ -1411,6 +1514,7 @@ class BridgeStore:
               ON web_user.user_id = web_session.user_id
              AND web_user.participant_id = message.sender_participant_id
             WHERE web_user.role = 'admin'
+              AND message.message_kind = 'message'
               AND NOT EXISTS (
                   SELECT 1 FROM chat_authorization_grants AS grant_record
                   WHERE grant_record.source_message_id = message.message_id
@@ -1986,7 +2090,7 @@ class BridgeStore:
         issuer_username: str,
         issuer_role: str,
     ) -> None:
-        if issuer_role != "admin":
+        if issuer_role != "admin" or str(message["message_kind"]) == "forward":
             return
         target = cls._admin_chat_authorization_targets_locked(
             conn,
@@ -5106,6 +5210,9 @@ class BridgeStore:
         return {
             "session_id": str(row["session_id"]),
             "participant_id": str(row["participant_id"]),
+            "registered_conversation_id": str(
+                row["registered_conversation_id"]
+            ),
             "client_type": str(row["client_type"]),
             "session_alias": str(row["session_alias"]),
             "display_name": str(row["display_name"]),
@@ -5507,10 +5614,11 @@ class BridgeStore:
         conversation = validate_conversation_id(conversation_id)
         now = time.time()
         with self._transaction() as conn:
-            self._require_live_session(
+            self._require_live_room_session(
                 conn,
                 session_id=session,
                 participant_id=follower,
+                conversation_id=conversation,
                 now=now,
             )
             self._require_membership(conn, follower, conversation)
@@ -5566,10 +5674,11 @@ class BridgeStore:
         conversation = validate_conversation_id(conversation_id)
         with self._connection() as conn:
             now = time.time()
-            self._require_live_session(
+            self._require_live_room_session(
                 conn,
                 session_id=session,
                 participant_id=follower,
+                conversation_id=conversation,
                 now=now,
             )
             self._require_membership(conn, follower, conversation)
@@ -5611,6 +5720,10 @@ class BridgeStore:
         wake_all_agents: bool = False,
         _owner_ui: bool = False,
         _web_user: bool = False,
+        _message_kind: str = "message",
+        _forwarded_from_message_id: str | None = None,
+        _suppress_chat_authorization: bool = False,
+        _suppress_mention_inference: bool = False,
     ) -> dict[str, Any]:
         session = opaque_id(
             authorized_session_id,
@@ -5630,6 +5743,19 @@ class BridgeStore:
         normalized_reply = (
             opaque_id(reply_to, field="reply_to") if reply_to else None
         )
+        normalized_message_kind = str(_message_kind or "message").strip().lower()
+        normalized_forward = (
+            opaque_id(
+                _forwarded_from_message_id,
+                field="forwarded_from_message_id",
+            )
+            if _forwarded_from_message_id
+            else None
+        )
+        if normalized_message_kind not in {"message", "forward"}:
+            raise ValidationError("unsupported internal message kind")
+        if (normalized_message_kind == "forward") != bool(normalized_forward):
+            raise ValidationError("cross-room forwards require one source message")
         if normalized_wake_all and normalized_audience != "room":
             raise ValidationError("wake_all_agents requires a room audience")
         normalized_target = self._normalize_audience_value(
@@ -5694,10 +5820,11 @@ class BridgeStore:
                     )
                 )
             else:
-                self._require_live_session(
+                self._require_live_room_session(
                     conn,
                     session_id=session,
                     participant_id=sender,
+                    conversation_id=conversation,
                     now=now,
                 )
                 self._require_membership(conn, sender, conversation)
@@ -5708,28 +5835,31 @@ class BridgeStore:
                 )
                 if normalized_wake_all:
                     raise AuthorizationError("Agent 不能发起结构化 @全员")
-            normalized_body, internal_mentions = (
-                self._rewrite_internal_text_mentions_locked(
-                    conn,
-                    conversation_id=conversation,
-                    sender_participant_id=sender,
-                    body_text=normalized_body,
+            internal_mentions: list[str] = []
+            if not _suppress_mention_inference:
+                normalized_body, internal_mentions = (
+                    self._rewrite_internal_text_mentions_locked(
+                        conn,
+                        conversation_id=conversation,
+                        sender_participant_id=sender,
+                        body_text=normalized_body,
+                    )
                 )
-            )
             # A display name can be longer than its opaque ID, so enforce the
             # body limit again after the user-visible rewrite.
             normalized_body = body(normalized_body)
             for inferred in internal_mentions:
                 if inferred not in normalized_mentions:
                     normalized_mentions.append(inferred)
-            for inferred in self._infer_text_mentions_locked(
-                conn,
-                conversation_id=conversation,
-                sender_participant_id=sender,
-                body_text=normalized_body,
-            ):
-                if inferred not in normalized_mentions:
-                    normalized_mentions.append(inferred)
+            if not _suppress_mention_inference:
+                for inferred in self._infer_text_mentions_locked(
+                    conn,
+                    conversation_id=conversation,
+                    sender_participant_id=sender,
+                    body_text=normalized_body,
+                ):
+                    if inferred not in normalized_mentions:
+                        normalized_mentions.append(inferred)
             if len(normalized_mentions) > MAX_MENTIONS_PER_MESSAGE:
                 raise ValidationError(
                     "mentions cannot contain more than "
@@ -5752,6 +5882,22 @@ class BridgeStore:
                         "reply chains are limited to one level; continue the "
                         "conversation with a new message"
                     )
+            if normalized_forward:
+                source = conn.execute(
+                    "SELECT conversation_id, message_kind FROM messages "
+                    "WHERE message_id = ?",
+                    (normalized_forward,),
+                ).fetchone()
+                if source is None:
+                    raise NotFoundError(
+                        f"unknown forwarded source message: {normalized_forward}"
+                    )
+                if str(source["conversation_id"]) == conversation:
+                    raise ConflictError("cross-room forward target must differ")
+                if str(source["message_kind"]) == "forward":
+                    raise ConflictError(
+                        "forward chains are not allowed; forward the original message"
+                    )
             self._assert_speaking_cooldown(
                 conn,
                 participant_id=sender,
@@ -5766,9 +5912,9 @@ class BridgeStore:
                         (message_id, conversation_id, sender_participant_id,
                          audience_kind, audience_value, message_kind, body,
                          refs_json, mentions_json, wake_all_agents, reply_to, status,
-                         authorized_session_id,
+                         authorized_session_id, forwarded_from_message_id,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 'message', ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -5776,12 +5922,14 @@ class BridgeStore:
                         sender,
                         normalized_audience,
                         normalized_target,
+                        normalized_message_kind,
                         normalized_body,
                         compact_json(normalized_refs),
                         compact_json(normalized_mentions),
                         1 if normalized_wake_all else 0,
                         normalized_reply,
                         session,
+                        normalized_forward,
                         now,
                         now,
                     ),
@@ -5814,7 +5962,11 @@ class BridgeStore:
                 "SELECT * FROM messages WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
-            if _web_user and str(web_identity["role"]) == "admin":
+            if (
+                _web_user
+                and str(web_identity["role"]) == "admin"
+                and not _suppress_chat_authorization
+            ):
                 self._insert_admin_chat_authorization_grant_locked(
                     conn,
                     message=row,
@@ -5880,6 +6032,86 @@ class BridgeStore:
             wake_all_agents=wake_all_agents,
             reply_to=reply_to,
             _web_user=True,
+        )
+
+    def forward_web_message(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        source_message_id: str,
+        target_conversation_id: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly copy one message into another room with durable provenance."""
+
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        source_id = opaque_id(source_message_id, field="source_message_id")
+        target = validate_conversation_id(target_conversation_id)
+        normalized_note = str(note or "").strip()
+        if len(normalized_note) > 2_000 or any(
+            ord(character) < 32 and character not in "\t\n\r"
+            for character in normalized_note
+        ):
+            raise ValidationError("forward note must contain at most 2000 characters")
+        with self._connection() as conn:
+            web_identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=time.time(),
+            )
+            if str(web_identity["role"]) != "admin":
+                raise AuthorizationError("只有管理员可以跨聊天室转发消息")
+            source = conn.execute(
+                """
+                SELECT message.*, sender.display_name AS sender_display_name,
+                       sender.client_type AS sender_client_type
+                FROM messages AS message
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                WHERE message.message_id = ?
+                """,
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                raise NotFoundError(f"unknown source message: {source_id}")
+            if str(source["message_kind"]) == "forward":
+                raise ConflictError(
+                    "forward chains are not allowed; forward the original message"
+                )
+            if str(source["conversation_id"]) == target:
+                raise ConflictError("cross-room forward target must differ")
+            source_label = (
+                str(source["sender_display_name"])
+                or str(source["sender_client_type"])
+            )
+            header = (
+                "【管理员显式转发 · 来源「"
+                f"{source['conversation_id']}」#{int(source['sequence'])} · "
+                f"{source_label}】"
+            )
+            sections = [header]
+            if normalized_note:
+                sections.append(f"转发说明：{normalized_note}")
+            sections.append(f"原文：\n{source['body']}")
+            forwarded_body = "\n\n".join(sections)
+            # Validate before entering send's write transaction, including the
+            # small provenance header added around the immutable source body.
+            forwarded_body = body(forwarded_body)
+        return self.send(
+            authorized_session_id=session,
+            sender_participant_id=participant,
+            conversation_id=target,
+            body_text=forwarded_body,
+            audience_kind="room",
+            audience_value="*",
+            _web_user=True,
+            _message_kind="forward",
+            _forwarded_from_message_id=source_id,
+            _suppress_chat_authorization=True,
+            _suppress_mention_inference=True,
         )
 
     @staticmethod
@@ -6034,6 +6266,10 @@ class BridgeStore:
         normalized_limit = max(1, min(int(limit), MAX_WAIT_MESSAGES_PAGE_SIZE))
         deadline = time.monotonic() + wait_for
         self.archive_stale_rooms()
+        conversation = self._authorized_session_room(
+            participant_id=participant,
+            authorized_session_id=authorized_session_id,
+        )
 
         while True:
             messages = self._pending_messages(
@@ -6041,11 +6277,16 @@ class BridgeStore:
                 limit=normalized_limit,
                 auto_claim_roles=bool(auto_claim_roles),
                 authorized_session_id=authorized_session_id,
+                conversation_id=conversation,
             )
             if messages:
-                backlog = self._pending_manifest(participant)
+                backlog = self._pending_manifest(
+                    participant,
+                    conversation_id=conversation,
+                )
                 return {
                     "participant_id": participant,
+                    "conversation_id": conversation,
                     "messages": messages,
                     "count": len(messages),
                     "timed_out": False,
@@ -6060,9 +6301,13 @@ class BridgeStore:
                     participant,
                     authorized_session_id=authorized_session_id,
                 )
-                backlog = self._pending_manifest(participant)
+                backlog = self._pending_manifest(
+                    participant,
+                    conversation_id=conversation,
+                )
                 return {
                     "participant_id": participant,
+                    "conversation_id": conversation,
                     "messages": [],
                     "count": 0,
                     "timed_out": True,
@@ -6084,10 +6329,11 @@ class BridgeStore:
         participant = opaque_id(participant_id, field="participant_id")
         requested_cursor = max(0, int(after_sequence or 0))
         now = time.time()
+        conversation: str | None = None
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
             if authorized_session_id is not None:
-                self._require_live_session(
+                session_row = self._require_live_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -6096,35 +6342,52 @@ class BridgeStore:
                     participant_id=participant,
                     now=now,
                 )
+                conversation = str(session_row["registered_conversation_id"])
             known = conn.execute(
                 "SELECT participant_id FROM participants WHERE participant_id = ?",
                 (participant,),
             ).fetchone()
             if known is None:
                 raise NotFoundError(f"unknown participant: {participant}")
-            global_sequence = int(
-                conn.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM messages"
-                ).fetchone()[0]
-            )
+            if conversation is None:
+                room_sequence = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM messages"
+                    ).fetchone()[0]
+                )
+            else:
+                self._require_membership(conn, participant, conversation)
+                room_sequence = int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM messages "
+                        "WHERE conversation_id = ?",
+                        (conversation,),
+                    ).fetchone()[0]
+                )
         # A corrupt or manually edited Last-Event-ID must not suppress every
         # future event forever.  Global message sequence is monotonic, so it is
         # the largest cursor the server can currently have issued.
-        cursor = min(requested_cursor, global_sequence)
-        backlog = self._pending_manifest(participant)
+        cursor = min(requested_cursor, room_sequence)
+        backlog = self._pending_manifest(
+            participant,
+            conversation_id=conversation,
+        )
         new_since_cursor = self._pending_manifest(
             participant,
             after_sequence=cursor,
+            conversation_id=conversation,
         )
         room_activity_since_cursor = self._activity_manifest(
             participant,
             after_sequence=cursor,
+            conversation_id=conversation,
         )
         return {
             "participant_id": participant,
-            # Cursor tracks the global append-only sequence, not unread state.
-            # This keeps "the room changed" separate from "I still owe an ack".
-            "cursor": global_sequence,
+            "conversation_id": conversation,
+            # Cursor tracks this connector room's append-only sequence, not
+            # unread state. Another room cannot wake or advance this listener.
+            "cursor": room_sequence,
             "has_new": new_since_cursor["pending_count"] > 0,
             "has_room_activity": room_activity_since_cursor["activity_count"] > 0,
             "backlog": backlog,
@@ -6165,7 +6428,9 @@ class BridgeStore:
                 snapshot["timed_out"] = True
                 return snapshot
             time.sleep(min(max(self.poll_interval_seconds, 0.5), remaining))
-            latest_sequence = self._global_message_sequence()
+            latest_sequence = self._message_sequence(
+                snapshot.get("conversation_id")
+            )
             if latest_sequence <= observed_sequence:
                 continue
             observed_sequence = latest_sequence
@@ -6178,10 +6443,18 @@ class BridgeStore:
                 snapshot["timed_out"] = False
                 return snapshot
 
-    def _global_message_sequence(self) -> int:
-        """Read the one monotonic notification change key without session writes."""
+    def _message_sequence(self, conversation_id: object = None) -> int:
+        """Read a monotonic room change key without renewing a session."""
 
         with self._connection() as conn:
+            if conversation_id is not None:
+                return int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM messages "
+                        "WHERE conversation_id = ?",
+                        (str(conversation_id),),
+                    ).fetchone()[0]
+                )
             return int(
                 conn.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM messages"
@@ -6238,17 +6511,19 @@ class BridgeStore:
                 "SELECT * FROM messages WHERE message_id = ?",
                 (original_id,),
             ).fetchone()
-            self._require_live_session(
+        if original is None:
+            raise NotFoundError(f"unknown message: {original_id}")
+        with self._connection() as conn:
+            self._require_live_room_session(
                 conn,
                 session_id=opaque_id(
                     authorized_session_id,
                     field="authorized_session_id",
                 ),
                 participant_id=participant,
+                conversation_id=str(original["conversation_id"]),
                 now=time.time(),
             )
-        if original is None:
-            raise NotFoundError(f"unknown message: {original_id}")
         if original["reply_to"] is not None:
             raise ConflictError(
                 "reply chains are limited to one level; continue the "
@@ -6322,13 +6597,14 @@ class BridgeStore:
             now = time.time()
             self._archive_stale_rooms_locked(conn, now=now)
             if authorized_session_id is not None:
-                self._require_live_session(
+                self._require_live_room_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
                         field="authorized_session_id",
                     ),
                     participant_id=participant,
+                    conversation_id=conversation,
                     now=now,
                 )
             self._require_membership(conn, participant, conversation)
@@ -6528,10 +6804,11 @@ class BridgeStore:
 
         now = time.time()
         with self._connection() as conn:
-            self._require_live_session(
+            self._require_live_room_session(
                 conn,
                 session_id=session_id,
                 participant_id=participant,
+                conversation_id=conversation,
                 now=now,
             )
             self._require_membership(conn, participant, conversation)
@@ -6598,31 +6875,62 @@ class BridgeStore:
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
             if authorized_session_id is not None:
-                self._require_live_session(
+                self._require_live_room_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
                         field="authorized_session_id",
                     ),
                     participant_id=caller,
+                    conversation_id=conversation,
                     now=now,
                 )
             self._require_membership(conn, caller, conversation)
             rows = conn.execute(
                 """
-                SELECT p.*, m.roles_json
+                SELECT p.*, m.roles_json,
+                       EXISTS (
+                           SELECT 1
+                           FROM agent_sessions AS session
+                           WHERE session.participant_id = p.participant_id
+                             AND session.registered_conversation_id = m.conversation_id
+                             AND session.cleared_at IS NULL
+                             AND session.revoked_at IS NULL
+                             AND session.expires_at > ?
+                             AND session.last_seen >= ?
+                       ) AS room_agent_online,
+                       EXISTS (
+                           SELECT 1
+                           FROM web_sessions AS web_session
+                           JOIN web_users AS web_user
+                             ON web_user.user_id = web_session.user_id
+                           WHERE web_user.participant_id = p.participant_id
+                             AND web_user.active = 1
+                             AND web_session.revoked_at IS NULL
+                             AND web_session.expires_at > ?
+                             AND web_session.last_seen >= ?
+                       ) AS room_web_online
                 FROM memberships AS m
                 JOIN participants AS p ON p.participant_id = m.participant_id
                 WHERE m.conversation_id = ? AND m.active = 1
                 ORDER BY p.display_name, p.participant_id
                 """,
-                (conversation,),
+                (
+                    now,
+                    now - float(online_window_seconds),
+                    now,
+                    now - float(online_window_seconds),
+                    conversation,
+                ),
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            online = (
-                str(row["status"]) == "online"
-                and now - float(row["last_seen"]) <= float(online_window_seconds)
+            online = bool(
+                (
+                    str(row["status"]) == "online"
+                    and row["room_agent_online"]
+                )
+                or row["room_web_online"]
             )
             if not include_offline and not online:
                 continue
@@ -6652,11 +6960,12 @@ class BridgeStore:
         limit: int,
         auto_claim_roles: bool,
         authorized_session_id: str | None,
+        conversation_id: str | None = None,
     ) -> list[dict[str, Any]]:
         now = time.time()
         with self._connection() as conn:
             if authorized_session_id is not None:
-                self._require_live_session(
+                session_row = self._require_live_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -6665,14 +6974,27 @@ class BridgeStore:
                     participant_id=participant_id,
                     now=now,
                 )
+                bound_room = str(session_row["registered_conversation_id"])
+                if conversation_id is not None and bound_room != conversation_id:
+                    raise AuthorizationError(
+                        f"Agent session is bound to conversation {bound_room}; "
+                        f"use a room-specific connector for {conversation_id}"
+                    )
+                conversation_id = bound_room
             participant = conn.execute(
                 "SELECT * FROM participants WHERE participant_id = ?",
                 (participant_id,),
             ).fetchone()
             if participant is None:
                 raise NotFoundError(f"unknown participant: {participant_id}")
+            room_clause = (
+                "AND message.conversation_id = ?" if conversation_id else ""
+            )
+            parameters: list[Any] = [participant_id, participant_id]
+            if conversation_id:
+                parameters.append(conversation_id)
             rows = conn.execute(
-                """
+                f"""
                 SELECT message.*,
                        delivery.state AS delivery_state,
                        delivery.reasons_json AS delivery_reasons_json,
@@ -6695,6 +7017,7 @@ class BridgeStore:
                 WHERE delivery.participant_id = ?
                   AND delivery.state IN ('pending', 'delivered')
                   AND message.sender_participant_id != ?
+                  {room_clause}
                 ORDER BY
                     CASE
                         WHEN instr(delivery.reasons_json, '"mention"') > 0 THEN 3
@@ -6705,7 +7028,7 @@ class BridgeStore:
                     message.sequence
                 LIMIT 500
                 """,
-                (participant_id, participant_id),
+                parameters,
             ).fetchall()
 
         selected: list[sqlite3.Row] = []
@@ -6768,7 +7091,7 @@ class BridgeStore:
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=delivered_at)
             if authorized_session_id is not None:
-                self._require_live_session(
+                session_row = self._require_live_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -6777,6 +7100,12 @@ class BridgeStore:
                     participant_id=participant_id,
                     now=delivered_at,
                 )
+                if conversation_id is not None and str(
+                    session_row["registered_conversation_id"]
+                ) != conversation_id:
+                    raise AuthorizationError(
+                        "Agent session room changed while messages were delivered"
+                    )
             conn.execute(
                 "UPDATE participants SET status = 'online', last_seen = ? "
                 "WHERE participant_id = ?",
@@ -6865,6 +7194,7 @@ class BridgeStore:
         participant_id: str,
         *,
         after_sequence: int | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         now = time.time()
         sequence_clause = ""
@@ -6872,6 +7202,10 @@ class BridgeStore:
         if after_sequence is not None:
             sequence_clause = "AND message.sequence > ?"
             parameters.append(max(0, int(after_sequence)))
+        room_clause = ""
+        if conversation_id is not None:
+            room_clause = "AND message.conversation_id = ?"
+            parameters.append(conversation_id)
         parameters.extend((participant_id, now))
         with self._connection() as conn:
             rows = conn.execute(
@@ -6904,6 +7238,7 @@ class BridgeStore:
                   AND delivery.state IN ('pending', 'delivered')
                   AND message.sender_participant_id != ?
                   {sequence_clause}
+                  {room_clause}
                   AND (
                       delivery.actionable = 0
                       OR message.claimed_by IS NULL
@@ -6965,11 +7300,21 @@ class BridgeStore:
         participant_id: str,
         *,
         after_sequence: int,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Summarize visible room activity independently from unread state."""
+        room_clause = ""
+        parameters: list[Any] = [
+            participant_id,
+            participant_id,
+            max(0, int(after_sequence)),
+        ]
+        if conversation_id is not None:
+            room_clause = "AND message.conversation_id = ?"
+            parameters.append(conversation_id)
         with self._connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT message.conversation_id,
                        COUNT(*) AS activity_count,
                        MIN(message.sequence) AS oldest_sequence,
@@ -6996,14 +7341,11 @@ class BridgeStore:
                   AND delivery.state != 'cancelled'
                   AND message.sender_participant_id != ?
                   AND message.sequence > ?
+                  {room_clause}
                 GROUP BY message.conversation_id
                 ORDER BY oldest_sequence
                 """,
-                (
-                    participant_id,
-                    participant_id,
-                    max(0, int(after_sequence)),
-                ),
+                parameters,
             ).fetchall()
         conversations = [
             {
@@ -7078,6 +7420,17 @@ class BridgeStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
+            if authorized_session_id is not None:
+                self._require_live_room_session(
+                    conn,
+                    session_id=opaque_id(
+                        authorized_session_id,
+                        field="authorized_session_id",
+                    ),
+                    participant_id=participant,
+                    conversation_id=str(row["conversation_id"]),
+                    now=now,
+                )
             delivery = self._require_eligible_row(conn, participant, row)
             if str(row["audience_kind"]) not in {"participant", "role"}:
                 raise ConflictError(
@@ -7134,6 +7487,17 @@ class BridgeStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
+            if authorized_session_id is not None:
+                self._require_live_room_session(
+                    conn,
+                    session_id=opaque_id(
+                        authorized_session_id,
+                        field="authorized_session_id",
+                    ),
+                    participant_id=participant,
+                    conversation_id=str(row["conversation_id"]),
+                    now=now,
+                )
             self._require_active_room(conn, str(row["conversation_id"]))
             if str(row["claimed_by"] or "") != participant:
                 raise ConflictError("only the current claimant can release a message")
@@ -7172,6 +7536,17 @@ class BridgeStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
+            if authorized_session_id is not None:
+                self._require_live_room_session(
+                    conn,
+                    session_id=opaque_id(
+                        authorized_session_id,
+                        field="authorized_session_id",
+                    ),
+                    participant_id=participant,
+                    conversation_id=str(row["conversation_id"]),
+                    now=now,
+                )
             delivery = self._require_eligible_row(conn, participant, row)
             actionable = bool(delivery["actionable"])
             claimed_by = str(row["claimed_by"] or "")
@@ -7355,6 +7730,56 @@ class BridgeStore:
                 "a live authenticated MCP session is required to chat"
             )
         return row
+
+    @staticmethod
+    def _require_live_room_session(
+        conn: sqlite3.Connection,
+        *,
+        session_id: str,
+        participant_id: str,
+        conversation_id: str,
+        now: float,
+    ) -> sqlite3.Row:
+        """Require a live MCP credential bound to exactly one room context."""
+
+        row = BridgeStore._require_live_session(
+            conn,
+            session_id=session_id,
+            participant_id=participant_id,
+            now=now,
+        )
+        registered_room = str(row["registered_conversation_id"])
+        if registered_room != conversation_id:
+            raise AuthorizationError(
+                f"Agent session is bound to conversation {registered_room}; "
+                f"use a room-specific connector for {conversation_id}"
+            )
+        return row
+
+    def _authorized_session_room(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str | None,
+    ) -> str | None:
+        """Resolve the room of a public MCP call; keep unauthenticated test helpers."""
+
+        if authorized_session_id is None:
+            return None
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        with self._connection() as conn:
+            row = self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant_id,
+                now=time.time(),
+            )
+            conversation = str(row["registered_conversation_id"])
+            self._require_membership(conn, participant_id, conversation)
+        return conversation
 
     @staticmethod
     def _require_live_web_session(
@@ -7587,6 +8012,14 @@ class BridgeStore:
             "created_at": float(row["created_at"]),
         }
         keys = set(row.keys())
+        if (
+            "forwarded_from_message_id" in keys
+            and row["forwarded_from_message_id"] is not None
+        ):
+            payload["message_kind"] = "forward"
+            payload["forwarded_from_message_id"] = str(
+                row["forwarded_from_message_id"]
+            )
         if authorization is not None:
             payload["authorization"] = authorization
         if "delivery_state" in keys:

@@ -295,6 +295,29 @@
       </form>
     </dialog>
 
+    <dialog class="room-dialog" id="forward-message-dialog" aria-labelledby="forward-message-title">
+      <form class="room-form" id="forward-message-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">EXPLICIT CROSS-ROOM SHARE</p>
+            <h2 id="forward-message-title">转发到其他聊天室</h2>
+          </div>
+          <button class="dialog-close" id="close-forward-message" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="forward-source-preview" id="forward-source-preview"></p>
+        <label class="field-label" for="forward-target-room">目标聊天室</label>
+        <select class="room-id-input" id="forward-target-room" required></select>
+        <label class="field-label access-field" for="forward-note">转发说明（可选）</label>
+        <textarea class="room-id-input forward-note" id="forward-note" maxlength="2000" placeholder="说明为什么把这条内容带到目标群"></textarea>
+        <p class="field-help">目标群会明确显示来源群、原消息序号和原作者；转发不会继承授权，也不会共享源群的其他上下文。</p>
+        <p class="form-feedback" id="forward-message-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="secondary-button" id="cancel-forward-message" type="button">取消</button>
+          <button class="primary-button" id="submit-forward-message" type="submit">确认转发</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="room-dialog rate-dialog" id="message-rate-dialog" aria-labelledby="message-rate-title">
       <div class="room-form">
         <div class="dialog-heading">

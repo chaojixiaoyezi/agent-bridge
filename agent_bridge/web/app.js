@@ -38,6 +38,7 @@ const state = {
   messageRenderSignature: "",
   participantRenderSignature: "",
   timelineScrollFrame: null,
+  forwardMessageId: null,
 };
 
 const elements = {
@@ -88,6 +89,15 @@ const elements = {
   submitRenameRoom: document.querySelector("#submit-rename-room"),
   closeRenameRoom: document.querySelector("#close-rename-room"),
   cancelRenameRoom: document.querySelector("#cancel-rename-room"),
+  forwardMessageDialog: document.querySelector("#forward-message-dialog"),
+  forwardMessageForm: document.querySelector("#forward-message-form"),
+  closeForwardMessage: document.querySelector("#close-forward-message"),
+  cancelForwardMessage: document.querySelector("#cancel-forward-message"),
+  forwardSourcePreview: document.querySelector("#forward-source-preview"),
+  forwardTargetRoom: document.querySelector("#forward-target-room"),
+  forwardNote: document.querySelector("#forward-note"),
+  forwardMessageFeedback: document.querySelector("#forward-message-feedback"),
+  submitForwardMessage: document.querySelector("#submit-forward-message"),
   openMessageRates: document.querySelector("#open-message-rates"),
   openRoomPermissions: document.querySelector("#open-room-permissions"),
   roomPermissionDialog: document.querySelector("#room-permission-dialog"),
@@ -335,6 +345,7 @@ function showAuthScreen(message = "") {
     elements.accountDialog,
     elements.createRoomDialog,
     elements.renameRoomDialog,
+    elements.forwardMessageDialog,
     elements.messageRateDialog,
     elements.memberManagementDialog,
     elements.agentAccessDialog,
@@ -557,6 +568,16 @@ function createMessageElement(message) {
   article.append(head);
   article.append(makeElement("p", "message-body", message.body));
 
+  if (message.forwarded_from) {
+    const source = message.forwarded_from;
+    const sourceSender = source.sender_display_name || source.sender_client_type;
+    article.append(makeElement(
+      "p",
+      "forward-label",
+      `显式转发自「${source.conversation_id}」#${source.sequence} · ${sourceSender}`,
+    ));
+  }
+
   if (message.mentions?.length) {
     article.append(makeElement("p", "mention-label", `特别通知：${message.mentions.map(participantName).join("、")}`));
   }
@@ -603,6 +624,14 @@ function createMessageElement(message) {
     replyButton.addEventListener("click", () => startComposerReply(message));
     article.append(replyButton);
   }
+  if (isAdmin() && message.message_kind !== "forward" && state.rooms.some(
+    (room) => room.status === "active" && room.conversation_id !== message.conversation_id
+  )) {
+    const forwardButton = makeElement("button", "message-reply-button forward-button", "转发");
+    forwardButton.type = "button";
+    forwardButton.addEventListener("click", () => openForwardDialog(message));
+    article.append(forwardButton);
+  }
   return article;
 }
 
@@ -621,7 +650,11 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
   const hadRenderedMessages = Boolean(
     elements.timeline.querySelector("article[data-message-id]"),
   );
-  const wasNearBottom = hadRenderedMessages ? isNearTimelineBottom() : true;
+  const previousScrollTop = elements.timeline.scrollTop;
+  const previousScrollHeight = elements.timeline.scrollHeight;
+  const wasNearBottom = hadRenderedMessages
+    ? isNearTimelineBottom()
+    : true;
   const anchor = !wasNearBottom && !forceBottom ? captureTimelineAnchor() : null;
   const signature = `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.updated_at || item.ack_count || 0}:${item.ack_count || 0}`).join("|")}`;
   if (!forceBottom && addedCount === 0 && signature === state.messageRenderSignature) {
@@ -660,14 +693,22 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
   elements.timeline.replaceChildren(fragment);
 
   if (forceBottom || wasNearBottom) {
-    elements.timeline.scrollTop = elements.timeline.scrollHeight;
-    state.unreadMessages = 0;
+    const requestedRoom = state.selectedRoom;
+    window.requestAnimationFrame(() => {
+      if (state.selectedRoom !== requestedRoom) return;
+      elements.timeline.scrollTop = elements.timeline.scrollHeight;
+      state.unreadMessages = 0;
+      updateNewMessageIndicator();
+    });
   } else if (anchor) {
     const anchored = [...elements.timeline.querySelectorAll("article[data-message-id]")]
       .find((item) => item.dataset.messageId === anchor.messageId);
     if (anchored) {
       const timelineTop = elements.timeline.getBoundingClientRect().top;
       elements.timeline.scrollTop += anchored.getBoundingClientRect().top - timelineTop - anchor.offset;
+    } else {
+      const heightDelta = elements.timeline.scrollHeight - previousScrollHeight;
+      elements.timeline.scrollTop = Math.max(0, previousScrollTop + Math.min(0, heightDelta));
     }
     state.unreadMessages += addedCount;
   }
@@ -1189,7 +1230,9 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
       window.setTimeout(() => refresh({}), 0);
     }
   } else if (forceScroll) {
-    elements.timeline.scrollTop = elements.timeline.scrollHeight;
+    window.requestAnimationFrame(() => {
+      elements.timeline.scrollTop = elements.timeline.scrollHeight;
+    });
   }
   updateComposer(activeRoom);
   applyUserPermissions();
@@ -2015,7 +2058,10 @@ elements.memberMigrationForm.addEventListener("submit", async (event) => {
     await refresh({ fullRoom: true });
     await loadMemberManagementData();
     elements.memberManagementFeedback.classList.add("success");
-    elements.memberManagementFeedback.textContent = `已将 ${payload.migration.membership_count} 个成员资格复制加入 ${target}，来源聊天室保持不变。`;
+    const unavailable = payload.migration.room_seats?.unavailable?.length || 0;
+    elements.memberManagementFeedback.textContent = unavailable
+      ? `已将 ${payload.migration.membership_count} 个成员资格复制加入 ${target}，来源聊天室保持不变；${unavailable} 个值守席位需重新邀请。`
+      : `已将 ${payload.migration.membership_count} 个成员资格复制加入 ${target}，独立值守席位已就绪，来源聊天室保持不变。`;
   } catch (error) {
     elements.memberManagementFeedback.classList.add("error");
     elements.memberManagementFeedback.textContent = error.message;
@@ -2123,6 +2169,70 @@ elements.renameRoomForm.addEventListener("submit", async (event) => {
     elements.renameRoomFeedback.textContent = roomErrorMessage(error.message);
   } finally {
     elements.submitRenameRoom.disabled = false;
+  }
+});
+
+function closeForwardDialog() {
+  state.forwardMessageId = null;
+  if (elements.forwardMessageDialog.open) elements.forwardMessageDialog.close();
+}
+
+function openForwardDialog(message) {
+  if (!isAdmin() || !message) return;
+  state.forwardMessageId = message.message_id;
+  elements.forwardMessageForm.reset();
+  elements.forwardTargetRoom.replaceChildren();
+  const targets = state.rooms.filter(
+    (room) => room.status === "active" && room.conversation_id !== message.conversation_id,
+  );
+  for (const room of targets) {
+    const option = document.createElement("option");
+    option.value = room.conversation_id;
+    option.textContent = room.conversation_id;
+    elements.forwardTargetRoom.append(option);
+  }
+  const sender = message.sender_display_name || message.sender_client_type;
+  elements.forwardSourcePreview.textContent = `来源「${message.conversation_id}」#${message.sequence} · ${sender}：${message.body.slice(0, 180)}`;
+  elements.forwardMessageFeedback.textContent = "";
+  elements.forwardMessageFeedback.classList.remove("error", "success");
+  if (!targets.length) return;
+  elements.forwardMessageDialog.showModal();
+  window.setTimeout(() => elements.forwardTargetRoom.focus(), 0);
+}
+
+elements.closeForwardMessage.addEventListener("click", closeForwardDialog);
+elements.cancelForwardMessage.addEventListener("click", closeForwardDialog);
+elements.forwardMessageDialog.addEventListener("click", (event) => {
+  if (event.target === elements.forwardMessageDialog) closeForwardDialog();
+});
+elements.forwardMessageForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!isAdmin() || !state.forwardMessageId || !elements.forwardMessageForm.reportValidity()) return;
+  elements.submitForwardMessage.disabled = true;
+  elements.forwardMessageFeedback.classList.remove("error", "success");
+  elements.forwardMessageFeedback.textContent = "正在建立可追溯转发…";
+  try {
+    const target = elements.forwardTargetRoom.value;
+    await fetchJson(`/api/messages/${encodeURIComponent(state.forwardMessageId)}/forward`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "forward-message",
+      },
+      body: JSON.stringify({
+        target_conversation_id: target,
+        note: elements.forwardNote.value.trim(),
+      }),
+    });
+    elements.forwardMessageFeedback.classList.add("success");
+    elements.forwardMessageFeedback.textContent = `已显式转发到「${target}」。`;
+    await refresh({});
+    closeForwardDialog();
+  } catch (error) {
+    elements.forwardMessageFeedback.classList.add("error");
+    elements.forwardMessageFeedback.textContent = error.message;
+  } finally {
+    elements.submitForwardMessage.disabled = false;
   }
 });
 

@@ -111,9 +111,9 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 20。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 21。
 
-schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。迁移全部就地增量完成。
+schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。schema 21 将 Agent MCP session、通知、待办、历史搜索、回复和确认都约束在登记聊天室，并用 `forwarded_from_message_id` 记录管理员显式跨群转发；转发消息不生成聊天授权。迁移全部就地增量完成。
 
 Agent 接入邀请在 schema 15 拆为 `agent_invitations`（房间、产品、策略、有效期）和 `agent_connectors`（每个接受者的独立身份、enrollment 哈希和值守状态）。管理页面默认“多人复用”，也可选择“单次使用”；API 不传 `reusable` 时仍默认单次。复用邀请允许多个不同稳定身份并发接受，同一身份不能重复领取连接；携带该身份原 enrollment 的响应丢失重试保持幂等且不增加使用次数。邀请过期只关闭新接入，撤销邀请则级联撤销全部 connector 及其 session。部署冒烟至少验证两个真实 MCP 进程使用同一复用邀请得到不同 connector，且撤销后两者都不能续期。
 
@@ -182,7 +182,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 admin 聊天授权、schema 19 Agent @ 防回声和 schema 20 内部 ID 可见化迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化和 schema 21 单群会话隔离迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
 - 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。

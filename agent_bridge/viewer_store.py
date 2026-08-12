@@ -205,6 +205,7 @@ class ViewerRepository:
                                         SELECT 1
                                         FROM agent_sessions AS session
                                         WHERE session.participant_id = p.participant_id
+                                          AND session.registered_conversation_id = m.conversation_id
                                           AND session.cleared_at IS NULL
                                           AND session.revoked_at IS NULL
                                           AND session.expires_at > ?
@@ -227,7 +228,27 @@ class ViewerRepository:
                             CASE
                                 WHEN m.active = 1
                                  AND (
-                                    (p.status = 'online' AND p.last_seen >= ?)
+                                    EXISTS (
+                                        SELECT 1
+                                        FROM agent_sessions AS session
+                                        WHERE session.participant_id = p.participant_id
+                                          AND session.registered_conversation_id = m.conversation_id
+                                          AND session.cleared_at IS NULL
+                                          AND session.revoked_at IS NULL
+                                          AND session.expires_at > ?
+                                          AND session.last_seen >= ?
+                                    )
+                                    OR EXISTS (
+                                        SELECT 1
+                                        FROM web_sessions AS web_session
+                                        JOIN web_users AS web_user
+                                          ON web_user.user_id = web_session.user_id
+                                        WHERE web_user.participant_id = p.participant_id
+                                          AND web_user.active = 1
+                                          AND web_session.revoked_at IS NULL
+                                          AND web_session.expires_at > ?
+                                          AND web_session.last_seen >= ?
+                                    )
                                     OR EXISTS (
                                         SELECT 1
                                         FROM agent_connectors AS connector
@@ -302,7 +323,16 @@ class ViewerRepository:
                     room.conversation_id
                 LIMIT ?
                 """,
-                (now, now, online_after, connector_online_after, normalized_limit),
+                (
+                    now,
+                    now,
+                    now,
+                    online_after,
+                    now,
+                    online_after,
+                    connector_online_after,
+                    normalized_limit,
+                ),
             ).fetchall()
         return [
             {
@@ -407,6 +437,10 @@ class ViewerRepository:
                     sender.signature AS sender_signature,
                     claimant.session_alias AS claimant_alias,
                     claimant.display_name AS claimant_display_name,
+                    source.conversation_id AS forwarded_source_conversation_id,
+                    source.sequence AS forwarded_source_sequence,
+                    source_sender.display_name AS forwarded_source_sender_display_name,
+                    source_sender.client_type AS forwarded_source_sender_client_type,
                     grant.authority_kind AS authorization_kind,
                     grant.issuer_web_user_id AS authorization_issuer_user_id,
                     grant.issuer_username_snapshot
@@ -436,6 +470,10 @@ class ViewerRepository:
                   ON sender.participant_id = m.sender_participant_id
                 LEFT JOIN participants AS claimant
                   ON claimant.participant_id = m.claimed_by
+                LEFT JOIN messages AS source
+                  ON source.message_id = m.forwarded_from_message_id
+                LEFT JOIN participants AS source_sender
+                  ON source_sender.participant_id = source.sender_participant_id
                 LEFT JOIN chat_authorization_grants AS grant
                   ON grant.source_message_id = m.message_id
                 WHERE m.conversation_id = ? {sequence_clause}
@@ -608,10 +646,20 @@ class ViewerRepository:
                     (
                         SELECT COUNT(*) FROM agent_sessions AS session
                         WHERE session.participant_id = p.participant_id
+                          AND session.registered_conversation_id = m.conversation_id
                           AND session.cleared_at IS NULL
                           AND session.revoked_at IS NULL
                           AND session.expires_at > ?
                     ) AS active_agent_session_count,
+                    (
+                        SELECT COUNT(*) FROM agent_sessions AS session
+                        WHERE session.participant_id = p.participant_id
+                          AND session.registered_conversation_id = m.conversation_id
+                          AND session.cleared_at IS NULL
+                          AND session.revoked_at IS NULL
+                          AND session.expires_at > ?
+                          AND session.last_seen >= ?
+                    ) AS online_agent_session_count,
                     (
                         SELECT COUNT(*)
                         FROM web_sessions AS web_session
@@ -621,7 +669,18 @@ class ViewerRepository:
                           AND web_user.active = 1
                           AND web_session.revoked_at IS NULL
                           AND web_session.expires_at > ?
-                    ) AS active_web_session_count
+                    ) AS active_web_session_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM web_sessions AS web_session
+                        JOIN web_users AS web_user
+                          ON web_user.user_id = web_session.user_id
+                        WHERE web_user.participant_id = p.participant_id
+                          AND web_user.active = 1
+                          AND web_session.revoked_at IS NULL
+                          AND web_session.expires_at > ?
+                          AND web_session.last_seen >= ?
+                    ) AS online_web_session_count
                 FROM memberships AS m
                 JOIN participants AS p
                   ON p.participant_id = m.participant_id
@@ -634,6 +693,7 @@ class ViewerRepository:
                     JOIN agent_invitations AS recent_invitation
                       ON recent_invitation.invitation_id = recent.invitation_id
                     WHERE recent.accepted_participant_id = p.participant_id
+                      AND recent.conversation_id = m.conversation_id
                       AND recent_invitation.status != 'revoked'
                       AND recent.revoked_at IS NULL
                     ORDER BY recent.updated_at DESC
@@ -647,7 +707,8 @@ class ViewerRepository:
                         WHEN room.status = 'active'
                          AND m.active = 1
                          AND (
-                            (p.status = 'online' AND p.last_seen >= ?)
+                            online_agent_session_count > 0
+                            OR online_web_session_count > 0
                             OR (
                                 connector.setup_status = 'configured'
                                 AND connector.connector_last_seen_at >= ?
@@ -658,7 +719,16 @@ class ViewerRepository:
                     p.display_name,
                     p.participant_id
                 """,
-                (now, now, conversation, online_after, connector_online_after),
+                (
+                    now,
+                    now,
+                    online_after,
+                    now,
+                    now,
+                    online_after,
+                    conversation,
+                    connector_online_after,
+                ),
             ).fetchall()
         return [
             {
@@ -674,10 +744,8 @@ class ViewerRepository:
                     if str(row["room_status"]) == "active"
                     and int(row["membership_active"]) == 1
                     and (
-                        (
-                            str(row["status"]) == "online"
-                            and float(row["last_seen"]) >= online_after
-                        )
+                        int(row["online_agent_session_count"] or 0) > 0
+                        or int(row["online_web_session_count"] or 0) > 0
                         or (
                             str(row["connector_setup_status"] or "") == "configured"
                             and row["connector_last_seen_at"] is not None
@@ -726,14 +794,7 @@ class ViewerRepository:
             }
             for row in rows
             if str(row["room_status"]) != "active"
-            or (
-                int(row["membership_active"]) == 1
-                and (
-                    int(row["active_agent_session_count"] or 0) > 0
-                    or int(row["active_web_session_count"] or 0) > 0
-                    or row["connector_id"] is not None
-                )
-            )
+            or int(row["membership_active"]) == 1
         ]
 
     @staticmethod
@@ -765,6 +826,19 @@ class ViewerRepository:
             "receipt_count": int(row["receipt_count"] or 0),
             "created_at": float(row["created_at"]),
         }
+        if row["forwarded_from_message_id"] is not None:
+            payload["message_kind"] = "forward"
+            payload["forwarded_from"] = {
+                "message_id": str(row["forwarded_from_message_id"]),
+                "conversation_id": str(row["forwarded_source_conversation_id"]),
+                "sequence": int(row["forwarded_source_sequence"]),
+                "sender_display_name": str(
+                    row["forwarded_source_sender_display_name"] or ""
+                ),
+                "sender_client_type": str(
+                    row["forwarded_source_sender_client_type"] or ""
+                ),
+            }
         if row["authorization_kind"] is not None:
             revoked_at = (
                 float(row["authorization_revoked_at"])
