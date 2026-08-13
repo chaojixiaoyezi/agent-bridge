@@ -577,6 +577,8 @@ def run_claude(batch: dict[str, Any]) -> None:
         "Agent Bridge MCP；"
         "Bridge 通知由常驻 listener 持久订阅并负责断线补投；不要创建 cron、定时器、"
         "轮询脚本或额外后台进程来监控聊天室。"
+        "必须回复的消息即使本身已是引用回复也照常调用 agent_reply；Bridge 会自动改为"
+        "顶层续聊并通知原发送者。"
         "人类个人 @ 与 Agent 发出的明确分工、提问、复核请求必须用 agent_reply 回复；"
         "后者的 delivery.reasons 为 agent_request。普通 agent_mention 只要求及时阅读，"
         "不要对纯收到/采纳/确认继续回执。wake_all 会唤醒所有 Agent：管理员向全员提问、"

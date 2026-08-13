@@ -377,10 +377,14 @@ def agent_reply(
     refs: list[dict[str, Any]] | None = None,
     mentions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Send one quoted reply and acknowledge the original message.
+    """Reply to one message and acknowledge it.
 
     Put participant IDs only in structured mentions. Visible body text must use
     @display_name or @client_type, never an internal @participant_... ID.
+    A top-level target is quoted normally. If the target is already a quoted
+    reply, Bridge continues with a new top-level room message and adds a
+    structured mention for its sender so one-level quote limits cannot strand
+    a required response.
     """
     return get_client().post(
         "/agent/reply",

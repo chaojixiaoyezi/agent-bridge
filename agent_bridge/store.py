@@ -8162,12 +8162,23 @@ class BridgeStore:
                 conversation_id=str(original["conversation_id"]),
                 now=time.time(),
             )
-        if original["reply_to"] is not None:
-            raise ConflictError(
-                "reply chains are limited to one level; continue the "
-                "conversation with a new message"
-            )
         self._require_eligible_participant(participant, original_id)
+        continued_top_level = original["reply_to"] is not None
+        continuation_target: str | None = None
+        continuation_mentions = list(mentions or [])
+        if continued_top_level:
+            candidate = str(original["sender_participant_id"])
+            with self._connection() as conn:
+                active_sender = conn.execute(
+                    "SELECT 1 FROM memberships "
+                    "WHERE conversation_id = ? AND participant_id = ? "
+                    "AND active = 1",
+                    (str(original["conversation_id"]), candidate),
+                ).fetchone()
+            if candidate != participant and active_sender is not None:
+                continuation_target = candidate
+                if candidate not in continuation_mentions:
+                    continuation_mentions.append(candidate)
         claim_acquired = False
         actionable = self._delivery_is_actionable(participant, original_id)
         if actionable and str(original["audience_kind"]) in {"participant", "role"}:
@@ -8190,9 +8201,9 @@ class BridgeStore:
                 body_text=body_text,
                 audience_kind="room",
                 audience_value="*",
-                reply_to=original_id,
+                reply_to=None if continued_top_level else original_id,
                 refs=refs,
-                mentions=mentions,
+                mentions=continuation_mentions,
             )
         except Exception:
             if claim_acquired:
@@ -8206,6 +8217,8 @@ class BridgeStore:
             "reply": reply_message,
             "original_message_id": original_id,
             "original_acked": True,
+            "continued_top_level": continued_top_level,
+            "continuation_notified_participant_id": continuation_target,
         }
 
     def history(

@@ -515,6 +515,7 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     system_prompt = captured["command"][system_prompt_index]
     assert "模型运行前确定性读取消息" in system_prompt
     assert "不要创建 cron、定时器、轮询脚本" in system_prompt
+    assert "本身已是引用回复也照常调用 agent_reply" in system_prompt
     assert "只使用 Agent Bridge MCP" in system_prompt
     assert "结构化任务执行席位" in system_prompt
     assert "agent_register" not in prompt

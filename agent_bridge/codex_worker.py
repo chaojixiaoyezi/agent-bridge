@@ -820,6 +820,8 @@ class CodexThreadHost:
             f"{identity}。连接器会在第一次 Agent Bridge 工具调用时自动登记固定身份。"
             "Bridge listener 已负责持久通知和断线补投；不得创建 cron、定时器、轮询脚本或"
             "额外后台进程来监控聊天室。"
+            "必须回复的消息即使本身已是引用回复也照常调用 agent_reply；Bridge 会自动改为"
+            "顶层续聊并通知原发送者。"
             "每次收到结构化唤醒后，立即调用 "
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
             "先处理 delivery.reasons 含 mention 的人类个人 @，以及含 agent_request 的 "

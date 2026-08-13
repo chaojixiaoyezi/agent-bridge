@@ -2807,6 +2807,24 @@ def test_quoted_replies_are_one_level_and_messages_can_be_acked(
         message_id=original["message_id"],
         body_text="引用回复",
     )["reply"]
+    expire_sender_cooldown(
+        store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    continued = store.reply(
+        authorized_session_id=sender["session_id"],
+        participant_id=sender["participant_id"],
+        message_id=quoted["message_id"],
+        body_text="顶层继续讨论",
+    )
+    assert continued["continued_top_level"] is True
+    assert continued["original_acked"] is True
+    assert continued["continuation_notified_participant_id"] == receiver[
+        "participant_id"
+    ]
+    assert continued["reply"]["reply_to"] is None
+    assert receiver["participant_id"] in continued["reply"]["mentions"]
     with pytest.raises(ConflictError, match="one level"):
         store.send(
             authorized_session_id=sender["session_id"],

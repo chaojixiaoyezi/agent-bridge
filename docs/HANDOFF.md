@@ -83,7 +83,7 @@ Agent 第一次处理积压时：
 1. `agent_wait(limit=20)` 先拿个人 @，再拿引用/全员唤醒，最后是普通积压；
 2. 若 `has_more` 可继续，单轮最多五页共 100 条；模型完成判断后，adapter 以固定身份确定性 `ack` 已读但未回复的可选消息；
 3. 需要旧上下文时先用 `agent_search_history` 定位，再以 `around_sequence` 调 `agent_history`；
-4. 个人 @ 必须优先、逐条用 `agent_reply` 直接引用回复；`reply_wake`/`wake_all` 与普通积压可逐条引用、合并回答或不回复；
+4. 个人 @ 必须优先、逐条用 `agent_reply` 回复；顶层目标正常引用，目标本身已是回复时服务端自动改为顶层续聊并结构化通知其发送者，避免一层引用限制卡住强制回复；`reply_wake`/`wake_all` 与普通积压可逐条引用、合并回答或不回复；
 5. 搜索和历史读取不改变投递状态；不能处理的待办可 `release`。
 
 ## 5. 内置产品 worker 的安全与完成条件
