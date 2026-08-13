@@ -27,7 +27,8 @@ const state = {
   taskPermissions: null,
   ownerEvents: null,
   fallbackRefreshTimer: null,
-  refreshQueued: false,
+  queuedRefresh: null,
+  eventRevisions: null,
   generatedAccessInstructions: "",
   messageRateLimits: null,
   rateConfiguration: null,
@@ -37,8 +38,14 @@ const state = {
   memberSelections: new Map(),
   roomPermissionUsers: [],
   theme: "paper",
+  roomRenderSignature: "",
   messageRenderSignature: "",
   participantRenderSignature: "",
+  participantById: new Map(),
+  accessRoomSignature: "",
+  sessionRenderSignature: "",
+  invitationRenderSignature: "",
+  nicknameRenderSignature: "",
   participantFilter: "",
   expandedDormantRooms: new Set(),
   timelineScrollFrame: null,
@@ -218,6 +225,34 @@ function makeElement(tag, className, text) {
 }
 
 const THEMES = new Set(["paper", "mist", "aurora", "ocean", "violet", "ember"]);
+const DATE_TIME_FORMATTERS = {
+  shortTime: new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }),
+  shortDate: new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }),
+  fullTime: new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }),
+  day: new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "short",
+  }),
+  syncTime: new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }),
+};
 
 try {
   state.theme = window.localStorage.getItem("agentBridgeTheme") || "paper";
@@ -244,21 +279,14 @@ function shortTime(timestamp) {
   const date = new Date(timestamp * 1000);
   const now = new Date();
   if (date.toDateString() === now.toDateString()) {
-    return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+    return DATE_TIME_FORMATTERS.shortTime.format(date);
   }
-  return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(date);
+  return DATE_TIME_FORMATTERS.shortDate.format(date);
 }
 
 function fullTime(timestamp) {
   if (!timestamp) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(new Date(timestamp * 1000));
+  return DATE_TIME_FORMATTERS.fullTime.format(new Date(timestamp * 1000));
 }
 
 function formatCooldown(value) {
@@ -270,7 +298,7 @@ function formatCooldown(value) {
 }
 
 function dayLabel(timestamp) {
-  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric", weekday: "short" }).format(new Date(timestamp * 1000));
+  return DATE_TIME_FORMATTERS.day.format(new Date(timestamp * 1000));
 }
 
 async function fetchJson(path, options = {}) {
@@ -473,6 +501,23 @@ function roomErrorMessage(message) {
 }
 
 function renderRooms() {
+  const signature = JSON.stringify([
+    state.currentUser?.user_id || "",
+    state.selectedRoom || "",
+    state.filter.trim().toLocaleLowerCase("zh-CN"),
+    state.rooms.map((room) => [
+      room.conversation_id,
+      room.status,
+      room.latest_created_at || room.last_activity_at,
+      room.latest_sender_client_type || room.latest_sender_alias,
+      room.latest_body,
+      room.online_count,
+      room.current_participant_count ?? room.participant_count ?? 0,
+      room.message_count,
+    ]),
+  ]);
+  if (signature === state.roomRenderSignature) return;
+  state.roomRenderSignature = signature;
   elements.roomList.replaceChildren();
   const normalizedFilter = state.filter.trim().toLowerCase();
   const visibleRooms = state.rooms.filter((room) => room.conversation_id.toLowerCase().includes(normalizedFilter));
@@ -566,7 +611,7 @@ function routeLabel(message) {
 }
 
 function participantName(participantId) {
-  const participant = state.participants.find((item) => item.participant_id === participantId);
+  const participant = state.participantById.get(participantId);
   return participant?.display_name || participant?.client_type || participantId;
 }
 
@@ -727,6 +772,10 @@ function updateNewMessageIndicator() {
   elements.newMessageIndicator.title = label;
 }
 
+function messageSignature(messages) {
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.task?.updated_at || item.updated_at || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
+}
+
 function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) {
   const hadRenderedMessages = Boolean(
     elements.timeline.querySelector("article[data-message-id]"),
@@ -737,7 +786,7 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     ? isNearTimelineBottom()
     : true;
   const anchor = !wasNearBottom && !forceBottom ? captureTimelineAnchor() : null;
-  const signature = `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.task?.updated_at || item.updated_at || 0}:${item.ack_count || 0}`).join("|")}`;
+  const signature = messageSignature(messages);
   if (!forceBottom && addedCount === 0 && signature === state.messageRenderSignature) {
     updateNewMessageIndicator();
     return;
@@ -794,6 +843,55 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     state.unreadMessages += addedCount;
   }
   updateNewMessageIndicator();
+}
+
+function appendMessages(messages, { forceBottom = false } = {}) {
+  if (!messages.length) return;
+  if (!elements.timeline.querySelector("article[data-message-id]")) {
+    renderMessages(state.messages, { forceBottom, addedCount: messages.length });
+    return;
+  }
+  const wasNearBottom = isNearTimelineBottom();
+  const fragment = document.createDocumentFragment();
+  const previousMessage = state.messages[state.messages.length - messages.length - 1];
+  let activeDay = previousMessage ? dayLabel(previousMessage.created_at) : "";
+  for (const message of messages) {
+    const nextDay = dayLabel(message.created_at);
+    if (nextDay !== activeDay) {
+      activeDay = nextDay;
+      fragment.append(makeElement("div", "day-divider", activeDay));
+    }
+    fragment.append(createMessageElement(message));
+  }
+  elements.timeline.append(fragment);
+  state.messageRenderSignature = messageSignature(state.messages);
+  if (forceBottom || wasNearBottom) {
+    const requestedRoom = state.selectedRoom;
+    window.requestAnimationFrame(() => {
+      if (state.selectedRoom !== requestedRoom) return;
+      elements.timeline.scrollTop = elements.timeline.scrollHeight;
+      state.unreadMessages = 0;
+      updateNewMessageIndicator();
+    });
+  } else {
+    state.unreadMessages += messages.length;
+    updateNewMessageIndicator();
+  }
+}
+
+function updateReceiptLabels(messages) {
+  const counts = new Map(
+    messages.map((message) => [message.message_id, message]),
+  );
+  for (const article of elements.timeline.querySelectorAll("article[data-message-id]")) {
+    const message = counts.get(article.dataset.messageId);
+    if (!message) continue;
+    const label = article.querySelector(".receipt-label");
+    if (label) {
+      label.textContent = `#${message.sequence} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`;
+    }
+  }
+  state.messageRenderSignature = messageSignature(state.messages);
 }
 
 function isWebParticipant(person) {
@@ -889,6 +987,9 @@ function createParticipantCard(person) {
 
 function renderParticipants(participants) {
   state.participants = participants;
+  state.participantById = new Map(
+    participants.map((participant) => [participant.participant_id, participant]),
+  );
   const query = state.participantFilter.trim().toLocaleLowerCase("zh-CN");
   const signature = `${state.selectedRoom || ""}|${query}|${participants.map((item) => [
     item.participant_id,
@@ -955,11 +1056,17 @@ function renderParticipants(participants) {
 }
 
 function populateAccessRooms() {
+  const activeRooms = state.rooms
+    .filter((item) => item.status === "active")
+    .map((item) => item.conversation_id);
+  const signature = JSON.stringify(activeRooms);
+  if (signature === state.accessRoomSignature) return;
+  state.accessRoomSignature = signature;
   const previous = elements.accessRoom.value || state.selectedRoom || "";
   elements.accessRoom.replaceChildren();
-  for (const room of state.rooms.filter((item) => item.status === "active")) {
-    const option = makeElement("option", "", room.conversation_id);
-    option.value = room.conversation_id;
+  for (const room of activeRooms) {
+    const option = makeElement("option", "", room);
+    option.value = room;
     elements.accessRoom.append(option);
   }
   if ([...elements.accessRoom.options].some((option) => option.value === previous)) {
@@ -970,6 +1077,13 @@ function populateAccessRooms() {
 function renderSessions() {
   elements.agentSessionSection.hidden = !isAdmin();
   if (!isAdmin()) return;
+  const signature = JSON.stringify([
+    state.currentUser?.user_id || "",
+    state.sessionStats,
+    state.sessions.slice(0, 20),
+  ]);
+  if (signature === state.sessionRenderSignature) return;
+  state.sessionRenderSignature = signature;
   elements.sessionList.replaceChildren();
   const activeCount = Number(state.sessionStats.active_count || 0);
   const clearableCount = Number(state.sessionStats.clearable_count || 0);
@@ -1035,6 +1149,12 @@ function invitationStatusLabel(invitation) {
 function renderAgentInvitations() {
   elements.agentInvitationSection.hidden = !isAdmin();
   if (!isAdmin()) return;
+  const signature = JSON.stringify([
+    state.currentUser?.user_id || "",
+    state.agentInvitations.slice(0, 30),
+  ]);
+  if (signature === state.invitationRenderSignature) return;
+  state.invitationRenderSignature = signature;
   elements.agentInvitationList.replaceChildren();
   elements.agentInvitationCount.textContent = `${state.agentInvitations.length} 个邀请`;
   if (!state.agentInvitations.length) {
@@ -1092,6 +1212,12 @@ async function revokeAgentInvitation(invitationId, button) {
 function renderNicknameRequests() {
   elements.nicknameSection.hidden = !isAdmin();
   if (!isAdmin()) return;
+  const signature = JSON.stringify([
+    state.currentUser?.user_id || "",
+    state.nicknameRequests,
+  ]);
+  if (signature === state.nicknameRenderSignature) return;
+  state.nicknameRenderSignature = signature;
   elements.nicknameRequestList.replaceChildren();
   elements.nicknameRequestCount.textContent = `${state.nicknameRequests.length} 个待处理`;
   if (!state.nicknameRequests.length) {
@@ -1333,10 +1459,12 @@ function selectedMentionIds(bodyText) {
 async function selectRoom(roomId) {
   state.selectedRoom = roomId;
   state.loadedRoom = null;
+  state.roomRenderSignature = "";
   state.messageRenderSignature = "";
   state.participantRenderSignature = "";
   state.messages = [];
   state.participants = [];
+  state.participantById = new Map();
   state.participantFilter = "";
   elements.participantSearch.value = "";
   state.hasEarlierMessages = false;
@@ -1396,7 +1524,15 @@ async function loadEarlierMessages(event) {
   }
 }
 
-async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
+async function refreshActiveRoom(
+  forceScroll = false,
+  fullRoom = false,
+  {
+    refreshParticipants = true,
+    refreshTaskState = false,
+    refreshReceipts = false,
+  } = {},
+) {
   if (!state.selectedRoom) return;
   const requestVersion = ++state.requestVersion;
   const selectedRoom = state.selectedRoom;
@@ -1405,17 +1541,22 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   const initialLoad = fullRoom || state.loadedRoom !== selectedRoom;
   const lastLoadedSequence = state.messages[state.messages.length - 1]?.sequence || 0;
   const hasServerUpdates = Number(activeRoom?.last_sequence || 0) > lastLoadedSequence;
-  const hasPendingTask = state.messages.some((message) =>
-    message.task && !["completed", "failed", "cancelled"].includes(message.task.status)
-  );
-  const messageRequest = initialLoad || hasPendingTask
+  const messageRequest = initialLoad || refreshTaskState
     ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=120`)
     : hasServerUpdates
       ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=200&after_sequence=${encodeURIComponent(lastLoadedSequence)}`)
       : Promise.resolve(null);
-  const [messagePayload, participantPayload] = await Promise.all([
+  const receiptRequest = refreshReceipts && state.messages.length > 0
+    ? fetchJson(
+        `/api/rooms/${encodedRoom}/receipts?limit=${encodeURIComponent(Math.max(120, state.messages.length))}&after_sequence=${encodeURIComponent(Math.max(0, Number(state.messages[0]?.sequence || 1) - 1))}`,
+      )
+    : Promise.resolve(null);
+  const [messagePayload, participantPayload, receiptPayload] = await Promise.all([
     messageRequest,
-    fetchJson(`/api/rooms/${encodedRoom}/participants`),
+    refreshParticipants
+      ? fetchJson(`/api/rooms/${encodedRoom}/participants`)
+      : Promise.resolve(null),
+    receiptRequest,
   ]);
   if (requestVersion !== state.requestVersion) return;
   elements.roomTitle.textContent = selectedRoom;
@@ -1426,22 +1567,53 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
       ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`
       : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
     : "本机聊天室";
-  renderParticipants(participantPayload.participants);
+  if (participantPayload) renderParticipants(participantPayload.participants);
   if (messagePayload) {
     let addedCount = 0;
-    if (initialLoad || hasPendingTask) {
+    let appendedMessages = [];
+    if (initialLoad) {
       state.messages = messagePayload.messages;
       state.hasEarlierMessages = messagePayload.has_more;
       state.loadedRoom = selectedRoom;
     } else {
       const knownIds = new Set(state.messages.map((message) => message.message_id));
-      addedCount = messagePayload.messages.filter((message) => !knownIds.has(message.message_id)).length;
+      appendedMessages = messagePayload.messages.filter(
+        (message) => !knownIds.has(message.message_id),
+      );
+      addedCount = appendedMessages.length;
       state.messages = mergeMessages(state.messages, messagePayload.messages);
     }
-    renderMessages(state.messages, { forceBottom: forceScroll, addedCount });
-    if (!initialLoad && !hasPendingTask && messagePayload.has_more) {
-      window.setTimeout(() => refresh({}), 0);
+    if (receiptPayload) {
+      const receiptById = new Map(
+        receiptPayload.receipts.map((receipt) => [receipt.message_id, receipt]),
+      );
+      state.messages = state.messages.map((message) => {
+        const receipt = receiptById.get(message.message_id);
+        return receipt ? { ...message, ...receipt } : message;
+      });
     }
+    const appendOnly = !initialLoad
+      && !refreshTaskState
+      && appendedMessages.length > 0
+      && appendedMessages.every((message) => Number(message.sequence) > lastLoadedSequence);
+    if (appendOnly) {
+      appendMessages(appendedMessages, { forceBottom: forceScroll });
+    } else {
+      renderMessages(state.messages, { forceBottom: forceScroll, addedCount });
+    }
+    if (receiptPayload) updateReceiptLabels(state.messages);
+    if (!initialLoad && !refreshTaskState && messagePayload.has_more) {
+      window.setTimeout(() => refresh({ mode: "room" }), 0);
+    }
+  } else if (receiptPayload) {
+    const receiptById = new Map(
+      receiptPayload.receipts.map((receipt) => [receipt.message_id, receipt]),
+    );
+    state.messages = state.messages.map((message) => {
+      const receipt = receiptById.get(message.message_id);
+      return receipt ? { ...message, ...receipt } : message;
+    });
+    updateReceiptLabels(state.messages);
   } else if (forceScroll) {
     window.requestAnimationFrame(() => {
       elements.timeline.scrollTop = elements.timeline.scrollHeight;
@@ -1451,21 +1623,47 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   applyUserPermissions();
 }
 
+const REFRESH_MODE_PRIORITY = { room: 1, task: 2, presence: 3, full: 4 };
+
+function mergeRefreshOptions(current, incoming) {
+  if (!current) return { ...incoming };
+  const currentMode = current.mode || "full";
+  const incomingMode = incoming.mode || "full";
+  return {
+    mode: REFRESH_MODE_PRIORITY[incomingMode] > REFRESH_MODE_PRIORITY[currentMode]
+      ? incomingMode
+      : currentMode,
+    fullRoom: Boolean(current.fullRoom || incoming.fullRoom),
+    forceRoomBottom: Boolean(current.forceRoomBottom || incoming.forceRoomBottom),
+    refreshTaskState: Boolean(
+      current.refreshTaskState
+      || incoming.refreshTaskState
+      || currentMode === "task"
+      || incomingMode === "task"
+    ),
+    refreshReceipts: Boolean(current.refreshReceipts || incoming.refreshReceipts),
+  };
+}
+
 async function refresh(options = {}) {
   if (!state.currentUser) return;
+  const mode = options.mode || "full";
   if (state.refreshing) {
-    state.refreshQueued = true;
+    state.queuedRefresh = mergeRefreshOptions(state.queuedRefresh, { ...options, mode });
     return;
   }
   state.refreshing = true;
-  elements.refreshButton.classList.add("spinning");
+  if (mode === "full") elements.refreshButton.classList.add("spinning");
   try {
-    const sessionRequest = isAdmin()
+    const refreshPresence = mode === "full" || mode === "presence";
+    const sessionRequest = isAdmin() && refreshPresence
       ? fetchJson("/api/sessions")
-      : Promise.resolve({ sessions: [], stats: { active_count: 0, clearable_count: 0 } });
-    const invitationRequest = isAdmin()
+      : Promise.resolve(null);
+    const invitationRequest = isAdmin() && refreshPresence
       ? fetchAgentInvitations()
-      : Promise.resolve({ invitations: [] });
+      : Promise.resolve(null);
+    const healthRequest = mode === "full" ? fetchJson("/api/health") : Promise.resolve(null);
+    const nicknameRequest = mode === "full" ? fetchNicknameRequests() : Promise.resolve(null);
     const [
       healthPayload,
       roomPayload,
@@ -1473,19 +1671,23 @@ async function refresh(options = {}) {
       nicknamePayload,
       invitationPayload,
     ] = await Promise.all([
-      fetchJson("/api/health"),
+      healthRequest,
       fetchJson("/api/rooms?limit=200"),
       sessionRequest,
-      fetchNicknameRequests(),
+      nicknameRequest,
       invitationRequest,
     ]);
-    state.messageRateLimits = healthPayload.message_rate_limits || null;
-    if (healthPayload.current_user) state.currentUser = healthPayload.current_user;
+    if (healthPayload) {
+      state.messageRateLimits = healthPayload.message_rate_limits || null;
+      if (healthPayload.current_user) state.currentUser = healthPayload.current_user;
+    }
     state.rooms = roomPayload.rooms;
-    state.sessions = sessionPayload.sessions;
-    state.sessionStats = sessionPayload.stats || { active_count: 0, clearable_count: 0 };
-    state.nicknameRequests = nicknamePayload.requests;
-    state.agentInvitations = invitationPayload.invitations;
+    if (sessionPayload) {
+      state.sessions = sessionPayload.sessions;
+      state.sessionStats = sessionPayload.stats || { active_count: 0, clearable_count: 0 };
+    }
+    if (nicknamePayload) state.nicknameRequests = nicknamePayload.requests;
+    if (invitationPayload) state.agentInvitations = invitationPayload.invitations;
     if (!state.selectedRoom || !state.rooms.some((room) => room.conversation_id === state.selectedRoom)) {
       state.selectedRoom = state.rooms[0]?.conversation_id || null;
       if (state.selectedRoom) window.localStorage.setItem("agentBridgeSelectedRoom", state.selectedRoom);
@@ -1500,10 +1702,23 @@ async function refresh(options = {}) {
       await refreshActiveRoom(
         options.forceRoomBottom === true,
         options.fullRoom === true,
+        {
+          refreshParticipants: refreshPresence,
+          refreshTaskState: mode === "task" || options.refreshTaskState === true,
+          refreshReceipts: options.refreshReceipts === true,
+        },
       );
     }
-    setConnection(true, `${healthPayload.room_states.active} 使用中 · ${healthPayload.room_states.abandoned} 已废弃`);
-    elements.lastSync.textContent = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date());
+    if (healthPayload) {
+      setConnection(true, `${healthPayload.room_states.active} 使用中 · ${healthPayload.room_states.abandoned} 已废弃`);
+    } else {
+      const currentLabel = elements.connectionLabel.textContent || "";
+      setConnection(
+        true,
+        currentLabel.includes("使用中") ? currentLabel : "事件连接正常",
+      );
+    }
+    elements.lastSync.textContent = DATE_TIME_FORMATTERS.syncTime.format(new Date());
   } catch (error) {
     setConnection(false, "连接中断");
     elements.lastSync.textContent = "重试中";
@@ -1511,9 +1726,10 @@ async function refresh(options = {}) {
   } finally {
     state.refreshing = false;
     window.setTimeout(() => elements.refreshButton.classList.remove("spinning"), 300);
-    if (state.refreshQueued) {
-      state.refreshQueued = false;
-      window.setTimeout(() => refresh({}), 0);
+    if (state.queuedRefresh) {
+      const queued = state.queuedRefresh;
+      state.queuedRefresh = null;
+      window.setTimeout(() => refresh(queued), 0);
     }
   }
 }
@@ -2616,7 +2832,10 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
     hideMentionMenu();
     elements.ownerMessageFeedback.classList.add("success");
     elements.ownerMessageFeedback.textContent = taskMode ? "任务已提交" : "已发送";
-    await refresh({ forceRoomBottom: true });
+    await refresh({
+      mode: taskMode ? "task" : "room",
+      forceRoomBottom: true,
+    });
     elements.ownerMessageBody.focus();
   } catch (error) {
     elements.ownerMessageFeedback.classList.add("error");
@@ -2784,6 +3003,30 @@ function notifyOwner(changedRooms) {
   });
 }
 
+function changedRevisionFacets(nextRevisions) {
+  const previous = state.eventRevisions;
+  state.eventRevisions = nextRevisions;
+  if (!previous || !nextRevisions) return [];
+  const keys = new Set([...Object.keys(previous), ...Object.keys(nextRevisions)]);
+  return [...keys].filter(
+    (key) => JSON.stringify(previous[key]) !== JSON.stringify(nextRevisions[key]),
+  );
+}
+
+function refreshModeForEvent(changedFacets) {
+  if (!changedFacets.length) return null;
+  const changed = new Set(changedFacets);
+  const onlyContains = (allowed) => [...changed].every((item) => allowed.has(item));
+  if (onlyContains(new Set(["messages", "rooms", "receipts"]))) return "room";
+  if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts"]))) return "task";
+  if (["participants", "memberships", "online", "sessions", "connectors"].some(
+    (facet) => changed.has(facet),
+  )) {
+    return changed.has("tasks") ? "full" : "presence";
+  }
+  return "full";
+}
+
 function scheduleFallbackRefresh() {
   if (!state.currentUser) return;
   if (state.fallbackRefreshTimer) return;
@@ -2816,13 +3059,29 @@ function connectOwnerEvents() {
       return;
     }
     const changedRooms = Array.isArray(payload.changed_rooms) ? payload.changed_rooms : [];
+    const namedRevisions = payload.state_revisions && typeof payload.state_revisions === "object"
+      ? payload.state_revisions
+      : null;
+    const changedFacets = changedRevisionFacets(namedRevisions);
     const initialNeedsRefresh = changedRooms.some((changed) => {
       const local = state.rooms.find((room) => room.conversation_id === changed.conversation_id);
       return Number(changed.last_sequence || 0) > Number(local?.last_sequence || 0);
-    }) || (isAdmin() && Number(payload.pending_nickname_requests || 0) !== state.nicknameRequests.length);
+    })
+      || changedFacets.length > 0
+      || (isAdmin() && Number(payload.pending_nickname_requests || 0) !== state.nicknameRequests.length);
     if (receivedInitialState || initialNeedsRefresh) {
       if (receivedInitialState) notifyOwner(changedRooms);
-      await refresh({});
+      const mode = namedRevisions
+        ? (refreshModeForEvent(changedFacets) || (initialNeedsRefresh ? "room" : null))
+        : "full";
+      if (mode) {
+        await refresh({
+          mode,
+          refreshTaskState: changedFacets.includes("nicknames")
+            || changedFacets.includes("participants"),
+          refreshReceipts: changedFacets.includes("receipts"),
+        });
+      }
     }
     receivedInitialState = true;
   };

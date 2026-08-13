@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from .store import ROOM_ABANDON_AFTER_SECONDS
+from .store import CONNECTOR_ONLINE_WINDOW_SECONDS, ROOM_ABANDON_AFTER_SECONDS
 from .validation import conversation_id as validate_conversation_id
 
 
@@ -516,6 +516,46 @@ class ViewerRepository:
         result = [self._message_payload(row) for row in ordered_rows]
         return result
 
+    def message_receipts(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ) -> list[dict[str, int | str]]:
+        conversation = validate_conversation_id(conversation_id)
+        normalized_after = max(0, int(after_sequence))
+        normalized_limit = max(1, min(int(limit), 1_000))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.sequence, m.message_id,
+                       (
+                           SELECT COUNT(*) FROM receipts AS receipt
+                           WHERE receipt.message_id = m.message_id
+                             AND receipt.state = 'acked'
+                       ) AS ack_count,
+                       (
+                           SELECT COUNT(*) FROM message_deliveries AS delivery
+                           WHERE delivery.message_id = m.message_id
+                       ) AS receipt_count
+                FROM messages AS m
+                WHERE m.conversation_id = ? AND m.sequence > ?
+                ORDER BY m.sequence DESC
+                LIMIT ?
+                """,
+                (conversation, normalized_after, normalized_limit),
+            ).fetchall()
+        return [
+            {
+                "sequence": int(row["sequence"]),
+                "message_id": str(row["message_id"]),
+                "ack_count": int(row["ack_count"] or 0),
+                "receipt_count": int(row["receipt_count"] or 0),
+            }
+            for row in reversed(rows)
+        ]
+
     def event_snapshot(self, *, after_sequence: int = 0) -> dict[str, Any]:
         requested_cursor = max(0, int(after_sequence))
         now = time.time()
@@ -601,9 +641,11 @@ class ViewerRepository:
                     "UNION ALL "
                     "SELECT 'connector:' || connector_id || ':' || conversation_id || ':' || "
                     "setup_status || ':' || "
-                    "COALESCE(CAST(connector_last_seen_at AS TEXT), '') || ':' || "
+                    "CASE WHEN connector_last_seen_at >= ? THEN 'online' "
+                    "ELSE 'offline' END || ':' || "
                     "COALESCE(CAST(revoked_at AS TEXT), '') AS connector_state "
-                    "FROM agent_connectors ORDER BY connector_state)"
+                    "FROM agent_connectors ORDER BY connector_state)",
+                    (now - CONNECTOR_ONLINE_WINDOW_SECONDS,),
                 ).fetchone()[0]
             )
             session_revocation_revision = float(
@@ -636,19 +678,50 @@ class ViewerRepository:
             )
             task_revision = float(
                 connection.execute(
+                    "SELECT COALESCE(MAX(updated_at), 0) FROM room_tasks"
+                ).fetchone()[0]
+            )
+            task_permission_revision = float(
+                connection.execute(
                     "SELECT MAX(revision) FROM ("
-                    "SELECT COALESCE(MAX(updated_at), 0) AS revision FROM room_tasks "
-                    "UNION ALL SELECT COALESCE(MAX(updated_at), 0) "
+                    "SELECT COALESCE(MAX(updated_at), 0) AS revision "
                     "FROM room_task_policies "
                     "UNION ALL SELECT COALESCE(MAX(updated_at), 0) "
                     "FROM room_task_grants)"
                 ).fetchone()[0]
                 or 0
             )
+            receipt_revision = float(
+                connection.execute(
+                    "SELECT COALESCE(MAX(acked_at), 0) FROM receipts"
+                ).fetchone()[0]
+            )
+        state_revisions = {
+            "messages": global_sequence,
+            "nicknames": nickname_revision,
+            "participants": participant_revision,
+            "memberships": membership_revision,
+            "online": online_revision,
+            "sessions": [
+                active_session_revision,
+                session_revocation_revision,
+                session_clear_revision,
+            ],
+            "rooms": room_revision,
+            "connectors": connector_revision,
+            "permissions": web_user_permission_revision,
+            "tasks": task_revision,
+            "task_permissions": task_permission_revision,
+            "receipts": receipt_revision,
+            "rates": rate_revision,
+        }
         return {
             "cursor": max(cursor, global_sequence),
             "changed_rooms": changed_rooms,
             "pending_nickname_requests": pending_nicknames,
+            # Keep the positional revision for older Web clients while giving
+            # newer clients named facets they can refresh independently.
+            "state_revisions": state_revisions,
             "state_revision": [
                 global_sequence,
                 nickname_revision,
@@ -661,8 +734,9 @@ class ViewerRepository:
                 room_revision,
                 connector_revision,
                 web_user_permission_revision,
-                task_revision,
+                max(task_revision, task_permission_revision),
                 rate_revision,
+                receipt_revision,
             ],
             "server_time": now,
         }

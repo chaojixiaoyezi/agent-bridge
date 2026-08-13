@@ -27,6 +27,8 @@ BRIDGE_TOOLS = (
     "agent_search_history",
     "agent_participants",
     "agent_heartbeat",
+    "agent_update_profile",
+    "agent_request_nickname",
 )
 MODEL_BRIDGE_TOOLS = tuple(tool for tool in BRIDGE_TOOLS if tool != "agent_wait")
 MAX_PREFETCH_PAGES = 5

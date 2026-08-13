@@ -46,6 +46,8 @@ BRIDGE_MCP_TOOLS = (
     "agent_history",
     "agent_search_history",
     "agent_participants",
+    "agent_update_profile",
+    "agent_request_nickname",
 )
 
 

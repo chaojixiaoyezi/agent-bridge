@@ -361,6 +361,7 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "--tools" in captured["command"]
     assert "mcp__agent-bridge__agent_wait" not in captured["command"]
     assert "mcp__agent-bridge__agent_reply" in captured["command"]
+    assert "mcp__agent-bridge__agent_request_nickname" in captured["command"]
     assert "mcp__agent-bridge__agent_register" not in captured["command"]
     tools_index = captured["command"].index("--tools") + 1
     assert captured["command"][tools_index] == ""

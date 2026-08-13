@@ -310,9 +310,30 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     ).json()
     assert [item["body"] for item in incremental["messages"]] == [malicious]
     assert incremental["has_more"] is False
+    receipts = client.get(
+        "/api/rooms/room-one/receipts?after_sequence=0&limit=20"
+    ).json()["receipts"]
+    assert [item["message_id"] for item in receipts] == [
+        item["message_id"] for item in payload["messages"]
+    ]
     event_snapshot = ViewerRepository(database).event_snapshot(
         after_sequence=payload["messages"][0]["sequence"]
     )
+    assert set(event_snapshot["state_revisions"]) == {
+        "messages",
+        "nicknames",
+        "participants",
+        "memberships",
+        "online",
+        "sessions",
+        "rooms",
+        "connectors",
+        "permissions",
+        "tasks",
+        "task_permissions",
+        "receipts",
+        "rates",
+    }
     assert event_snapshot["changed_rooms"] == [
         {
             "conversation_id": "room-one",
@@ -336,10 +357,15 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260812-6" in index_html
-    assert "app.css?v=20260812-6" in index_html
+    assert "app.js?v=20260813-1" in index_html
+    assert "app.css?v=20260813-1" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
+    assert "function appendMessages" in javascript
+    assert "function updateReceiptLabels" in javascript
+    assert "/receipts?limit=" in javascript
+    assert 'mode: taskMode ? "task" : "room"' in javascript
+    assert "state_revisions" in javascript
     assert "? isNearTimelineBottom()" in javascript
     assert "dormant-member-group" in javascript
     assert "inactivity_expires_at" in javascript
@@ -1577,7 +1603,9 @@ def test_admin_manages_global_and_individual_message_rates(
         ).json()["participants"]
     )
 
-    revision_before = ViewerRepository(database).event_snapshot()["state_revision"][-1]
+    revision_before = ViewerRepository(database).event_snapshot()[
+        "state_revisions"
+    ]["rates"]
     updated_global = admin_client.patch(
         "/api/message-rates/global/agent",
         headers=intent_headers(admin_client, "update-global-message-rate"),
@@ -1592,7 +1620,9 @@ def test_admin_manages_global_and_individual_message_rates(
     )
     assert longer_individual.status_code == 200
     assert longer_individual.json()["participant"]["effective_cooldown_seconds"] == 5
-    assert ViewerRepository(database).event_snapshot()["state_revision"][-1] > revision_before
+    assert ViewerRepository(database).event_snapshot()["state_revisions"][
+        "rates"
+    ] > revision_before
 
     with store._transaction() as connection:
         connection.execute(

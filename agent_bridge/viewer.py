@@ -1234,6 +1234,26 @@ def create_app(
             }
         )
 
+    async def message_receipts(request: Request) -> Response:
+        try:
+            authenticated_web_user(request)
+            after_raw = request.query_params.get("after_sequence")
+            after = max(0, min(int(after_raw or 0), 2_147_483_647))
+            limit = _int_query(request, "limit", default=500, maximum=1_000)
+            receipts = repository.message_receipts(
+                request.path_params["conversation_id"],
+                after_sequence=after,
+                limit=limit,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+        return JSONResponse(
+            {
+                "conversation_id": request.path_params["conversation_id"],
+                "receipts": receipts,
+            }
+        )
+
     async def web_send_message(request: Request) -> Response:
         try:
             require_web_intent(request, intent="send-message")
@@ -2139,6 +2159,11 @@ def create_app(
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 messages,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/receipts",
+                message_receipts,
                 methods=["GET"],
             ),
             Route(

@@ -311,6 +311,8 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     )
     command_text = " ".join(host.rpc._command)
     assert "agent_register" not in command_text
+    assert "agent_request_nickname" in command_text
+    assert "agent_update_profile" in command_text
     assert 'mcp_servers.agent-bridge.env.AGENT_BRIDGE_AUTO_REGISTER="1"' in (
         host.rpc._command
     )

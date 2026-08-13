@@ -178,6 +178,29 @@ def test_structured_tasks_are_separate_from_chat_authorization_and_claim_once(
     )
     assert claimed is not None
     assert claimed["claimed_by_participant_id"] == first["participant_id"]
+    first_running = store.update_agent_task(
+        participant_id=first["participant_id"],
+        authorized_session_id=first["session_id"],
+        task_id=claimed["task_id"],
+        status="running",
+        execution_cwd=str(tmp_path),
+        execution_thread_id="019f0000-0000-7000-8000-000000000001",
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE room_tasks SET lease_expires_at = ? WHERE task_id = ?",
+            (time.time() - 1, claimed["task_id"]),
+        )
+    renewed_running = store.update_agent_task(
+        participant_id=first["participant_id"],
+        authorized_session_id=first["session_id"],
+        task_id=claimed["task_id"],
+        status="running",
+        execution_cwd=str(tmp_path),
+        execution_thread_id="019f0000-0000-7000-8000-000000000001",
+    )
+    assert renewed_running["updated_at"] == first_running["updated_at"]
+    assert renewed_running["lease_expires_at"] > time.time()
     assert store.claim_next_task(
         participant_id=second["participant_id"],
         authorized_session_id=second["session_id"],
@@ -213,6 +236,43 @@ def test_structured_tasks_are_separate_from_chat_authorization_and_claim_once(
     assert typed_mention_task["task"]["target_participant_ids"] == [
         second["participant_id"]
     ]
+
+
+def test_connector_heartbeat_does_not_change_visible_dashboard_revision(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("心跳刷新群")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="心跳刷新群",
+        username="heartbeat-agent",
+    )
+    store.report_agent_connector_setup(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        connector_id=agent["connector_id"],
+        setup_status="configured",
+        detail={"status": "configured"},
+    )
+    store.touch_agent_connector(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        connector_id=agent["connector_id"],
+    )
+    repository = ViewerRepository(store.database)
+    initial = repository.event_snapshot()
+    store.touch_agent_connector(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        connector_id=agent["connector_id"],
+    )
+    after_heartbeat = repository.event_snapshot()
+    assert after_heartbeat["state_revisions"]["connectors"] == initial[
+        "state_revisions"
+    ]["connectors"]
 
 
 def test_expired_task_claim_is_requeued_and_needs_input_is_not_overwritten(

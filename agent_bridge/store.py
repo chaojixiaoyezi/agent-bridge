@@ -6754,6 +6754,17 @@ class BridgeStore:
                 if normalized_status in {"running", "needs_input"}
                 else None
             )
+            existing_summary = str(row["result_summary"] or "")
+            existing_cwd = str(row["execution_cwd"] or "")
+            existing_thread_id = str(row["execution_thread_id"] or "")
+            visible_task_changed = (
+                normalized_status != current_status
+                or (normalized_status == "running" and row["started_at"] is None)
+                or (bool(summary) and summary != existing_summary)
+                or (bool(cwd) and cwd != existing_cwd)
+                or (bool(thread_id) and thread_id != existing_thread_id)
+            )
+            visible_updated_at = now if visible_task_changed else float(row["updated_at"])
             conn.execute(
                 """
                 UPDATE room_tasks
@@ -6783,7 +6794,7 @@ class BridgeStore:
                     thread_id,
                     thread_id,
                     lease_expires_at,
-                    now,
+                    visible_updated_at,
                     task,
                 ),
             )
