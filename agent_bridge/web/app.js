@@ -37,6 +37,7 @@ const state = {
   theme: "aurora",
   messageRenderSignature: "",
   participantRenderSignature: "",
+  expandedDormantRooms: new Set(),
   timelineScrollFrame: null,
   forwardMessageId: null,
 };
@@ -715,78 +716,137 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
   updateNewMessageIndicator();
 }
 
+function isWebParticipant(person) {
+  return person.client_type.startsWith("web-user");
+}
+
+function isDormantParticipant(person) {
+  return person.room_status === "active"
+    && person.membership_active
+    && !isWebParticipant(person)
+    && Number(person.active_session_count || 0) === 0
+    && !person.connector_id;
+}
+
+function createParticipantCard(person) {
+  const archived = person.room_status === "abandoned" || !person.membership_active;
+  const card = makeElement("article", `person-card${archived ? " archived" : ""}`);
+  const head = makeElement("div", "person-head");
+  const username = person.client_type.includes("-")
+    ? person.client_type.slice(person.client_type.indexOf("-") + 1)
+    : person.client_type;
+  const initial = Array.from(username)[0] || "A";
+  head.append(makeElement("div", `avatar ${person.status}`, initial));
+  const name = makeElement("div", "person-name");
+  name.append(makeElement("strong", "", person.display_name || person.client_type));
+  name.append(makeElement("span", "", person.signature || "未填写签名"));
+  name.append(makeElement("span", "identity-line", person.client_type));
+  head.append(name);
+  head.append(makeElement("span", `presence-dot ${person.status}`));
+  const isWebUser = isWebParticipant(person);
+  if (!isWebUser && !archived) {
+    const mention = makeElement("button", "mention-button", "@");
+    mention.type = "button";
+    mention.title = `特别通知 ${person.display_name || person.client_type}`;
+    mention.addEventListener("click", () => addComposerMention(person));
+    head.append(mention);
+    if (isAdmin() && state.selectedRoom) {
+      const kick = makeElement("button", "person-kick-button", "踢");
+      kick.type = "button";
+      kick.title = `将 ${person.display_name || person.client_type} 踢出当前聊天室`;
+      kick.addEventListener("click", () => kickAgentFromRoom(
+        state.selectedRoom,
+        person,
+        kick,
+      ));
+      head.append(kick);
+    }
+  }
+  card.append(head);
+  if (person.roles.length) {
+    const roles = makeElement("div", "roles");
+    for (const role of person.roles) roles.append(makeElement("span", "role-chip", role));
+    card.append(roles);
+  }
+  let authLabel;
+  if (isWebUser) {
+    authLabel = "网页用户";
+  } else if (person.resident_status === "online") {
+    authLabel = `自动值守在线 · ${person.connector_adapter_kind}`;
+  } else if (person.resident_status === "degraded") {
+    authLabel = `本机值守异常 · 可点“修复值守”自愈 · ${person.connector_adapter_kind}`;
+  } else if (person.resident_status === "offline") {
+    authLabel = `已配置自动值守 · 当前离线 · ${person.connector_adapter_kind}`;
+  } else if (person.resident_status === "failed") {
+    authLabel = "值守配置失败 · MCP 仍可手动接入";
+  } else if (person.resident_status === "manual") {
+    authLabel = "基础接入 · 未配置自动唤醒";
+  } else {
+    authLabel = person.active_session_count > 0 ? "MCP 会话有效 · 未确认常驻值守" : "无有效 MCP 会话";
+  }
+  const authenticated = isWebUser || person.active_session_count > 0 || person.connector_id;
+  card.append(makeElement("p", `membership-label${authenticated ? " authenticated" : ""}`, authLabel));
+  if (isDormantParticipant(person) && person.inactivity_expires_at) {
+    card.append(makeElement(
+      "p",
+      "membership-label member-expiry-label",
+      `未重新发言则 ${fullTime(person.inactivity_expires_at)} 自动移出`,
+    ));
+  }
+  if (archived) card.append(makeElement("p", "membership-label", "历史成员 · 已不可进入"));
+  return card;
+}
+
 function renderParticipants(participants) {
   state.participants = participants;
-  const signature = participants.map((item) => `${item.participant_id}:${item.status}:${item.membership_active}:${item.resident_status}:${item.display_name}:${item.signature}`).join("|");
+  const signature = `${state.selectedRoom || ""}|${participants.map((item) => [
+    item.participant_id,
+    item.status,
+    item.membership_active,
+    item.resident_status,
+    item.active_session_count,
+    item.connector_id || "",
+    item.inactivity_expires_at || "",
+    item.display_name,
+    item.signature,
+  ].join(":")).join("|")}`;
   if (signature === state.participantRenderSignature) return;
   state.participantRenderSignature = signature;
   elements.peopleList.replaceChildren();
+  const dormant = participants.filter(isDormantParticipant);
+  const current = participants.filter((person) => !isDormantParticipant(person));
   elements.participantCount.textContent = String(participants.length);
+  elements.participantCount.title = dormant.length
+    ? `${current.length} 个当前可用，${dormant.length} 个无有效接入`
+    : `${participants.length} 个成员`;
   if (!participants.length) {
     elements.peopleList.append(makeElement("p", "muted-copy", "这个聊天室还没有活跃成员。"));
     return;
   }
-  for (const person of participants) {
-    const archived = person.room_status === "abandoned" || !person.membership_active;
-    const card = makeElement("article", `person-card${archived ? " archived" : ""}`);
-    const head = makeElement("div", "person-head");
-    const username = person.client_type.includes("-")
-      ? person.client_type.slice(person.client_type.indexOf("-") + 1)
-      : person.client_type;
-    const initial = Array.from(username)[0] || "A";
-    head.append(makeElement("div", `avatar ${person.status}`, initial));
-    const name = makeElement("div", "person-name");
-    name.append(makeElement("strong", "", person.display_name || person.client_type));
-    name.append(makeElement("span", "", person.signature || "未填写签名"));
-    name.append(makeElement("span", "identity-line", person.client_type));
-    head.append(name);
-    head.append(makeElement("span", `presence-dot ${person.status}`));
-    const isWebUser = person.client_type.startsWith("web-user");
-    if (!isWebUser && !archived) {
-      const mention = makeElement("button", "mention-button", "@");
-      mention.type = "button";
-      mention.title = `特别通知 ${person.display_name || person.client_type}`;
-      mention.addEventListener("click", () => addComposerMention(person));
-      head.append(mention);
-      if (isAdmin() && state.selectedRoom) {
-        const kick = makeElement("button", "person-kick-button", "踢");
-        kick.type = "button";
-        kick.title = `将 ${person.display_name || person.client_type} 踢出当前聊天室`;
-        kick.addEventListener("click", () => kickAgentFromRoom(
-          state.selectedRoom,
-          person,
-          kick,
-        ));
-        head.append(kick);
-      }
-    }
-    card.append(head);
-    if (person.roles.length) {
-      const roles = makeElement("div", "roles");
-      for (const role of person.roles) roles.append(makeElement("span", "role-chip", role));
-      card.append(roles);
-    }
-    let authLabel;
-    if (isWebUser) {
-      authLabel = "网页用户";
-    } else if (person.resident_status === "online") {
-      authLabel = `自动值守在线 · ${person.connector_adapter_kind}`;
-    } else if (person.resident_status === "degraded") {
-      authLabel = `本机值守异常 · 可点“修复值守”自愈 · ${person.connector_adapter_kind}`;
-    } else if (person.resident_status === "offline") {
-      authLabel = `已配置自动值守 · 当前离线 · ${person.connector_adapter_kind}`;
-    } else if (person.resident_status === "failed") {
-      authLabel = "值守配置失败 · MCP 仍可手动接入";
-    } else if (person.resident_status === "manual") {
-      authLabel = "基础接入 · 未配置自动唤醒";
-    } else {
-      authLabel = person.active_session_count > 0 ? "MCP 会话有效 · 未确认常驻值守" : "无有效 MCP 会话";
-    }
-    const authenticated = isWebUser || person.active_session_count > 0 || person.connector_id;
-    card.append(makeElement("p", `membership-label${authenticated ? " authenticated" : ""}`, authLabel));
-    if (archived) card.append(makeElement("p", "membership-label", "历史成员 · 已不可进入"));
-    elements.peopleList.append(card);
-  }
+  for (const person of current) elements.peopleList.append(createParticipantCard(person));
+  if (!dormant.length) return;
+
+  const room = state.selectedRoom || "";
+  const group = makeElement("details", "dormant-member-group");
+  group.open = state.expandedDormantRooms.has(room);
+  const summary = makeElement("summary", "dormant-member-summary");
+  summary.append(makeElement("strong", "", `无有效接入成员（${dormant.length}）`));
+  summary.append(makeElement("span", "", "到期自动移出"));
+  group.append(summary);
+  const list = makeElement("div", "dormant-member-list");
+  list.append(makeElement(
+    "p",
+    "dormant-member-note",
+    "这些成员目前无法即时唤醒；重新接入并发言会续期，否则按管理员设置的期限自动移出。历史消息会保留。",
+  ));
+  for (const person of dormant) list.append(createParticipantCard(person));
+  group.append(list);
+  group.addEventListener("toggle", () => {
+    if (!room) return;
+    if (group.open) state.expandedDormantRooms.add(room);
+    else state.expandedDormantRooms.delete(room);
+  });
+  elements.peopleList.append(group);
 }
 
 function populateAccessRooms() {

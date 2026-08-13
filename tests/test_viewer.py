@@ -277,6 +277,7 @@ def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None
         "开发会话",
         "审计会话",
     }
+    assert all(person["inactivity_expires_at"] for person in participants)
 
 
 def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
@@ -334,9 +335,14 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert 'id="theme-select"' in (WEB_ROOT / "index.html").read_text(
         encoding="utf-8"
     )
+    index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert "app.js?v=20260812-2" in index_html
+    assert "app.css?v=20260812-2" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "? isNearTimelineBottom()" in javascript
+    assert "dormant-member-group" in javascript
+    assert "inactivity_expires_at" in javascript
 
     stylesheet_response = client.get("/assets/app.css")
     assert stylesheet_response.headers["cache-control"] == (
@@ -455,6 +461,13 @@ def test_dashboard_auto_clears_expired_sessions_and_keeps_manual_cleanup(
         person for person in participants
         if person["participant_id"] == sender["participant_id"]
     )["status"] == "offline"
+    inactive_sender = next(
+        person for person in participants
+        if person["participant_id"] == sender["participant_id"]
+    )
+    assert inactive_sender["active_session_count"] == 0
+    assert inactive_sender["connector_id"] is None
+    assert inactive_sender["inactivity_expires_at"] > time.time()
     room = next(
         item
         for item in client.get("/api/rooms").json()["rooms"]

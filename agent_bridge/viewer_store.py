@@ -643,6 +643,21 @@ class ViewerRepository:
                     invitation.adapter_kind AS connector_adapter_kind,
                     connector.setup_status AS connector_setup_status,
                     connector.connector_last_seen_at,
+                    CASE
+                        WHEN lifecycle.participant_id IS NOT NULL THEN
+                            MAX(
+                                COALESCE(
+                                    lifecycle.access_granted_at,
+                                    m.joined_at
+                                ),
+                                COALESCE(
+                                    lifecycle.last_spoke_at,
+                                    lifecycle.access_granted_at,
+                                    m.joined_at
+                                )
+                            ) + policy.inactivity_days * 86400.0
+                        ELSE NULL
+                    END AS inactivity_expires_at,
                     (
                         SELECT COUNT(*) FROM agent_sessions AS session
                         WHERE session.participant_id = p.participant_id
@@ -701,6 +716,10 @@ class ViewerRepository:
                   )
                 LEFT JOIN agent_invitations AS invitation
                   ON invitation.invitation_id = connector.invitation_id
+                LEFT JOIN agent_lifecycle_states AS lifecycle
+                  ON lifecycle.participant_id = p.participant_id
+                JOIN agent_lifecycle_policy AS policy
+                  ON policy.singleton = 1
                 WHERE m.conversation_id = ?
                 ORDER BY
                     CASE
@@ -759,6 +778,11 @@ class ViewerRepository:
                 "room_status": str(row["room_status"]),
                 "last_seen": float(row["last_seen"]),
                 "joined_at": float(row["joined_at"]),
+                "inactivity_expires_at": (
+                    float(row["inactivity_expires_at"])
+                    if row["inactivity_expires_at"] is not None
+                    else None
+                ),
                 "active_session_count": int(
                     row["active_agent_session_count"] or 0
                 )
