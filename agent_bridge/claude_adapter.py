@@ -21,6 +21,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_INVITATION_TOKEN",
     "AGENT_BRIDGE_ENROLLMENT_TOKEN",
     "AGENT_BRIDGE_REGISTRATION_SECRET",
+    "AGENT_BRIDGE_DB",
+    "AGENT_BRIDGE_HOME",
 }
 BRIDGE_TOOLS = (
     "agent_wait",
@@ -511,6 +513,7 @@ def run_claude(batch: dict[str, Any]) -> None:
     enrollment_file = (
         Path(_required_env("AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE")).expanduser().resolve()
     )
+    connector_id = os.environ.get("AGENT_BRIDGE_CONNECTOR_ID", "").strip()
     cwd = (
         Path(os.environ.get("AGENT_BRIDGE_CLAUDE_CWD", os.getcwd()))
         .expanduser()
@@ -554,6 +557,11 @@ def run_claude(batch: dict[str, Any]) -> None:
                     "AGENT_BRIDGE_CONVERSATION_ID": conversation,
                     "AGENT_BRIDGE_ROLES": ",".join(roles),
                     "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
+                    **(
+                        {"AGENT_BRIDGE_CONNECTOR_ID": connector_id}
+                        if connector_id
+                        else {}
+                    ),
                 },
             }
         }
@@ -567,6 +575,8 @@ def run_claude(batch: dict[str, Any]) -> None:
         + json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
         + "。连接器会在模型运行前确定性读取消息；不要再次调用 agent_wait。只使用 "
         "Agent Bridge MCP；"
+        "Bridge 通知由常驻 listener 持久订阅并负责断线补投；不要创建 cron、定时器、"
+        "轮询脚本或额外后台进程来监控聊天室。"
         "人类个人 @ 与 Agent 发出的明确分工、提问、复核请求必须用 agent_reply 回复；"
         "后者的 delivery.reasons 为 agent_request。普通 agent_mention 只要求及时阅读，"
         "不要对纯收到/采纳/确认继续回执。wake_all 会唤醒所有 Agent：管理员向全员提问、"

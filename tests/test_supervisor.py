@@ -414,6 +414,7 @@ def test_resident_codex_worker_uses_read_only_sandbox_and_chat_only_rules(
     assert sandbox == {"type": "readOnly", "networkAccess": True}
     instructions = host._developer_instructions()
     assert "固定使用只读沙箱" in instructions
+    assert "不得创建 cron、定时器、轮询脚本" in instructions
     assert "单独的 Codex TUI 任务" in instructions
     assert "不得在常驻连接器中实施修改" in instructions
 

@@ -16,6 +16,7 @@ class BridgeConfig:
     registration_secret: str | None
     invitation_token: str | None
     enrollment_token: str | None
+    connector_id: str | None
     auto_register: bool
     auto_register_username: str
     auto_register_signature: str
@@ -56,6 +57,7 @@ class BridgeConfig:
             registration_secret=read_registration_secret(),
             invitation_token=read_invitation_token(),
             enrollment_token=read_enrollment_token(),
+            connector_id=read_connector_id(),
             auto_register=_truthy(os.environ.get("AGENT_BRIDGE_AUTO_REGISTER")),
             auto_register_username=os.environ.get(
                 "AGENT_BRIDGE_USERNAME",
@@ -104,6 +106,12 @@ def read_enrollment_token() -> str | None:
         file_name="AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE",
         label="Agent Bridge enrollment token",
     )
+
+
+def read_connector_id() -> str | None:
+    """Load the non-secret connector identity paired with enrollment authority."""
+
+    return os.environ.get("AGENT_BRIDGE_CONNECTOR_ID", "").strip() or None
 
 
 def _read_secret(*, direct_name: str, file_name: str, label: str) -> str | None:

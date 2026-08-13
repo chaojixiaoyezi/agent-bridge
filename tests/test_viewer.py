@@ -716,7 +716,9 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert "Agent 无需 Web 登录" in generated["instructions"]
     assert "access_token" not in access.text
     assert "registration-authority" not in access.text
-    assert "Agent 自己选择长期稳定的 username" in generated["instructions"]
+    assert "实际机器 username 由 Bridge 返回并固定到该 connector" in generated[
+        "instructions"
+    ]
 
     access_html = client.get("/").text
     assert '<select class="room-id-input" id="access-room" required>' in access_html
@@ -781,6 +783,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     stable_env = stable_deepseek_row["config"]["env"]
     assert "AGENT_BRIDGE_INVITATION_TOKEN" not in stable_env
     assert "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE" in stable_env
+    assert "AGENT_BRIDGE_CONNECTOR_ID" in stable_env
     assert stable_env["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert "HMR 热加载" in deepseek_access["instructions"]
     assert "常驻自动唤醒适配器尚未启用" in deepseek_access["instructions"]
@@ -1102,7 +1105,10 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
     assert renamed.status_code == 200
     renewed = client.post(
         "/agent/register",
-        headers={"X-Agent-Bridge-Enrollment": enrollment_token},
+        headers={
+            "X-Agent-Bridge-Enrollment": enrollment_token,
+            "X-Agent-Bridge-Connector": connector_id,
+        },
         json={
             "product": "codex",
             "username": "invitee",
@@ -1179,6 +1185,7 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
                 "username": username,
                 "signature": f"第 {index} 个独立接入。",
                 "enrollment_token": enrollment_token,
+                "connector_binding_version": 2,
             },
         )
         assert response.status_code == 201
@@ -1189,17 +1196,25 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
     assert len({item["participant_id"] for item in registrations}) == 2
     assert all(item["invitation_reusable"] is True for item in registrations)
 
-    duplicate_identity = client.post(
+    same_requested_name = client.post(
         "/agent/invitations/accept",
         headers={"X-Agent-Bridge-Invitation": invitation_token},
         json={
             "product": "codex",
             "username": "multi-one",
-            "signature": "不能领取第二份凭据。",
+            "signature": "同名接入也必须获得独立凭据。",
             "enrollment_token": "enroll_" + ("3" * 48),
+            "connector_binding_version": 2,
         },
     )
-    assert duplicate_identity.status_code == 409
+    assert same_requested_name.status_code == 201
+    assert same_requested_name.json()["participant_id"] not in {
+        item["participant_id"] for item in registrations
+    }
+    assert same_requested_name.json()["connector_id"] not in {
+        item["connector_id"] for item in registrations
+    }
+    assert same_requested_name.json()["username"].startswith("multi-one-")
 
     retry = client.post(
         "/agent/invitations/accept",
@@ -1239,9 +1254,9 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
         if item["invitation_id"] == invitation_id
     )
     assert listed["status"] == "active"
-    assert listed["use_count"] == 2
-    assert listed["connector_count"] == 2
-    assert listed["active_connector_count"] == 2
+    assert listed["use_count"] == 3
+    assert listed["connector_count"] == 3
+    assert listed["active_connector_count"] == 3
     assert listed["online_connector_count"] == 1
     assert invitation_token not in str(listed)
     assert all(secret not in str(listed) for secret in enrollment_tokens)
@@ -1269,7 +1284,10 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
 
     renewed = client.post(
         "/agent/register",
-        headers={"X-Agent-Bridge-Enrollment": enrollment_tokens[1]},
+        headers={
+            "X-Agent-Bridge-Enrollment": enrollment_tokens[1],
+            "X-Agent-Bridge-Connector": registrations[1]["connector_id"],
+        },
         json={
             "product": "codex",
             "username": "multi-two",
@@ -1303,7 +1321,7 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
             "SELECT COUNT(*) FROM agent_connectors "
             "WHERE invitation_id = ? AND revoked_at IS NOT NULL",
             (invitation_id,),
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 3
         assert connection.execute(
             "SELECT COUNT(*) FROM agent_sessions "
             "WHERE connector_id IN (SELECT connector_id FROM agent_connectors "

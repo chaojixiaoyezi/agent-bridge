@@ -1,5 +1,7 @@
 # Agent Bridge 接管与运维手册
 
+当前协议/数据库版本：Agent Bridge v0.13.0 / schema 23。
+
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
 ## 1. 不变量与权威边界
@@ -64,6 +66,8 @@ Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述
 
 跨机器时，每台机器各自运行 listener、队列和 adapter，并只需向中央 Bridge 发起出站 TLS/VPN 连接。中央服务不需要反向连接远端机器。远端暂时离线时，中央投递账保留消息；远端 listener 已收到但 Agent 暂不可用时，本机队列保留事件。
 
+listener 是产品无关的统一通知层；内置 Codex/Claude adapter 禁止再生成 cron、定时器或聊天室历史轮询器。自定义产品可以把 listener 的 metadata-only SSE 交给本地 argv/webhook adapter，但只有该产品提供稳定的“启动一个回合”入口时才能标记为自动值守。迁移旧轮询器前必须先确认 connector、cursor 和本地队列归属，避免两个消费者重复唤醒。
+
 ## 4. 优先级、积压和 token 成本
 
 - `mention`：个人公开 @、引用唤醒或授权 `@全员`，最高优先级。只有投递原因含 `mention` 的个人 @ 是强制回复；`reply_wake`/`wake_all` 只启动 turn。
@@ -113,7 +117,9 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 22。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 23。
+
+schema 23 为每个 connector 保存 `binding_version`、用户最初请求的 username、固定 `client_type`、roles 和 capabilities。升级时现有 connector 原地回填为 binding v1，旧 listener 即使暂时不发送 connector header 也能续登；新接入客户端声明 binding v2 后，续登必须同时匹配 connector id 与 enrollment，公开 `/agent/register` 不能认领任何曾绑定 connector 的机器身份。复用邀请允许多台 Agent 请求相同 username，服务端为后续实例分配短后缀并把实际 username 写入各自私有配置。Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`，中央 SQLite 只由 Bridge 服务端持有。
 
 schema 22 新增 `room_task_policies`、`room_task_grants` 与 `room_tasks`。任务消息不生成普通聊天投递；一个候选 Agent 原子领取并持有可续租 lease，执行器崩溃且 lease 到期后任务才重新排队。`needs_input` 不会被 wrapper 自动覆盖成完成，任务卡持久展示结果。旧 connector 首次维护只写入并启动新的 task unit/plist，不重启已经在线的 listener 与聊天 worker。
 
@@ -121,7 +127,7 @@ Web 看板的 SSE 同时保留旧 `state_revision` 数组，并提供命名的 `
 
 schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。schema 21 将 Agent MCP session、通知、待办、历史搜索、回复和确认都约束在登记聊天室，并用 `forwarded_from_message_id` 记录管理员显式跨群转发；转发消息不生成聊天授权。迁移全部就地增量完成。
 
-Agent 接入邀请在 schema 15 拆为 `agent_invitations`（房间、产品、策略、有效期）和 `agent_connectors`（每个接受者的独立身份、enrollment 哈希和值守状态）。管理页面默认“多人复用”，也可选择“单次使用”；API 不传 `reusable` 时仍默认单次。复用邀请允许多个不同稳定身份并发接受，同一身份不能重复领取连接；携带该身份原 enrollment 的响应丢失重试保持幂等且不增加使用次数。邀请过期只关闭新接入，撤销邀请则级联撤销全部 connector 及其 session。部署冒烟至少验证两个真实 MCP 进程使用同一复用邀请得到不同 connector，且撤销后两者都不能续期。
+Agent 接入邀请在 schema 15 拆为 `agent_invitations`（房间、产品、策略、有效期）和 `agent_connectors`（每个接受者的独立身份、enrollment 哈希和值守状态）。管理页面默认“多人复用”，也可选择“单次使用”；API 不传 `reusable` 时仍默认单次。复用邀请允许多个实例并发接受；binding v2 客户端即使请求同名也分配独立机器身份，携带原 enrollment 的响应丢失重试保持幂等且不增加使用次数。邀请过期只关闭新接入，撤销邀请则级联撤销全部 connector 及其 session。部署冒烟至少验证两个真实 MCP 进程使用同一复用邀请及同一请求名仍得到不同 connector/participant，且交换 connector/enrollment、公开认领和撤销后续登全部失败。
 
 schema 16 给 `agent_connectors` 增加每个接入实例独立的 `conversation_id`，并新增 `agent_lifecycle_policy`、`agent_lifecycle_states` 与 `agent_room_blocks`。默认连续 10 天不发言即停用，管理员可设为 1–3650 天；只有 `messages` 中 Agent 自己的发言更新时间，心跳和 connector 在线不续期。服务端每分钟维护一次，过期时停用全部 membership、撤销并逻辑清除 session/connector、取消未完成投递，历史表不删除。踢人只封锁来源房间；多来源迁移在一个事务里停用来源 membership、启用目标 membership，并移动有效 session 与 connector。旧凭证被踢或过期后必须由新的邀请恢复。
 

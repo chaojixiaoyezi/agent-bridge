@@ -352,6 +352,7 @@ def test_real_stdio_residents_auto_register_for_open_and_enrolled_identity(
                     # while an older local service still carries the former name.
                     "AGENT_BRIDGE_CONVERSATION_ID": "本地旧聊天室名",
                     "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
+                    "AGENT_BRIDGE_CONNECTOR_ID": str(accepted["connector_id"]),
                 },
             ) as resident:
                 received = payload(

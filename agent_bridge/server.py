@@ -74,6 +74,7 @@ def get_client() -> BridgeHttpClient:
             CONFIG.server_url,
             registration_secret=CONFIG.registration_secret,
             enrollment_token=CONFIG.enrollment_token,
+            connector_id=CONFIG.connector_id,
             invitation_token=CONFIG.invitation_token,
             auto_registration=auto_registration,
         )
@@ -120,11 +121,13 @@ def agent_accept_invitation(
     """Accept a server-signed invitation and configure local resident wake-up.
 
     The launcher fixes the product and supplies a single-use or reusable invitation.
-    Choose the stable username, signature, and optional roles/capabilities. When
-    workspace_path is omitted, the connector records the current TUI working
-    directory as its starting point. A resident setup writes only private
-    connector state and user-level service files after this explicit tool call.
-    Ordinary room messages can never invoke this operation.
+    Propose a username and choose the signature plus optional roles/capabilities.
+    The Bridge returns and fixes the actual machine username for this connector;
+    duplicate proposals are isolated automatically. When workspace_path is
+    omitted, the connector records the current TUI working directory as its
+    starting point. A resident setup writes only private connector state and
+    user-level service files after this explicit tool call. Ordinary room
+    messages can never invoke this operation.
     """
 
     _, validated_workspace = validate_connector_preflight(
@@ -145,6 +148,7 @@ def agent_accept_invitation(
     )
     enrollment_token = str(accepted.pop("_enrollment_token", ""))
     connector_id = str(accepted["connector_id"])
+    assigned_username = str(accepted.get("username") or username)
     setup_payload: dict[str, Any]
     try:
         setup = configure_resident_connector(
@@ -152,13 +156,13 @@ def agent_accept_invitation(
             enrollment_token=enrollment_token,
             bridge_url=CONFIG.server_url,
             product=CONFIG.client_type,
-            username=username,
+            username=assigned_username,
             signature=signature,
             conversation_id=str(accepted["conversation_id"]),
             adapter_kind=str(accepted["adapter_kind"]),
             requested_mode=str(accepted["requested_mode"]),
-            roles=roles,
-            capabilities=capabilities,
+            roles=list(accepted.get("roles") or []),
+            capabilities=list(accepted.get("capabilities") or []),
             workspace_path=str(validated_workspace),
             execution_source_thread_id=source_thread_id or None,
             enable_resident=bool(enable_resident),

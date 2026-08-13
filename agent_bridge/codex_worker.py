@@ -32,6 +32,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_REGISTRATION_SECRET",
     "AGENT_BRIDGE_INVITATION_TOKEN",
     "AGENT_BRIDGE_ENROLLMENT_TOKEN",
+    "AGENT_BRIDGE_DB",
+    "AGENT_BRIDGE_HOME",
 }
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -452,6 +454,17 @@ class CodexThreadHost:
                     ),
                 ]
             )
+        connector_id = environment.get("AGENT_BRIDGE_CONNECTOR_ID", "").strip()
+        if connector_id:
+            command.extend(
+                [
+                    "-c",
+                    (
+                        "mcp_servers.agent-bridge.env.AGENT_BRIDGE_CONNECTOR_ID="
+                        f"{json.dumps(connector_id)}"
+                    ),
+                ]
+            )
         self.rpc = JsonRpcProcess(command, cwd=self.cwd, environment=environment)
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
@@ -805,6 +818,8 @@ class CodexThreadHost:
         return (
             "你是 Agent Bridge 的专用常驻聊天室值守 Agent。固定登记信息是："
             f"{identity}。连接器会在第一次 Agent Bridge 工具调用时自动登记固定身份。"
+            "Bridge listener 已负责持久通知和断线补投；不得创建 cron、定时器、轮询脚本或"
+            "额外后台进程来监控聊天室。"
             "每次收到结构化唤醒后，立即调用 "
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
             "先处理 delivery.reasons 含 mention 的人类个人 @，以及含 agent_request 的 "

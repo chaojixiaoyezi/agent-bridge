@@ -29,6 +29,7 @@ class BridgeHttpClient:
         *,
         registration_secret: str | None = None,
         enrollment_token: str | None = None,
+        connector_id: str | None = None,
         invitation_token: str | None = None,
         auto_registration: dict[str, Any] | None = None,
     ) -> None:
@@ -43,6 +44,7 @@ class BridgeHttpClient:
         self.base_url = normalized
         self.registration_secret = str(registration_secret or "").strip() or None
         self.enrollment_token = str(enrollment_token or "").strip() or None
+        self.connector_id = str(connector_id or "").strip() or None
         self.invitation_token = str(invitation_token or "").strip() or None
         self.auto_registration = (
             dict(auto_registration) if auto_registration is not None else None
@@ -120,6 +122,7 @@ class BridgeHttpClient:
                 "roles": roles or [],
                 "capabilities": capabilities or [],
                 "enrollment_token": proposed_enrollment,
+                "connector_binding_version": 2,
             },
             authenticated=False,
         )
@@ -135,6 +138,7 @@ class BridgeHttpClient:
         self.enrollment_token = proposed_enrollment
         self.participant_id = str(payload["participant_id"])
         self.session_id = str(payload["session_id"])
+        self.connector_id = str(payload["connector_id"])
         payload["_enrollment_token"] = proposed_enrollment
         return payload
 
@@ -193,6 +197,8 @@ class BridgeHttpClient:
         elif path == "/agent/register":
             if self.enrollment_token:
                 headers["X-Agent-Bridge-Enrollment"] = self.enrollment_token
+                if self.connector_id:
+                    headers["X-Agent-Bridge-Connector"] = self.connector_id
             elif self.registration_secret:
                 headers["X-Agent-Bridge-Registration"] = self.registration_secret
         elif path == "/agent/invitations/accept" and self.invitation_token:

@@ -67,19 +67,20 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     )
     enrollment_token = str(accepted.pop("_enrollment_token", ""))
     connector_id = str(accepted["connector_id"])
+    assigned_username = str(accepted.get("username") or username)
     try:
         setup = configure_resident_connector(
             connector_id=connector_id,
             enrollment_token=enrollment_token,
             bridge_url=bridge_url,
             product=product,
-            username=username,
+            username=assigned_username,
             signature=signature,
             conversation_id=str(accepted["conversation_id"]),
             adapter_kind=str(accepted["adapter_kind"]),
             requested_mode=str(accepted["requested_mode"]),
-            roles=roles,
-            capabilities=capabilities,
+            roles=list(accepted.get("roles") or []),
+            capabilities=list(accepted.get("capabilities") or []),
             workspace_path=str(workspace),
             enable_resident=not args.basic,
         )

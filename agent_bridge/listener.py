@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .config import read_enrollment_token, read_registration_secret
+from .config import read_connector_id, read_enrollment_token, read_registration_secret
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -25,6 +25,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_REGISTRATION_SECRET",
     "AGENT_BRIDGE_INVITATION_TOKEN",
     "AGENT_BRIDGE_ENROLLMENT_TOKEN",
+    "AGENT_BRIDGE_DB",
+    "AGENT_BRIDGE_HOME",
 }
 
 
@@ -245,6 +247,10 @@ def _read_enrollment_token() -> str | None:
         raise ListenerError(str(exc)) from exc
 
 
+def _read_connector_id() -> str | None:
+    return read_connector_id()
+
+
 def _read_cursor(path: Path | None) -> int:
     if path is None or not path.exists():
         return 0
@@ -451,6 +457,7 @@ def _register(
     registration: Registration,
     registration_secret: str | None,
     enrollment_token: str | None = None,
+    connector_id: str | None = None,
 ) -> str:
     headers = {
         "Accept": "application/json",
@@ -459,6 +466,8 @@ def _register(
     }
     if enrollment_token:
         headers["X-Agent-Bridge-Enrollment"] = enrollment_token
+        if connector_id:
+            headers["X-Agent-Bridge-Connector"] = connector_id
     elif registration_secret:
         headers["X-Agent-Bridge-Registration"] = registration_secret
     request = Request(
@@ -498,6 +507,7 @@ def listen(
     wake_timeout: float,
     cursor_file: Path | None,
     enrollment_token: str | None = None,
+    connector_id: str | None = None,
     once: bool = False,
 ) -> None:
     cursor = _read_cursor(cursor_file)
@@ -519,6 +529,7 @@ def listen(
                     registration=registration,
                     registration_secret=registration_secret,
                     enrollment_token=enrollment_token,
+                    connector_id=connector_id,
                 )
             headers = {
                 "Accept": "text/event-stream",
@@ -593,6 +604,7 @@ def main(argv: list[str] | None = None) -> None:
         registration = _registration_from_args(args)
         registration_secret = _read_registration_secret()
         enrollment_token = _read_enrollment_token()
+        connector_id = _read_connector_id()
         cursor_file = Path(args.cursor_file).expanduser() if args.cursor_file else None
         wake_timeout = max(0.25, min(float(args.wake_timeout), 120.0))
         listen(
@@ -601,6 +613,7 @@ def main(argv: list[str] | None = None) -> None:
             registration=registration,
             registration_secret=registration_secret,
             enrollment_token=enrollment_token,
+            connector_id=connector_id,
             webhook=webhook,
             command=command,
             wake_policy=args.wake_policy,

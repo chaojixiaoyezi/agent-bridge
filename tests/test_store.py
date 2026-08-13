@@ -507,7 +507,7 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -1890,7 +1890,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 22
+    assert version == 23
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -1962,7 +1962,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 22
+    assert version == 23
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2058,7 +2058,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 22
+    assert version == 23
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -2223,6 +2223,7 @@ def test_connector_registration_retires_only_old_superseded_sessions(
         registrations.append(
             store.register_agent_session_from_enrollment(
                 enrollment_token=agent["enrollment_token"],
+                connector_id=agent["connector_id"],
                 product="codex",
                 username="bounded-connector-sessions",
                 signature="同一常驻连接器",
@@ -2238,6 +2239,7 @@ def test_connector_registration_retires_only_old_superseded_sessions(
 
     newest = store.register_agent_session_from_enrollment(
         enrollment_token=agent["enrollment_token"],
+        connector_id=agent["connector_id"],
         product="codex",
         username="bounded-connector-sessions",
         signature="同一常驻连接器",
@@ -3147,6 +3149,158 @@ def test_reusable_invitation_accepts_distinct_agents_concurrently(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_reusable_invitation_isolates_same_requested_username_and_reconnects(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("十个 Claude 群")
+    invitation = store.create_agent_invitation(
+        conversation_id="十个 Claude 群",
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+        reusable=True,
+    )
+    invitation_token = str(invitation["invitation_token"])
+    enrollments = ["enroll_" + str(index) * 48 for index in range(1, 4)]
+    accepted = [
+        store.accept_agent_invitation(
+            invitation_token=invitation_token,
+            product="claude-code",
+            username="worker",
+            signature=f"同名 Claude {index}",
+            roles=["reviewer"],
+            capabilities=["history"],
+            enrollment_token=enrollment,
+        )
+        for index, enrollment in enumerate(enrollments, start=1)
+    ]
+
+    assert len({item["participant_id"] for item in accepted}) == 3
+    assert len({item["client_type"] for item in accepted}) == 3
+    assert accepted[0]["username"] == "worker"
+    assert all(item["identity_binding_version"] == 2 for item in accepted)
+    assert all(
+        item["username"] == "worker" or item["username"].startswith("worker-")
+        for item in accepted
+    )
+
+    retried_acceptance = store.accept_agent_invitation(
+        invitation_token=invitation_token,
+        product="claude-code",
+        username="worker",
+        signature="响应丢失后仍回到第二个连接器",
+        roles=["admin"],
+        capabilities=["database"],
+        enrollment_token=enrollments[1],
+    )
+    assert retried_acceptance["connector_id"] == accepted[1]["connector_id"]
+    assert retried_acceptance["participant_id"] == accepted[1]["participant_id"]
+    assert retried_acceptance["username"] == accepted[1]["username"]
+    assert retried_acceptance["roles"] == ["reviewer"]
+    assert retried_acceptance["capabilities"] == ["history"]
+
+    for item, enrollment in zip(accepted, enrollments, strict=True):
+        renewed = store.register_agent_session_from_enrollment(
+            enrollment_token=enrollment,
+            connector_id=item["connector_id"],
+            product="claude-code",
+            username=item["username"],
+            signature="断线后回到原身份",
+            roles=["admin"],
+            capabilities=["database"],
+        )
+        assert renewed["participant_id"] == item["participant_id"]
+        assert renewed["client_type"] == item["client_type"]
+        assert renewed["roles"] == ["reviewer"]
+        assert renewed["capabilities"] == ["history"]
+
+    with pytest.raises(AuthenticationError, match="connector does not match"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=enrollments[0],
+            connector_id=accepted[1]["connector_id"],
+            product="claude-code",
+            username=accepted[0]["username"],
+            signature="错误连接器不能串身份",
+        )
+    with pytest.raises(AuthenticationError, match="identity is required"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=enrollments[0],
+            product="claude-code",
+            username=accepted[0]["username"],
+            signature="新连接器不能降级重连",
+        )
+    with pytest.raises(AuthenticationError, match="connector enrollment"):
+        store.register_agent_session(
+            product="claude-code",
+            username=accepted[0]["username"],
+            signature="公开注册不能认领受邀身份",
+            conversation_id="十个 Claude 群",
+        )
+
+
+def test_version_twenty_two_connectors_keep_legacy_enrollment_compatibility(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("旧连接器群")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="旧连接器群",
+        username="legacy-resident",
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_connectors SET binding_version = 1 "
+            "WHERE connector_id = ?",
+            (agent["connector_id"],),
+        )
+
+    renewed = store.register_agent_session_from_enrollment(
+        enrollment_token=agent["enrollment_token"],
+        product="codex",
+        username="legacy-resident",
+        signature="旧服务不带 connector header 仍可平滑续连",
+    )
+    assert renewed["participant_id"] == agent["participant_id"]
+    assert renewed["identity_binding_version"] == 1
+
+
+def test_strict_invitation_does_not_adopt_an_unbound_existing_identity(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("身份占用群")
+    existing = store.register_agent_session(
+        product="claude-code",
+        username="occupied",
+        signature="原有未绑定身份",
+        conversation_id="身份占用群",
+    )
+    invitation = store.create_agent_invitation(
+        conversation_id="身份占用群",
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    accepted = store.accept_agent_invitation(
+        invitation_token=invitation["invitation_token"],
+        product="claude-code",
+        username="occupied",
+        signature="新连接器不得继承旧身份",
+        connector_binding_version=2,
+    )
+
+    assert accepted["participant_id"] != existing["participant_id"]
+    assert accepted["username"].startswith("occupied-")
+
+
 def test_version_fourteen_invitations_migrate_without_losing_connectors(
     tmp_path: Path,
 ) -> None:
@@ -3310,7 +3464,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 23
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -3365,7 +3519,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 22
+    assert version == 23
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -3576,6 +3730,7 @@ def test_agent_inactivity_uses_speech_not_heartbeat_and_requires_reinvite(
     with pytest.raises(AuthenticationError, match="revoked"):
         store.register_agent_session_from_enrollment(
             enrollment_token=agent["enrollment_token"],
+            connector_id=agent["connector_id"],
             product="codex",
             username="inactive-agent",
             signature="旧 enrollment 不能复活。",
@@ -3635,6 +3790,7 @@ def test_admin_kick_preserves_history_and_blocks_old_agent_credentials(
     with pytest.raises(AuthenticationError, match="revoked"):
         store.register_agent_session_from_enrollment(
             enrollment_token=agent["enrollment_token"],
+            connector_id=agent["connector_id"],
             product="codex",
             username="kick-target",
             signature="旧 enrollment 已失效。",
@@ -3756,6 +3912,7 @@ def test_admin_migrates_agents_from_multiple_rooms_atomically(
     assert source_message["conversation_id"] == "来源-A"
     renewed = store.register_agent_session_from_enrollment(
         enrollment_token=from_c_one["enrollment_token"],
+        connector_id=from_c_one["connector_id"],
         product="codex",
         username="from-c-one",
         signature="复制加入后 enrollment 仍续到原登记群。",
@@ -3809,7 +3966,8 @@ def test_agent_sessions_isolate_room_delivery_history_and_database_writes(
         room="隔离-B",
         username="same-identity",
     )
-    assert first["participant_id"] == second["participant_id"]
+    assert first["participant_id"] != second["participant_id"]
+    assert first["client_type"] != second["client_type"]
 
     store.send_owner_message(conversation_id="隔离-A", body_text="只属于 A 的消息")
     store.send_owner_message(conversation_id="隔离-B", body_text="只属于 B 的消息")
@@ -3996,7 +4154,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 22
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

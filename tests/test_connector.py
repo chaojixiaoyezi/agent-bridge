@@ -186,6 +186,9 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE"
     ] == str(enrollment_file)
     assert listener["EnvironmentVariables"]["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
+    assert listener["EnvironmentVariables"]["AGENT_BRIDGE_CONNECTOR_ID"] == (
+        "connector_1234567890abcdef"
+    )
     assert listener["EnvironmentVariables"]["AGENT_BRIDGE_WAKE_POLICY"] == "all"
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AGENT_WAKE_POLICY"] == (
@@ -198,6 +201,35 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert worker["ProgramArguments"][0].endswith("agent-bridge-codex-worker")
     assert task["ProgramArguments"][0].endswith("agent-bridge-task-worker")
     assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "codex"
+    assert json.loads(manifest_file.read_text(encoding="utf-8"))["schema_version"] == 3
+
+
+def test_connector_refuses_to_overwrite_identity_or_enrollment(
+    tmp_path: Path,
+) -> None:
+    kwargs = {
+        "connector_id": "connector_fixed123456",
+        "enrollment_token": "enroll_fixed-private-token",
+        "bridge_url": "http://127.0.0.1:8765",
+        "product": "claude-code",
+        "username": "fixed-agent",
+        "signature": "固定连接器。",
+        "conversation_id": "固定群",
+        "adapter_kind": "manual",
+        "requested_mode": "basic",
+        "workspace_path": str(tmp_path),
+        "home": tmp_path,
+        "system_name": "Darwin",
+        "activate": False,
+    }
+    configure_resident_connector(**kwargs)
+
+    with pytest.raises(ConnectorSetupError, match="credential differs"):
+        configure_resident_connector(
+            **{**kwargs, "enrollment_token": "enroll_other-private-token"}
+        )
+    with pytest.raises(ConnectorSetupError, match="username differs"):
+        configure_resident_connector(**{**kwargs, "username": "other-agent"})
 
 
 def test_custom_product_acceptance_stays_manual_without_installing_services(
@@ -482,6 +514,7 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     system_prompt_index = captured["command"].index("--append-system-prompt") + 1
     system_prompt = captured["command"][system_prompt_index]
     assert "模型运行前确定性读取消息" in system_prompt
+    assert "不要创建 cron、定时器、轮询脚本" in system_prompt
     assert "只使用 Agent Bridge MCP" in system_prompt
     assert "结构化任务执行席位" in system_prompt
     assert "agent_register" not in prompt

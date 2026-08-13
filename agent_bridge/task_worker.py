@@ -36,6 +36,8 @@ SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_REGISTRATION_SECRET",
     "AGENT_BRIDGE_INVITATION_TOKEN",
     "AGENT_BRIDGE_ENROLLMENT_TOKEN",
+    "AGENT_BRIDGE_DB",
+    "AGENT_BRIDGE_HOME",
 }
 
 
@@ -122,6 +124,7 @@ def _mcp_config_arguments(
     roles: list[str],
     capabilities: list[str],
     enrollment_file: Path,
+    connector_id: str | None = None,
 ) -> list[str]:
     values = {
         "AGENT_BRIDGE_CLIENT_TYPE": product,
@@ -134,6 +137,8 @@ def _mcp_config_arguments(
         "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
     }
+    if connector_id:
+        values["AGENT_BRIDGE_CONNECTOR_ID"] = connector_id
     arguments = [
         "-c",
         f"mcp_servers.agent-bridge.command={json.dumps(str(mcp_command))}",
@@ -343,7 +348,11 @@ def _claude_mcp_config(
     roles: list[str],
     capabilities: list[str],
     enrollment_file: Path,
+    connector_id: str | None = None,
 ) -> dict[str, Any]:
+    connector_environment = (
+        {"AGENT_BRIDGE_CONNECTOR_ID": connector_id} if connector_id else {}
+    )
     return {
         "mcpServers": {
             "agent-bridge": {
@@ -359,6 +368,7 @@ def _claude_mcp_config(
                     "AGENT_BRIDGE_CONVERSATION_ID": conversation,
                     "AGENT_BRIDGE_ROLES": ",".join(roles),
                     "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
+                    **connector_environment,
                 },
             }
         }
@@ -437,6 +447,7 @@ def run_worker(args: argparse.Namespace) -> None:
         _required_env("AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE")
     ).expanduser().resolve()
     mcp_command = Path(_required_env("AGENT_BRIDGE_MCP_COMMAND")).expanduser().resolve()
+    connector_id = os.environ.get("AGENT_BRIDGE_CONNECTOR_ID", "").strip() or None
     if not cwd.is_dir() or not enrollment_file.is_file() or not mcp_command.is_file():
         raise TaskWorkerError("task worker workspace or private connector files are missing")
     environment = dict(os.environ)
@@ -473,6 +484,7 @@ def run_worker(args: argparse.Namespace) -> None:
                     roles=roles,
                     capabilities=capabilities,
                     enrollment_file=enrollment_file,
+                    connector_id=connector_id,
                 ),
                 environment=environment,
             )
@@ -535,6 +547,7 @@ def run_worker(args: argparse.Namespace) -> None:
                             roles=roles,
                             capabilities=capabilities,
                             enrollment_file=enrollment_file,
+                            connector_id=connector_id,
                         ),
                         environment=environment,
                     )

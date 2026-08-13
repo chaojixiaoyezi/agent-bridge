@@ -745,9 +745,14 @@ def create_app(
             return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
         enrollment_token = request.headers.get("x-agent-bridge-enrollment", "").strip()
         if enrollment_token:
+            connector_id = request.headers.get(
+                "x-agent-bridge-connector",
+                "",
+            ).strip()
             return _json_call(
                 lambda: store.register_agent_session_from_enrollment(
                     enrollment_token=enrollment_token,
+                    connector_id=connector_id or None,
                     product=payload["product"],
                     username=payload["username"],
                     session_alias=payload.get("session_alias"),
@@ -799,6 +804,7 @@ def create_app(
                     "roles",
                     "capabilities",
                     "enrollment_token",
+                    "connector_binding_version",
                 },
             )
         except HttpInputError as exc:
@@ -812,6 +818,10 @@ def create_app(
                 roles=payload.get("roles"),
                 capabilities=payload.get("capabilities"),
                 enrollment_token=payload.get("enrollment_token"),
+                connector_binding_version=payload.get(
+                    "connector_binding_version",
+                    1,
+                ),
             ),
             success_status=201,
         )
@@ -1542,7 +1552,9 @@ def create_app(
                                     ),
                                     bridge_url=f"http://127.0.0.1:{local_port}",
                                     product=product,
-                                    username=username,
+                                    username=str(
+                                        registration.get("username") or username
+                                    ),
                                     signature=str(participant["signature"]),
                                     conversation_id=conversation,
                                     adapter_kind=adapter_kind_for_product(product),
@@ -1729,7 +1741,7 @@ def create_app(
                     enrollment_token=str(registration["enrollment_token"]),
                     bridge_url=f"http://127.0.0.1:{local_port}",
                     product=product,
-                    username=username,
+                    username=str(registration.get("username") or username),
                     signature=str(participant["signature"]),
                     conversation_id=conversation_id,
                     adapter_kind=adapter_kind_for_product(product),
@@ -1928,6 +1940,7 @@ def create_app(
                                         "AGENT_BRIDGE_URL": bridge_url,
                                         "AGENT_BRIDGE_CLIENT_TYPE": normalized_product,
                                         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": "<resident_setup.state_directory>/enrollment.token",
+                                        "AGENT_BRIDGE_CONNECTOR_ID": "<agent_accept_invitation.connector_id>",
                                         "AGENT_BRIDGE_AUTO_REGISTER": "1",
                                         "AGENT_BRIDGE_USERNAME": "<接受邀请时自行选择的 username>",
                                         "AGENT_BRIDGE_SIGNATURE": "<接受邀请时自行填写的 signature>",
@@ -1969,7 +1982,8 @@ def create_app(
             if reusable:
                 invitation_note = (
                     "这是管理员签发的 Agent Bridge 多人复用邀请，可以转发给多个不同 Agent；"
-                    f"每个接受者都会获得独立连接凭据并加入聊天室「{conversation}」。"
+                    f"每个接受者都会获得独立连接凭据并加入聊天室「{conversation}」；"
+                    "即使多个 Agent 选择同一 username，服务端也会为连接器分配不同机器身份。"
                 )
                 expiry_note = (
                     f"邀请有效期至 Unix 时间 {invitation['expires_at']}；到期前可由多个不同的稳定身份分别接受，"
@@ -1991,7 +2005,8 @@ def create_app(
                     f"AGENT_BRIDGE_CLIENT_TYPE={normalized_product}",
                     f"AGENT_BRIDGE_INVITATION_TOKEN={invitation_token}",
                     expiry_note,
-                    "连接后由 Agent 自己选择长期稳定的 username、填写 signature、工作目录，并按职责决定 roles/capabilities。",
+                    "连接后由 Agent 提供 username、signature、工作目录，并按职责决定 roles/capabilities；"
+                    "实际机器 username 由 Bridge 返回并固定到该 connector，同名时自动隔离。",
                     "请明确调用 agent_accept_invitation；不要先调用 agent_register：",
                     "Agent 自行填写字段：",
                     json.dumps(agent_supplied_fields, ensure_ascii=False, indent=2),

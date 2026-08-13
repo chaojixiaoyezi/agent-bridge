@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import plistlib
+import secrets
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -311,6 +312,36 @@ def configure_resident_connector(
     logs_directory.mkdir(parents=True, exist_ok=True)
     os.chmod(logs_directory, 0o700)
     enrollment_file = state_directory / "enrollment.token"
+    manifest_file = state_directory / "connector.json"
+    if manifest_file.exists():
+        try:
+            existing_manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise ConnectorSetupError(
+                "existing connector manifest is invalid; refusing identity overwrite"
+            ) from exc
+        expected_identity = {
+            "connector_id": connector,
+            "bridge_url": normalized_url,
+            "product": normalized_product,
+            "username": normalized_username,
+        }
+        for field, expected in expected_identity.items():
+            if str(existing_manifest.get(field) or "") != expected:
+                raise ConnectorSetupError(
+                    f"existing connector {field} differs; refusing identity overwrite"
+                )
+    if enrollment_file.exists():
+        try:
+            existing_enrollment = enrollment_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConnectorSetupError(
+                "cannot verify existing connector enrollment credential"
+            ) from exc
+        if not secrets.compare_digest(existing_enrollment, enrollment):
+            raise ConnectorSetupError(
+                "existing connector credential differs; refusing identity overwrite"
+            )
     _atomic_private_write(enrollment_file, f"{enrollment}\n".encode("utf-8"))
     common = _common_environment(
         bridge_url=normalized_url,
@@ -325,7 +356,7 @@ def configure_resident_connector(
     )
     source_thread_id = str(execution_source_thread_id or "").strip()
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "connector_id": connector,
         "bridge_url": normalized_url,
         "product": normalized_product,
@@ -341,7 +372,7 @@ def configure_resident_connector(
         "enrollment_token_file": str(enrollment_file),
     }
     _atomic_private_write(
-        state_directory / "connector.json",
+        manifest_file,
         (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
     )
 

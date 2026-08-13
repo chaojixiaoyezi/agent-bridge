@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .validation import (
+    MAX_AGENT_USERNAME_CHARS,
+    MAX_CLIENT_IDENTITY_CHARS,
     ValidationError,
+    agent_username,
     alias,
     body,
     client_identity,
@@ -771,6 +774,12 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     setup_detail_json TEXT NOT NULL DEFAULT '{}',
     setup_updated_at REAL,
     connector_last_seen_at REAL,
+    binding_version INTEGER NOT NULL DEFAULT 1
+        CHECK (binding_version IN (1, 2)),
+    requested_username TEXT,
+    bound_client_type TEXT,
+    bound_roles_json TEXT,
+    bound_capabilities_json TEXT,
     created_at REAL NOT NULL,
     revoked_at REAL,
     updated_at REAL NOT NULL,
@@ -1185,6 +1194,7 @@ class BridgeStore:
             self._migrate_reusable_agent_invitations(conn)
             self._migrate_agent_connector_conversations(conn)
             conn.executescript(INVITATION_SCHEMA)
+            self._migrate_connector_identity_bindings(conn)
             if schema_version < 21:
                 self._repair_connector_room_bindings(conn)
             conn.executescript(AGENT_LIFECYCLE_SCHEMA)
@@ -1254,7 +1264,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 22")
+            conn.execute("PRAGMA user_version = 23")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1504,6 +1514,116 @@ class BridgeStore:
             raise BridgeError(
                 "agent connector room migration would leave "
                 f"{missing} connector(s) without a room"
+            )
+
+    @staticmethod
+    def _migrate_connector_identity_bindings(conn: sqlite3.Connection) -> None:
+        """Snapshot immutable connector identity without invalidating v22 clients."""
+
+        connector_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'agent_connectors'"
+        ).fetchone()
+        if connector_table is None:
+            return
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(agent_connectors)").fetchall()
+        }
+        additions = {
+            "binding_version": (
+                "INTEGER NOT NULL DEFAULT 1 CHECK (binding_version IN (1, 2))"
+            ),
+            "requested_username": "TEXT",
+            "bound_client_type": "TEXT",
+            "bound_roles_json": "TEXT",
+            "bound_capabilities_json": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(
+                    f"ALTER TABLE agent_connectors ADD COLUMN {name} {declaration}"
+                )
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET bound_client_type = (
+                    SELECT participant.client_type
+                    FROM participants AS participant
+                    WHERE participant.participant_id =
+                          agent_connectors.accepted_participant_id
+                )
+            WHERE bound_client_type IS NULL OR trim(bound_client_type) = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET requested_username = (
+                    SELECT CASE
+                        WHEN substr(
+                                 participant.client_type,
+                                 1,
+                                 length(invitation.product) + 1
+                             ) = invitation.product || '-'
+                        THEN substr(
+                                 participant.client_type,
+                                 length(invitation.product) + 2
+                             )
+                        ELSE participant.client_type
+                    END
+                    FROM participants AS participant
+                    JOIN agent_invitations AS invitation
+                      ON invitation.invitation_id = agent_connectors.invitation_id
+                    WHERE participant.participant_id =
+                          agent_connectors.accepted_participant_id
+                )
+            WHERE requested_username IS NULL OR trim(requested_username) = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET bound_roles_json = COALESCE((
+                    SELECT membership.roles_json
+                    FROM memberships AS membership
+                    WHERE membership.conversation_id =
+                          agent_connectors.conversation_id
+                      AND membership.participant_id =
+                          agent_connectors.accepted_participant_id
+                ), '[]')
+            WHERE bound_roles_json IS NULL OR trim(bound_roles_json) = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET bound_capabilities_json = COALESCE((
+                    SELECT participant.capabilities_json
+                    FROM participants AS participant
+                    WHERE participant.participant_id =
+                          agent_connectors.accepted_participant_id
+                ), '[]')
+            WHERE bound_capabilities_json IS NULL
+               OR trim(bound_capabilities_json) = ''
+            """
+        )
+        incomplete = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM agent_connectors
+                WHERE requested_username IS NULL OR trim(requested_username) = ''
+                   OR bound_client_type IS NULL OR trim(bound_client_type) = ''
+                   OR bound_roles_json IS NULL OR trim(bound_roles_json) = ''
+                   OR bound_capabilities_json IS NULL
+                      OR trim(bound_capabilities_json) = ''
+                """
+            ).fetchone()[0]
+        )
+        if incomplete:
+            raise BridgeError(
+                "connector identity migration left "
+                f"{incomplete} incomplete binding(s)"
             )
 
     @staticmethod
@@ -4473,12 +4593,31 @@ class BridgeStore:
         roles: Sequence[str] | None = None,
         capabilities: Sequence[str] | None = None,
         enrollment_token: str | None = None,
+        connector_binding_version: object = 2,
     ) -> dict[str, Any]:
         normalized_invitation_token = opaque_id(
             invitation_token,
             field="invitation_token",
         )
         normalized_product = token(product, field="product_name")
+        requested_username = agent_username(username)
+        if isinstance(connector_binding_version, bool):
+            raise ValidationError("connector_binding_version must be 1 or 2")
+        try:
+            requested_binding_version = int(connector_binding_version)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(
+                "connector_binding_version must be 1 or 2"
+            ) from exc
+        if (
+            requested_binding_version not in {1, 2}
+            or (
+                not isinstance(connector_binding_version, int)
+                and str(connector_binding_version).strip()
+                != str(requested_binding_version)
+            )
+        ):
+            raise ValidationError("connector_binding_version must be 1 or 2")
         normalized_enrollment = None
         if enrollment_token is not None:
             normalized_enrollment = opaque_id(
@@ -4507,16 +4646,6 @@ class BridgeStore:
                 str(invitation["product"]),
             ):
                 raise AuthenticationError("Agent invitation product does not match")
-            registration = self._normalized_agent_registration(
-                product=normalized_product,
-                username=username,
-                session_alias=None,
-                signature=signature,
-                conversation_id=str(invitation["conversation_id"]),
-                roles=roles,
-                capabilities=capabilities,
-                session_ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
-            )
             existing_connector = None
             if normalized_enrollment is not None:
                 existing_connector = conn.execute(
@@ -4538,17 +4667,46 @@ class BridgeStore:
                     )
                 if existing_connector["revoked_at"] is not None:
                     raise ConflictError("Agent connector is revoked")
-                if not self._constant_time_eq(
-                    str(registration["identity"]),
-                    str(existing_connector["client_type"]),
+                bound_identity = str(
+                    existing_connector["bound_client_type"]
+                    or existing_connector["client_type"]
+                )
+                assigned_username = self._username_from_bound_identity(
+                    product=normalized_product,
+                    client_type=bound_identity,
+                )
+                original_username = str(
+                    existing_connector["requested_username"]
+                    or assigned_username
+                )
+                if not any(
+                    self._constant_time_eq(requested_username, candidate)
+                    for candidate in (original_username, assigned_username)
                 ):
                     raise AuthenticationError(
                         "Agent invitation retry identity does not match"
                     )
-                connector_id = str(existing_connector["connector_id"])
-                registration["conversation_id"] = str(
-                    existing_connector["conversation_id"]
+                bound_roles = self._connector_bound_tokens(
+                    existing_connector,
+                    column="bound_roles_json",
+                    field="roles",
                 )
+                bound_capabilities = self._connector_bound_tokens(
+                    existing_connector,
+                    column="bound_capabilities_json",
+                    field="capabilities",
+                )
+                registration = self._normalized_agent_registration(
+                    product=normalized_product,
+                    username=assigned_username,
+                    session_alias=None,
+                    signature=signature,
+                    conversation_id=str(existing_connector["conversation_id"]),
+                    roles=bound_roles,
+                    capabilities=bound_capabilities,
+                    session_ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
+                )
+                connector_id = str(existing_connector["connector_id"])
                 registered = self._register_agent_session_locked(
                     conn,
                     registration=registration,
@@ -4562,30 +4720,55 @@ class BridgeStore:
                     (now, now, connector_id),
                 )
                 setup_status = str(existing_connector["setup_status"])
+                binding_version = int(existing_connector["binding_version"] or 1)
             else:
                 if invitation_status != "active":
                     raise ConflictError(
                         f"Agent invitation is {invitation_status}"
                     )
-                duplicate_identity = conn.execute(
-                    """
-                    SELECT connector.connector_id
-                    FROM agent_connectors AS connector
-                    JOIN participants AS participant
-                      ON participant.participant_id = connector.accepted_participant_id
-                    WHERE connector.invitation_id = ?
-                      AND participant.client_type = ?
-                    """,
-                    (
-                        str(invitation["invitation_id"]),
-                        str(registration["identity"]),
-                    ),
-                ).fetchone()
-                if duplicate_identity is not None:
-                    raise ConflictError(
-                        "this Agent identity already accepted the invitation"
-                    )
                 connector_id = f"connector_{uuid.uuid4().hex}"
+                if requested_binding_version >= 2:
+                    assigned_username = self._allocate_connector_username_locked(
+                        conn,
+                        product=normalized_product,
+                        requested_username=requested_username,
+                        connector_id=connector_id,
+                        conversation_id=str(invitation["conversation_id"]),
+                    )
+                else:
+                    assigned_username = requested_username
+                    requested_identity = product_username(
+                        normalized_product,
+                        assigned_username,
+                    )
+                    duplicate_connector = conn.execute(
+                        """
+                        SELECT connector.connector_id
+                        FROM agent_connectors AS connector
+                        JOIN participants AS participant
+                          ON participant.participant_id =
+                             connector.accepted_participant_id
+                        WHERE participant.client_type = ?
+                          AND connector.revoked_at IS NULL
+                        LIMIT 1
+                        """,
+                        (requested_identity,),
+                    ).fetchone()
+                    if duplicate_connector is not None:
+                        raise ConflictError(
+                            "this legacy Agent client must choose a unique username "
+                            "or upgrade connector support"
+                        )
+                registration = self._normalized_agent_registration(
+                    product=normalized_product,
+                    username=assigned_username,
+                    session_alias=None,
+                    signature=signature,
+                    conversation_id=str(invitation["conversation_id"]),
+                    roles=roles,
+                    capabilities=capabilities,
+                    session_ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
+                )
                 normalized_enrollment = normalized_enrollment or (
                     f"enroll_{secrets.token_urlsafe(32)}"
                 )
@@ -4608,9 +4791,12 @@ class BridgeStore:
                         (connector_id, invitation_id, conversation_id,
                          accepted_participant_id,
                          initial_session_id, enrollment_token_hash,
-                         enrollment_last_used_at, setup_status,
-                         setup_updated_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        enrollment_last_used_at, setup_status,
+                         setup_updated_at, binding_version,
+                         requested_username, bound_client_type,
+                         bound_roles_json, bound_capabilities_json,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         connector_id,
@@ -4622,10 +4808,16 @@ class BridgeStore:
                         now,
                         setup_status,
                         now,
+                        requested_binding_version,
+                        requested_username,
+                        str(registration["identity"]),
+                        compact_json(registration["roles"]),
+                        compact_json(registration["capabilities"]),
                         now,
                         now,
                     ),
                 )
+                binding_version = requested_binding_version
                 conn.execute(
                     """
                     UPDATE agent_invitations
@@ -4654,14 +4846,102 @@ class BridgeStore:
                 ),
                 "enrollment_token": normalized_enrollment,
                 "setup_status": setup_status,
+                "identity_binding_version": binding_version,
             }
         )
         return registered
+
+    @staticmethod
+    def _username_from_bound_identity(*, product: str, client_type: str) -> str:
+        prefix = f"{product}-"
+        if not client_type.startswith(prefix):
+            raise AuthenticationError("Agent connector product binding is invalid")
+        return agent_username(client_type[len(prefix) :])
+
+    @staticmethod
+    def _connector_bound_tokens(
+        connector: sqlite3.Row,
+        *,
+        column: str,
+        field: str,
+    ) -> list[str]:
+        try:
+            raw = json.loads(str(connector[column] or "[]"))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise BridgeError("Agent connector authority binding is invalid") from exc
+        if not isinstance(raw, list):
+            raise BridgeError("Agent connector authority binding is invalid")
+        return string_tokens(raw, field=field)
+
+    @staticmethod
+    def _allocate_connector_username_locked(
+        conn: sqlite3.Connection,
+        *,
+        product: str,
+        requested_username: str,
+        connector_id: str,
+        conversation_id: str,
+    ) -> str:
+        """Allocate one durable machine username without reusing an identity."""
+
+        requested_identity = product_username(product, requested_username)
+        existing = conn.execute(
+            """
+            SELECT participant.participant_id,
+                   EXISTS (
+                       SELECT 1 FROM agent_connectors AS connector
+                       WHERE connector.accepted_participant_id =
+                             participant.participant_id
+                         AND connector.revoked_at IS NULL
+                   ) AS has_active_connector,
+                   COALESCE(lifecycle.reinvite_required, 0) AS reinvite_required,
+                   EXISTS (
+                       SELECT 1 FROM agent_room_blocks AS block
+                       WHERE block.participant_id = participant.participant_id
+                         AND block.conversation_id = ?
+                   ) AS blocked_in_room
+            FROM participants AS participant
+            LEFT JOIN agent_lifecycle_states AS lifecycle
+              ON lifecycle.participant_id = participant.participant_id
+            WHERE participant.client_type = ?
+            """,
+            (conversation_id, requested_identity),
+        ).fetchone()
+        if existing is None:
+            return requested_username
+        if (
+            not bool(existing["has_active_connector"])
+            and (
+                bool(existing["reinvite_required"])
+                or bool(existing["blocked_in_room"])
+            )
+        ):
+            return requested_username
+        identifier = connector_id.removeprefix("connector_")
+        maximum = min(
+            MAX_AGENT_USERNAME_CHARS,
+            MAX_CLIENT_IDENTITY_CHARS - len(product) - 1,
+        )
+        for suffix_length in (8, 12, 16, 24, 32):
+            suffix = identifier[:suffix_length]
+            base_length = maximum - len(suffix) - 1
+            if base_length < 1:
+                continue
+            candidate = f"{requested_username[:base_length]}-{suffix}"
+            candidate_identity = product_username(product, candidate)
+            collision = conn.execute(
+                "SELECT 1 FROM participants WHERE client_type = ?",
+                (candidate_identity,),
+            ).fetchone()
+            if collision is None:
+                return candidate
+        raise ConflictError("could not allocate a unique Agent connector identity")
 
     def register_agent_session_from_enrollment(
         self,
         *,
         enrollment_token: str,
+        connector_id: str | None = None,
         product: str,
         username: str,
         session_alias: str | None = None,
@@ -4676,6 +4956,9 @@ class BridgeStore:
         )
         normalized_product = token(product, field="product_name")
         normalized_identity = product_username(normalized_product, username)
+        normalized_connector = (
+            opaque_id(connector_id, field="connector_id") if connector_id else None
+        )
         now = time.time()
         with self._transaction() as conn:
             self._expire_inactive_agents_locked(conn, now=now)
@@ -4685,6 +4968,10 @@ class BridgeStore:
                        connector.conversation_id AS connector_conversation_id,
                        connector.accepted_participant_id,
                        connector.revoked_at AS connector_revoked_at,
+                       connector.binding_version,
+                       connector.bound_client_type,
+                       connector.bound_roles_json,
+                       connector.bound_capabilities_json,
                        participant.client_type
                 FROM agent_connectors AS connector
                 JOIN agent_invitations AS invitation
@@ -4701,35 +4988,64 @@ class BridgeStore:
                 or invitation["connector_revoked_at"] is not None
             ):
                 raise AuthenticationError("invalid or revoked Agent enrollment")
+            bound_connector_id = str(invitation["connector_id"])
+            binding_version = int(invitation["binding_version"] or 1)
+            if normalized_connector is not None and not self._constant_time_eq(
+                normalized_connector,
+                bound_connector_id,
+            ):
+                raise AuthenticationError("Agent enrollment connector does not match")
+            if binding_version >= 2 and normalized_connector is None:
+                raise AuthenticationError(
+                    "Agent connector identity is required for enrollment"
+                )
+            bound_identity = str(
+                invitation["bound_client_type"] or invitation["client_type"]
+            )
             if not self._constant_time_eq(
                 normalized_identity,
-                str(invitation["client_type"]),
+                bound_identity,
             ):
                 raise AuthenticationError("Agent enrollment identity does not match")
+            assigned_username = self._username_from_bound_identity(
+                product=normalized_product,
+                client_type=bound_identity,
+            )
+            bound_roles = self._connector_bound_tokens(
+                invitation,
+                column="bound_roles_json",
+                field="roles",
+            )
+            bound_capabilities = self._connector_bound_tokens(
+                invitation,
+                column="bound_capabilities_json",
+                field="capabilities",
+            )
             registration = self._normalized_agent_registration(
                 product=normalized_product,
-                username=username,
+                username=assigned_username,
                 session_alias=session_alias,
                 signature=signature,
                 conversation_id=str(invitation["connector_conversation_id"]),
-                roles=roles,
-                capabilities=capabilities,
+                roles=bound_roles,
+                capabilities=bound_capabilities,
                 session_ttl_seconds=session_ttl_seconds,
             )
             registered = self._register_agent_session_locked(
                 conn,
                 registration=registration,
-                connector_id=str(invitation["connector_id"]),
+                connector_id=bound_connector_id,
                 invitation_grant=False,
                 now=now,
             )
             conn.execute(
                 "UPDATE agent_connectors SET enrollment_last_used_at = ?, "
                 "updated_at = ? WHERE connector_id = ?",
-                (now, now, str(invitation["connector_id"])),
+                (now, now, bound_connector_id),
             )
         registered["invitation_id"] = str(invitation["invitation_id"])
         registered["adapter_kind"] = str(invitation["adapter_kind"])
+        registered["identity_binding_version"] = binding_version
         return registered
 
     def report_agent_connector_setup(
@@ -5266,7 +5582,11 @@ class BridgeStore:
         session_ttl_seconds: float,
     ) -> dict[str, Any]:
         normalized_product = token(product, field="product_name")
-        normalized_identity = product_username(normalized_product, username)
+        normalized_username = agent_username(username)
+        normalized_identity = product_username(
+            normalized_product,
+            normalized_username,
+        )
         if normalized_identity == OWNER_CLIENT_TYPE:
             raise ConflictError("this identity is reserved for the local web user")
         if not str(session_alias or "").strip() and not str(signature or "").strip():
@@ -5282,6 +5602,7 @@ class BridgeStore:
         session_ttl = max(300.0, min(float(session_ttl_seconds), 28_800.0))
         return {
             "product": normalized_product,
+            "username": normalized_username,
             "identity": normalized_identity,
             "alias": normalized_alias,
             "signature": normalized_signature,
@@ -5341,15 +5662,47 @@ class BridgeStore:
             )
         else:
             participant_id = str(existing["participant_id"])
-            if invitation_grant:
-                self._grant_agent_invitation_locked(
+            if connector_id is None and not invitation_grant:
+                self._assert_agent_registration_allowed_locked(
                     conn,
                     participant_id=participant_id,
                     conversation_id=conversation,
                     now=now,
                 )
-            else:
-                self._assert_agent_registration_allowed_locked(
+            if connector_id is not None and not invitation_grant:
+                connector_binding = conn.execute(
+                    """
+                    SELECT accepted_participant_id
+                    FROM agent_connectors
+                    WHERE connector_id = ? AND revoked_at IS NULL
+                    """,
+                    (connector_id,),
+                ).fetchone()
+                if (
+                    connector_binding is None
+                    or str(connector_binding["accepted_participant_id"])
+                    != participant_id
+                ):
+                    raise AuthenticationError(
+                        "Agent connector is not bound to this identity"
+                    )
+            if connector_id is None and not invitation_grant:
+                bound_connector = conn.execute(
+                    """
+                    SELECT connector_id
+                    FROM agent_connectors
+                    WHERE accepted_participant_id = ?
+                    LIMIT 1
+                    """,
+                    (participant_id,),
+                ).fetchone()
+                if bound_connector is not None:
+                    raise AuthenticationError(
+                        "existing Agent identity requires its connector enrollment "
+                        "credential"
+                    )
+            if invitation_grant:
+                self._grant_agent_invitation_locked(
                     conn,
                     participant_id=participant_id,
                     conversation_id=conversation,
@@ -5446,6 +5799,7 @@ class BridgeStore:
 
         return {
             "participant_id": participant_id,
+            "username": str(registration["username"]),
             "client_type": normalized_identity,
             "session_alias": str(profile["session_alias"]),
             "display_name": str(profile["display_name"]),
