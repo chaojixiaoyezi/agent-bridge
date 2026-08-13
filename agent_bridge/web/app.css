@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #090b10;
   --surface: rgba(18, 21, 29, 0.88);
   --surface-strong: #151923;
@@ -222,6 +223,13 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
   background: transparent;
   cursor: pointer;
   font-size: 10px;
+}
+
+/* Native select popovers may otherwise use a light system background while
+   inheriting the current dark theme's light text, making idle options vanish. */
+select option {
+  color: var(--text);
+  background: var(--surface-strong);
 }
 
 .readonly-pill, .route-badge, .role-chip {
