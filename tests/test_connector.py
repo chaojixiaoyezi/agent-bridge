@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import agent_bridge.claude_adapter as claude_adapter
+import agent_bridge.invitation_cli as invitation_cli
 import agent_bridge.server as bridge_server
 from agent_bridge.connector import configure_resident_connector
 from agent_bridge.connector import ConnectorSetupError
@@ -47,6 +48,89 @@ def test_task_worker_launcher_imports_package_outside_bridge_checkout(
 
     assert completed.returncode == 0, completed.stderr
     assert "Agent Bridge task executor" in completed.stdout
+
+
+def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accepted_calls: list[dict] = []
+    reported_calls: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def __init__(self, bridge_url, *, invitation_token):
+            assert bridge_url == "http://127.0.0.1:8765"
+            assert invitation_token == "invite_private"
+
+        def accept_invitation(self, **payload):
+            accepted_calls.append(payload)
+            return {
+                "_enrollment_token": "enroll_private",
+                "connector_id": "connector_direct123456",
+                "participant_id": "participant_direct123456",
+                "conversation_id": "直连群",
+                "adapter_kind": "claude-code",
+                "requested_mode": "resident",
+                "invitation_reusable": False,
+            }
+
+        def post(self, path, payload):
+            reported_calls.append((path, payload))
+            return {"connector": {"setup_status": payload["setup_status"]}}
+
+    setup_calls: list[dict] = []
+
+    def configure(**payload):
+        setup_calls.append(payload)
+        return SimpleNamespace(
+            public_payload=lambda: {
+                "status": "configured",
+                "platform": "Darwin",
+                "adapter_kind": "claude-code",
+                "connector_id": "connector_direct123456",
+                "state_directory": str(tmp_path / "state"),
+                "listener_service": "listener",
+                "worker_service": "worker",
+                "task_service": "task",
+                "detail": "ready",
+            }
+        )
+
+    monkeypatch.setattr(invitation_cli, "BridgeHttpClient", FakeClient)
+    monkeypatch.setattr(invitation_cli, "configure_resident_connector", configure)
+    monkeypatch.setattr(
+        invitation_cli,
+        "_stdin_invitation_token",
+        lambda: "invite_private",
+    )
+    result = invitation_cli.accept_invitation(
+        SimpleNamespace(
+            bridge_url="http://127.0.0.1:8765",
+            product="claude-code",
+            username="direct-agent",
+            signature="直接接入。",
+            workspace=str(tmp_path),
+            role=["reviewer"],
+            capability=["chat"],
+            basic=False,
+        )
+    )
+
+    assert accepted_calls == [
+        {
+            "product": "claude-code",
+            "username": "direct-agent",
+            "signature": "直接接入。",
+            "roles": ["reviewer"],
+            "capabilities": ["chat"],
+        }
+    ]
+    assert setup_calls[0]["workspace_path"] == str(tmp_path.resolve())
+    assert setup_calls[0]["enable_resident"] is True
+    assert reported_calls[0][0] == "/agent/connector/setup"
+    assert result["invitation_accepted"] is True
+    assert result["invitation_consumed"] is True
+    assert result["resident_setup"]["status"] == "configured"
 
 
 def test_codex_connector_writes_private_launchd_services_without_secret_leak(
@@ -402,18 +486,93 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     assert "结构化任务执行席位" in system_prompt
     assert "agent_register" not in prompt
 
+    completion_client.calls.clear()
+    fallback_runs: list[list[str]] = []
+
     def incomplete_run(command, **kwargs):
+        fallback_runs.append(command)
+        output_format = command[command.index("--output-format") + 1]
+        prompt = str(kwargs.get("input") or "")
         return SimpleNamespace(
             returncode=0,
-            stdout="",
+            stdout=(
+                (
+                    "收到，已申请将显示名改为「claude-code-小开发」，等待管理员审批。"
+                    if "底层已成功提交昵称申请" in prompt
+                    else "我在，已经看到你的消息；可以继续说明需要我协助的内容。"
+                )
+                if output_format == "text"
+                else ""
+            ),
             stderr="",
         )
 
     monkeypatch.setattr(claude_adapter.subprocess, "run", incomplete_run)
-    with pytest.raises(claude_adapter.ClaudeAdapterError, match="message-42"):
-        claude_adapter.run_claude(batch)
+    claude_adapter.run_claude(batch)
+    assert len(fallback_runs) == 2
+    assert fallback_runs[1][fallback_runs[1].index("--output-format") + 1] == "text"
+    assert "--mcp-config" not in fallback_runs[1]
+    assert completion_client.calls[-2:] == [
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0,
+                "limit": 20,
+                "auto_claim_roles": True,
+            },
+        ),
+        (
+            "/agent/reply",
+            {
+                "message_id": "message-42",
+                "body": "我在，已经看到你的消息；可以继续说明需要我协助的内容。",
+                "refs": [],
+                "mentions": [],
+            },
+        ),
+    ]
+
+    completion_client.calls.clear()
+    wait_result["messages"][0]["body_text"] = (
+        "claude-code-小开发 @claude-code-claude-pi-agent"
+    )
+    claude_adapter.run_claude(batch)
+    assert completion_client.calls == [
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0,
+                "limit": 20,
+                "auto_claim_roles": True,
+            },
+        ),
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0,
+                "limit": 20,
+                "auto_claim_roles": True,
+            },
+        ),
+        (
+            "/agent/nickname/request",
+            {"display_name": "claude-code-小开发"},
+        ),
+        (
+            "/agent/reply",
+            {
+                "message_id": "message-42",
+                "body": "收到，已申请将显示名改为「claude-code-小开发」，等待管理员审批。",
+                "refs": [],
+                "mentions": [],
+            },
+        ),
+    ]
+    wait_result["messages"][0]["body_text"] = "正文不应出现在命令行"
 
     def wrong_reply_run(command, **kwargs):
+        if command[command.index("--output-format") + 1] == "text":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         events = [
             {
                 "type": "tool_use",
@@ -434,7 +593,10 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
         )
 
     monkeypatch.setattr(claude_adapter.subprocess, "run", wrong_reply_run)
-    with pytest.raises(claude_adapter.ClaudeAdapterError, match="message-42"):
+    with pytest.raises(
+        claude_adapter.ClaudeAdapterError,
+        match="fallback reply generation failed",
+    ):
         claude_adapter.run_claude(batch)
 
 

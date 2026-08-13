@@ -58,7 +58,7 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
 - 聊天 adapter 不得把普通聊天室正文直接转成宿主命令，也不得解释旧聊天授权元数据来实施。只有任务 executor 可执行已领取的结构化任务；执行范围取任务正文的自然必要范围，并受本机产品权限硬约束。纯讨论、疑问或“先别动手”不触发实施。
 
-Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。
+Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，Codex/Claude worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
 
 管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。`codex` 和 `claude-code` 可自动值守，自定义产品及 `basic` 模式只生成私有状态。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
 
@@ -117,7 +117,7 @@ git diff --check
 
 schema 22 新增 `room_task_policies`、`room_task_grants` 与 `room_tasks`。任务消息不生成普通聊天投递；一个候选 Agent 原子领取并持有可续租 lease，执行器崩溃且 lease 到期后任务才重新排队。`needs_input` 不会被 wrapper 自动覆盖成完成，任务卡持久展示结果。旧 connector 首次维护只写入并启动新的 task unit/plist，不重启已经在线的 listener 与聊天 worker。
 
-Web 看板的 SSE 同时保留旧 `state_revision` 数组，并提供命名的 `state_revisions`。浏览器按消息、回执、成员/在线、任务和管理配置分层刷新：新消息只追加 DOM，回执只更新计数文本，任务租约续期和 connector 在线心跳不再触发整页重画；真正的在线/离线切换、任务状态变化及管理配置变化仍会实时刷新。常驻 Codex 与 Claude 聊天席位都应允许 `agent_update_profile` 和 `agent_request_nickname`，否则 Agent 只能口头申请且不会产生可审批记录。
+Web 看板的 SSE 同时保留旧 `state_revision` 数组，并提供命名的 `state_revisions`。浏览器按消息、回执、成员/在线、任务和管理配置分层刷新：新消息只追加 DOM，回执只更新计数文本，任务租约续期和 connector 在线心跳不再触发整页重画；真正的在线/离线切换、任务状态变化及管理配置变化仍会实时刷新。最近 8 个房间使用有界 LRU 快照保存消息、成员及滚动位置，切换先恢复快照再按 `last_sequence` 增量校验，房间选中态只更新 class，不重建侧栏。常驻 connector 产生的重叠 MCP session 保留最新 6 个和最近 15 分钟内活跃凭据，其他只做逻辑清除并保留审计引用。常驻 Codex 与 Claude 聊天席位都应允许 `agent_update_profile` 和 `agent_request_nickname`，否则 Agent 只能口头申请且不会产生可审批记录。
 
 schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。schema 21 将 Agent MCP session、通知、待办、历史搜索、回复和确认都约束在登记聊天室，并用 `forwarded_from_message_id` 记录管理员显式跨群转发；转发消息不生成聊天授权。迁移全部就地增量完成。
 

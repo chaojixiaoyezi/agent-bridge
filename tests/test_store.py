@@ -802,6 +802,64 @@ def test_human_mentions_require_reply_but_agent_mentions_only_wake(
     assert "mention" not in agent_delivery["reasons"]
 
 
+def test_explicit_agent_assignment_requires_one_reply_without_courtesy_loop(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    assigner = register(store, client="codex", name="任务分派者")
+    assignee = register(store, client="claude-code", name="任务执行者")
+
+    assigned = store.send(
+        authorized_session_id=assigner["session_id"],
+        sender_participant_id=assigner["participant_id"],
+        conversation_id="tools-room",
+        body_text="@任务执行者：请负责检查切房性能，并回复你的结论。",
+        mentions=[assignee["participant_id"]],
+    )
+    notification = store.notification_snapshot(
+        participant_id=assignee["participant_id"],
+        authorized_session_id=assignee["session_id"],
+        after_sequence=0,
+    )
+    assert notification["backlog"]["required_reply_count"] == 1
+    delivery = next(
+        item["delivery"]
+        for item in store.wait_messages(
+            participant_id=assignee["participant_id"],
+            authorized_session_id=assignee["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == assigned["message_id"]
+    )
+    assert delivery["priority"] == "mention"
+    assert "agent_request" in delivery["reasons"]
+    assert "agent_mention" not in delivery["reasons"]
+
+    expire_sender_cooldown(
+        store,
+        participant_id=assigner["participant_id"],
+        conversation_id="tools-room",
+    )
+    courtesy = store.send(
+        authorized_session_id=assigner["session_id"],
+        sender_participant_id=assigner["participant_id"],
+        conversation_id="tools-room",
+        body_text="@任务执行者 收到，边界已记录。",
+        mentions=[assignee["participant_id"]],
+    )
+    courtesy_delivery = next(
+        item["delivery"]
+        for item in store.wait_messages(
+            participant_id=assignee["participant_id"],
+            authorized_session_id=assignee["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == courtesy["message_id"]
+    )
+    assert "agent_mention" in courtesy_delivery["reasons"]
+    assert "agent_request" not in courtesy_delivery["reasons"]
+
+
 def test_history_search_finds_old_context_without_consuming_backlog(
     tmp_path: Path,
 ) -> None:
@@ -1055,6 +1113,143 @@ def test_visible_at_alias_is_inferred_at_start_middle_and_end(
         assert sent["mentions"] == [receiver["participant_id"]]
 
 
+def test_explicit_review_request_routes_named_member_without_at(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="开发者")
+    reviewer = register(store, client="codex", name="拾光")
+    observer = register(store, client="opencode", name="旁观者")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="codex-拾光，麻烦复核一下这次事务边界。",
+    )
+
+    assert sent["mentions"] == [reviewer["participant_id"]]
+    assert sent["review_routing"] == {
+        "requested": True,
+        "notified": True,
+        "source": "named_member",
+        "target_participant_ids": [reviewer["participant_id"]],
+    }
+    reviewed = next(
+        message
+        for message in store.wait_messages(
+            participant_id=reviewer["participant_id"],
+            authorized_session_id=reviewer["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if message["message_id"] == sent["message_id"]
+    )
+    assert reviewed["delivery"]["priority"] == "mention"
+    assert "agent_request" in reviewed["delivery"]["reasons"]
+    observed = next(
+        message
+        for message in store.wait_messages(
+            participant_id=observer["participant_id"],
+            authorized_session_id=observer["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if message["message_id"] == sent["message_id"]
+    )
+    assert observed["delivery"]["priority"] == "normal"
+
+
+def test_explicit_review_request_uses_reply_author_when_at_is_omitted(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    reviewer = register(store, client="codex", name="原消息作者")
+    sender = register(store, client="claude-code", name="开发者")
+    original = store.send(
+        authorized_session_id=reviewer["session_id"],
+        sender_participant_id=reviewer["participant_id"],
+        conversation_id="tools-room",
+        body_text="请把实现证据补齐。",
+    )
+    reply = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="证据已补齐，麻烦确认一下。",
+        reply_to=original["message_id"],
+    )
+
+    assert reply["mentions"] == [reviewer["participant_id"]]
+    assert reply["review_routing"]["source"] == "reply_author"
+    assert reply["review_routing"]["notified"] is True
+
+
+def test_ambiguous_review_request_warns_but_status_chat_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="开发者")
+    register(store, client="codex", name="审计一")
+    register(store, client="opencode", name="审计二")
+
+    unresolved = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="实现完成了，麻烦审核一下。",
+    )
+    assert unresolved["mentions"] == []
+    assert unresolved["review_routing"]["notified"] is False
+    assert "review_or_confirmation_target_required" in unresolved[
+        "review_routing"
+    ]["warning"]
+
+    expire_sender_cooldown(
+        store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    status = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="实现已提交，目前等待审核。",
+    )
+    assert status["mentions"] == []
+    assert "review_routing" not in status
+
+
+def test_explicit_review_role_audience_stays_claimable_without_personal_mention(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="开发者")
+    reviewer = register(store, client="codex", name="审计员", roles=["reviewer"])
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="麻烦复核一下这次事务边界。",
+        audience_kind="role",
+        audience_value="reviewer",
+    )
+
+    assert sent["mentions"] == []
+    assert sent["review_routing"] == {
+        "requested": True,
+        "notified": True,
+        "source": "audience:role",
+        "target_participant_ids": [reviewer["participant_id"]],
+    }
+    delivered = store.wait_messages(
+        participant_id=reviewer["participant_id"],
+        authorized_session_id=reviewer["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    assert delivered[0]["message_id"] == sent["message_id"]
+    assert delivered[0]["delivery"]["actionable"] is True
+
+
 def test_internal_participant_ids_become_visible_names_and_real_mentions(
     tmp_path: Path,
 ) -> None:
@@ -1091,7 +1286,7 @@ def test_internal_participant_ids_become_visible_names_and_real_mentions(
             wait_seconds=0,
         )["messages"][0]
         assert delivered["delivery"]["priority"] == "mention"
-        assert "agent_mention" in delivered["delivery"]["reasons"]
+        assert "agent_request" in delivered["delivery"]["reasons"]
     observed = store.wait_messages(
         participant_id=observer["participant_id"],
         authorized_session_id=observer["session_id"],
@@ -2009,6 +2204,60 @@ def test_same_fixed_identity_keeps_sessions_and_renews_them_sliding(
     assert legacy_reconnect["participant_id"] == first["participant_id"]
     assert legacy_reconnect["session_alias"] == first["session_alias"]
     assert legacy_reconnect["signature"] == first["signature"]
+
+
+def test_connector_registration_retires_only_old_superseded_sessions(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("tools-room")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="tools-room",
+        username="bounded-connector-sessions",
+    )
+    registrations = [agent]
+    for _ in range(8):
+        registrations.append(
+            store.register_agent_session_from_enrollment(
+                enrollment_token=agent["enrollment_token"],
+                product="codex",
+                username="bounded-connector-sessions",
+                signature="同一常驻连接器",
+            )
+        )
+    now = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_sessions SET last_seen = ?, expires_at = ? "
+            "WHERE connector_id = ?",
+            (now - 3600, now + 3600, agent["connector_id"]),
+        )
+
+    newest = store.register_agent_session_from_enrollment(
+        enrollment_token=agent["enrollment_token"],
+        product="codex",
+        username="bounded-connector-sessions",
+        signature="同一常驻连接器",
+    )
+    with store._connection() as connection:
+        active_rows = connection.execute(
+            "SELECT session_id FROM agent_sessions WHERE connector_id = ? "
+            "AND cleared_at IS NULL AND revoked_at IS NULL ORDER BY last_seen DESC",
+            (agent["connector_id"],),
+        ).fetchall()
+        retired_rows = connection.execute(
+            "SELECT revoked_reason, cleared_at FROM agent_sessions "
+            "WHERE connector_id = ? AND revoked_reason = "
+            "'connector_session_superseded'",
+            (agent["connector_id"],),
+        ).fetchall()
+    assert len(active_rows) == 6
+    assert newest["session_id"] in {str(row["session_id"]) for row in active_rows}
+    assert len(retired_rows) == len(registrations) + 1 - 6
+    assert all(row["cleared_at"] is not None for row in retired_rows)
 
 
 def test_initialize_preserves_recent_legacy_session_for_sliding_renewal(

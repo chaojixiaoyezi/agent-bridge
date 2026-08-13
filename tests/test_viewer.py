@@ -357,7 +357,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260813-1" in index_html
+    assert "app.js?v=20260813-2" in index_html
     assert "app.css?v=20260813-1" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
@@ -741,6 +741,50 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert custom_product.json()["access"]["adapter_kind"] == "manual"
     assert custom_product.json()["access"]["resident_capable"] is False
 
+    claude_product = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={"conversation_id": "old-room", "product": "claude-code"},
+    )
+    assert claude_product.status_code == 200
+    claude_access = claude_product.json()["access"]
+    assert claude_access["quick_start"]["kind"] == "claude-code-direct-accept"
+    assert claude_access["quick_start"]["requires_mcp_restart"] is False
+    assert "agent-bridge-accept" in claude_access["quick_start"]["command"]
+    assert "printf %s" in claude_access["quick_start"]["command"]
+    assert "无需重启现有 TUI/MCP" in claude_access["instructions"]
+
+    deepseek_product = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={"conversation_id": "old-room", "product": "deepseek-harness"},
+    )
+    assert deepseek_product.status_code == 200
+    deepseek_access = deepseek_product.json()["access"]
+    assert deepseek_access["adapter_kind"] == "manual"
+    assert deepseek_access["resident_capable"] is False
+    assert deepseek_access["quick_start"]["kind"] == (
+        "deepseek-harness-cordis-patch"
+    )
+    assert deepseek_access["quick_start"]["hot_reload"] is True
+    deepseek_row = deepseek_access["quick_start"]["patch"][0]["insert"][0]
+    assert deepseek_row["name"] == "@deepseek-ai/dsh-mcp-client"
+    assert deepseek_row["config"]["serverName"].startswith("agent-bridge-")
+    assert deepseek_row["config"]["transport"] == "stdio"
+    assert "cwd" not in deepseek_row["config"]
+    assert deepseek_access["quick_start"]["accept_tool"].endswith(
+        "__agent_accept_invitation"
+    )
+    stable_deepseek_row = deepseek_access["quick_start"]["stable_patch_template"][
+        0
+    ]["insert"][0]
+    stable_env = stable_deepseek_row["config"]["env"]
+    assert "AGENT_BRIDGE_INVITATION_TOKEN" not in stable_env
+    assert "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE" in stable_env
+    assert stable_env["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
+    assert "HMR 热加载" in deepseek_access["instructions"]
+    assert "常驻自动唤醒适配器尚未启用" in deepseek_access["instructions"]
+
     user_identity_rejected = client.post(
         "/api/agent-access",
         headers=intent_headers(client, "generate-agent-access"),
@@ -786,7 +830,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         assert connection.execute(
             "SELECT COUNT(*) FROM agent_invitations "
             "WHERE conversation_id = 'new-room'"
-        ).fetchone()[0] == 2
+        ).fetchone()[0] == 4
 
 
 def test_dashboard_projects_and_revokes_admin_chat_authority(
@@ -1865,3 +1909,14 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert "select option {" in stylesheet
     assert ".message {\n  position: relative;" in stylesheet
     assert "contain-intrinsic-size: 120px" not in stylesheet
+    assert "roomSnapshots: new Map()" in javascript
+    assert "const ROOM_SNAPSHOT_LIMIT = 8" in javascript
+    assert "cacheActiveRoomSnapshot();\n  ++state.requestVersion;" in javascript
+    assert "const restored = restoreRoomSnapshot(roomId);" in javascript
+    assert "await refreshActiveRoom(!restored, !restored" in javascript
+    assert "timelineNodes: [...elements.timeline.childNodes]" in javascript
+    assert "elements.timeline.replaceChildren(...snapshot.timelineNodes)" in javascript
+    assert 'state.selectedRoom || ""' not in javascript[
+        javascript.index("function renderRooms()"):
+        javascript.index("function isNearTimelineBottom()")
+    ]

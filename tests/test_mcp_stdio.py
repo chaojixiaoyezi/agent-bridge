@@ -232,6 +232,10 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         )
                     )
                     assert received["messages"][0]["message_id"] == sent["message_id"]
+                    assert sent["review_routing"]["notified"] is True
+                    assert sent["review_routing"]["source"] == (
+                        "audience:participant"
+                    )
 
                     reply = payload(
                         await codex.call_tool(

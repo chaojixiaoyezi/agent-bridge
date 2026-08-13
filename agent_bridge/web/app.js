@@ -48,9 +48,12 @@ const state = {
   nicknameRenderSignature: "",
   participantFilter: "",
   expandedDormantRooms: new Set(),
+  roomSnapshots: new Map(),
   timelineScrollFrame: null,
   forwardMessageId: null,
 };
+
+const ROOM_SNAPSHOT_LIMIT = 8;
 
 const elements = {
   appShell: document.querySelector("#app-shell"),
@@ -381,6 +384,10 @@ function showAuthScreen(message = "") {
   closeLiveConnections();
   state.currentUser = null;
   state.passwordChangeRequired = false;
+  state.roomSnapshots.clear();
+  state.loadedRoom = null;
+  state.messages = [];
+  state.participants = [];
   elements.appShell.hidden = true;
   for (const dialog of [
     elements.passwordDialog,
@@ -500,10 +507,18 @@ function roomErrorMessage(message) {
   return text;
 }
 
+function syncRoomSelection() {
+  for (const card of elements.roomList.querySelectorAll(".room-card[data-room]")) {
+    const selected = card.dataset.room === state.selectedRoom;
+    card.classList.toggle("active", selected);
+    if (selected) card.setAttribute("aria-current", "true");
+    else card.removeAttribute("aria-current");
+  }
+}
+
 function renderRooms() {
   const signature = JSON.stringify([
     state.currentUser?.user_id || "",
-    state.selectedRoom || "",
     state.filter.trim().toLocaleLowerCase("zh-CN"),
     state.rooms.map((room) => [
       room.conversation_id,
@@ -516,7 +531,10 @@ function renderRooms() {
       room.message_count,
     ]),
   ]);
-  if (signature === state.roomRenderSignature) return;
+  if (signature === state.roomRenderSignature) {
+    syncRoomSelection();
+    return;
+  }
   state.roomRenderSignature = signature;
   elements.roomList.replaceChildren();
   const normalizedFilter = state.filter.trim().toLowerCase();
@@ -583,6 +601,7 @@ function renderRooms() {
     }
     elements.roomList.append(section);
   }
+  syncRoomSelection();
 }
 
 function isNearTimelineBottom() {
@@ -1456,19 +1475,79 @@ function selectedMentionIds(bodyText) {
   return ids;
 }
 
-async function selectRoom(roomId) {
-  state.selectedRoom = roomId;
-  state.loadedRoom = null;
-  state.roomRenderSignature = "";
-  state.messageRenderSignature = "";
+function renderActiveRoomHeader(roomId = state.selectedRoom) {
+  const activeRoom = state.rooms.find((room) => room.conversation_id === roomId);
+  elements.roomTitle.textContent = roomId || "未选择聊天室";
+  const abandoned = activeRoom?.status === "abandoned";
+  elements.roomRoute.textContent = abandoned ? "ABANDONED · HISTORY ONLY" : "ROOM · EVENT LIVE VIEW";
+  elements.roomSummary.textContent = activeRoom
+    ? abandoned
+      ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`
+      : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
+    : "本机聊天室";
+  updateComposer(activeRoom);
+  applyUserPermissions();
+  return activeRoom;
+}
+
+function cacheActiveRoomSnapshot() {
+  const roomId = state.loadedRoom;
+  if (!roomId || roomId !== state.selectedRoom) return;
+  const snapshot = {
+    messages: state.messages,
+    participants: state.participants,
+    timelineNodes: [...elements.timeline.childNodes],
+    hasEarlierMessages: state.hasEarlierMessages,
+    unreadMessages: state.unreadMessages,
+    scrollTop: elements.timeline.scrollTop,
+    nearBottom: isNearTimelineBottom(),
+  };
+  state.roomSnapshots.delete(roomId);
+  state.roomSnapshots.set(roomId, snapshot);
+  while (state.roomSnapshots.size > ROOM_SNAPSHOT_LIMIT) {
+    const oldestRoom = state.roomSnapshots.keys().next().value;
+    state.roomSnapshots.delete(oldestRoom);
+  }
+}
+
+function restoreRoomSnapshot(roomId) {
+  const snapshot = state.roomSnapshots.get(roomId);
+  if (!snapshot) return false;
+  state.roomSnapshots.delete(roomId);
+  state.roomSnapshots.set(roomId, snapshot);
+  state.loadedRoom = roomId;
+  state.messages = snapshot.messages;
+  state.participants = snapshot.participants;
+  state.hasEarlierMessages = snapshot.hasEarlierMessages;
+  state.unreadMessages = snapshot.unreadMessages;
   state.participantRenderSignature = "";
-  state.messages = [];
-  state.participants = [];
-  state.participantById = new Map();
+  renderParticipants(state.participants);
+  if (snapshot.timelineNodes?.length) {
+    elements.timeline.replaceChildren(...snapshot.timelineNodes);
+    state.messageRenderSignature = messageSignature(state.messages);
+    updateNewMessageIndicator();
+  } else {
+    state.messageRenderSignature = "";
+    renderMessages(state.messages, { forceBottom: snapshot.nearBottom });
+  }
+  const requestedRoom = roomId;
+  window.requestAnimationFrame(() => {
+    if (state.selectedRoom !== requestedRoom) return;
+    elements.timeline.scrollTop = snapshot.nearBottom
+      ? elements.timeline.scrollHeight
+      : Math.min(snapshot.scrollTop, elements.timeline.scrollHeight);
+    updateNewMessageIndicator();
+  });
+  return true;
+}
+
+async function selectRoom(roomId) {
+  if (roomId === state.selectedRoom && state.loadedRoom === roomId) return;
+  cacheActiveRoomSnapshot();
+  ++state.requestVersion;
+  state.selectedRoom = roomId;
   state.participantFilter = "";
   elements.participantSearch.value = "";
-  state.hasEarlierMessages = false;
-  state.unreadMessages = 0;
   state.composerMentions.clear();
   state.composerMode = "chat";
   state.taskPermissions = null;
@@ -1477,7 +1556,24 @@ async function selectRoom(roomId) {
   updateNewMessageIndicator();
   window.localStorage.setItem("agentBridgeSelectedRoom", roomId);
   renderRooms();
-  await refreshActiveRoom(true, true);
+  const restored = restoreRoomSnapshot(roomId);
+  if (!restored) {
+    state.loadedRoom = null;
+    state.messageRenderSignature = "";
+    state.participantRenderSignature = "";
+    state.messages = [];
+    state.participants = [];
+    state.participantById = new Map();
+    state.hasEarlierMessages = false;
+    state.unreadMessages = 0;
+    renderParticipants([]);
+    renderMessages([]);
+  }
+  renderActiveRoomHeader(roomId);
+  await refreshActiveRoom(!restored, !restored, {
+    refreshParticipants: true,
+    refreshReceipts: restored,
+  });
 }
 
 elements.participantSearch.addEventListener("input", (event) => {
@@ -1516,6 +1612,7 @@ async function loadEarlierMessages(event) {
     state.messages = mergeMessages(state.messages, payload.messages);
     state.hasEarlierMessages = payload.has_more;
     renderMessages(state.messages);
+    cacheActiveRoomSnapshot();
   } catch (error) {
     console.error(error);
     if (button) button.textContent = "加载失败 · 重试";
@@ -1559,14 +1656,7 @@ async function refreshActiveRoom(
     receiptRequest,
   ]);
   if (requestVersion !== state.requestVersion) return;
-  elements.roomTitle.textContent = selectedRoom;
-  const abandoned = activeRoom?.status === "abandoned";
-  elements.roomRoute.textContent = abandoned ? "ABANDONED · HISTORY ONLY" : "ROOM · EVENT LIVE VIEW";
-  elements.roomSummary.textContent = activeRoom
-    ? abandoned
-      ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`
-      : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
-    : "本机聊天室";
+  renderActiveRoomHeader(selectedRoom);
   if (participantPayload) renderParticipants(participantPayload.participants);
   if (messagePayload) {
     let addedCount = 0;
@@ -1619,8 +1709,7 @@ async function refreshActiveRoom(
       elements.timeline.scrollTop = elements.timeline.scrollHeight;
     });
   }
-  updateComposer(activeRoom);
-  applyUserPermissions();
+  cacheActiveRoomSnapshot();
 }
 
 const REFRESH_MODE_PRIORITY = { room: 1, task: 2, presence: 3, full: 4 };
@@ -2660,6 +2749,10 @@ elements.createRoomForm.addEventListener("submit", async (event) => {
       body: JSON.stringify({ conversation_id: conversationId }),
     });
     state.selectedRoom = payload.room.conversation_id;
+    state.roomSnapshots.delete(state.selectedRoom);
+    state.loadedRoom = null;
+    state.messages = [];
+    state.participants = [];
     window.localStorage.setItem("agentBridgeSelectedRoom", state.selectedRoom);
     elements.createRoomFeedback.classList.add("success");
     elements.createRoomFeedback.textContent = "创建成功";
@@ -2709,6 +2802,8 @@ elements.renameRoomForm.addEventListener("submit", async (event) => {
       body: JSON.stringify({ new_conversation_id: renamedRoom }),
     });
     state.selectedRoom = payload.room.conversation_id;
+    state.roomSnapshots.delete(previousRoom);
+    state.roomSnapshots.delete(state.selectedRoom);
     state.loadedRoom = null;
     state.messages = [];
     state.participants = [];
@@ -2943,10 +3038,16 @@ elements.agentAccessForm.addEventListener("submit", async (event) => {
     state.agentInvitations.unshift(payload.access.invitation);
     renderAgentInvitations();
     const inviteKind = payload.access.reusable ? "多人复用邀请" : "单次邀请";
-    elements.accessFeedback.textContent = payload.access.resident_capable
-      && payload.access.requested_mode === "resident"
-      ? `${inviteKind}已生成；Agent 接受后会各自配置 listener 和产品适配器。`
-      : `${inviteKind}已生成；该产品当前为基础接入，尚不能自动唤醒。`;
+    if (payload.access.quick_start?.kind === "claude-code-direct-accept") {
+      elements.accessFeedback.textContent = `${inviteKind}已生成；Claude Code 可直接执行一键命令，无需重启现有 MCP/TUI。`;
+    } else if (payload.access.quick_start?.kind === "deepseek-harness-cordis-patch") {
+      elements.accessFeedback.textContent = `${inviteKind}已生成；DeepSeek Harness 可通过 Cordis HMR 热加载 MCP，无需重启。`;
+    } else {
+      elements.accessFeedback.textContent = payload.access.resident_capable
+        && payload.access.requested_mode === "resident"
+        ? `${inviteKind}已生成；Agent 接受后会各自配置 listener 和产品适配器。`
+        : `${inviteKind}已生成；该产品当前为基础接入，尚不能自动唤醒。`;
+    }
   } catch (error) {
     elements.accessFeedback.classList.add("error");
     elements.accessFeedback.textContent = error.message;

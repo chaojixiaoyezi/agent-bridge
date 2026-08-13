@@ -46,6 +46,8 @@ RATE_LIMIT_ACTOR_KINDS = {"agent", "web_user"}
 AGENT_ACTIVE_ROOM_LIMIT = 2
 ROOM_ABANDON_AFTER_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_SESSION_TTL_SECONDS = 2 * 60 * 60
+CONNECTOR_SESSION_IDLE_RETIRE_SECONDS = 15 * 60
+CONNECTOR_SESSION_MIN_RETAIN = 6
 NICKNAME_REQUEST_COOLDOWN_SECONDS = 24 * 60 * 60
 MAX_MENTIONS_PER_MESSAGE = 64
 MAX_WAIT_MESSAGES_PAGE_SIZE = 20
@@ -82,6 +84,68 @@ OWNER_PARTICIPANT_ID = "participant_web_owner"
 OWNER_AUTHORIZATION_ID = "owner_web_ui"
 OWNER_CLIENT_TYPE = "web-user"
 OWNER_SESSION_ALIAS = "本机用户"
+
+
+_REVIEW_TERMS = (
+    "确认",
+    "审核",
+    "审查",
+    "复核",
+    "验收",
+    "批准",
+    "审批",
+    "过目",
+)
+_REVIEW_TERM_PATTERN = "|".join(re.escape(term) for term in _REVIEW_TERMS)
+_DIRECT_REVIEW_REQUEST_PATTERNS = (
+    re.compile(
+        rf"(?:请|麻烦|烦请|劳烦|能否|可否)"
+        rf"[^。！？\n]{{0,64}}(?:{_REVIEW_TERM_PATTERN})",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:{_REVIEW_TERM_PATTERN})[^。！？\n]{{0,12}}"
+        r"(?:一下|下吧|一下吧|好吗|可以吗|行吗|\?|？)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"需要(?:你|您)[^。！？\n]{{0,32}}(?:{_REVIEW_TERM_PATTERN})",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:please|could\s+you|can\s+you|would\s+you|need\s+you\s+to)"
+        r"[^.!?\n]{0,80}"
+        r"(?:review|confirm|approve|verify|sign[ -]?off)",
+        flags=re.IGNORECASE,
+    ),
+)
+_AGENT_ASSIGNMENT_ACTION_PATTERN = (
+    r"(?:负责|处理|执行|完成|实现|修改|开发|核对|检查|分析|调研|测试|验证|"
+    r"接手|跟进|给出|回复|答复|排查|修复|审计|评审)"
+)
+_DIRECT_AGENT_REPLY_REQUEST_PATTERNS = (
+    re.compile(
+        rf"(?:请|麻烦|烦请|劳烦|需要(?:你|您)|由(?:你|您)|交给(?:你|您)|"
+        rf"安排(?:你|您))[^。！？\n]{{0,64}}{_AGENT_ASSIGNMENT_ACTION_PATTERN}",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"@[^\s@，,。.!！?？:：;；]{{1,128}}\s*[：:,，]\s*"
+        rf"(?:请|麻烦|烦请|劳烦|你来|由你|{_AGENT_ASSIGNMENT_ACTION_PATTERN})",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"@[^\s@，,。.!！?？:：;；]{1,128}[^。！？\n]{0,64}"
+        r"(?:请问|能否|可否|是否|怎么看|你觉得|你认为|有没有|为什么|为何|怎么)",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"@[A-Za-z0-9._:-]{1,128}\s*[:,]?\s*"
+        r"(?:please|could\s+you|can\s+you|would\s+you|own|take|handle|"
+        r"implement|fix|review|verify|test|investigate|reply)",
+        flags=re.IGNORECASE,
+    ),
+)
 
 
 class BridgeError(RuntimeError):
@@ -257,7 +321,6 @@ CREATE INDEX IF NOT EXISTS idx_receipts_participant
     ON receipts(participant_id, state, message_id);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_participant_active
     ON agent_sessions(participant_id, revoked_at, expires_at);
-
 DROP TRIGGER IF EXISTS trg_messages_reply_only_to_question;
 
 CREATE TRIGGER IF NOT EXISTS trg_participants_identity_immutable
@@ -1077,6 +1140,10 @@ class BridgeStore:
                 "CREATE INDEX IF NOT EXISTS idx_agent_sessions_visible_state "
                 "ON agent_sessions(cleared_at, revoked_at, expires_at)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_sessions_connector_activity "
+                "ON agent_sessions(connector_id, cleared_at, revoked_at, last_seen DESC)"
+            )
             message_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(messages)").fetchall()
@@ -1780,6 +1847,158 @@ class BridgeStore:
         return sorted(set(inferred))
 
     @staticmethod
+    def _is_direct_review_request(body_text: str) -> bool:
+        """Identify only explicit requests for review or confirmation.
+
+        Status prose such as ``等待审批`` or ``需要审核`` is deliberately not
+        enough.  The sender must use a request form, which keeps ordinary room
+        discussion and progress updates on the existing interest-based path.
+        """
+
+        return any(
+            pattern.search(body_text)
+            for pattern in _DIRECT_REVIEW_REQUEST_PATTERNS
+        )
+
+    @classmethod
+    def _is_direct_agent_reply_request(cls, body_text: str) -> bool:
+        """Distinguish actionable Agent requests from courtesy mentions.
+
+        Agent-to-Agent mentions stay optional by default.  An explicit task,
+        question, review, or confirmation request requires one substantive
+        response, which prevents delegated work from silently stalling while
+        still avoiding acknowledgement loops.
+        """
+
+        return cls._is_direct_review_request(body_text) or any(
+            pattern.search(body_text)
+            for pattern in _DIRECT_AGENT_REPLY_REQUEST_PATTERNS
+        )
+
+    @staticmethod
+    def _infer_named_review_targets_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        body_text: str,
+    ) -> list[str]:
+        """Resolve unique same-room names in an explicit review request.
+
+        This is intentionally narrower than fuzzy name matching: only complete
+        public ``display_name`` or ``client_type`` aliases are considered, and
+        an alias shared by multiple active members is ignored.  Existing @
+        inference remains authoritative for text that already contains @.
+        """
+
+        rows = conn.execute(
+            """
+            SELECT participant.participant_id,
+                   participant.client_type,
+                   participant.display_name
+            FROM memberships AS membership
+            JOIN participants AS participant
+              ON participant.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND membership.active = 1
+              AND participant.participant_id != ?
+            """,
+            (conversation_id, sender_participant_id),
+        ).fetchall()
+        alias_targets: dict[str, set[str]] = {}
+        aliases: dict[str, str] = {}
+        for row in rows:
+            participant_id = str(row["participant_id"])
+            for candidate in (row["display_name"], row["client_type"]):
+                visible = str(candidate or "").strip()
+                if not visible or visible.casefold() == "全员".casefold():
+                    continue
+                folded = visible.casefold()
+                alias_targets.setdefault(folded, set()).add(participant_id)
+                aliases.setdefault(folded, visible)
+
+        inferred: set[str] = set()
+        occupied_spans: list[tuple[int, int]] = []
+        for folded, targets in sorted(
+            alias_targets.items(),
+            key=lambda item: len(aliases[item[0]]),
+            reverse=True,
+        ):
+            if len(targets) != 1:
+                continue
+            visible = aliases[folded]
+            left_boundary = (
+                r"(?<![A-Za-z0-9._:@-])"
+                if visible[0].isascii()
+                else r"(?<!@)"
+            )
+            right_boundary = (
+                r"(?![A-Za-z0-9._:@-])" if visible[-1].isascii() else ""
+            )
+            pattern = rf"{left_boundary}{re.escape(visible)}{right_boundary}"
+            for match in re.finditer(pattern, body_text, flags=re.IGNORECASE):
+                span = match.span()
+                if any(
+                    span[0] < occupied_end and occupied_start < span[1]
+                    for occupied_start, occupied_end in occupied_spans
+                ):
+                    continue
+                inferred.add(next(iter(targets)))
+                occupied_spans.append(span)
+                break
+        return sorted(inferred)
+
+    @staticmethod
+    def _reply_sender_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        reply_to: str | None,
+    ) -> str | None:
+        if reply_to is None:
+            return None
+        row = conn.execute(
+            """
+            SELECT original.sender_participant_id
+            FROM messages AS original
+            JOIN memberships AS membership
+              ON membership.conversation_id = original.conversation_id
+             AND membership.participant_id = original.sender_participant_id
+             AND membership.active = 1
+            WHERE original.message_id = ?
+              AND original.conversation_id = ?
+              AND original.sender_participant_id != ?
+            """,
+            (reply_to, conversation_id, sender_participant_id),
+        ).fetchone()
+        return str(row["sender_participant_id"]) if row is not None else None
+
+    @staticmethod
+    def _role_review_targets_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        role: str,
+    ) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT membership.participant_id, membership.roles_json
+            FROM memberships AS membership
+            WHERE membership.conversation_id = ?
+              AND membership.active = 1
+              AND membership.participant_id != ?
+            """,
+            (conversation_id, sender_participant_id),
+        ).fetchall()
+        return sorted(
+            str(row["participant_id"])
+            for row in rows
+            if role in set(json.loads(str(row["roles_json"])))
+        )
+
+    @staticmethod
     def _rewrite_internal_text_mentions_locked(
         conn: sqlite3.Connection,
         *,
@@ -1933,6 +2152,11 @@ class BridgeStore:
             (sender,),
         ).fetchone() is not None
         sender_is_human = sender_is_web_user or sender == OWNER_PARTICIPANT_ID
+        agent_request_requires_reply = (
+            not sender_is_human
+            and bool(mention_ids)
+            and cls._is_direct_agent_reply_request(str(message["body"]))
+        )
         reply_target = None
         if message["reply_to"] is not None:
             replied = conn.execute(
@@ -1979,10 +2203,15 @@ class BridgeStore:
             if primary_recipient:
                 reasons.append(f"audience:{audience_kind}")
             if participant in mention_ids:
-                # Agent mentions remain high-priority wakes, but only a human's
-                # explicit @ requires a reply. This prevents acknowledgement
-                # loops without muting useful Agent-to-Agent conversation.
-                reasons.append("mention" if sender_is_human else "agent_mention")
+                # Courtesy Agent mentions remain optional, while explicit
+                # assignments/questions get one required response.  Human
+                # personal mentions retain their existing required semantics.
+                if sender_is_human:
+                    reasons.append("mention")
+                elif agent_request_requires_reply:
+                    reasons.append("agent_request")
+                else:
+                    reasons.append("agent_mention")
             if include_optional_wakes and wake_all_agents and is_agent:
                 reasons.append("wake_all")
             if include_optional_wakes and reply_target == participant and is_agent:
@@ -5202,6 +5431,12 @@ class BridgeStore:
                 connector_id,
             ),
         )
+        if connector_id is not None:
+            self._retire_idle_connector_sessions_locked(
+                conn,
+                now=now,
+                connector_id=connector_id,
+            )
         owned_count = self._agent_active_room_count(conn, participant_id)
         profile = conn.execute(
             "SELECT session_alias, display_name, signature FROM participants "
@@ -5228,6 +5463,70 @@ class BridgeStore:
             "owned_active_room_limit": AGENT_ACTIVE_ROOM_LIMIT,
             "connector_id": connector_id,
         }
+
+    @staticmethod
+    def _retire_idle_connector_sessions_locked(
+        conn: sqlite3.Connection,
+        *,
+        now: float,
+        connector_id: str | None = None,
+    ) -> int:
+        """Bound superseded credentials created by resident connector turns.
+
+        Listener, chat-worker, task-worker, and short-lived model processes can
+        each register a credential for the same durable connector.  Preserve
+        the newest working set and audit rows, but logically retire older idle
+        credentials so participant projections do not scan an ever-growing
+        two-hour overlap window.
+        """
+
+        connector_clause = "AND connector_id = ?" if connector_id else ""
+        parameters: tuple[object, ...] = (
+            (now, connector_id) if connector_id else (now,)
+        )
+        rows = conn.execute(
+            f"""
+            SELECT session_id, connector_id, last_seen
+            FROM agent_sessions
+            WHERE connector_id IS NOT NULL
+              AND cleared_at IS NULL
+              AND revoked_at IS NULL
+              AND expires_at > ?
+              {connector_clause}
+            ORDER BY connector_id, last_seen DESC, created_at DESC, session_id DESC
+            """,
+            parameters,
+        ).fetchall()
+        cutoff = now - CONNECTOR_SESSION_IDLE_RETIRE_SECONDS
+        ranks: dict[str, int] = {}
+        retired_session_ids: list[str] = []
+        for row in rows:
+            row_connector = str(row["connector_id"])
+            rank = ranks.get(row_connector, 0) + 1
+            ranks[row_connector] = rank
+            if (
+                rank > CONNECTOR_SESSION_MIN_RETAIN
+                and float(row["last_seen"]) <= cutoff
+            ):
+                retired_session_ids.append(str(row["session_id"]))
+        if not retired_session_ids:
+            return 0
+        conn.executemany(
+            """
+            UPDATE agent_sessions
+            SET revoked_at = COALESCE(revoked_at, ?),
+                revoked_reason = COALESCE(
+                    revoked_reason,
+                    'connector_session_superseded'
+                ),
+                cleared_at = COALESCE(cleared_at, ?)
+            WHERE session_id = ?
+              AND cleared_at IS NULL
+              AND revoked_at IS NULL
+            """,
+            ((now, now, session_id) for session_id in retired_session_ids),
+        )
+        return len(retired_session_ids)
 
     def register_agent_session(
         self,
@@ -5379,6 +5678,12 @@ class BridgeStore:
                 conn,
                 now=cleared_at,
             )
+            retired_connector_sessions = (
+                self._retire_idle_connector_sessions_locked(
+                    conn,
+                    now=cleared_at,
+                )
+            )
             cleared_count = conn.execute(
                 """
                 UPDATE agent_sessions
@@ -5413,6 +5718,10 @@ class BridgeStore:
         if expired_agents:
             result["expired_agent_count"] = len(expired_agents)
             result["expired_agents"] = expired_agents
+        if retired_connector_sessions:
+            result["retired_connector_session_count"] = (
+                retired_connector_sessions
+            )
         return result
 
     def archive_stale_rooms(self, *, now: float | None = None) -> dict[str, Any]:
@@ -5873,6 +6182,7 @@ class BridgeStore:
         task_id = f"task_{uuid.uuid4().hex}" if _task_request else None
         task_target_kind: str | None = None
         task_target_ids: list[str] = []
+        review_routing: dict[str, Any] | None = None
 
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
@@ -6004,6 +6314,77 @@ class BridgeStore:
                         "reply chains are limited to one level; continue the "
                         "conversation with a new message"
                     )
+            if (
+                not _owner_ui
+                and not _web_user
+                and normalized_message_kind == "message"
+                and self._is_direct_review_request(normalized_body)
+            ):
+                review_targets = list(normalized_mentions)
+                review_source = "structured_or_visible_mention"
+                if normalized_audience in {"participant", "role"}:
+                    # The audience itself is already an explicit routing
+                    # decision.  Participant audiences have been folded into
+                    # mentions above; role messages use their claimable role
+                    # delivery without manufacturing a personal @.
+                    review_source = f"audience:{normalized_audience}"
+                    if normalized_audience == "role":
+                        review_targets = self._role_review_targets_locked(
+                            conn,
+                            conversation_id=conversation,
+                            sender_participant_id=sender,
+                            role=normalized_target,
+                        )
+                elif not review_targets:
+                    review_targets = self._infer_named_review_targets_locked(
+                        conn,
+                        conversation_id=conversation,
+                        sender_participant_id=sender,
+                        body_text=normalized_body,
+                    )
+                    review_source = "named_member"
+                if not review_targets and normalized_audience == "room":
+                    reply_sender = self._reply_sender_locked(
+                        conn,
+                        conversation_id=conversation,
+                        sender_participant_id=sender,
+                        reply_to=normalized_reply,
+                    )
+                    if reply_sender is not None:
+                        review_targets = [reply_sender]
+                        review_source = "reply_author"
+                if (
+                    normalized_audience not in {"participant", "role"}
+                    and not review_targets
+                ):
+                    review_routing = {
+                        "requested": True,
+                        "notified": False,
+                        "source": "unresolved",
+                        "target_participant_ids": [],
+                        "warning": (
+                            "review_or_confirmation_target_required: no reviewer "
+                            "was notified; immediately resend with a same-room "
+                            "member's exact name, structured mentions, reply_to, "
+                            "or a participant/role audience"
+                        ),
+                    }
+                if normalized_audience != "role":
+                    for review_target in review_targets:
+                        if review_target not in normalized_mentions:
+                            normalized_mentions.append(review_target)
+                if len(normalized_mentions) > MAX_MENTIONS_PER_MESSAGE:
+                    raise ValidationError(
+                        "mentions cannot contain more than "
+                        f"{MAX_MENTIONS_PER_MESSAGE} entries"
+                    )
+                if review_routing is None:
+                    review_routing = {
+                        "requested": True,
+                        "notified": True,
+                        "source": review_source,
+                        "target_participant_ids": sorted(set(review_targets)),
+                    }
             if normalized_forward:
                 source = conn.execute(
                     "SELECT conversation_id, message_kind FROM messages "
@@ -6137,6 +6518,8 @@ class BridgeStore:
             )
             if task_payload is not None:
                 payload["task"] = task_payload
+            if review_routing is not None:
+                payload["review_routing"] = review_routing
         return payload
 
     def send_owner_message(
@@ -7921,7 +8304,9 @@ class BridgeStore:
                   {room_clause}
                 ORDER BY
                     CASE
-                        WHEN instr(delivery.reasons_json, '"mention"') > 0 THEN 3
+                        WHEN instr(delivery.reasons_json, '"mention"') > 0
+                          OR instr(delivery.reasons_json, '"agent_request"') > 0
+                        THEN 3
                         WHEN delivery.priority IN ('direct', 'mention') THEN 2
                         WHEN delivery.priority = 'important' THEN 1
                         ELSE 0
@@ -8120,6 +8505,10 @@ class BridgeStore:
                        SUM(CASE WHEN delivery.priority IN ('direct', 'mention')
                                 THEN 1 ELSE 0 END) AS mention_count,
                        SUM(CASE WHEN instr(delivery.reasons_json, '"mention"') > 0
+                                      OR instr(
+                                          delivery.reasons_json,
+                                          '"agent_request"'
+                                      ) > 0
                                 THEN 1 ELSE 0 END) AS required_reply_count,
                        SUM(CASE WHEN delivery.priority = 'important' THEN 1 ELSE 0 END)
                            AS important_count,
@@ -8223,6 +8612,10 @@ class BridgeStore:
                        SUM(CASE WHEN delivery.priority IN ('direct', 'mention')
                                 THEN 1 ELSE 0 END) AS mention_count,
                        SUM(CASE WHEN instr(delivery.reasons_json, '"mention"') > 0
+                                      OR instr(
+                                          delivery.reasons_json,
+                                          '"agent_request"'
+                                      ) > 0
                                 THEN 1 ELSE 0 END) AS required_reply_count,
                        SUM(CASE WHEN delivery.priority = 'important' THEN 1 ELSE 0 END)
                            AS important_count,
