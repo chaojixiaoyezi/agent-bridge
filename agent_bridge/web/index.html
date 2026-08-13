@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260812-2">
-    <script src="/assets/app.js?v=20260812-2" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260812-3">
+    <script src="/assets/app.js?v=20260812-3" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -131,6 +131,17 @@
             </div>
             <span class="count-badge" id="participant-count">0</span>
           </div>
+          <label class="participant-search" for="participant-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              id="participant-search"
+              type="search"
+              maxlength="64"
+              placeholder="搜索当前聊天室 Agent"
+              autocomplete="off"
+              aria-label="搜索当前聊天室 Agent"
+            >
+          </label>
           <div class="people-list" id="people-list">
             <p class="muted-copy">选择聊天室后显示成员。</p>
           </div>

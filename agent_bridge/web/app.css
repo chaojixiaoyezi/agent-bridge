@@ -553,7 +553,33 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
 .ref-list { display: grid; gap: 5px; margin-top: 10px; }
 .ref-item { padding: 7px 9px; border: 1px solid var(--line); border-radius: 9px; color: #939baa; background: rgba(255,255,255,.025); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; overflow-wrap: anywhere; }
 
+.participant-search {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 4px 8px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(3,5,9,.3);
+}
+.participant-search:focus-within { border-color: rgba(85,214,199,.3); box-shadow: 0 0 0 3px rgba(85,214,199,.05); }
+.participant-search span { flex: none; color: var(--muted); font-size: 13px; }
+.participant-search input {
+  min-width: 0;
+  width: 100%;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  background: transparent;
+  font-size: 10px;
+}
+.participant-search input::placeholder { color: #646c7a; }
 .people-list { flex: 1; padding: 0 3px 16px; }
+.participant-search-result { margin: 5px 8px 1px; color: var(--cyan); font-size: 8px; }
+.participant-search-empty { margin: 14px 8px; color: var(--muted); font-size: 9px; line-height: 1.55; }
 .person-card { padding: 12px 8px; border-bottom: 1px solid rgba(255,255,255,.045); }
 .person-card, .room-card { content-visibility: auto; contain-intrinsic-size: 72px; }
 .person-head { gap: 9px; }

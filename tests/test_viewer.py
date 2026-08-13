@@ -336,13 +336,33 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260812-2" in index_html
-    assert "app.css?v=20260812-2" in index_html
+    assert "app.js?v=20260812-3" in index_html
+    assert "app.css?v=20260812-3" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "? isNearTimelineBottom()" in javascript
     assert "dormant-member-group" in javascript
     assert "inactivity_expires_at" in javascript
+    assert 'id="participant-search"' in index_html
+    assert ".filter((person) => !isDormantParticipant(person))" in javascript
+    assert "participantMatchesQuery" in javascript
+    mention_menu_start = javascript.index("function updateMentionMenu")
+    mention_candidates = javascript.index(
+        "const candidates = state.participants",
+        mention_menu_start,
+    )
+    add_mention = javascript.index("function addComposerMention")
+    dormant_filter = javascript.index(
+        ".filter((person) => !isDormantParticipant(person))",
+        mention_candidates,
+        add_mention,
+    )
+    assert mention_candidates < dormant_filter < add_mention
+    card_mention = javascript.index(
+        'mention.addEventListener("click", () => addComposerMention(person))'
+    )
+    participant_search = javascript.index("function participantMatchesQuery")
+    assert participant_search < card_mention < mention_menu_start
 
     stylesheet_response = client.get("/assets/app.css")
     assert stylesheet_response.headers["cache-control"] == (

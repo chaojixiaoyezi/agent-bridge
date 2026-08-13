@@ -37,6 +37,7 @@ const state = {
   theme: "aurora",
   messageRenderSignature: "",
   participantRenderSignature: "",
+  participantFilter: "",
   expandedDormantRooms: new Set(),
   timelineScrollFrame: null,
   forwardMessageId: null,
@@ -62,6 +63,7 @@ const elements = {
   roomSummary: document.querySelector("#room-summary"),
   peopleList: document.querySelector("#people-list"),
   participantCount: document.querySelector("#participant-count"),
+  participantSearch: document.querySelector("#participant-search"),
   statusDot: document.querySelector("#status-dot"),
   connectionLabel: document.querySelector("#connection-label"),
   lastSync: document.querySelector("#last-sync"),
@@ -728,6 +730,14 @@ function isDormantParticipant(person) {
     && !person.connector_id;
 }
 
+function participantMatchesQuery(person, query) {
+  if (!query) return true;
+  if (isWebParticipant(person)) return false;
+  const haystack = `${person.display_name || ""} ${person.client_type || ""}`
+    .toLocaleLowerCase("zh-CN");
+  return haystack.includes(query);
+}
+
 function createParticipantCard(person) {
   const archived = person.room_status === "abandoned" || !person.membership_active;
   const card = makeElement("article", `person-card${archived ? " archived" : ""}`);
@@ -799,7 +809,8 @@ function createParticipantCard(person) {
 
 function renderParticipants(participants) {
   state.participants = participants;
-  const signature = `${state.selectedRoom || ""}|${participants.map((item) => [
+  const query = state.participantFilter.trim().toLocaleLowerCase("zh-CN");
+  const signature = `${state.selectedRoom || ""}|${query}|${participants.map((item) => [
     item.participant_id,
     item.status,
     item.membership_active,
@@ -813,14 +824,26 @@ function renderParticipants(participants) {
   if (signature === state.participantRenderSignature) return;
   state.participantRenderSignature = signature;
   elements.peopleList.replaceChildren();
-  const dormant = participants.filter(isDormantParticipant);
-  const current = participants.filter((person) => !isDormantParticipant(person));
-  elements.participantCount.textContent = String(participants.length);
-  elements.participantCount.title = dormant.length
-    ? `${current.length} 个当前可用，${dormant.length} 个无有效接入`
-    : `${participants.length} 个成员`;
+  const matching = participants.filter((person) => participantMatchesQuery(person, query));
+  const dormant = matching.filter(isDormantParticipant);
+  const current = matching.filter((person) => !isDormantParticipant(person));
+  elements.participantCount.textContent = String(query ? matching.length : participants.length);
+  elements.participantCount.title = query
+    ? `${matching.length} 个匹配，共 ${participants.length} 个成员`
+    : dormant.length
+      ? `${current.length} 个当前可用，${dormant.length} 个无有效接入`
+      : `${participants.length} 个成员`;
   if (!participants.length) {
     elements.peopleList.append(makeElement("p", "muted-copy", "这个聊天室还没有活跃成员。"));
+    return;
+  }
+  if (query) {
+    if (!matching.length) {
+      elements.peopleList.append(makeElement("p", "participant-search-empty", "当前聊天室没有匹配的 Agent。"));
+      return;
+    }
+    elements.peopleList.append(makeElement("p", "participant-search-result", `搜索结果 · ${matching.length} 个 Agent`));
+    for (const person of matching) elements.peopleList.append(createParticipantCard(person));
     return;
   }
   for (const person of current) elements.peopleList.append(createParticipantCard(person));
@@ -1155,7 +1178,8 @@ function updateMentionMenu() {
     return;
   }
   const candidates = state.participants
-    .filter((person) => !person.client_type.startsWith("web-user") && person.membership_active)
+    .filter((person) => !isWebParticipant(person) && person.membership_active)
+    .filter((person) => !isDormantParticipant(person))
     .filter((person) => {
       const haystack = `${person.display_name} ${person.client_type}`.toLocaleLowerCase("zh-CN");
       return haystack.includes(current.query);
@@ -1205,6 +1229,8 @@ async function selectRoom(roomId) {
   state.participantRenderSignature = "";
   state.messages = [];
   state.participants = [];
+  state.participantFilter = "";
+  elements.participantSearch.value = "";
   state.hasEarlierMessages = false;
   state.unreadMessages = 0;
   state.composerMentions.clear();
@@ -1215,6 +1241,20 @@ async function selectRoom(roomId) {
   renderRooms();
   await refreshActiveRoom(true, true);
 }
+
+elements.participantSearch.addEventListener("input", (event) => {
+  state.participantFilter = event.currentTarget.value;
+  state.participantRenderSignature = "";
+  renderParticipants(state.participants);
+});
+elements.participantSearch.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !elements.participantSearch.value) return;
+  event.preventDefault();
+  elements.participantSearch.value = "";
+  state.participantFilter = "";
+  state.participantRenderSignature = "";
+  renderParticipants(state.participants);
+});
 
 function mergeMessages(existing, incoming) {
   const byId = new Map(existing.map((message) => [message.message_id, message]));
