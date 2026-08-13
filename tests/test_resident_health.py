@@ -65,6 +65,8 @@ def test_local_resident_snapshot_recognizes_legacy_and_connector_services(
     assert snapshot["codex-小团子"]["resident_status"] == "online"
     assert snapshot["codex-小团子"]["listener_running"] is True
     assert snapshot["codex-小团子"]["worker_running"] is True
+    assert snapshot["codex-小团子"]["task_configured"] is False
+    assert snapshot["codex-小团子"]["task_running"] is False
 
 
 def test_resident_snapshot_and_repair_are_scoped_to_one_room_connector(

@@ -105,12 +105,17 @@ def _launchd_services(home: Path) -> dict[str, dict[str, Any]]:
         except ValueError:
             continue
         executable = Path(str(arguments[0])).name if arguments else ""
-        kind = (
-            "listener"
-            if executable in {"agent-bridge-listen", "agent_bridge.listener"}
-            or "agent_bridge.listener" in command
-            else "worker"
-        )
+        if executable in {"agent-bridge-listen", "agent_bridge.listener"} or (
+            "agent_bridge.listener" in command
+        ):
+            kind = "listener"
+        elif executable in {
+            "agent-bridge-task-worker",
+            "agent_bridge.task_worker",
+        } or "agent_bridge.task_worker" in command:
+            kind = "task"
+        else:
+            kind = "worker"
         launchd_state = _launchd_state(label)
         service = {
             "label": label,
@@ -157,12 +162,16 @@ def local_resident_snapshot(
         services = list(detail["services"])
         listeners = [item for item in services if item["kind"] == "listener"]
         workers = [item for item in services if item["kind"] == "worker"]
+        tasks = [item for item in services if item["kind"] == "task"]
         listener_running = any(item["state"] == "running" for item in listeners)
         worker_running = any(item["state"] == "running" for item in workers)
+        task_running = any(item["state"] == "running" for item in tasks)
         snapshot[identity] = {
             **detail,
             "listener_running": listener_running,
             "worker_running": worker_running,
+            "task_configured": bool(tasks),
+            "task_running": task_running,
             "resident_status": (
                 "online"
                 if listener_running and worker_running
@@ -192,12 +201,19 @@ def local_resident_snapshot(
             connector_workers = [
                 item for item in connector["services"] if item["kind"] == "worker"
             ]
+            connector_tasks = [
+                item for item in connector["services"] if item["kind"] == "task"
+            ]
             connector["listener_running"] = any(
                 item["state"] == "running" for item in connector_listeners
             )
             connector["worker_running"] = any(
                 item["state"] == "running" for item in connector_workers
             )
+            connector["task_running"] = any(
+                item["state"] == "running" for item in connector_tasks
+            )
+            connector["task_configured"] = bool(connector_tasks)
             connector["resident_status"] = (
                 "online"
                 if connector["listener_running"] and connector["worker_running"]
@@ -406,6 +422,7 @@ def configure_existing_connector_from_disk(
     conversation_id: str | None = None,
     home: Path | None = None,
     system_name: str | None = None,
+    activate_task_only: bool = False,
 ) -> dict[str, Any] | None:
     current_home = (home or Path.home()).expanduser().resolve()
     host_system = system_name or platform.system()
@@ -452,9 +469,14 @@ def configure_existing_connector_from_disk(
             roles=list(manifest.get("roles") or []),
             capabilities=list(manifest.get("capabilities") or []),
             workspace_path=str(manifest.get("workspace_path") or ""),
+            execution_source_thread_id=str(
+                manifest.get("execution_source_thread_id") or ""
+            )
+            or None,
             home=current_home,
             system_name=host_system,
             activate=True,
+            activate_task_only=activate_task_only,
         )
         local_resident_snapshot(force=True)
         return result.public_payload()

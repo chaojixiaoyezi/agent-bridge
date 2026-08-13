@@ -142,7 +142,22 @@ def create_app(
                         )
                         continue
                     for connector in connectors.values():
-                        if connector.get("resident_status") == "online":
+                        chat_online = connector.get("resident_status") == "online"
+                        task_configured = bool(connector.get("task_configured"))
+                        task_running = bool(connector.get("task_running"))
+                        if chat_online and task_running:
+                            continue
+                        if chat_online and not task_configured:
+                            # Existing v0.11 connectors already keep chat healthy.
+                            # Install only the new task seat so an upgrade never
+                            # restarts listener/worker or interrupts room traffic.
+                            await asyncio.to_thread(
+                                configure_existing_connector_from_disk,
+                                client_type,
+                                connector_id=connector.get("connector_id"),
+                                conversation_id=connector.get("conversation_id"),
+                                activate_task_only=True,
+                            )
                             continue
                         await asyncio.to_thread(
                             repair_known_identity_services,
@@ -401,9 +416,26 @@ def create_app(
             )
             user_id = str(identity["user_id"])
             admin = bool(identity["is_admin"])
+            task_permissions = store.room_task_permissions_bulk(
+                authorized_session_id=str(identity["session_id"]),
+                participant_id=str(identity["participant_id"]),
+                conversation_ids=[str(room["conversation_id"]) for room in projected],
+            )
             for room in projected:
                 room["is_room_owner"] = room.get("owner_web_user_id") == user_id
                 room["can_wake_all"] = admin or bool(room["is_room_owner"])
+                permissions = task_permissions[str(room["conversation_id"])]
+                room.update(
+                    {
+                        key: permissions[key]
+                        for key in (
+                            "can_assign_tasks",
+                            "can_cancel_tasks",
+                            "can_manage_task_permissions",
+                            "allow_global_admin",
+                        )
+                    }
+                )
             return {"rooms": projected}
 
         return _json_call(payload, before=store.archive_stale_rooms)
@@ -1107,6 +1139,66 @@ def create_app(
             ),
         )
 
+    async def agent_task_next(request: Request) -> Response:
+        try:
+            auth = _authenticate_request(request, store)
+            payload = await _json_body(
+                request,
+                required=set(),
+                allowed={"wait_seconds"},
+            )
+            result = await asyncio.to_thread(
+                store.wait_next_task,
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                wait_seconds=payload.get("wait_seconds", 20),
+            )
+            return JSONResponse(result)
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def agent_task_update(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"task_id", "status"},
+            allowed={
+                "task_id",
+                "status",
+                "result_summary",
+                "execution_cwd",
+                "execution_thread_id",
+            },
+            operation=lambda auth, payload: {
+                "task": store.update_agent_task(
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    task_id=payload["task_id"],
+                    status=payload["status"],
+                    result_summary=payload.get("result_summary"),
+                    execution_cwd=payload.get("execution_cwd"),
+                    execution_thread_id=payload.get("execution_thread_id"),
+                )
+            },
+        )
+
+    async def agent_task_delegate(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"parent_task_id", "body", "target_participant_ids"},
+            allowed={"parent_task_id", "body", "target_participant_ids"},
+            operation=lambda auth, payload: {
+                "task": store.delegate_agent_task(
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    parent_task_id=payload["parent_task_id"],
+                    body_text=payload["body"],
+                    target_participant_ids=payload["target_participant_ids"],
+                )
+            },
+        )
+
     async def messages(request: Request) -> Response:
         try:
             authenticated_web_user(request)
@@ -1164,6 +1256,104 @@ def create_app(
                     )
                 },
                 status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def web_send_task(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="send-task")
+            identity = authenticated_web_user(request)
+            payload = await _json_body(
+                request,
+                required={"body"},
+                allowed={"body", "target_participant_ids", "reply_to"},
+            )
+            return JSONResponse(
+                {
+                    "message": store.send_web_task(
+                        authorized_session_id=str(identity["session_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        conversation_id=request.path_params["conversation_id"],
+                        body_text=payload["body"],
+                        target_participant_ids=payload.get(
+                            "target_participant_ids"
+                        ),
+                        reply_to=payload.get("reply_to"),
+                    )
+                },
+                status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def room_task_permissions(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            return JSONResponse(
+                store.room_task_permissions(
+                    authorized_session_id=str(identity["session_id"]),
+                    participant_id=str(identity["participant_id"]),
+                    conversation_id=request.path_params["conversation_id"],
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def update_room_task_policy(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="manage-task-permissions")
+            identity = authenticated_web_user(request)
+            payload = await _json_body(
+                request,
+                required={"allow_global_admin"},
+                allowed={"allow_global_admin"},
+            )
+            return JSONResponse(
+                store.update_room_task_policy(
+                    authorized_session_id=str(identity["session_id"]),
+                    participant_id=str(identity["participant_id"]),
+                    conversation_id=request.path_params["conversation_id"],
+                    allow_global_admin=payload["allow_global_admin"],
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def update_room_task_grant(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="manage-task-permissions")
+            identity = authenticated_web_user(request)
+            payload = await _json_body(
+                request,
+                required={"can_assign_tasks", "can_cancel_tasks"},
+                allowed={"can_assign_tasks", "can_cancel_tasks"},
+            )
+            return JSONResponse(
+                store.update_room_task_grant(
+                    authorized_session_id=str(identity["session_id"]),
+                    participant_id=str(identity["participant_id"]),
+                    conversation_id=request.path_params["conversation_id"],
+                    target_web_user_id=request.path_params["user_id"],
+                    can_assign_tasks=payload["can_assign_tasks"],
+                    can_cancel_tasks=payload["can_cancel_tasks"],
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def cancel_web_task(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="cancel-task")
+            identity = authenticated_web_user(request)
+            return JSONResponse(
+                {
+                    "task": store.cancel_web_task(
+                        authorized_session_id=str(identity["session_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        task_id=request.path_params["task_id"],
+                    )
+                }
             )
         except Exception as exc:
             return _json_error(exc)
@@ -1943,6 +2133,9 @@ def create_app(
                 methods=["POST"],
             ),
             Route("/agent/participants", agent_participants, methods=["POST"]),
+            Route("/agent/tasks/next", agent_task_next, methods=["POST"]),
+            Route("/agent/tasks/update", agent_task_update, methods=["POST"]),
+            Route("/agent/tasks/delegate", agent_task_delegate, methods=["POST"]),
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 messages,
@@ -1951,6 +2144,31 @@ def create_app(
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 web_send_message,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/tasks",
+                web_send_task,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/task-permissions",
+                room_task_permissions,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/task-policy",
+                update_room_task_policy,
+                methods=["PATCH"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/task-grants/{user_id:str}",
+                update_room_task_grant,
+                methods=["PUT"],
+            ),
+            Route(
+                "/api/tasks/{task_id:str}/cancel",
+                cancel_web_task,
                 methods=["POST"],
             ),
             Route(

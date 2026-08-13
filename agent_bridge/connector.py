@@ -42,6 +42,7 @@ class ConnectorSetupResult:
     state_directory: str
     listener_service: str | None
     worker_service: str | None
+    task_service: str | None
     detail: str
 
     def public_payload(self) -> dict[str, Any]:
@@ -53,6 +54,7 @@ class ConnectorSetupResult:
             "state_directory": self.state_directory,
             "listener_service": self.listener_service,
             "worker_service": self.worker_service,
+            "task_service": self.task_service,
             "detail": self.detail,
         }
 
@@ -98,7 +100,7 @@ def validate_connector_preflight(
     workspace = (
         Path(workspace_path).expanduser().resolve()
         if str(workspace_path or "").strip()
-        else PROJECT_ROOT
+        else Path.cwd().resolve()
     )
     if not workspace.is_dir():
         raise ConnectorSetupError("Agent workspace does not exist")
@@ -275,10 +277,12 @@ def configure_resident_connector(
     roles: list[str] | None = None,
     capabilities: list[str] | None = None,
     workspace_path: str | None = None,
+    execution_source_thread_id: str | None = None,
     enable_resident: bool = True,
     home: Path | None = None,
     system_name: str | None = None,
     activate: bool = True,
+    activate_task_only: bool = False,
 ) -> ConnectorSetupResult:
     connector = opaque_id(connector_id, field="connector_id")
     enrollment = opaque_id(enrollment_token, field="enrollment_token")
@@ -319,8 +323,9 @@ def configure_resident_connector(
         enrollment_file=enrollment_file,
         connector_id=connector,
     )
+    source_thread_id = str(execution_source_thread_id or "").strip()
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "connector_id": connector,
         "bridge_url": normalized_url,
         "product": normalized_product,
@@ -332,6 +337,7 @@ def configure_resident_connector(
         "roles": list(normalized_roles),
         "capabilities": list(normalized_capabilities),
         "workspace_path": str(workspace),
+        "execution_source_thread_id": source_thread_id or None,
         "enrollment_token_file": str(enrollment_file),
     }
     _atomic_private_write(
@@ -348,6 +354,7 @@ def configure_resident_connector(
             state_directory=str(state_directory),
             listener_service=None,
             worker_service=None,
+            task_service=None,
             detail=("基础接入已完成；该产品需要本地启动命令或 webhook 才能自动唤醒。"),
         )
 
@@ -355,6 +362,7 @@ def configure_resident_connector(
     queue_database = state_directory / "wake-queue.db"
     cursor_file = state_directory / "listener.cursor"
     thread_file = state_directory / "codex-thread"
+    task_thread_file = state_directory / "task-execution-thread"
     listener_environment = {
         **common,
         "AGENT_BRIDGE_CURSOR_FILE": str(cursor_file),
@@ -428,13 +436,31 @@ def configure_resident_connector(
         if claude_binary:
             worker_environment["AGENT_BRIDGE_CLAUDE_BINARY"] = claude_binary
 
+    task_arguments = [str(PROJECT_ROOT / "bin" / "agent-bridge-task-worker")]
+    task_environment = {
+        **common,
+        "AGENT_BRIDGE_TASK_ADAPTER": adapter,
+        "AGENT_BRIDGE_TASK_CWD": str(workspace),
+        "AGENT_BRIDGE_TASK_THREAD_STATE_FILE": str(task_thread_file),
+        "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
+        "PATH": merged_path,
+    }
+    if source_thread_id:
+        task_environment["AGENT_BRIDGE_TASK_SOURCE_THREAD_ID"] = source_thread_id
+    if adapter == "codex" and codex_binary:
+        task_environment["AGENT_BRIDGE_CODEX_BINARY"] = codex_binary
+    if adapter == "claude-code" and claude_binary:
+        task_environment["AGENT_BRIDGE_CLAUDE_BINARY"] = claude_binary
+
     if host_system == "Darwin":
         launch_agents = user_home / "Library" / "LaunchAgents"
         launch_agents.mkdir(parents=True, exist_ok=True)
         listener_label = f"com.agentbridge.connector.{suffix}.listener"
         worker_label = f"com.agentbridge.connector.{suffix}.worker"
+        task_label = f"com.agentbridge.connector.{suffix}.task"
         listener_plist = launch_agents / f"{listener_label}.plist"
         worker_plist = launch_agents / f"{worker_label}.plist"
+        task_plist = launch_agents / f"{task_label}.plist"
         _atomic_private_write(
             listener_plist,
             _launchd_plist(
@@ -455,10 +481,23 @@ def configure_resident_connector(
                 stderr_path=logs_directory / "worker.error.log",
             ),
         )
+        _atomic_private_write(
+            task_plist,
+            _launchd_plist(
+                label=task_label,
+                program_arguments=task_arguments,
+                environment=task_environment,
+                stdout_path=logs_directory / "task.log",
+                stderr_path=logs_directory / "task.error.log",
+            ),
+        )
         if activate:
-            _activate_launchd(
-                [(listener_label, listener_plist), (worker_label, worker_plist)]
-            )
+            services = [(task_label, task_plist)] if activate_task_only else [
+                (listener_label, listener_plist),
+                (worker_label, worker_plist),
+                (task_label, task_plist),
+            ]
+            _activate_launchd(services)
         return ConnectorSetupResult(
             status="configured",
             platform=host_system,
@@ -467,7 +506,8 @@ def configure_resident_connector(
             state_directory=str(state_directory),
             listener_service=listener_label,
             worker_service=worker_label,
-            detail="listener 和产品适配器已配置为当前用户的常驻服务。",
+            task_service=task_label,
+            detail="listener、聊天值守和任务执行席位已配置为当前用户的常驻服务。",
         )
 
     if host_system == "Linux":
@@ -475,8 +515,10 @@ def configure_resident_connector(
         unit_directory.mkdir(parents=True, exist_ok=True)
         listener_name = f"agent-bridge-{suffix}-listener.service"
         worker_name = f"agent-bridge-{suffix}-worker.service"
+        task_name = f"agent-bridge-{suffix}-task.service"
         listener_unit = unit_directory / listener_name
         worker_unit = unit_directory / worker_name
+        task_unit = unit_directory / task_name
         _atomic_private_write(
             listener_unit,
             _systemd_unit(
@@ -493,8 +535,21 @@ def configure_resident_connector(
                 environment=worker_environment,
             ),
         )
+        _atomic_private_write(
+            task_unit,
+            _systemd_unit(
+                description=f"Agent Bridge task executor {connector}",
+                program_arguments=task_arguments,
+                environment=task_environment,
+            ),
+        )
         if activate:
-            _activate_systemd([listener_unit, worker_unit])
+            units = [task_unit] if activate_task_only else [
+                listener_unit,
+                worker_unit,
+                task_unit,
+            ]
+            _activate_systemd(units)
         return ConnectorSetupResult(
             status="configured",
             platform=host_system,
@@ -503,7 +558,8 @@ def configure_resident_connector(
             state_directory=str(state_directory),
             listener_service=listener_name,
             worker_service=worker_name,
-            detail="listener 和产品适配器已配置为当前用户的 systemd 服务。",
+            task_service=task_name,
+            detail="listener、聊天值守和任务执行席位已配置为当前用户的 systemd 服务。",
         )
 
     return ConnectorSetupResult(
@@ -514,5 +570,6 @@ def configure_resident_connector(
         state_directory=str(state_directory),
         listener_service=None,
         worker_service=None,
+        task_service=None,
         detail="当前操作系统暂不支持自动安装；已生成私有连接配置。",
     )

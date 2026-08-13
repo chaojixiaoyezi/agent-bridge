@@ -59,6 +59,9 @@ class ViewerRepository:
                     "agent_lifecycle_states",
                     "agent_room_blocks",
                     "chat_authorization_grants",
+                    "room_task_policies",
+                    "room_task_grants",
+                    "room_tasks",
                 )
             }
             room_states = {
@@ -302,6 +305,8 @@ class ViewerRepository:
                     , ownership.web_user_id AS owner_web_user_id
                     , owner.username AS owner_username
                     , owner.display_name AS owner_display_name
+                    , COALESCE(task_policy.allow_global_admin, 0)
+                        AS allow_global_admin_tasks
                 FROM rooms AS room
                 LEFT JOIN membership_stats AS ms
                   ON ms.conversation_id = room.conversation_id
@@ -317,6 +322,8 @@ class ViewerRepository:
                   ON ownership.conversation_id = room.conversation_id
                 LEFT JOIN web_users AS owner
                   ON owner.user_id = ownership.web_user_id
+                LEFT JOIN room_task_policies AS task_policy
+                  ON task_policy.conversation_id = room.conversation_id
                 ORDER BY
                     CASE WHEN room.status = 'active' THEN 0 ELSE 1 END,
                     room.last_activity_at DESC,
@@ -354,6 +361,9 @@ class ViewerRepository:
                 ),
                 "owner_username": str(row["owner_username"] or ""),
                 "owner_display_name": str(row["owner_display_name"] or ""),
+                "allow_global_admin_tasks": bool(
+                    row["allow_global_admin_tasks"]
+                ),
                 "participant_count": int(row["participant_count"] or 0),
                 "active_participant_count": int(
                     row["active_participant_count"] or 0
@@ -457,6 +467,24 @@ class ViewerRepository:
                     grant.revoked_by_web_user_id
                         AS authorization_revoked_by_web_user_id,
                     grant.revocation_reason AS authorization_revocation_reason,
+                    task.task_id AS room_task_id,
+                    task.parent_task_id AS room_task_parent_id,
+                    task.issuer_web_user_id AS room_task_issuer_web_user_id,
+                    task.target_kind AS room_task_target_kind,
+                    task.target_participant_ids_json
+                        AS room_task_target_participant_ids_json,
+                    task.status AS room_task_status,
+                    task.claimed_by_participant_id
+                        AS room_task_claimed_by_participant_id,
+                    task.claimed_at AS room_task_claimed_at,
+                    task.lease_expires_at AS room_task_lease_expires_at,
+                    task.started_at AS room_task_started_at,
+                    task.completed_at AS room_task_completed_at,
+                    task.result_summary AS room_task_result_summary,
+                    task.execution_cwd AS room_task_execution_cwd,
+                    task.execution_thread_id AS room_task_execution_thread_id,
+                    task.created_at AS room_task_created_at,
+                    task.updated_at AS room_task_updated_at,
                     (
                         SELECT COUNT(*) FROM receipts AS r
                         WHERE r.message_id = m.message_id AND r.state = 'acked'
@@ -476,6 +504,8 @@ class ViewerRepository:
                   ON source_sender.participant_id = source.sender_participant_id
                 LEFT JOIN chat_authorization_grants AS grant
                   ON grant.source_message_id = m.message_id
+                LEFT JOIN room_tasks AS task
+                  ON task.source_message_id = m.message_id
                 WHERE m.conversation_id = ? {sequence_clause}
                 ORDER BY m.sequence {order}
                 LIMIT ?
@@ -604,6 +634,17 @@ class ViewerRepository:
                     "SELECT COALESCE(MAX(updated_at), 0) FROM web_users"
                 ).fetchone()[0]
             )
+            task_revision = float(
+                connection.execute(
+                    "SELECT MAX(revision) FROM ("
+                    "SELECT COALESCE(MAX(updated_at), 0) AS revision FROM room_tasks "
+                    "UNION ALL SELECT COALESCE(MAX(updated_at), 0) "
+                    "FROM room_task_policies "
+                    "UNION ALL SELECT COALESCE(MAX(updated_at), 0) "
+                    "FROM room_task_grants)"
+                ).fetchone()[0]
+                or 0
+            )
         return {
             "cursor": max(cursor, global_sequence),
             "changed_rooms": changed_rooms,
@@ -620,6 +661,7 @@ class ViewerRepository:
                 room_revision,
                 connector_revision,
                 web_user_permission_revision,
+                task_revision,
                 rate_revision,
             ],
             "server_time": now,
@@ -897,5 +939,63 @@ class ViewerRepository:
                     else None
                 ),
                 "semantics": "natural_language_minimum_necessary",
+            }
+        if row["room_task_id"] is not None:
+            payload["message_kind"] = "task"
+            payload["task"] = {
+                "task_id": str(row["room_task_id"]),
+                "parent_task_id": (
+                    str(row["room_task_parent_id"])
+                    if row["room_task_parent_id"] is not None
+                    else None
+                ),
+                "issuer_web_user_id": str(row["room_task_issuer_web_user_id"]),
+                "target_kind": str(row["room_task_target_kind"]),
+                "target_participant_ids": json.loads(
+                    str(row["room_task_target_participant_ids_json"] or "[]")
+                ),
+                "status": str(row["room_task_status"]),
+                "claimed_by_participant_id": (
+                    str(row["room_task_claimed_by_participant_id"])
+                    if row["room_task_claimed_by_participant_id"] is not None
+                    else None
+                ),
+                "claimed_at": (
+                    float(row["room_task_claimed_at"])
+                    if row["room_task_claimed_at"] is not None
+                    else None
+                ),
+                "lease_expires_at": (
+                    float(row["room_task_lease_expires_at"])
+                    if row["room_task_lease_expires_at"] is not None
+                    else None
+                ),
+                "started_at": (
+                    float(row["room_task_started_at"])
+                    if row["room_task_started_at"] is not None
+                    else None
+                ),
+                "completed_at": (
+                    float(row["room_task_completed_at"])
+                    if row["room_task_completed_at"] is not None
+                    else None
+                ),
+                "result_summary": (
+                    str(row["room_task_result_summary"])
+                    if row["room_task_result_summary"] is not None
+                    else None
+                ),
+                "execution_cwd": (
+                    str(row["room_task_execution_cwd"])
+                    if row["room_task_execution_cwd"] is not None
+                    else None
+                ),
+                "execution_thread_id": (
+                    str(row["room_task_execution_thread_id"])
+                    if row["room_task_execution_thread_id"] is not None
+                    else None
+                ),
+                "created_at": float(row["room_task_created_at"]),
+                "updated_at": float(row["room_task_updated_at"]),
             }
         return payload

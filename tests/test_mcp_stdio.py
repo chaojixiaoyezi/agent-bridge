@@ -148,6 +148,9 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_set_follow",
                         "agent_following",
                         "agent_accept_invitation",
+                        "agent_task_next",
+                        "agent_task_update",
+                        "agent_task_delegate",
                     }
                     assert expected == {tool.name for tool in codex_tools.tools}
                     register_tool = next(

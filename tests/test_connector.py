@@ -33,6 +33,22 @@ def test_codex_worker_launcher_imports_package_outside_bridge_checkout(
     assert "agent-bridge-codex-worker" in completed.stdout
 
 
+def test_task_worker_launcher_imports_package_outside_bridge_checkout(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [str(BRIDGE_ROOT / "bin" / "agent-bridge-task-worker"), "--help"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Agent Bridge task executor" in completed.stdout
+
+
 def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -73,10 +89,13 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     launch_agents = tmp_path / "Library" / "LaunchAgents"
     listener_path = launch_agents / f"{result.listener_service}.plist"
     worker_path = launch_agents / f"{result.worker_service}.plist"
+    task_path = launch_agents / f"{result.task_service}.plist"
     listener = plistlib.loads(listener_path.read_bytes())
     worker = plistlib.loads(worker_path.read_bytes())
-    serialized = listener_path.read_text(encoding="utf-8") + worker_path.read_text(
-        encoding="utf-8"
+    task = plistlib.loads(task_path.read_bytes())
+    serialized = "".join(
+        path.read_text(encoding="utf-8")
+        for path in (listener_path, worker_path, task_path)
     )
     assert "enroll_private-test-token" not in serialized
     assert listener["EnvironmentVariables"][
@@ -93,6 +112,8 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     )
     assert "/opt/homebrew/bin" in worker["EnvironmentVariables"]["PATH"].split(":")
     assert worker["ProgramArguments"][0].endswith("agent-bridge-codex-worker")
+    assert task["ProgramArguments"][0].endswith("agent-bridge-task-worker")
+    assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "codex"
 
 
 def test_custom_product_acceptance_stays_manual_without_installing_services(
@@ -119,6 +140,41 @@ def test_custom_product_acceptance_stays_manual_without_installing_services(
     assert not (tmp_path / "Library" / "LaunchAgents").exists()
 
 
+def test_task_only_upgrade_does_not_restart_existing_chat_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    activated: list[list[tuple[str, Path]]] = []
+    monkeypatch.setattr(
+        "agent_bridge.connector._activate_launchd",
+        lambda services: activated.append(services),
+    )
+    result = configure_resident_connector(
+        connector_id="connector_upgrade123456",
+        enrollment_token="enroll_upgrade-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="平滑升级者",
+        signature="聊天室持续在线。",
+        conversation_id="平滑群",
+        adapter_kind="codex",
+        requested_mode="resident",
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=True,
+        activate_task_only=True,
+    )
+
+    assert len(activated) == 1
+    assert activated[0] == [
+        (
+            str(result.task_service),
+            tmp_path / "Library" / "LaunchAgents" / f"{result.task_service}.plist",
+        )
+    ]
+
+
 def test_linux_connector_uses_private_systemd_units_and_escapes_specifiers(
     tmp_path: Path,
 ) -> None:
@@ -141,7 +197,7 @@ def test_linux_connector_uses_private_systemd_units_and_escapes_specifiers(
     assert result.status == "configured"
     unit_directory = tmp_path / ".config" / "systemd" / "user"
     units = list(unit_directory.glob("*.service"))
-    assert len(units) == 2
+    assert len(units) == 3
     serialized = "\n".join(path.read_text(encoding="utf-8") for path in units)
     assert "enroll_linux-private-token" not in serialized
     assert "100%% ready" in serialized
@@ -172,6 +228,20 @@ def test_invalid_workspace_is_rejected_before_invitation_is_consumed(
             signature="只处理明确通知。",
             workspace_path=str(tmp_path / "missing"),
         )
+
+
+def test_connector_preflight_defaults_to_current_tui_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    _url, workspace = bridge_server.validate_connector_preflight(
+        bridge_url="http://127.0.0.1:8765",
+        workspace_path=None,
+    )
+
+    assert workspace == tmp_path.resolve()
 
 
 def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
@@ -328,7 +398,7 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     system_prompt = captured["command"][system_prompt_index]
     assert "模型运行前确定性读取消息" in system_prompt
     assert "只使用 Agent Bridge MCP" in system_prompt
-    assert "单独的 TUI" in system_prompt
+    assert "结构化任务执行席位" in system_prompt
     assert "agent_register" not in prompt
 
     def incomplete_run(command, **kwargs):

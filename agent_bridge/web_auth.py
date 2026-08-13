@@ -297,51 +297,73 @@ class WebAuthStore:
                 "SELECT * FROM web_users WHERE username = ? COLLATE NOCASE",
                 (DEFAULT_ADMIN_USERNAME,),
             ).fetchone()
-            if existing is not None:
-                return
-            participant = connection.execute(
-                "SELECT display_name, signature FROM participants WHERE participant_id = ?",
-                (DEFAULT_ADMIN_PARTICIPANT_ID,),
+            if existing is None:
+                participant = connection.execute(
+                    "SELECT display_name, signature FROM participants "
+                    "WHERE participant_id = ?",
+                    (DEFAULT_ADMIN_PARTICIPANT_ID,),
+                ).fetchone()
+                display = (
+                    str(participant["display_name"])
+                    if participant is not None
+                    else DEFAULT_ADMIN_USERNAME
+                )
+                signature = (
+                    str(participant["signature"])
+                    if participant is not None
+                    else "Agent Bridge 管理员"
+                )
+                user_id = f"webuser_{uuid.uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO web_users
+                        (user_id, username, password_hash, role, participant_id,
+                         display_name, signature, must_change_password, active,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, 'admin', ?, ?, ?, 1, 1, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        DEFAULT_ADMIN_USERNAME,
+                        _password_hash(DEFAULT_ADMIN_PASSWORD),
+                        DEFAULT_ADMIN_PARTICIPANT_ID,
+                        display,
+                        signature,
+                        now,
+                        now,
+                    ),
+                )
+                if participant is None:
+                    self._insert_participant_locked(
+                        connection,
+                        participant_id=DEFAULT_ADMIN_PARTICIPANT_ID,
+                        client_type=DEFAULT_ADMIN_CLIENT_TYPE,
+                        username=DEFAULT_ADMIN_USERNAME,
+                        display_name=display,
+                        signature=signature,
+                        now=now,
+                    )
+            else:
+                user_id = str(existing["user_id"])
+
+            # Versions before structured room tasks did not persist a Web owner
+            # for a few legacy user-created rooms.  Assign only those orphaned
+            # rooms to the existing default admin; explicit ownership is never
+            # overwritten.
+            has_ownership_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'room_web_owners'"
             ).fetchone()
-            display = (
-                str(participant["display_name"])
-                if participant is not None
-                else DEFAULT_ADMIN_USERNAME
-            )
-            signature = (
-                str(participant["signature"])
-                if participant is not None
-                else "Agent Bridge 管理员"
-            )
-            user_id = f"webuser_{uuid.uuid4().hex}"
-            connection.execute(
-                """
-                INSERT INTO web_users
-                    (user_id, username, password_hash, role, participant_id,
-                     display_name, signature, must_change_password, active,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, 'admin', ?, ?, ?, 1, 1, ?, ?)
-                """,
-                (
-                    user_id,
-                    DEFAULT_ADMIN_USERNAME,
-                    _password_hash(DEFAULT_ADMIN_PASSWORD),
-                    DEFAULT_ADMIN_PARTICIPANT_ID,
-                    display,
-                    signature,
-                    now,
-                    now,
-                ),
-            )
-            if participant is None:
-                self._insert_participant_locked(
-                    connection,
-                    participant_id=DEFAULT_ADMIN_PARTICIPANT_ID,
-                    client_type=DEFAULT_ADMIN_CLIENT_TYPE,
-                    username=DEFAULT_ADMIN_USERNAME,
-                    display_name=display,
-                    signature=signature,
-                    now=now,
+            if has_ownership_table is not None:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO room_web_owners
+                        (conversation_id, web_user_id, created_at)
+                    SELECT room.conversation_id, ?, ?
+                    FROM rooms AS room
+                    WHERE room.creator_kind = 'user'
+                    """,
+                    (user_id, now),
                 )
 
     @staticmethod

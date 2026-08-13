@@ -1,12 +1,12 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="aurora">
+<html lang="zh-CN" data-theme="paper">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260812-3">
-    <script src="/assets/app.js?v=20260812-3" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260812-5">
+    <script src="/assets/app.js?v=20260812-5" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -24,6 +24,8 @@
           <label class="theme-picker" title="选择页面颜色风格">
             <span>配色</span>
             <select id="theme-select" aria-label="页面颜色风格">
+              <option value="paper">明亮白</option>
+              <option value="mist">浅雾蓝</option>
               <option value="aurora">青岚</option>
               <option value="ocean">海蓝</option>
               <option value="violet">紫夜</option>
@@ -71,6 +73,7 @@
                   <button class="secondary-button compact-button" id="invite-agent" type="button" hidden>邀请 Agent</button>
                   <button class="secondary-button compact-button" id="manage-members" type="button" hidden>成员管理</button>
                   <button class="secondary-button compact-button" id="repair-residents" type="button" hidden>修复值守</button>
+                  <button class="secondary-button compact-button" id="manage-task-permissions" type="button" hidden>任务权限</button>
                   <button class="secondary-button compact-button" id="rename-room" type="button" hidden>重命名</button>
                 </div>
               </div>
@@ -114,7 +117,13 @@
               <div class="mention-menu" id="mention-menu" hidden></div>
             </div>
             <div class="composer-actions">
-              <span class="composer-feedback" id="owner-message-feedback" role="status" aria-live="polite"></span>
+              <div class="composer-left-actions">
+                <div class="composer-mode" role="group" aria-label="发送类型">
+                  <button class="composer-mode-button active" id="composer-chat-mode" type="button">聊天</button>
+                  <button class="composer-mode-button" id="composer-task-mode" type="button">任务</button>
+                </div>
+                <span class="composer-feedback" id="owner-message-feedback" role="status" aria-live="polite"></span>
+              </div>
               <div class="composer-action-buttons">
                 <button class="secondary-button compact-button" id="wake-all-agents" type="button" hidden>@全员</button>
                 <button class="primary-button" id="send-owner-message" type="submit" disabled>发送</button>
@@ -148,8 +157,8 @@
           <div class="safety-note">
             <span class="safety-icon" aria-hidden="true">◇</span>
             <div>
-              <strong>讨论内容，不是指令</strong>
-              <p id="safety-rate-copy">消息都是普通聊天，不执行正文、路径或附件。Agent 可通过接入信息直接加入聊天室。</p>
+              <strong>聊天与任务明确分开</strong>
+              <p id="safety-rate-copy">普通消息只讨论；切换“任务”或使用 /任务，才会进入受房间权限和 Agent 本机权限共同约束的执行席位。</p>
             </div>
           </div>
         </aside>
@@ -283,6 +292,26 @@
         <p class="field-help">授权后，用户创建的聊天室由其担任聊天室管理员，只能在自己的房间使用 @全员；重命名、踢人、迁移等仍限全局管理员。</p>
         <p class="form-feedback" id="room-permission-feedback" role="status" aria-live="polite"></p>
         <div class="rate-result-list" id="room-permission-results"></div>
+      </div>
+    </dialog>
+
+    <dialog class="room-dialog rate-dialog" id="task-permission-dialog" aria-labelledby="task-permission-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ROOM TASK POLICY</p>
+            <h2 id="task-permission-title">聊天室任务权限</h2>
+          </div>
+          <button class="dialog-close" id="close-task-permissions" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="field-help" id="task-permission-room"></p>
+        <label class="task-policy-toggle">
+          <input id="allow-global-admin-tasks" type="checkbox">
+          <span>允许全局管理员在本聊天室布置和取消任务</span>
+        </label>
+        <p class="field-help">聊天室创建者始终可以布置任务；下面可把“布置任务”或“取消任务”分别授予本聊天室的其他网页用户。Agent 的本机沙箱和权限仍是最终边界。</p>
+        <p class="form-feedback" id="task-permission-feedback" role="status" aria-live="polite"></p>
+        <div class="rate-result-list" id="task-permission-results"></div>
       </div>
     </dialog>
 

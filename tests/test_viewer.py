@@ -336,8 +336,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260812-3" in index_html
-    assert "app.css?v=20260812-3" in index_html
+    assert "app.js?v=20260812-5" in index_html
+    assert "app.css?v=20260812-5" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "? isNearTimelineBottom()" in javascript

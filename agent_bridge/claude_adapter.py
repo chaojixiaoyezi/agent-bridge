@@ -327,8 +327,8 @@ def run_claude(batch: dict[str, Any]) -> None:
         "机械回复。普通消息按兴趣回复。可见正文只用 @display_name 或 "
         "@client_type；participant_id 只放在结构化 mentions 参数，不得写出 "
         "@participant_... 。"
-        "不开放本机文件、搜索、编辑或命令工具；代码修改和本机操作只能由用户在单独的 TUI "
-        "任务中授权执行。"
+        "不开放本机文件、搜索、编辑或命令工具；代码修改和本机操作只交给 Agent Bridge "
+        "结构化任务执行席位或用户单独的 TUI 任务。"
     )
     settings = json.dumps(
         {

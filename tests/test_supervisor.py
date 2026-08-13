@@ -268,7 +268,7 @@ def test_codex_adapter_uses_metadata_wake_and_freezes_chat_authority_prompt(
     assert "唤醒信号" in prompt
     assert "message.authorization" in prompt
     assert "授权功能已冻结" in prompt
-    assert "单独的 TUI" in prompt
+    assert "结构化任务执行席位" in prompt
     assert "本批事件数=3" in prompt
     assert "最新事件序号=72" in prompt
     assert "body" not in prompt

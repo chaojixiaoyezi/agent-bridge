@@ -23,6 +23,8 @@ const state = {
   composerMentions: new Map(),
   composerReplyTo: null,
   composerWakeAll: false,
+  composerMode: "chat",
+  taskPermissions: null,
   ownerEvents: null,
   fallbackRefreshTimer: null,
   refreshQueued: false,
@@ -34,7 +36,7 @@ const state = {
   memberRooms: [],
   memberSelections: new Map(),
   roomPermissionUsers: [],
-  theme: "aurora",
+  theme: "paper",
   messageRenderSignature: "",
   participantRenderSignature: "",
   participantFilter: "",
@@ -74,8 +76,11 @@ const elements = {
   inviteAgent: document.querySelector("#invite-agent"),
   manageMembers: document.querySelector("#manage-members"),
   repairResidents: document.querySelector("#repair-residents"),
+  manageTaskPermissions: document.querySelector("#manage-task-permissions"),
   renameRoom: document.querySelector("#rename-room"),
   themeSelect: document.querySelector("#theme-select"),
+  composerChatMode: document.querySelector("#composer-chat-mode"),
+  composerTaskMode: document.querySelector("#composer-task-mode"),
   openCreateRoom: document.querySelector("#open-create-room"),
   createRoomDialog: document.querySelector("#create-room-dialog"),
   createRoomForm: document.querySelector("#create-room-form"),
@@ -105,6 +110,12 @@ const elements = {
   openRoomPermissions: document.querySelector("#open-room-permissions"),
   roomPermissionDialog: document.querySelector("#room-permission-dialog"),
   closeRoomPermissions: document.querySelector("#close-room-permissions"),
+  taskPermissionDialog: document.querySelector("#task-permission-dialog"),
+  closeTaskPermissions: document.querySelector("#close-task-permissions"),
+  taskPermissionRoom: document.querySelector("#task-permission-room"),
+  allowGlobalAdminTasks: document.querySelector("#allow-global-admin-tasks"),
+  taskPermissionFeedback: document.querySelector("#task-permission-feedback"),
+  taskPermissionResults: document.querySelector("#task-permission-results"),
   roomPermissionSearchForm: document.querySelector("#room-permission-search-form"),
   roomPermissionSearch: document.querySelector("#room-permission-search"),
   searchRoomPermissions: document.querySelector("#search-room-permissions"),
@@ -206,16 +217,16 @@ function makeElement(tag, className, text) {
   return element;
 }
 
-const THEMES = new Set(["aurora", "ocean", "violet", "ember"]);
+const THEMES = new Set(["paper", "mist", "aurora", "ocean", "violet", "ember"]);
 
 try {
-  state.theme = window.localStorage.getItem("agentBridgeTheme") || "aurora";
+  state.theme = window.localStorage.getItem("agentBridgeTheme") || "paper";
 } catch (error) {
-  state.theme = "aurora";
+  state.theme = "paper";
 }
 
 function applyTheme(theme) {
-  const selected = THEMES.has(theme) ? theme : "aurora";
+  const selected = THEMES.has(theme) ? theme : "paper";
   state.theme = selected;
   document.documentElement.dataset.theme = selected;
   elements.themeSelect.value = selected;
@@ -349,6 +360,7 @@ function showAuthScreen(message = "") {
     elements.createRoomDialog,
     elements.renameRoomDialog,
     elements.forwardMessageDialog,
+    elements.taskPermissionDialog,
     elements.messageRateDialog,
     elements.memberManagementDialog,
     elements.agentAccessDialog,
@@ -383,6 +395,9 @@ function applyUserPermissions() {
   elements.inviteAgent.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.manageMembers.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.repairResidents.hidden = !(admin && activeRoom && activeRoom.status === "active");
+  elements.manageTaskPermissions.hidden = !(
+    activeRoom?.can_manage_task_permissions && activeRoom.status === "active"
+  );
   elements.wakeAllAgents.hidden = !(activeRoom?.can_wake_all && activeRoom.status === "active");
   elements.openAccount.textContent = `${state.currentUser.display_name}${admin ? " · 管理员" : ""}`;
   const agentGlobal = state.messageRateLimits?.agent_global_cooldown_seconds ?? 15;
@@ -392,8 +407,8 @@ function applyUserPermissions() {
     ? `管理员不限频 · Agent 整体 ${formatCooldown(agentGlobal)}`
     : `你的发言间隔：${formatCooldown(currentEffective)}`;
   elements.safetyRateCopy.textContent = admin
-    ? `消息都是普通聊天，不执行正文、路径或附件。管理员不限频；Agent 整体间隔为 ${formatCooldown(agentGlobal)}。`
-    : `消息都是普通聊天，不执行正文、路径或附件。你的当前间隔为 ${formatCooldown(currentEffective)}；普通用户整体间隔为 ${formatCooldown(webGlobal)}。`;
+    ? `普通聊天不执行；切换“任务”或使用 /任务 才进入执行席位。管理员不限频；Agent 聊天整体间隔为 ${formatCooldown(agentGlobal)}。`
+    : `普通聊天不执行；只有获权后切换“任务”或使用 /任务 才进入执行席位。你的聊天间隔为 ${formatCooldown(currentEffective)}。`;
 }
 
 function openPasswordDialog(required = false) {
@@ -542,6 +557,7 @@ function captureTimelineAnchor() {
 }
 
 function routeLabel(message) {
+  if (message.task) return "结构化任务";
   if (message.wake_all_agents) return "@全员 · 唤醒 Agent";
   if (message.audience_kind === "participant") return "@成员";
   if (message.audience_kind === "role") return `@角色 · ${message.audience_value}`;
@@ -563,6 +579,18 @@ function createMessageElement(message) {
   const signature = message.sender_signature || message.sender_alias || "未填写签名";
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
+  if (message.task) {
+    const statusLabel = {
+      queued: "等待领取",
+      claimed: "已领取",
+      running: "执行中",
+      needs_input: "等待补充",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+    }[message.task.status] || message.task.status;
+    senderLine.append(makeElement("span", "task-badge", `任务 · ${statusLabel}`));
+  }
   if (message.authorization) {
     senderLine.append(makeElement("span", "authorization-badge revoked", "授权待提交"));
   }
@@ -570,6 +598,56 @@ function createMessageElement(message) {
   head.append(makeElement("time", "message-time", fullTime(message.created_at)));
   article.append(head);
   article.append(makeElement("p", "message-body", message.body));
+
+  if (message.task) {
+    const task = message.task;
+    const labels = {
+      queued: "等待领取",
+      claimed: "已领取",
+      running: "执行中",
+      needs_input: "等待补充",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+    };
+    const taskCard = makeElement("div", "task-card");
+    const taskHead = makeElement("div", "task-card-head");
+    const targetText = task.target_kind === "room_agents"
+      ? "由聊天室 Agent 先领取，再按需分工"
+      : `候选：${task.target_participant_ids.map(participantName).join("、")}`;
+    taskHead.append(makeElement("span", "", targetText));
+    taskHead.append(makeElement(
+      "span",
+      `task-status ${task.status}`,
+      labels[task.status] || task.status,
+    ));
+    taskCard.append(taskHead);
+    if (task.result_summary) {
+      taskCard.append(makeElement("p", "task-summary", task.result_summary));
+    }
+    const room = state.rooms.find((item) => item.conversation_id === message.conversation_id);
+    if (room?.can_cancel_tasks && !["completed", "failed", "cancelled"].includes(task.status)) {
+      const cancelTask = makeElement("button", "message-reply-button task-cancel", "取消任务");
+      cancelTask.type = "button";
+      cancelTask.addEventListener("click", async () => {
+        if (!window.confirm("取消后，尚未领取的任务不会再执行；已领取的本机回合可能继续到当前回合结束，但其结果不会被记为任务完成。确定取消？")) return;
+        cancelTask.disabled = true;
+        try {
+          await fetchJson(`/api/tasks/${encodeURIComponent(task.task_id)}/cancel`, {
+            method: "POST",
+            headers: { "X-Agent-Bridge-Intent": "cancel-task" },
+          });
+          await refresh({ fullRoom: true });
+        } catch (error) {
+          window.alert(error.message);
+        } finally {
+          cancelTask.disabled = false;
+        }
+      });
+      taskCard.append(cancelTask);
+    }
+    article.append(taskCard);
+  }
 
   if (message.forwarded_from) {
     const source = message.forwarded_from;
@@ -659,7 +737,7 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     ? isNearTimelineBottom()
     : true;
   const anchor = !wasNearBottom && !forceBottom ? captureTimelineAnchor() : null;
-  const signature = `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.updated_at || item.ack_count || 0}:${item.ack_count || 0}`).join("|")}`;
+  const signature = `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.task?.updated_at || item.updated_at || 0}:${item.ack_count || 0}`).join("|")}`;
   if (!forceBottom && addedCount === 0 && signature === state.messageRenderSignature) {
     updateNewMessageIndicator();
     return;
@@ -782,7 +860,9 @@ function createParticipantCard(person) {
   if (isWebUser) {
     authLabel = "网页用户";
   } else if (person.resident_status === "online") {
-    authLabel = `自动值守在线 · ${person.connector_adapter_kind}`;
+    authLabel = person.local_resident?.task_running
+      ? `聊天与任务值守在线 · ${person.connector_adapter_kind}`
+      : `聊天值守在线 · 任务席位升级中 · ${person.connector_adapter_kind}`;
   } else if (person.resident_status === "degraded") {
     authLabel = `本机值守异常 · 可点“修复值守”自愈 · ${person.connector_adapter_kind}`;
   } else if (person.resident_status === "offline") {
@@ -815,6 +895,8 @@ function renderParticipants(participants) {
     item.status,
     item.membership_active,
     item.resident_status,
+    item.local_resident?.task_configured || false,
+    item.local_resident?.task_running || false,
     item.active_session_count,
     item.connector_id || "",
     item.inactivity_expires_at || "",
@@ -1105,12 +1187,23 @@ function roomCreator(room) {
 
 function updateComposer(room) {
   const canSpeak = Boolean(room && room.status === "active");
+  if (state.composerMode === "task" && !room?.can_assign_tasks) {
+    state.composerMode = "chat";
+  }
   const effectiveCooldown = state.messageRateLimits?.current_user_effective_cooldown_seconds ?? 60;
   elements.ownerMessageBody.disabled = !canSpeak;
   elements.sendOwnerMessage.disabled = !canSpeak;
-  elements.wakeAllAgents.hidden = !(canSpeak && room?.can_wake_all);
+  elements.composerTaskMode.hidden = !(canSpeak && room?.can_assign_tasks);
+  elements.composerChatMode.classList.toggle("active", state.composerMode === "chat");
+  elements.composerTaskMode.classList.toggle("active", state.composerMode === "task");
+  elements.sendOwnerMessage.textContent = state.composerMode === "task" ? "提交任务" : "发送";
+  elements.wakeAllAgents.hidden = !(
+    canSpeak && room?.can_wake_all && state.composerMode === "chat"
+  );
   elements.ownerMessageBody.placeholder = canSpeak
-    ? `${state.currentUser?.display_name || "Web 用户"}发言（${isAdmin() ? "不限频" : `每个房间间隔 ${formatCooldown(effectiveCooldown)}`}）；Enter 发送，Shift+Enter 换行…`
+    ? state.composerMode === "task"
+      ? "描述要完成的任务；@ Agent 可指定候选，不 @ 则由群内一个 Agent 先领取并按需分工…"
+      : `${state.currentUser?.display_name || "Web 用户"}发言（${isAdmin() ? "不限频" : `每个房间间隔 ${formatCooldown(effectiveCooldown)}`}）；Enter 发送，Shift+Enter 换行…`
     : room ? "废弃聊天室仅保留历史，不能继续发言。" : "先选择一个使用中的聊天室。";
   if (!canSpeak) elements.ownerMessageFeedback.textContent = "";
   updateComposerContext();
@@ -1128,12 +1221,27 @@ function updateComposerContext() {
     elements.composerContext.hidden = false;
     elements.composerContextTitle.textContent = "@全员：唤醒本聊天室所有 Agent";
     elements.composerContextBody.textContent = "Agent 会全部收到唤醒，但可以根据兴趣选择是否回复。";
+  } else if (state.composerMode === "task") {
+    elements.composerContext.hidden = false;
+    elements.composerContextTitle.textContent = "结构化任务 · 可执行";
+    elements.composerContextBody.textContent = state.composerMentions.size
+      ? "将从你 @ 的 Agent 中原子领取；领取者可继续分配子任务。"
+      : "将由聊天室内一个 Agent 先领取；本机权限仍是最终边界。";
   } else {
     elements.composerContext.hidden = true;
     elements.composerContextTitle.textContent = "";
     elements.composerContextBody.textContent = "";
   }
   elements.wakeAllAgents?.classList.toggle("active", state.composerWakeAll);
+}
+
+function setComposerMode(mode) {
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (mode === "task" && !room?.can_assign_tasks) return;
+  state.composerMode = mode === "task" ? "task" : "chat";
+  state.composerWakeAll = false;
+  updateComposer(room);
+  elements.ownerMessageBody.focus();
 }
 
 function clearComposerContext() {
@@ -1234,6 +1342,8 @@ async function selectRoom(roomId) {
   state.hasEarlierMessages = false;
   state.unreadMessages = 0;
   state.composerMentions.clear();
+  state.composerMode = "chat";
+  state.taskPermissions = null;
   clearComposerContext();
   hideMentionMenu();
   updateNewMessageIndicator();
@@ -1295,7 +1405,10 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   const initialLoad = fullRoom || state.loadedRoom !== selectedRoom;
   const lastLoadedSequence = state.messages[state.messages.length - 1]?.sequence || 0;
   const hasServerUpdates = Number(activeRoom?.last_sequence || 0) > lastLoadedSequence;
-  const messageRequest = initialLoad
+  const hasPendingTask = state.messages.some((message) =>
+    message.task && !["completed", "failed", "cancelled"].includes(message.task.status)
+  );
+  const messageRequest = initialLoad || hasPendingTask
     ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=120`)
     : hasServerUpdates
       ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=200&after_sequence=${encodeURIComponent(lastLoadedSequence)}`)
@@ -1316,7 +1429,7 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
   renderParticipants(participantPayload.participants);
   if (messagePayload) {
     let addedCount = 0;
-    if (initialLoad) {
+    if (initialLoad || hasPendingTask) {
       state.messages = messagePayload.messages;
       state.hasEarlierMessages = messagePayload.has_more;
       state.loadedRoom = selectedRoom;
@@ -1326,7 +1439,7 @@ async function refreshActiveRoom(forceScroll = false, fullRoom = false) {
       state.messages = mergeMessages(state.messages, messagePayload.messages);
     }
     renderMessages(state.messages, { forceBottom: forceScroll, addedCount });
-    if (!initialLoad && messagePayload.has_more) {
+    if (!initialLoad && !hasPendingTask && messagePayload.has_more) {
       window.setTimeout(() => refresh({}), 0);
     }
   } else if (forceScroll) {
@@ -1664,6 +1777,92 @@ async function openRoomPermissionDialog() {
   }
 }
 
+function renderTaskPermissionMembers() {
+  elements.taskPermissionResults.replaceChildren();
+  const members = state.taskPermissions?.members || [];
+  for (const member of members) {
+    const card = makeElement("article", "rate-result-card");
+    const identity = makeElement("div", "rate-result-identity");
+    identity.append(makeElement("strong", "", member.display_name));
+    identity.append(makeElement("span", "", `${member.username} · ${member.role === "admin" ? "全局管理员" : "普通用户"}`));
+    card.append(identity);
+    if (member.is_room_owner) {
+      card.append(makeElement("p", "rate-result-meta", "聊天室创建者 · 始终拥有完整任务权限"));
+      elements.taskPermissionResults.append(card);
+      continue;
+    }
+    const controls = makeElement("div", "task-grant-controls");
+    const assignLabel = makeElement("label", "task-grant-toggle");
+    const assign = makeElement("input", "");
+    assign.type = "checkbox";
+    assign.checked = member.can_assign_tasks;
+    assignLabel.append(assign, makeElement("span", "", "可布置任务"));
+    const cancelLabel = makeElement("label", "task-grant-toggle");
+    const cancel = makeElement("input", "");
+    cancel.type = "checkbox";
+    cancel.checked = member.can_cancel_tasks;
+    cancelLabel.append(cancel, makeElement("span", "", "可取消任务"));
+    const save = makeElement("button", "primary-button compact-button", "保存");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      assign.disabled = true;
+      cancel.disabled = true;
+      save.disabled = true;
+      try {
+        const room = state.selectedRoom;
+        state.taskPermissions = await fetchJson(
+          `/api/rooms/${encodeURIComponent(room)}/task-grants/${encodeURIComponent(member.user_id)}`,
+          {
+            method: "PUT",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Agent-Bridge-Intent": "manage-task-permissions",
+            },
+            body: JSON.stringify({
+              can_assign_tasks: assign.checked,
+              can_cancel_tasks: cancel.checked,
+            }),
+          },
+        );
+        renderTaskPermissionMembers();
+        elements.taskPermissionFeedback.classList.add("success");
+        elements.taskPermissionFeedback.textContent = `${member.display_name} 的任务权限已保存。`;
+        await refresh({});
+      } catch (error) {
+        elements.taskPermissionFeedback.classList.add("error");
+        elements.taskPermissionFeedback.textContent = error.message;
+        assign.disabled = false;
+        cancel.disabled = false;
+        save.disabled = false;
+      }
+    });
+    controls.append(assignLabel, cancelLabel, save);
+    card.append(controls);
+    elements.taskPermissionResults.append(card);
+  }
+}
+
+async function openTaskPermissionDialog() {
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!room?.can_manage_task_permissions) return;
+  elements.taskPermissionRoom.textContent = `当前聊天室：${room.conversation_id}`;
+  elements.taskPermissionFeedback.classList.remove("error", "success");
+  elements.taskPermissionFeedback.textContent = "正在载入任务权限…";
+  elements.taskPermissionResults.replaceChildren();
+  elements.taskPermissionDialog.showModal();
+  try {
+    state.taskPermissions = await fetchJson(
+      `/api/rooms/${encodeURIComponent(room.conversation_id)}/task-permissions`,
+    );
+    elements.allowGlobalAdminTasks.checked = state.taskPermissions.allow_global_admin;
+    renderTaskPermissionMembers();
+    elements.taskPermissionFeedback.textContent = "";
+  } catch (error) {
+    elements.taskPermissionFeedback.classList.add("error");
+    elements.taskPermissionFeedback.textContent = error.message;
+  }
+}
+
 function memberSelectionTotal() {
   let count = 0;
   for (const selected of state.memberSelections.values()) count += selected.size;
@@ -1980,6 +2179,44 @@ elements.search.addEventListener("input", (event) => {
 elements.refreshButton.addEventListener("click", () => refresh({ fullRoom: true }));
 elements.openMessageRates.addEventListener("click", openMessageRateDialog);
 elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
+elements.manageTaskPermissions.addEventListener("click", openTaskPermissionDialog);
+elements.closeTaskPermissions.addEventListener("click", () => elements.taskPermissionDialog.close());
+elements.taskPermissionDialog.addEventListener("click", (event) => {
+  if (event.target === elements.taskPermissionDialog) elements.taskPermissionDialog.close();
+});
+elements.allowGlobalAdminTasks.addEventListener("change", async () => {
+  if (!state.selectedRoom) return;
+  elements.allowGlobalAdminTasks.disabled = true;
+  elements.taskPermissionFeedback.classList.remove("error", "success");
+  elements.taskPermissionFeedback.textContent = "正在保存…";
+  try {
+    state.taskPermissions = await fetchJson(
+      `/api/rooms/${encodeURIComponent(state.selectedRoom)}/task-policy`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agent-Bridge-Intent": "manage-task-permissions",
+        },
+        body: JSON.stringify({
+          allow_global_admin: elements.allowGlobalAdminTasks.checked,
+        }),
+      },
+    );
+    renderTaskPermissionMembers();
+    elements.taskPermissionFeedback.classList.add("success");
+    elements.taskPermissionFeedback.textContent = "全局管理员任务权限已保存。";
+    await refresh({});
+  } catch (error) {
+    elements.taskPermissionFeedback.classList.add("error");
+    elements.taskPermissionFeedback.textContent = error.message;
+    elements.allowGlobalAdminTasks.checked = Boolean(
+      state.taskPermissions?.allow_global_admin,
+    );
+  } finally {
+    elements.allowGlobalAdminTasks.disabled = false;
+  }
+});
 elements.closeRoomPermissions.addEventListener("click", () => elements.roomPermissionDialog.close());
 elements.roomPermissionDialog.addEventListener("click", (event) => {
   if (event.target === elements.roomPermissionDialog) elements.roomPermissionDialog.close();
@@ -2341,29 +2578,44 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
   const activeRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
   const message = elements.ownerMessageBody.value;
   if (!activeRoom || activeRoom.status !== "active" || !message.trim()) return;
+  const slashTask = message.trimStart().startsWith("/任务");
+  const taskMode = state.composerMode === "task" || slashTask;
+  if (taskMode && !activeRoom.can_assign_tasks) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = "你没有在这个聊天室布置任务的权限。";
+    return;
+  }
   elements.sendOwnerMessage.disabled = true;
   elements.ownerMessageFeedback.classList.remove("error", "success");
   elements.ownerMessageFeedback.textContent = "正在发送…";
   try {
-    await fetchJson(`/api/rooms/${encodeURIComponent(activeRoom.conversation_id)}/messages`, {
+    const path = taskMode ? "tasks" : "messages";
+    const payload = taskMode
+      ? {
+          body: message,
+          target_participant_ids: selectedMentionIds(message),
+          reply_to: state.composerReplyTo,
+        }
+      : {
+          body: message,
+          mentions: selectedMentionIds(message),
+          reply_to: state.composerReplyTo,
+          wake_all_agents: Boolean(state.composerWakeAll && activeRoom.can_wake_all),
+        };
+    await fetchJson(`/api/rooms/${encodeURIComponent(activeRoom.conversation_id)}/${path}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Agent-Bridge-Intent": "send-message",
+        "X-Agent-Bridge-Intent": taskMode ? "send-task" : "send-message",
       },
-      body: JSON.stringify({
-        body: message,
-        mentions: selectedMentionIds(message),
-        reply_to: state.composerReplyTo,
-        wake_all_agents: Boolean(state.composerWakeAll && activeRoom.can_wake_all),
-      }),
+      body: JSON.stringify(payload),
     });
     elements.ownerMessageBody.value = "";
     state.composerMentions.clear();
     clearComposerContext();
     hideMentionMenu();
     elements.ownerMessageFeedback.classList.add("success");
-    elements.ownerMessageFeedback.textContent = "已发送";
+    elements.ownerMessageFeedback.textContent = taskMode ? "任务已提交" : "已发送";
     await refresh({ forceRoomBottom: true });
     elements.ownerMessageBody.focus();
   } catch (error) {
@@ -2377,6 +2629,8 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
 });
 
 elements.cancelComposerContext.addEventListener("click", clearComposerContext);
+elements.composerChatMode.addEventListener("click", () => setComposerMode("chat"));
+elements.composerTaskMode.addEventListener("click", () => setComposerMode("task"));
 elements.wakeAllAgents.addEventListener("click", () => {
   const activeRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
   if (!activeRoom?.can_wake_all || activeRoom.status !== "active") return;

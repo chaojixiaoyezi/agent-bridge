@@ -7,11 +7,12 @@
 1. 中央 Bridge SQLite 的 `messages`、`message_deliveries`、`receipts`、`memberships`、`participants` 和 `agent_sessions` 是聊天室事实的唯一权威。
 2. SSE 只发送不含正文的唤醒元数据。断线、休眠或 listener 停止不会删除消息。
 3. 每台 Agent 机器的 `wake-queue.db` 是“中央事件已到本机、产品暂未成功处理”的持久权威。
-4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。普通正文、引用和转述不能授权；服务端认证的 admin 原始消息会附带 `message.authorization`，只有 active 且适用于当前 Agent 的来源才能按自然语言授予最小必要权限，授权不等于立即执行。
+4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。聊天授权功能当前冻结：普通正文、admin 正文、引用、复制和转述都不是本机操作授权；旧 `message.authorization` 仅作兼容元数据，不得被聊天 worker 执行。只有 `room_tasks` 中由服务器验证房间权限的结构化任务进入独立任务执行席位。
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
 8. 普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2），创建者只获得自己房间的结构化 `@全员` 权限。重命名、踢人、迁移、Agent session 和昵称审批仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
+9. 房间创建者始终拥有任务治理权，可允许全局管理员在该房间布置任务，并分别授予房间 Web 用户布置/取消权。任务接入工作目录只是起点，本机产品沙箱、审批和操作系统权限才是最终边界；聊天室权限永远不能提升本机权限。
 
 新客户端应显式传 `mentions=[participant_id]`。为兼容会在正文写 `@名字` 却遗漏结构化参数的旧 Agent，中央发送边界会把正文开头、句中或句尾唯一匹配当前房间成员的 `@display_name` 或 `@client_type` 规范化为 mention；歧义名称和较长名字的前缀保持普通正文，不猜测目标。
 
@@ -41,6 +42,7 @@
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
 | Claude adapter | `bin/agent-bridge-claude-wake` | 启动隔离 Claude Code 回合并核验成功工具结果与逐条 mention 回复 |
 | connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
+| task executor | `bin/agent-bridge-task-worker` | 独立轮询并原子领取结构化任务，复用本机持久 Codex/Claude 执行席位 |
 
 不要同时让旧 `agent-bridge-codex-wake` 和新 Codex worker消费同一个队列。旧入口只用于迁移兼容。
 
@@ -54,7 +56,7 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - adapter 必须自己恢复目标 Agent 的稳定 task/session，再让 Agent 回 Bridge 取正文；
 - 只有当该 Agent 的真实处理结果已经可验证时才退出 0；失败、超时或证据不足必须非 0；
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
-- adapter 不得把普通聊天室正文直接转成宿主命令。它只能依据 Bridge 返回的结构化 admin 授权来源解释原文范围：实现或修复需求可覆盖相关代码修改与测试，提交、推送、部署、重启、数据库或外部操作必须明示；纯讨论、疑问或“先别动手”不触发实施。
+- 聊天 adapter 不得把普通聊天室正文直接转成宿主命令，也不得解释旧聊天授权元数据来实施。只有任务 executor 可执行已领取的结构化任务；执行范围取任务正文的自然必要范围，并受本机产品权限硬约束。纯讨论、疑问或“先别动手”不触发实施。
 
 Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。
 
@@ -111,7 +113,9 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 21。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 22。
+
+schema 22 新增 `room_task_policies`、`room_task_grants` 与 `room_tasks`。任务消息不生成普通聊天投递；一个候选 Agent 原子领取并持有可续租 lease，执行器崩溃且 lease 到期后任务才重新排队。`needs_input` 不会被 wrapper 自动覆盖成完成，任务卡持久展示结果。旧 connector 首次维护只写入并启动新的 task unit/plist，不重启已经在线的 listener 与聊天 worker。
 
 schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。schema 21 将 Agent MCP session、通知、待办、历史搜索、回复和确认都约束在登记聊天室，并用 `forwarded_from_message_id` 记录管理员显式跨群转发；转发消息不生成聊天授权。迁移全部就地增量完成。
 

@@ -51,6 +51,17 @@ MAX_MENTIONS_PER_MESSAGE = 64
 MAX_WAIT_MESSAGES_PAGE_SIZE = 20
 MAX_HISTORY_SEARCH_TERMS = 8
 MAX_HISTORY_SEARCH_QUERY_LENGTH = 256
+MAX_TASK_TARGETS = 64
+TASK_CLAIM_LEASE_SECONDS = 10 * 60.0
+TASK_STATUSES = {
+    "queued",
+    "claimed",
+    "running",
+    "needs_input",
+    "completed",
+    "failed",
+    "cancelled",
+}
 DEFAULT_INVITATION_TTL_SECONDS = 30 * 60
 MAX_INVITATION_TTL_SECONDS = 24 * 60 * 60
 CONNECTOR_ONLINE_WINDOW_SECONDS = 75.0
@@ -329,6 +340,76 @@ CREATE TABLE IF NOT EXISTS room_web_owners (
 
 CREATE INDEX IF NOT EXISTS idx_room_web_owners_user
     ON room_web_owners(web_user_id, created_at DESC);
+"""
+
+
+ROOM_TASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS room_task_policies (
+    conversation_id TEXT PRIMARY KEY,
+    allow_global_admin INTEGER NOT NULL DEFAULT 0
+        CHECK (allow_global_admin IN (0, 1)),
+    updated_by_web_user_id TEXT,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS room_task_grants (
+    conversation_id TEXT NOT NULL,
+    web_user_id TEXT NOT NULL,
+    can_assign_tasks INTEGER NOT NULL DEFAULT 0
+        CHECK (can_assign_tasks IN (0, 1)),
+    can_cancel_tasks INTEGER NOT NULL DEFAULT 0
+        CHECK (can_cancel_tasks IN (0, 1)),
+    granted_by_web_user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (conversation_id, web_user_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (web_user_id) REFERENCES web_users(user_id),
+    FOREIGN KEY (granted_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE TABLE IF NOT EXISTS room_tasks (
+    task_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    source_message_id TEXT UNIQUE,
+    parent_task_id TEXT,
+    issuer_web_user_id TEXT,
+    issuer_participant_id TEXT NOT NULL,
+    target_kind TEXT NOT NULL
+        CHECK (target_kind IN ('participants', 'room_agents')),
+    target_participant_ids_json TEXT NOT NULL DEFAULT '[]',
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN (
+            'queued', 'claimed', 'running', 'needs_input',
+            'completed', 'failed', 'cancelled'
+        )),
+    claimed_by_participant_id TEXT,
+    claimed_at REAL,
+    lease_expires_at REAL,
+    started_at REAL,
+    completed_at REAL,
+    result_summary TEXT,
+    execution_cwd TEXT,
+    execution_thread_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (source_message_id) REFERENCES messages(message_id),
+    FOREIGN KEY (parent_task_id) REFERENCES room_tasks(task_id),
+    FOREIGN KEY (issuer_web_user_id) REFERENCES web_users(user_id),
+    FOREIGN KEY (issuer_participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (claimed_by_participant_id) REFERENCES participants(participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_tasks_room_created
+    ON room_tasks(conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_room_tasks_claim
+    ON room_tasks(status, conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_room_task_grants_user
+    ON room_task_grants(web_user_id, conversation_id);
 """
 
 
@@ -1025,6 +1106,13 @@ class BridgeStore:
             conn.executescript(WEB_AUTH_SCHEMA)
             self._migrate_web_user_room_permissions(conn)
             conn.executescript(ROOM_GOVERNANCE_SCHEMA)
+            conn.executescript(ROOM_TASK_SCHEMA)
+            task_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(room_tasks)").fetchall()
+            }
+            if "lease_expires_at" not in task_columns:
+                conn.execute("ALTER TABLE room_tasks ADD COLUMN lease_expires_at REAL")
             conn.executescript(RATE_LIMIT_SCHEMA)
             conn.executescript(PROFILE_SCHEMA)
             self._migrate_reusable_agent_invitations(conn)
@@ -1099,7 +1187,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 21")
+            conn.execute("PRAGMA user_version = 22")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1955,6 +2043,12 @@ class BridgeStore:
         conn: sqlite3.Connection,
         message: sqlite3.Row,
     ) -> None:
+        if str(message["message_kind"]) == "task":
+            # Structured tasks have their own atomic claim ledger and resident
+            # executor.  Keeping them out of the ordinary chat-delivery queue
+            # prevents a later @ wake from making the read-only chat worker
+            # discuss or acknowledge the task a second time.
+            return
         mention_ids = set(json.loads(str(message["mentions_json"] or "[]")))
         candidates = cls._delivery_candidates_locked(conn, message)
         candidate_ids = {str(item["participant_id"]) for item in candidates}
@@ -4834,6 +4928,9 @@ class BridgeStore:
                 "agent_connectors",
                 "agent_room_blocks",
                 "room_web_owners",
+                "room_task_policies",
+                "room_task_grants",
+                "room_tasks",
                 "chat_authorization_grants",
             ):
                 column = (
@@ -5724,6 +5821,7 @@ class BridgeStore:
         _forwarded_from_message_id: str | None = None,
         _suppress_chat_authorization: bool = False,
         _suppress_mention_inference: bool = False,
+        _task_request: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         session = opaque_id(
             authorized_session_id,
@@ -5752,10 +5850,12 @@ class BridgeStore:
             if _forwarded_from_message_id
             else None
         )
-        if normalized_message_kind not in {"message", "forward"}:
+        if normalized_message_kind not in {"message", "forward", "task"}:
             raise ValidationError("unsupported internal message kind")
         if (normalized_message_kind == "forward") != bool(normalized_forward):
             raise ValidationError("cross-room forwards require one source message")
+        if (normalized_message_kind == "task") != bool(_task_request):
+            raise ValidationError("structured task messages require task metadata")
         if normalized_wake_all and normalized_audience != "room":
             raise ValidationError("wake_all_agents requires a room audience")
         normalized_target = self._normalize_audience_value(
@@ -5770,6 +5870,9 @@ class BridgeStore:
             normalized_mentions.append(normalized_target)
         now = time.time()
         message_id = f"msg_{uuid.uuid4().hex}"
+        task_id = f"task_{uuid.uuid4().hex}" if _task_request else None
+        task_target_kind: str | None = None
+        task_target_ids: list[str] = []
 
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
@@ -5800,6 +5903,25 @@ class BridgeStore:
                     role=str(web_identity["role"]),
                     now=now,
                 )
+                if _task_request is not None:
+                    task_permissions = self._room_task_permissions_locked(
+                        conn,
+                        conversation_id=conversation,
+                        web_identity=web_identity,
+                    )
+                    if not task_permissions["can_assign_tasks"]:
+                        raise AuthorizationError(
+                            "你没有在这个聊天室布置结构化任务的权限"
+                        )
+                    task_target_kind, task_target_ids = (
+                        self._resolve_task_targets_locked(
+                            conn,
+                            conversation_id=conversation,
+                            requested_participant_ids=_task_request.get(
+                                "target_participant_ids"
+                            ),
+                        )
+                    )
                 if normalized_wake_all and str(web_identity["role"]) != "admin":
                     ownership = conn.execute(
                         "SELECT 1 FROM room_web_owners "
@@ -5962,6 +6084,36 @@ class BridgeStore:
                 "SELECT * FROM messages WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
+            task_payload = None
+            if _task_request is not None:
+                conn.execute(
+                    """
+                    INSERT INTO room_tasks
+                        (task_id, conversation_id, source_message_id,
+                         parent_task_id, issuer_web_user_id,
+                         issuer_participant_id, target_kind,
+                         target_participant_ids_json, body, status,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                    """,
+                    (
+                        task_id,
+                        conversation,
+                        message_id,
+                        str(web_identity["user_id"]),
+                        sender,
+                        task_target_kind,
+                        compact_json(task_target_ids),
+                        normalized_body,
+                        now,
+                        now,
+                    ),
+                )
+                task_row = conn.execute(
+                    "SELECT * FROM room_tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                task_payload = self._task_payload(task_row)
             if (
                 _web_user
                 and str(web_identity["role"]) == "admin"
@@ -5983,6 +6135,8 @@ class BridgeStore:
                     recipient_participant_id=None,
                 ),
             )
+            if task_payload is not None:
+                payload["task"] = task_payload
         return payload
 
     def send_owner_message(
@@ -6033,6 +6187,742 @@ class BridgeStore:
             reply_to=reply_to,
             _web_user=True,
         )
+
+    def send_web_task(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_id: str,
+        body_text: str,
+        target_participant_ids: Sequence[str] | None = None,
+        reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a server-authorized task without changing ordinary chat authority."""
+
+        normalized_body = str(body_text or "").strip()
+        if normalized_body.startswith("/任务"):
+            normalized_body = normalized_body[len("/任务") :].lstrip("：: \t")
+        if not normalized_body:
+            raise ValidationError("任务内容不能为空")
+        requested_targets = self._normalize_mentions(target_participant_ids)
+
+        # The Web composer normally sends structured IDs. Keep the typed
+        # ``/任务 @昵称 ...`` shortcut equivalent by resolving exact visible
+        # aliases only when the caller omitted those IDs. The stored task body
+        # remains unchanged and no ordinary chat delivery is created.
+        if not requested_targets:
+            with self._connection() as conn:
+                requested_targets = self._infer_text_mentions_locked(
+                    conn,
+                    conversation_id=validate_conversation_id(conversation_id),
+                    sender_participant_id=opaque_id(
+                        participant_id,
+                        field="participant_id",
+                    ),
+                    body_text=normalized_body,
+                )
+
+        return self.send(
+            authorized_session_id=authorized_session_id,
+            sender_participant_id=participant_id,
+            conversation_id=conversation_id,
+            body_text=normalized_body,
+            audience_kind="room",
+            audience_value="*",
+            mentions=[],
+            reply_to=reply_to,
+            _web_user=True,
+            _message_kind="task",
+            _suppress_chat_authorization=True,
+            _suppress_mention_inference=True,
+            _task_request={
+                "target_participant_ids": requested_targets
+            },
+        )
+
+    @staticmethod
+    def _room_task_permissions_locked(
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        web_identity: sqlite3.Row,
+    ) -> dict[str, Any]:
+        ownership = conn.execute(
+            "SELECT web_user_id FROM room_web_owners WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        policy = conn.execute(
+            "SELECT * FROM room_task_policies WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        grant = conn.execute(
+            "SELECT * FROM room_task_grants WHERE conversation_id = ? "
+            "AND web_user_id = ?",
+            (conversation_id, str(web_identity["user_id"])),
+        ).fetchone()
+        owner_user_id = (
+            str(ownership["web_user_id"]) if ownership is not None else None
+        )
+        user_id = str(web_identity["user_id"])
+        is_admin = str(web_identity["role"]) == "admin"
+        # Orphaned legacy Web rooms are treated as admin-owned until the
+        # WebAuthStore migration writes their explicit owner row.
+        is_owner = owner_user_id == user_id or (owner_user_id is None and is_admin)
+        admin_allowed = bool(policy["allow_global_admin"]) if policy else False
+        delegated_assign = bool(grant and grant["can_assign_tasks"])
+        delegated_cancel = bool(grant and grant["can_cancel_tasks"])
+        can_admin_act = is_admin and (is_owner or admin_allowed)
+        return {
+            "conversation_id": conversation_id,
+            "owner_web_user_id": owner_user_id,
+            "is_room_owner": is_owner,
+            "allow_global_admin": admin_allowed,
+            "can_assign_tasks": bool(is_owner or can_admin_act or delegated_assign),
+            "can_cancel_tasks": bool(is_owner or can_admin_act or delegated_cancel),
+            "can_manage_task_permissions": bool(is_owner),
+        }
+
+    def _resolve_task_targets_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        requested_participant_ids: Sequence[str] | None,
+    ) -> tuple[str, list[str]]:
+        requested = self._normalize_mentions(requested_participant_ids)
+        if len(requested) > MAX_TASK_TARGETS:
+            raise ValidationError(
+                f"task targets cannot contain more than {MAX_TASK_TARGETS} entries"
+            )
+        rows = conn.execute(
+            """
+            SELECT membership.participant_id
+            FROM memberships AS membership
+            LEFT JOIN web_users AS web_user
+              ON web_user.participant_id = membership.participant_id
+             AND web_user.active = 1
+            WHERE membership.conversation_id = ?
+              AND membership.active = 1
+              AND web_user.user_id IS NULL
+              AND membership.participant_id != ?
+            ORDER BY membership.joined_at, membership.participant_id
+            """,
+            (conversation_id, OWNER_PARTICIPANT_ID),
+        ).fetchall()
+        available = [str(row["participant_id"]) for row in rows]
+        available_set = set(available)
+        if requested:
+            invalid = [item for item in requested if item not in available_set]
+            if invalid:
+                raise ConflictError(
+                    "task targets must be active Agent members of this room: "
+                    + ", ".join(invalid)
+                )
+            return "participants", requested
+        if not available:
+            raise ConflictError("这个聊天室当前没有可领取任务的 Agent")
+        return "room_agents", available[:MAX_TASK_TARGETS]
+
+    def room_task_permissions(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        conversation = validate_conversation_id(conversation_id)
+        with self._transaction() as conn:
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=time.time(),
+            )
+            self._require_active_room(conn, conversation)
+            permissions = self._room_task_permissions_locked(
+                conn,
+                conversation_id=conversation,
+                web_identity=identity,
+            )
+            members: list[dict[str, Any]] = []
+            if permissions["can_manage_task_permissions"]:
+                rows = conn.execute(
+                    """
+                    SELECT web_user.user_id, web_user.username,
+                           web_user.display_name, web_user.role,
+                           COALESCE(task_grant.can_assign_tasks, 0)
+                               AS can_assign_tasks,
+                           COALESCE(task_grant.can_cancel_tasks, 0)
+                               AS can_cancel_tasks
+                    FROM memberships AS membership
+                    JOIN web_users AS web_user
+                      ON web_user.participant_id = membership.participant_id
+                     AND web_user.active = 1
+                    LEFT JOIN room_task_grants AS task_grant
+                      ON task_grant.conversation_id = membership.conversation_id
+                     AND task_grant.web_user_id = web_user.user_id
+                    WHERE membership.conversation_id = ?
+                      AND membership.active = 1
+                    ORDER BY web_user.display_name COLLATE NOCASE,
+                             web_user.username COLLATE NOCASE
+                    """,
+                    (conversation,),
+                ).fetchall()
+                members = [
+                    {
+                        "user_id": str(row["user_id"]),
+                        "username": str(row["username"]),
+                        "display_name": str(row["display_name"]),
+                        "role": str(row["role"]),
+                        "is_room_owner": str(row["user_id"])
+                        == permissions["owner_web_user_id"],
+                        "can_assign_tasks": bool(row["can_assign_tasks"]),
+                        "can_cancel_tasks": bool(row["can_cancel_tasks"]),
+                    }
+                    for row in rows
+                ]
+        return {**permissions, "members": members}
+
+    def room_task_permissions_bulk(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        conversations = [
+            validate_conversation_id(value) for value in conversation_ids
+        ]
+        with self._connection() as conn:
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=time.time(),
+            )
+            return {
+                conversation: self._room_task_permissions_locked(
+                    conn,
+                    conversation_id=conversation,
+                    web_identity=identity,
+                )
+                for conversation in conversations
+            }
+
+    def update_room_task_policy(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_id: str,
+        allow_global_admin: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(allow_global_admin, bool):
+            raise ValidationError("allow_global_admin must be a boolean")
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        conversation = validate_conversation_id(conversation_id)
+        now = time.time()
+        with self._transaction() as conn:
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            self._require_active_room(conn, conversation)
+            permissions = self._room_task_permissions_locked(
+                conn,
+                conversation_id=conversation,
+                web_identity=identity,
+            )
+            if not permissions["can_manage_task_permissions"]:
+                raise AuthorizationError("只有聊天室创建者可以调整任务权限")
+            conn.execute(
+                """
+                INSERT INTO room_task_policies
+                    (conversation_id, allow_global_admin,
+                     updated_by_web_user_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    allow_global_admin = excluded.allow_global_admin,
+                    updated_by_web_user_id = excluded.updated_by_web_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation,
+                    1 if allow_global_admin else 0,
+                    str(identity["user_id"]),
+                    now,
+                ),
+            )
+        return self.room_task_permissions(
+            authorized_session_id=session,
+            participant_id=participant,
+            conversation_id=conversation,
+        )
+
+    def update_room_task_grant(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        conversation_id: str,
+        target_web_user_id: str,
+        can_assign_tasks: bool,
+        can_cancel_tasks: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(can_assign_tasks, bool) or not isinstance(
+            can_cancel_tasks, bool
+        ):
+            raise ValidationError("task grant values must be booleans")
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        target = opaque_id(target_web_user_id, field="target_web_user_id")
+        conversation = validate_conversation_id(conversation_id)
+        now = time.time()
+        with self._transaction() as conn:
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            permissions = self._room_task_permissions_locked(
+                conn,
+                conversation_id=conversation,
+                web_identity=identity,
+            )
+            if not permissions["can_manage_task_permissions"]:
+                raise AuthorizationError("只有聊天室创建者可以调整任务权限")
+            target_row = conn.execute(
+                """
+                SELECT web_user.user_id
+                FROM web_users AS web_user
+                JOIN memberships AS membership
+                  ON membership.participant_id = web_user.participant_id
+                 AND membership.conversation_id = ?
+                 AND membership.active = 1
+                WHERE web_user.user_id = ? AND web_user.active = 1
+                """,
+                (conversation, target),
+            ).fetchone()
+            if target_row is None:
+                raise NotFoundError("目标用户不是这个聊天室的有效成员")
+            if target == permissions["owner_web_user_id"]:
+                raise ConflictError("聊天室创建者始终拥有完整任务权限")
+            if can_assign_tasks or can_cancel_tasks:
+                conn.execute(
+                    """
+                    INSERT INTO room_task_grants
+                        (conversation_id, web_user_id, can_assign_tasks,
+                         can_cancel_tasks, granted_by_web_user_id,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, web_user_id) DO UPDATE SET
+                        can_assign_tasks = excluded.can_assign_tasks,
+                        can_cancel_tasks = excluded.can_cancel_tasks,
+                        granted_by_web_user_id = excluded.granted_by_web_user_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        conversation,
+                        target,
+                        1 if can_assign_tasks else 0,
+                        1 if can_cancel_tasks else 0,
+                        str(identity["user_id"]),
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM room_task_grants WHERE conversation_id = ? "
+                    "AND web_user_id = ?",
+                    (conversation, target),
+                )
+        return self.room_task_permissions(
+            authorized_session_id=session,
+            participant_id=participant,
+            conversation_id=conversation,
+        )
+
+    def cancel_web_task(
+        self,
+        *,
+        authorized_session_id: str,
+        participant_id: str,
+        task_id: str,
+    ) -> dict[str, Any]:
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        participant = opaque_id(participant_id, field="participant_id")
+        task = opaque_id(task_id, field="task_id")
+        now = time.time()
+        with self._transaction() as conn:
+            identity = self._require_live_web_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            row = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (task,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"unknown task: {task}")
+            permissions = self._room_task_permissions_locked(
+                conn,
+                conversation_id=str(row["conversation_id"]),
+                web_identity=identity,
+            )
+            owns_task = str(row["issuer_web_user_id"] or "") == str(
+                identity["user_id"]
+            )
+            if not owns_task and not permissions["can_cancel_tasks"]:
+                raise AuthorizationError("你没有取消这个任务的权限")
+            if str(row["status"]) in {"completed", "failed"}:
+                raise ConflictError("已结束的任务不能取消")
+            if str(row["status"]) != "cancelled":
+                conn.execute(
+                    "UPDATE room_tasks SET status = 'cancelled', "
+                    "completed_at = ?, updated_at = ? WHERE task_id = ?",
+                    (now, now, task),
+                )
+            updated = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (task,)
+            ).fetchone()
+        return self._task_payload(updated)
+
+    def claim_next_task(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+    ) -> dict[str, Any] | None:
+        participant = opaque_id(participant_id, field="participant_id")
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        now = time.time()
+        with self._transaction() as conn:
+            session_row = self._require_live_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            conversation = str(session_row["registered_conversation_id"])
+            self._require_membership(conn, participant, conversation)
+            # A task executor can disappear after an atomic claim. Requeue only
+            # expired non-terminal claims; the live worker renews this lease
+            # before and during a long product turn.
+            conn.execute(
+                "UPDATE room_tasks SET status = 'queued', "
+                "claimed_by_participant_id = NULL, claimed_at = NULL, "
+                "lease_expires_at = NULL, updated_at = ? "
+                "WHERE conversation_id = ? "
+                "AND status IN ('claimed', 'running') "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
+                (now, conversation, now),
+            )
+            candidates = conn.execute(
+                "SELECT * FROM room_tasks WHERE conversation_id = ? "
+                "AND status = 'queued' ORDER BY created_at, task_id LIMIT 100",
+                (conversation,),
+            ).fetchall()
+            selected = next(
+                (
+                    row
+                    for row in candidates
+                    if participant
+                    in json.loads(str(row["target_participant_ids_json"] or "[]"))
+                ),
+                None,
+            )
+            if selected is None:
+                return None
+            changed = conn.execute(
+                "UPDATE room_tasks SET status = 'claimed', "
+                "claimed_by_participant_id = ?, claimed_at = ?, "
+                "lease_expires_at = ?, updated_at = ? "
+                "WHERE task_id = ? AND status = 'queued'",
+                (
+                    participant,
+                    now,
+                    now + TASK_CLAIM_LEASE_SECONDS,
+                    now,
+                    str(selected["task_id"]),
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+            updated = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?",
+                (str(selected["task_id"]),),
+            ).fetchone()
+        return self._task_payload(updated)
+
+    def wait_next_task(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        wait_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        bounded_wait = max(0.0, min(float(wait_seconds), 30.0))
+        deadline = time.monotonic() + bounded_wait
+        while True:
+            claimed = self.claim_next_task(
+                participant_id=participant_id,
+                authorized_session_id=authorized_session_id,
+            )
+            if claimed is not None:
+                return {"task": claimed}
+            if time.monotonic() >= deadline:
+                return {"task": None}
+            time.sleep(min(self.poll_interval_seconds, deadline - time.monotonic()))
+
+    def update_agent_task(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        task_id: str,
+        status: str,
+        result_summary: str | None = None,
+        execution_cwd: str | None = None,
+        execution_thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        task = opaque_id(task_id, field="task_id")
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {
+            "running",
+            "needs_input",
+            "completed",
+            "failed",
+        }:
+            raise ValidationError("unsupported Agent task status")
+        summary = str(result_summary or "").strip()
+        cwd = str(execution_cwd or "").strip()
+        thread_id = str(execution_thread_id or "").strip()
+        if len(summary) > 20_000:
+            raise ValidationError("task result summary is too long")
+        if len(cwd) > 2_000 or len(thread_id) > 256:
+            raise ValidationError("task execution metadata is too long")
+        now = time.time()
+        with self._transaction() as conn:
+            session_row = self._require_live_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            row = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (task,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"unknown task: {task}")
+            if str(row["conversation_id"]) != str(
+                session_row["registered_conversation_id"]
+            ):
+                raise AuthorizationError("task belongs to another room")
+            if str(row["claimed_by_participant_id"] or "") != participant:
+                raise AuthorizationError("only the Agent that claimed this task may update it")
+            if str(row["status"]) == "cancelled":
+                raise ConflictError("task was cancelled")
+            current_status = str(row["status"])
+            if current_status in {"completed", "failed"}:
+                if current_status == normalized_status:
+                    return self._task_payload(row)
+                raise ConflictError("task is already finished")
+            if current_status == "needs_input" and normalized_status in {
+                "running",
+                "completed",
+            }:
+                # A model can deliberately pause a task for missing local
+                # authority or user context. The resident lease heartbeat and
+                # wrapper closeout must not silently overwrite that decision.
+                return self._task_payload(row)
+            completed_at = now if normalized_status in {"completed", "failed"} else None
+            lease_expires_at = (
+                now + TASK_CLAIM_LEASE_SECONDS
+                if normalized_status in {"running", "needs_input"}
+                else None
+            )
+            conn.execute(
+                """
+                UPDATE room_tasks
+                SET status = ?,
+                    started_at = CASE
+                        WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                        ELSE started_at
+                    END,
+                    completed_at = COALESCE(?, completed_at),
+                    result_summary = CASE WHEN ? != '' THEN ? ELSE result_summary END,
+                    execution_cwd = CASE WHEN ? != '' THEN ? ELSE execution_cwd END,
+                    execution_thread_id = CASE WHEN ? != '' THEN ?
+                                               ELSE execution_thread_id END,
+                    lease_expires_at = ?,
+                    updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    normalized_status,
+                    normalized_status,
+                    now,
+                    completed_at,
+                    summary,
+                    summary,
+                    cwd,
+                    cwd,
+                    thread_id,
+                    thread_id,
+                    lease_expires_at,
+                    now,
+                    task,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (task,)
+            ).fetchone()
+        return self._task_payload(updated)
+
+    def delegate_agent_task(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        parent_task_id: str,
+        body_text: str,
+        target_participant_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        session = opaque_id(authorized_session_id, field="authorized_session_id")
+        parent = opaque_id(parent_task_id, field="parent_task_id")
+        normalized_body = body(body_text)
+        now = time.time()
+        with self._transaction() as conn:
+            session_row = self._require_live_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            parent_row = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (parent,)
+            ).fetchone()
+            if parent_row is None:
+                raise NotFoundError(f"unknown parent task: {parent}")
+            if str(parent_row["claimed_by_participant_id"] or "") != participant:
+                raise AuthorizationError("only the task coordinator may delegate it")
+            conversation = str(parent_row["conversation_id"])
+            if conversation != str(session_row["registered_conversation_id"]):
+                raise AuthorizationError("parent task belongs to another room")
+            target_kind, target_ids = self._resolve_task_targets_locked(
+                conn,
+                conversation_id=conversation,
+                requested_participant_ids=target_participant_ids,
+            )
+            child_id = f"task_{uuid.uuid4().hex}"
+            conn.execute(
+                """
+                INSERT INTO room_tasks
+                    (task_id, conversation_id, source_message_id, parent_task_id,
+                     issuer_web_user_id, issuer_participant_id, target_kind,
+                     target_participant_ids_json, body, status,
+                     created_at, updated_at)
+                VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    child_id,
+                    conversation,
+                    parent,
+                    participant,
+                    target_kind,
+                    compact_json(target_ids),
+                    normalized_body,
+                    now,
+                    now,
+                ),
+            )
+            child = conn.execute(
+                "SELECT * FROM room_tasks WHERE task_id = ?", (child_id,)
+            ).fetchone()
+        return self._task_payload(child)
+
+    @staticmethod
+    def _task_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("task row disappeared")
+        return {
+            "task_id": str(row["task_id"]),
+            "conversation_id": str(row["conversation_id"]),
+            "source_message_id": (
+                str(row["source_message_id"])
+                if row["source_message_id"] is not None
+                else None
+            ),
+            "parent_task_id": (
+                str(row["parent_task_id"])
+                if row["parent_task_id"] is not None
+                else None
+            ),
+            "issuer_web_user_id": (
+                str(row["issuer_web_user_id"])
+                if row["issuer_web_user_id"] is not None
+                else None
+            ),
+            "issuer_participant_id": str(row["issuer_participant_id"]),
+            "target_kind": str(row["target_kind"]),
+            "target_participant_ids": json.loads(
+                str(row["target_participant_ids_json"] or "[]")
+            ),
+            "body": str(row["body"]),
+            "status": str(row["status"]),
+            "claimed_by_participant_id": (
+                str(row["claimed_by_participant_id"])
+                if row["claimed_by_participant_id"] is not None
+                else None
+            ),
+            "claimed_at": (
+                float(row["claimed_at"]) if row["claimed_at"] is not None else None
+            ),
+            "lease_expires_at": (
+                float(row["lease_expires_at"])
+                if row["lease_expires_at"] is not None
+                else None
+            ),
+            "started_at": (
+                float(row["started_at"]) if row["started_at"] is not None else None
+            ),
+            "completed_at": (
+                float(row["completed_at"])
+                if row["completed_at"] is not None
+                else None
+            ),
+            "result_summary": (
+                str(row["result_summary"])
+                if row["result_summary"] is not None
+                else None
+            ),
+            "execution_cwd": (
+                str(row["execution_cwd"])
+                if row["execution_cwd"] is not None
+                else None
+            ),
+            "execution_thread_id": (
+                str(row["execution_thread_id"])
+                if row["execution_thread_id"] is not None
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
 
     def forward_web_message(
         self,
