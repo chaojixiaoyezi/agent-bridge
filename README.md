@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.25.0。
+当前版本：v0.26.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -262,7 +262,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.25.0 在 schema 30 上增加管理员只读运行诊断，不写状态、不扫描远端机器；v0.24.0 的显式重连可选积压压缩、v0.23.0 的只读待回复中心、v0.22.0 的房间分级治理、v0.21.0 的私有 Web 房间访问、v0.20.0 的数据库注册码、v0.19.0 的显式公网安全模式及此前消息/通知语义全部保留。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.26.0 增加在线一致性快照、离线恢复演练和只重启 Web 的发布门禁；v0.25.0 的管理员只读运行诊断、v0.24.0 的显式重连可选积压压缩及此前消息/通知语义全部保留。v0.26.0 仍使用 schema 30。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -286,6 +286,25 @@ bin/agent-bridge revoke-session --session session_xxx
 bin/agent-bridge history --conversation "工具修改的聊天室"
 bin/agent-bridge participants --conversation "工具修改的聊天室"
 ```
+
+发布维护使用独立工具。`snapshot` 通过 SQLite online backup 同时纳入 WAL
+中的已提交数据，`verify` 检查 SHA-256、`integrity_check`、外键与表行数，
+`rehearse-restore` 只在临时目录恢复并运行当前迁移，绝不会覆盖生产库。
+`release-viewer` 串联以上三项后只 kickstart Web viewer，并要求健康检查、
+注册模式、数据库行数以及全部 Agent launchd PID 都保持正确：
+
+```bash
+bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
+  --output-root "$PWD/backups" \
+  --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
+  --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
+  --expected-registration-mode access_code \
+  --label v0.26.0
+```
+
+生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明
+快照可读、可迁移且数据不减少；真正回滚需另开维护窗口，先停掉全部中央库写入者，
+再使用已验证快照恢复。这一限制是故意的，工具不提供静默覆盖活库的命令。
 
 ## 数据与失败语义
 
