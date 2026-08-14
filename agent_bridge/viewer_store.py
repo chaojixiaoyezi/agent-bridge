@@ -421,12 +421,18 @@ class ViewerRepository:
         limit: int = 300,
         before_sequence: int | None = None,
         after_sequence: int | None = None,
+        around_sequence: int | None = None,
     ) -> list[dict[str, Any]]:
         conversation = validate_conversation_id(conversation_id)
         normalized_limit = max(1, min(int(limit), 501))
-        if before_sequence is not None and after_sequence is not None:
+        supplied_cursors = sum(
+            value is not None
+            for value in (before_sequence, after_sequence, around_sequence)
+        )
+        if supplied_cursors > 1:
             raise ValueError(
-                "before_sequence and after_sequence cannot be used together"
+                "before_sequence, after_sequence, and around_sequence cannot "
+                "be used together"
             )
         parameters: list[Any] = [conversation]
         sequence_clause = ""
@@ -437,6 +443,20 @@ class ViewerRepository:
         elif after_sequence is not None:
             sequence_clause = "AND m.sequence > ?"
             parameters.append(int(after_sequence))
+            order = "ASC"
+        elif around_sequence is not None:
+            sequence_clause = """
+                AND m.message_id IN (
+                    SELECT candidate.message_id
+                    FROM messages AS candidate
+                    WHERE candidate.conversation_id = ?
+                    ORDER BY ABS(candidate.sequence - ?), candidate.sequence DESC
+                    LIMIT ?
+                )
+            """
+            parameters.extend(
+                (conversation, max(0, int(around_sequence)), normalized_limit)
+            )
             order = "ASC"
         parameters.append(normalized_limit)
         with self._connection() as connection:
@@ -540,9 +560,130 @@ class ViewerRepository:
                 """,
                 parameters,
             ).fetchall()
-        ordered_rows = rows if after_sequence is not None else reversed(rows)
+        ordered_rows = (
+            rows
+            if after_sequence is not None or around_sequence is not None
+            else reversed(rows)
+        )
         result = [self._message_payload(row) for row in ordered_rows]
         return result
+
+    def message_window_bounds(
+        self,
+        conversation_id: str,
+        *,
+        first_sequence: int | None,
+        last_sequence: int | None,
+    ) -> dict[str, bool]:
+        conversation = validate_conversation_id(conversation_id)
+        if first_sequence is None or last_sequence is None:
+            return {"has_earlier": False, "has_later": False}
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE conversation_id = ? AND sequence < ?
+                    ) AS has_earlier,
+                    EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE conversation_id = ? AND sequence > ?
+                    ) AS has_later
+                """,
+                (
+                    conversation,
+                    int(first_sequence),
+                    conversation,
+                    int(last_sequence),
+                ),
+            ).fetchone()
+        return {
+            "has_earlier": bool(row["has_earlier"]),
+            "has_later": bool(row["has_later"]),
+        }
+
+    def search_messages(
+        self,
+        conversation_id: str,
+        *,
+        query: str = "",
+        sender_participant_id: str | None = None,
+        before_sequence: int | None = None,
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        """Search one room only and return a compact newest-first page."""
+
+        conversation = validate_conversation_id(conversation_id)
+        normalized_query = str(query or "").strip()
+        normalized_sender = str(sender_participant_id or "").strip() or None
+        if not normalized_query and normalized_sender is None:
+            raise ValueError("query or sender_participant_id is required")
+        if len(normalized_query) > 200:
+            raise ValueError("query must be at most 200 characters")
+        if normalized_sender is not None and len(normalized_sender) > 200:
+            raise ValueError("sender_participant_id is invalid")
+        normalized_limit = max(1, min(int(limit), 50))
+        clauses = ["message.conversation_id = ?"]
+        parameters: list[Any] = [conversation]
+        if normalized_query:
+            clauses.append("instr(lower(message.body), lower(?)) > 0")
+            parameters.append(normalized_query)
+        if normalized_sender is not None:
+            clauses.append("message.sender_participant_id = ?")
+            parameters.append(normalized_sender)
+        if before_sequence is not None:
+            clauses.append("message.sequence < ?")
+            parameters.append(max(0, int(before_sequence)))
+        parameters.append(normalized_limit + 1)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT message.sequence, message.message_id,
+                       message.sender_participant_id, message.message_kind,
+                       message.body, message.created_at,
+                       sender.client_type AS sender_client_type,
+                       sender.display_name AS sender_display_name,
+                       sender.avatar_key AS sender_avatar_key
+                FROM messages AS message
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY message.sequence DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > normalized_limit
+        page = rows[:normalized_limit]
+        results = []
+        for row in page:
+            body = str(row["body"])
+            results.append(
+                {
+                    "sequence": int(row["sequence"]),
+                    "message_id": str(row["message_id"]),
+                    "sender_participant_id": str(row["sender_participant_id"]),
+                    "sender_client_type": str(row["sender_client_type"]),
+                    "sender_display_name": str(row["sender_display_name"]),
+                    "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
+                    "message_kind": str(row["message_kind"] or "message"),
+                    "body_preview": body[:500],
+                    "body_truncated": len(body) > 500,
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return {
+            "conversation_id": conversation,
+            "query": normalized_query,
+            "sender_participant_id": normalized_sender,
+            "results": results,
+            "count": len(results),
+            "has_more": has_more,
+            "next_before_sequence": (
+                int(page[-1]["sequence"]) if has_more and page else None
+            ),
+        }
 
     def message_receipts(
         self,

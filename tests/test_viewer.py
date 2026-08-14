@@ -337,6 +337,101 @@ def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None
     assert all(person["inactivity_expires_at"] for person in participants)
 
 
+def test_room_message_search_is_scoped_composable_paginated_and_jumpable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    _store, _sender, _receiver = seed(database)
+    client = TestClient(make_app(database))
+    admin = login_admin(client)
+    headers = intent_headers(client, "send-message")
+
+    room_one_messages = []
+    for index in range(6):
+        response = client.post(
+            "/api/rooms/room-one/messages",
+            headers=headers,
+            json={"body": f"alpha room-one result {index}"},
+        )
+        assert response.status_code == 201
+        room_one_messages.append(response.json()["message"])
+    room_two = client.post(
+        "/api/rooms/room-two/messages",
+        headers=headers,
+        json={"body": "alpha room-two private result"},
+    )
+    assert room_two.status_code == 201
+
+    assert client.get("/api/rooms/room-one/search").status_code == 400
+    assert client.get(
+        "/api/rooms/room-one/search",
+        params={"sender_participant_id": "bad id"},
+    ).status_code == 400
+
+    first_page = client.get(
+        "/api/rooms/room-one/search",
+        params={
+            "q": "ALPHA",
+            "sender_participant_id": admin["participant_id"],
+            "limit": 2,
+        },
+    )
+    assert first_page.status_code == 200
+    first_payload = first_page.json()
+    assert first_payload["conversation_id"] == "room-one"
+    assert first_payload["count"] == 2
+    assert first_payload["has_more"] is True
+    assert first_payload["next_before_sequence"] is not None
+    assert all(
+        item["sender_participant_id"] == admin["participant_id"]
+        and "room-one" in item["body_preview"]
+        and "room-two" not in item["body_preview"]
+        for item in first_payload["results"]
+    )
+
+    second_page = client.get(
+        "/api/rooms/room-one/search",
+        params={
+            "q": "alpha",
+            "sender_participant_id": admin["participant_id"],
+            "limit": 2,
+            "before_sequence": first_payload["next_before_sequence"],
+        },
+    ).json()
+    assert {
+        item["message_id"] for item in first_payload["results"]
+    }.isdisjoint({item["message_id"] for item in second_page["results"]})
+    assert all("room-two" not in item["body_preview"] for item in second_page["results"])
+
+    sender_only = client.get(
+        "/api/rooms/room-one/search",
+        params={"sender_participant_id": admin["participant_id"], "limit": 20},
+    ).json()
+    assert sender_only["count"] == 6
+
+    target = room_one_messages[2]
+    around = client.get(
+        "/api/rooms/room-one/messages",
+        params={"around_sequence": target["sequence"], "limit": 3},
+    )
+    assert around.status_code == 200
+    around_payload = around.json()
+    assert target["message_id"] in {
+        item["message_id"] for item in around_payload["messages"]
+    }
+    assert around_payload["has_earlier"] is True
+    assert around_payload["has_later"] is True
+    assert all(
+        item["conversation_id"] == "room-one"
+        and "room-two private" not in item["body"]
+        for item in around_payload["messages"]
+    )
+    assert client.get(
+        "/api/rooms/room-one/messages",
+        params={"around_sequence": 1, "before_sequence": 2},
+    ).status_code == 400
+
+
 def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     tmp_path: Path,
 ) -> None:
@@ -414,10 +509,14 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-2" in index_html
-    assert "app.css?v=20260814-2" in index_html
+    assert "app.js?v=20260814-3" in index_html
+    assert "app.css?v=20260814-3" in index_html
     assert "requestAnimationFrame" in javascript
-    assert "limit=120" in javascript
+    assert "const INITIAL_ROOM_MESSAGE_LIMIT = 60" in javascript
+    assert "const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100" in javascript
+    assert "new AbortController()" in javascript
+    assert "/search?${parameters.toString()}" in javascript
+    assert 'id="room-message-search-form"' in index_html
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript
     assert "/receipts?limit=" in javascript
@@ -2039,10 +2138,10 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert ".message {\n  position: relative;" in stylesheet
     assert "contain-intrinsic-size: 120px" not in stylesheet
     assert "roomSnapshots: new Map()" in javascript
-    assert "const ROOM_SNAPSHOT_LIMIT = 8" in javascript
-    assert "cacheActiveRoomSnapshot();\n  ++state.requestVersion;" in javascript
+    assert "const ROOM_SNAPSHOT_LIMIT = 4" in javascript
+    assert "cacheActiveRoomSnapshot();\n  state.roomRequestController?.abort();" in javascript
     assert "const restored = restoreRoomSnapshot(roomId);" in javascript
-    assert "await refreshActiveRoom(!restored, !restored" in javascript
+    assert "refreshActiveRoom(!restored, !restored" in javascript
     assert "timelineNodes: [...elements.timeline.childNodes]" in javascript
     assert "elements.timeline.replaceChildren(...snapshot.timelineNodes)" in javascript
     assert "本体已接收并纳入当前任务" in javascript

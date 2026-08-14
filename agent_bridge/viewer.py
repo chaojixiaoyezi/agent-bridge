@@ -57,6 +57,7 @@ from .store import (
 from .validation import (
     ValidationError,
     conversation_id as validate_conversation_id,
+    opaque_id,
     token,
 )
 from .viewer_store import ViewerRepository
@@ -1516,24 +1517,52 @@ def create_app(
             return _json_error(exc)
         before = request.query_params.get("before_sequence")
         after = request.query_params.get("after_sequence")
-        if before is not None and after is not None:
+        around = request.query_params.get("around_sequence")
+        if sum(value is not None for value in (before, after, around)) > 1:
             return JSONResponse(
-                {"error": "before_sequence and after_sequence cannot be combined"},
+                {
+                    "error": "before_sequence, after_sequence, and "
+                    "around_sequence cannot be combined"
+                },
                 status_code=400,
             )
         limit = _int_query(request, "limit", default=300, maximum=500)
         try:
+            around_sequence = int(around) if around is not None else None
             page = repository.messages(
                 request.path_params["conversation_id"],
-                limit=limit + 1,
+                limit=limit if around_sequence is not None else limit + 1,
                 before_sequence=int(before) if before is not None else None,
                 after_sequence=int(after) if after is not None else None,
+                around_sequence=around_sequence,
             )
+            if around_sequence is not None:
+                bounds = repository.message_window_bounds(
+                    request.path_params["conversation_id"],
+                    first_sequence=page[0]["sequence"] if page else None,
+                    last_sequence=page[-1]["sequence"] if page else None,
+                )
+            else:
+                bounds = None
         except Exception as exc:
             return _json_error(exc)
-        has_more = len(page) > limit
-        if has_more:
+        has_more = (
+            bool(bounds["has_earlier"] or bounds["has_later"])
+            if bounds is not None
+            else len(page) > limit
+        )
+        if bounds is None and has_more:
             page = page[:limit] if after is not None else page[-limit:]
+        has_earlier = (
+            bool(bounds["has_earlier"])
+            if bounds is not None
+            else bool(has_more and after is None)
+        )
+        has_later = (
+            bool(bounds["has_later"])
+            if bounds is not None
+            else bool(has_more and after is not None)
+        )
         return _json_call(
             lambda: {
                 "conversation_id": request.path_params["conversation_id"],
@@ -1541,8 +1570,34 @@ def create_app(
                 "first_sequence": page[0]["sequence"] if page else None,
                 "last_sequence": page[-1]["sequence"] if page else None,
                 "has_more": has_more,
+                "has_earlier": has_earlier,
+                "has_later": has_later,
+                "around_sequence": around_sequence,
             }
         )
+
+    async def search_room_messages(request: Request) -> Response:
+        try:
+            authenticated_web_user(request)
+            sender = request.query_params.get("sender_participant_id")
+            payload = repository.search_messages(
+                request.path_params["conversation_id"],
+                query=request.query_params.get("q", ""),
+                sender_participant_id=(
+                    opaque_id(sender, field="sender_participant_id")
+                    if sender
+                    else None
+                ),
+                before_sequence=(
+                    int(request.query_params["before_sequence"])
+                    if "before_sequence" in request.query_params
+                    else None
+                ),
+                limit=_int_query(request, "limit", default=25, maximum=50),
+            )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _json_error(exc)
 
     async def message_receipts(request: Request) -> Response:
         try:
@@ -2834,6 +2889,11 @@ def create_app(
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 messages,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/search",
+                search_room_messages,
                 methods=["GET"],
             ),
             Route(

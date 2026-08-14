@@ -18,7 +18,10 @@ from .validation import client_identity
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT = 0.0
 _CACHE_VALUE: dict[str, dict[str, Any]] = {}
-_CACHE_SECONDS = 3.0
+# Page-level presence already refreshes from the durable database and SSE.
+# Avoid repeating the comparatively expensive launchd/systemd filesystem scan
+# on every fast room switch; the maintenance loop still forces a fresh probe.
+_CACHE_SECONDS = 15.0
 
 
 def split_supported_identity(value: str) -> tuple[str, str] | None:

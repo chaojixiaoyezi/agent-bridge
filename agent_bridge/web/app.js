@@ -19,6 +19,7 @@ const state = {
   messages: [],
   loadedRoom: null,
   hasEarlierMessages: false,
+  hasLaterMessages: false,
   unreadMessages: 0,
   composerMentions: new Map(),
   composerReplyTo: null,
@@ -49,6 +50,13 @@ const state = {
   participantFilter: "",
   expandedDormantRooms: new Set(),
   roomSnapshots: new Map(),
+  roomSnapshotRestoredAt: 0,
+  roomRequestController: null,
+  roomSearchRequestController: null,
+  roomSearchResults: [],
+  roomSearchHasMore: false,
+  roomSearchNextBefore: null,
+  roomSearchTargetMessageId: null,
   avatarCatalog: null,
   avatarByKey: new Map(),
   profileAvatarKey: "auto",
@@ -56,7 +64,10 @@ const state = {
   forwardMessageId: null,
 };
 
-const ROOM_SNAPSHOT_LIMIT = 8;
+const ROOM_SNAPSHOT_LIMIT = 4;
+const ROOM_SNAPSHOT_FRESH_MS = 15_000;
+const INITIAL_ROOM_MESSAGE_LIMIT = 60;
+const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100;
 
 const elements = {
   appShell: document.querySelector("#app-shell"),
@@ -76,6 +87,13 @@ const elements = {
   roomTitle: document.querySelector("#active-room-title"),
   roomRoute: document.querySelector("#room-route"),
   roomSummary: document.querySelector("#room-summary"),
+  roomMessageSearchForm: document.querySelector("#room-message-search-form"),
+  roomMessageSearchParticipant: document.querySelector("#room-message-search-participant"),
+  roomMessageSearchQuery: document.querySelector("#room-message-search-query"),
+  searchRoomMessages: document.querySelector("#search-room-messages"),
+  clearRoomMessageSearch: document.querySelector("#clear-room-message-search"),
+  roomMessageSearchFeedback: document.querySelector("#room-message-search-feedback"),
+  roomMessageSearchResults: document.querySelector("#room-message-search-results"),
   peopleList: document.querySelector("#people-list"),
   participantCount: document.querySelector("#participant-count"),
   participantSearch: document.querySelector("#participant-search"),
@@ -487,6 +505,10 @@ function isAdmin() {
 function closeLiveConnections() {
   state.ownerEvents?.close();
   state.ownerEvents = null;
+  state.roomRequestController?.abort();
+  state.roomRequestController = null;
+  state.roomSearchRequestController?.abort();
+  state.roomSearchRequestController = null;
   if (state.fallbackRefreshTimer) {
     window.clearTimeout(state.fallbackRefreshTimer);
     state.fallbackRefreshTimer = null;
@@ -536,6 +558,8 @@ function showAuthScreen(message = "") {
   state.loadedRoom = null;
   state.messages = [];
   state.participants = [];
+  state.hasEarlierMessages = false;
+  state.hasLaterMessages = false;
   elements.appShell.hidden = true;
   for (const dialog of [
     elements.passwordDialog,
@@ -1021,10 +1045,13 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
 }
 
-function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) {
+function renderMessages(
+  messages,
+  { forceBottom = false, addedCount = 0, targetMessageId = null } = {},
+) {
   const hadRenderedMessages = Boolean(
     elements.timeline.querySelector("article[data-message-id]"),
   );
@@ -1068,9 +1095,29 @@ function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) 
     }
     fragment.append(createMessageElement(message));
   }
+  if (state.hasLaterMessages) {
+    const latest = makeElement("button", "return-latest-button", "回到最新消息");
+    latest.type = "button";
+    latest.addEventListener("click", loadLatestMessages);
+    fragment.append(latest);
+  }
   elements.timeline.replaceChildren(fragment);
 
-  if (forceBottom || wasNearBottom) {
+  if (targetMessageId) {
+    const requestedRoom = state.selectedRoom;
+    window.requestAnimationFrame(() => {
+      if (state.selectedRoom !== requestedRoom) return;
+      const target = [...elements.timeline.querySelectorAll("article[data-message-id]")]
+        .find((item) => item.dataset.messageId === targetMessageId);
+      if (!target) return;
+      const desiredTop = target.offsetTop
+        - Math.max(16, (elements.timeline.clientHeight - target.offsetHeight) / 2);
+      elements.timeline.scrollTop = Math.max(0, desiredTop);
+      target.classList.add("search-target");
+      state.unreadMessages = 0;
+      updateNewMessageIndicator();
+    });
+  } else if (forceBottom || wasNearBottom) {
     const requestedRoom = state.selectedRoom;
     window.requestAnimationFrame(() => {
       if (state.selectedRoom !== requestedRoom) return;
@@ -1250,11 +1297,33 @@ function createParticipantCard(person) {
   return card;
 }
 
+function populateRoomMessageSearchParticipants(participants) {
+  const selected = elements.roomMessageSearchParticipant.value;
+  const fragment = document.createDocumentFragment();
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "全部发言人";
+  fragment.append(all);
+  for (const participant of participants) {
+    const option = document.createElement("option");
+    option.value = participant.participant_id;
+    option.textContent = participant.display_name || participant.client_type;
+    fragment.append(option);
+  }
+  elements.roomMessageSearchParticipant.replaceChildren(fragment);
+  if ([...elements.roomMessageSearchParticipant.options].some(
+    (option) => option.value === selected,
+  )) {
+    elements.roomMessageSearchParticipant.value = selected;
+  }
+}
+
 function renderParticipants(participants) {
   state.participants = participants;
   state.participantById = new Map(
     participants.map((participant) => [participant.participant_id, participant]),
   );
+  populateRoomMessageSearchParticipants(participants);
   const query = state.participantFilter.trim().toLocaleLowerCase("zh-CN");
   const signature = `${state.selectedRoom || ""}|${query}|${participants.map((item) => [
     item.participant_id,
@@ -1726,6 +1795,10 @@ function selectedMentionIds(bodyText) {
 
 function renderActiveRoomHeader(roomId = state.selectedRoom) {
   const activeRoom = state.rooms.find((room) => room.conversation_id === roomId);
+  const searchable = Boolean(activeRoom);
+  elements.roomMessageSearchParticipant.disabled = !searchable;
+  elements.roomMessageSearchQuery.disabled = !searchable;
+  elements.searchRoomMessages.disabled = !searchable;
   elements.roomTitle.textContent = roomId || "未选择聊天室";
   const abandoned = activeRoom?.status === "abandoned";
   elements.roomRoute.textContent = abandoned ? "ABANDONED · HISTORY ONLY" : "ROOM · EVENT LIVE VIEW";
@@ -1747,9 +1820,12 @@ function cacheActiveRoomSnapshot() {
     participants: state.participants,
     timelineNodes: [...elements.timeline.childNodes],
     hasEarlierMessages: state.hasEarlierMessages,
+    hasLaterMessages: state.hasLaterMessages,
     unreadMessages: state.unreadMessages,
     scrollTop: elements.timeline.scrollTop,
     nearBottom: isNearTimelineBottom(),
+    searchTargetMessageId: state.roomSearchTargetMessageId,
+    cachedAt: Date.now(),
   };
   state.roomSnapshots.delete(roomId);
   state.roomSnapshots.set(roomId, snapshot);
@@ -1768,7 +1844,10 @@ function restoreRoomSnapshot(roomId) {
   state.messages = snapshot.messages;
   state.participants = snapshot.participants;
   state.hasEarlierMessages = snapshot.hasEarlierMessages;
+  state.hasLaterMessages = Boolean(snapshot.hasLaterMessages);
   state.unreadMessages = snapshot.unreadMessages;
+  state.roomSearchTargetMessageId = snapshot.searchTargetMessageId || null;
+  state.roomSnapshotRestoredAt = Number(snapshot.cachedAt || 0);
   state.participantRenderSignature = "";
   renderParticipants(state.participants);
   if (snapshot.timelineNodes?.length) {
@@ -1793,6 +1872,8 @@ function restoreRoomSnapshot(roomId) {
 async function selectRoom(roomId) {
   if (roomId === state.selectedRoom && state.loadedRoom === roomId) return;
   cacheActiveRoomSnapshot();
+  state.roomRequestController?.abort();
+  state.roomSearchRequestController?.abort();
   ++state.requestVersion;
   state.selectedRoom = roomId;
   state.participantFilter = "";
@@ -1801,6 +1882,7 @@ async function selectRoom(roomId) {
   state.composerMode = "chat";
   state.taskPermissions = null;
   clearComposerContext();
+  clearRoomMessageSearch();
   hideMentionMenu();
   updateNewMessageIndicator();
   window.localStorage.setItem("agentBridgeSelectedRoom", roomId);
@@ -1814,14 +1896,20 @@ async function selectRoom(roomId) {
     state.participants = [];
     state.participantById = new Map();
     state.hasEarlierMessages = false;
+    state.hasLaterMessages = false;
     state.unreadMessages = 0;
+    state.roomSnapshotRestoredAt = 0;
     renderParticipants([]);
     renderMessages([]);
   }
   renderActiveRoomHeader(roomId);
-  await refreshActiveRoom(!restored, !restored, {
-    refreshParticipants: true,
-    refreshReceipts: restored,
+  const snapshotFresh = restored
+    && Date.now() - state.roomSnapshotRestoredAt < ROOM_SNAPSHOT_FRESH_MS;
+  refreshActiveRoom(!restored, !restored, {
+    refreshParticipants: !snapshotFresh,
+    refreshReceipts: restored && !snapshotFresh,
+  }).catch((error) => {
+    if (error.name !== "AbortError") console.error(error);
   });
 }
 
@@ -1839,6 +1927,169 @@ elements.participantSearch.addEventListener("keydown", (event) => {
   renderParticipants(state.participants);
 });
 
+function clearRoomMessageSearch({ clearInputs = true } = {}) {
+  state.roomSearchRequestController?.abort();
+  state.roomSearchRequestController = null;
+  state.roomSearchResults = [];
+  state.roomSearchHasMore = false;
+  state.roomSearchNextBefore = null;
+  state.roomSearchTargetMessageId = null;
+  if (clearInputs) {
+    elements.roomMessageSearchQuery.value = "";
+    elements.roomMessageSearchParticipant.value = "";
+  }
+  elements.roomMessageSearchResults.replaceChildren();
+  elements.roomMessageSearchResults.hidden = true;
+  elements.clearRoomMessageSearch.hidden = true;
+  elements.roomMessageSearchFeedback.textContent = "";
+}
+
+function renderRoomMessageSearchResults() {
+  elements.roomMessageSearchResults.replaceChildren();
+  elements.roomMessageSearchResults.hidden = false;
+  elements.clearRoomMessageSearch.hidden = false;
+  if (!state.roomSearchResults.length) {
+    elements.roomMessageSearchResults.append(makeElement(
+      "p",
+      "room-message-search-empty",
+      "当前聊天室没有匹配消息。",
+    ));
+    return;
+  }
+  const list = makeElement("div", "room-message-search-result-list");
+  for (const result of state.roomSearchResults) {
+    const button = makeElement("button", "room-message-search-result");
+    button.type = "button";
+    button.dataset.messageId = result.message_id;
+    const heading = makeElement("span", "room-message-search-result-heading");
+    heading.append(makeElement(
+      "strong",
+      "",
+      result.sender_display_name || result.sender_client_type,
+    ));
+    heading.append(makeElement(
+      "small",
+      "",
+      `#${result.sequence} · ${fullTime(result.created_at)}`,
+    ));
+    button.append(heading);
+    button.append(makeElement(
+      "span",
+      "room-message-search-result-body",
+      `${result.body_preview}${result.body_truncated ? "…" : ""}`,
+    ));
+    button.addEventListener("click", () => jumpToRoomSearchResult(result));
+    list.append(button);
+  }
+  elements.roomMessageSearchResults.append(list);
+  if (state.roomSearchHasMore) {
+    const more = makeElement("button", "load-search-results", "加载更多结果");
+    more.type = "button";
+    more.addEventListener("click", () => searchRoomMessagesPage({ append: true }));
+    elements.roomMessageSearchResults.append(more);
+  }
+}
+
+async function searchRoomMessagesPage({ append = false } = {}) {
+  const roomId = state.selectedRoom;
+  const query = elements.roomMessageSearchQuery.value.trim();
+  const participantId = elements.roomMessageSearchParticipant.value;
+  if (!roomId) return;
+  if (!query && !participantId) {
+    elements.roomMessageSearchFeedback.textContent = "请输入关键词或选择发言人。";
+    elements.roomMessageSearchQuery.focus();
+    return;
+  }
+  if (append && !state.roomSearchNextBefore) return;
+  state.roomSearchRequestController?.abort();
+  const controller = new AbortController();
+  state.roomSearchRequestController = controller;
+  elements.searchRoomMessages.disabled = true;
+  elements.roomMessageSearchFeedback.textContent = append ? "正在加载更多…" : "正在搜索…";
+  const parameters = new URLSearchParams({ limit: "25" });
+  if (query) parameters.set("q", query);
+  if (participantId) parameters.set("sender_participant_id", participantId);
+  if (append) parameters.set("before_sequence", String(state.roomSearchNextBefore));
+  try {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/search?${parameters.toString()}`,
+      { signal: controller.signal },
+    );
+    if (state.selectedRoom !== roomId || controller.signal.aborted) return;
+    if (append) {
+      const known = new Set(state.roomSearchResults.map((item) => item.message_id));
+      state.roomSearchResults.push(
+        ...payload.results.filter((item) => !known.has(item.message_id)),
+      );
+    } else {
+      state.roomSearchResults = payload.results;
+    }
+    state.roomSearchHasMore = Boolean(payload.has_more);
+    state.roomSearchNextBefore = payload.next_before_sequence;
+    elements.roomMessageSearchFeedback.textContent = state.roomSearchResults.length
+      ? `${state.roomSearchResults.length} 条匹配 · 仅当前聊天室`
+      : "没有匹配消息";
+    renderRoomMessageSearchResults();
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      elements.roomMessageSearchFeedback.textContent = `搜索失败：${error.message}`;
+    }
+  } finally {
+    if (state.roomSearchRequestController === controller) {
+      state.roomSearchRequestController = null;
+      elements.searchRoomMessages.disabled = false;
+    }
+  }
+}
+
+async function jumpToRoomSearchResult(result) {
+  const roomId = state.selectedRoom;
+  if (!roomId) return;
+  state.roomRequestController?.abort();
+  const controller = new AbortController();
+  state.roomRequestController = controller;
+  elements.roomMessageSearchFeedback.textContent = `正在定位 #${result.sequence}…`;
+  try {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}&around_sequence=${encodeURIComponent(result.sequence)}`,
+      { signal: controller.signal },
+    );
+    if (state.selectedRoom !== roomId || controller.signal.aborted) return;
+    state.messages = payload.messages;
+    state.hasEarlierMessages = Boolean(payload.has_earlier);
+    state.hasLaterMessages = Boolean(payload.has_later);
+    state.loadedRoom = roomId;
+    state.roomSearchTargetMessageId = result.message_id;
+    state.messageRenderSignature = "";
+    renderMessages(state.messages, { targetMessageId: result.message_id });
+    cacheActiveRoomSnapshot();
+    elements.roomMessageSearchResults.hidden = true;
+    elements.roomMessageSearchFeedback.textContent = `已定位 #${result.sequence}`;
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      elements.roomMessageSearchFeedback.textContent = `定位失败：${error.message}`;
+    }
+  } finally {
+    if (state.roomRequestController === controller) {
+      state.roomRequestController = null;
+    }
+  }
+}
+
+elements.roomMessageSearchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  searchRoomMessagesPage();
+});
+elements.clearRoomMessageSearch.addEventListener("click", () => {
+  clearRoomMessageSearch();
+  if (state.hasLaterMessages) loadLatestMessages();
+});
+elements.roomMessageSearchQuery.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  clearRoomMessageSearch();
+});
+
 function mergeMessages(existing, incoming) {
   const byId = new Map(existing.map((message) => [message.message_id, message]));
   for (const message of incoming) byId.set(message.message_id, message);
@@ -1848,25 +2099,65 @@ function mergeMessages(existing, incoming) {
 async function loadEarlierMessages(event) {
   const button = event?.currentTarget;
   const firstSequence = state.messages[0]?.sequence;
-  if (!state.selectedRoom || !firstSequence) return;
+  const roomId = state.selectedRoom;
+  if (!roomId || !firstSequence) return;
+  state.roomRequestController?.abort();
+  const controller = new AbortController();
+  state.roomRequestController = controller;
   if (button) {
     button.disabled = true;
     button.textContent = "正在加载…";
   }
   try {
-    const encodedRoom = encodeURIComponent(state.selectedRoom);
+    const encodedRoom = encodeURIComponent(roomId);
     const payload = await fetchJson(
       `/api/rooms/${encodedRoom}/messages?limit=200&before_sequence=${encodeURIComponent(firstSequence)}`,
+      { signal: controller.signal },
     );
+    if (state.selectedRoom !== roomId || controller.signal.aborted) return;
     state.messages = mergeMessages(state.messages, payload.messages);
     state.hasEarlierMessages = payload.has_more;
     renderMessages(state.messages);
     cacheActiveRoomSnapshot();
   } catch (error) {
-    console.error(error);
-    if (button) button.textContent = "加载失败 · 重试";
+    if (error.name !== "AbortError") {
+      console.error(error);
+      if (button) button.textContent = "加载失败 · 重试";
+    }
   } finally {
+    if (state.roomRequestController === controller) {
+      state.roomRequestController = null;
+    }
     if (button) button.disabled = false;
+  }
+}
+
+async function loadLatestMessages() {
+  const roomId = state.selectedRoom;
+  if (!roomId) return;
+  state.roomRequestController?.abort();
+  const controller = new AbortController();
+  state.roomRequestController = controller;
+  try {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}`,
+      { signal: controller.signal },
+    );
+    if (state.selectedRoom !== roomId || controller.signal.aborted) return;
+    state.messages = payload.messages;
+    state.hasEarlierMessages = Boolean(payload.has_earlier ?? payload.has_more);
+    state.hasLaterMessages = false;
+    state.loadedRoom = roomId;
+    state.roomSearchTargetMessageId = null;
+    state.messageRenderSignature = "";
+    renderMessages(state.messages, { forceBottom: true });
+    cacheActiveRoomSnapshot();
+  } catch (error) {
+    if (error.name !== "AbortError") console.error(error);
+  } finally {
+    if (state.roomRequestController === controller) {
+      state.roomRequestController = null;
+    }
   }
 }
 
@@ -1880,30 +2171,62 @@ async function refreshActiveRoom(
   } = {},
 ) {
   if (!state.selectedRoom) return;
+  state.roomRequestController?.abort();
+  const controller = new AbortController();
+  state.roomRequestController = controller;
   const requestVersion = ++state.requestVersion;
   const selectedRoom = state.selectedRoom;
   const encodedRoom = encodeURIComponent(selectedRoom);
   const activeRoom = state.rooms.find((room) => room.conversation_id === selectedRoom);
   const initialLoad = fullRoom || state.loadedRoom !== selectedRoom;
+  const browsingHistory = !initialLoad && state.hasLaterMessages;
   const lastLoadedSequence = state.messages[state.messages.length - 1]?.sequence || 0;
   const hasServerUpdates = Number(activeRoom?.last_sequence || 0) > lastLoadedSequence;
-  const messageRequest = initialLoad || refreshTaskState
-    ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=120`)
-    : hasServerUpdates
-      ? fetchJson(`/api/rooms/${encodedRoom}/messages?limit=200&after_sequence=${encodeURIComponent(lastLoadedSequence)}`)
+  const messageRequest = initialLoad
+    ? fetchJson(
+        `/api/rooms/${encodedRoom}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}`,
+        { signal: controller.signal },
+      )
+    : browsingHistory
+      ? Promise.resolve(null)
+      : refreshTaskState
+        ? fetchJson(
+            `/api/rooms/${encodedRoom}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}`,
+            { signal: controller.signal },
+          )
+        : hasServerUpdates
+          ? fetchJson(
+              `/api/rooms/${encodedRoom}/messages?limit=${INCREMENTAL_ROOM_MESSAGE_LIMIT}&after_sequence=${encodeURIComponent(lastLoadedSequence)}`,
+              { signal: controller.signal },
+            )
       : Promise.resolve(null);
   const receiptRequest = refreshReceipts && state.messages.length > 0
     ? fetchJson(
-        `/api/rooms/${encodedRoom}/receipts?limit=${encodeURIComponent(Math.max(120, state.messages.length))}&after_sequence=${encodeURIComponent(Math.max(0, Number(state.messages[0]?.sequence || 1) - 1))}`,
+        `/api/rooms/${encodedRoom}/receipts?limit=${encodeURIComponent(Math.max(INITIAL_ROOM_MESSAGE_LIMIT, state.messages.length))}&after_sequence=${encodeURIComponent(Math.max(0, Number(state.messages[0]?.sequence || 1) - 1))}`,
+        { signal: controller.signal },
       )
     : Promise.resolve(null);
-  const [messagePayload, participantPayload, receiptPayload] = await Promise.all([
-    messageRequest,
-    refreshParticipants
-      ? fetchJson(`/api/rooms/${encodedRoom}/participants`)
-      : Promise.resolve(null),
-    receiptRequest,
-  ]);
+  let responses;
+  try {
+    responses = await Promise.all([
+      messageRequest,
+      refreshParticipants
+        ? fetchJson(
+            `/api/rooms/${encodedRoom}/participants`,
+            { signal: controller.signal },
+          )
+        : Promise.resolve(null),
+      receiptRequest,
+    ]);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    throw error;
+  } finally {
+    if (state.roomRequestController === controller) {
+      state.roomRequestController = null;
+    }
+  }
+  const [messagePayload, participantPayload, receiptPayload] = responses;
   if (requestVersion !== state.requestVersion) return;
   renderActiveRoomHeader(selectedRoom);
   if (participantPayload) renderParticipants(participantPayload.participants);
@@ -1912,7 +2235,10 @@ async function refreshActiveRoom(
     let appendedMessages = [];
     if (initialLoad) {
       state.messages = messagePayload.messages;
-      state.hasEarlierMessages = messagePayload.has_more;
+      state.hasEarlierMessages = Boolean(
+        messagePayload.has_earlier ?? messagePayload.has_more,
+      );
+      state.hasLaterMessages = Boolean(messagePayload.has_later);
       state.loadedRoom = selectedRoom;
     } else {
       const knownIds = new Set(state.messages.map((message) => message.message_id));

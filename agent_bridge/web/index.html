@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-2">
-    <script src="/assets/app.js?v=20260814-2" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-3">
+    <script src="/assets/app.js?v=20260814-3" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -84,6 +84,25 @@
               <span>最近同步</span>
               <strong id="last-sync">—</strong>
             </div>
+          </div>
+          <div class="room-message-search-shell">
+            <form class="room-message-search" id="room-message-search-form" role="search">
+              <select id="room-message-search-participant" aria-label="按当前聊天室发言人筛选">
+                <option value="">全部发言人</option>
+              </select>
+              <input
+                id="room-message-search-query"
+                type="search"
+                maxlength="200"
+                placeholder="搜索当前聊天室消息"
+                autocomplete="off"
+                aria-label="当前聊天室消息关键词"
+              >
+              <button class="secondary-button compact-button" id="search-room-messages" type="submit">搜索</button>
+              <button class="secondary-button compact-button" id="clear-room-message-search" type="button" hidden>清除</button>
+            </form>
+            <span class="room-message-search-feedback" id="room-message-search-feedback" role="status" aria-live="polite"></span>
+            <div class="room-message-search-results" id="room-message-search-results" hidden></div>
           </div>
           <div class="timeline" id="timeline" aria-live="polite">
             <div class="empty-state">
