@@ -525,6 +525,10 @@ function formatAge(value) {
   return `${Math.floor(seconds / 86400)} 天前`;
 }
 
+function roomSequence(item) {
+  return Number(item?.room_sequence ?? item?.sequence ?? 0);
+}
+
 function dayLabel(timestamp) {
   return DATE_TIME_FORMATTERS.day.format(new Date(timestamp * 1000));
 }
@@ -1032,7 +1036,7 @@ function createMessageElement(message) {
     article.append(makeElement(
       "p",
       "forward-label",
-      `显式转发自「${source.conversation_id}」#${source.sequence} · ${sourceSender}`,
+      `显式转发自「${source.conversation_id}」#${roomSequence(source)} · ${sourceSender}`,
     ));
   }
 
@@ -1065,7 +1069,7 @@ function createMessageElement(message) {
       article.append(submitButton);
     }
   }
-  article.append(makeElement("p", "receipt-label", `#${message.sequence} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
+  article.append(makeElement("p", "receipt-label", `#${roomSequence(message)} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
 
   if (message.refs.length) {
     const refs = makeElement("div", "ref-list");
@@ -1273,7 +1277,7 @@ function updateReceiptLabels(messages) {
     if (!message) continue;
     const label = article.querySelector(".receipt-label");
     if (label) {
-      label.textContent = `#${message.sequence} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`;
+      label.textContent = `#${roomSequence(message)} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`;
     }
   }
   state.messageRenderSignature = messageSignature(state.messages);
@@ -2217,7 +2221,7 @@ function renderRoomMessageSearchResults() {
     heading.append(makeElement(
       "small",
       "",
-      `#${result.sequence} · ${fullTime(result.created_at)}`,
+      `#${roomSequence(result)} · ${fullTime(result.created_at)}`,
     ));
     button.append(heading);
     button.append(makeElement(
@@ -2295,7 +2299,7 @@ async function jumpToRoomSearchResult(result) {
   state.roomRequestController?.abort();
   const controller = new AbortController();
   state.roomRequestController = controller;
-  elements.roomMessageSearchFeedback.textContent = `正在定位 #${result.sequence}…`;
+  elements.roomMessageSearchFeedback.textContent = `正在定位 #${roomSequence(result)}…`;
   try {
     const payload = await fetchJson(
       `/api/rooms/${encodeURIComponent(roomId)}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}&around_sequence=${encodeURIComponent(result.sequence)}`,
@@ -2311,7 +2315,7 @@ async function jumpToRoomSearchResult(result) {
     renderMessages(state.messages, { targetMessageId: result.message_id });
     cacheActiveRoomSnapshot();
     elements.roomMessageSearchResults.hidden = true;
-    elements.roomMessageSearchFeedback.textContent = `已定位 #${result.sequence}`;
+    elements.roomMessageSearchFeedback.textContent = `已定位 #${roomSequence(result)}`;
   } catch (error) {
     if (error.name !== "AbortError") {
       elements.roomMessageSearchFeedback.textContent = `定位失败：${error.message}`;
@@ -2387,7 +2391,7 @@ function renderPendingCenter() {
         makeElement(
           "small",
           "pending-item-meta",
-          `#${item.sequence} · ${formatAge(item.age_seconds)} · ${item.delivery_state === "delivered" ? "已送达，等待回复" : "等待送达或处理"}`,
+          `#${roomSequence(item)} · ${formatAge(item.age_seconds)} · ${item.delivery_state === "delivered" ? "已送达，等待回复" : "等待送达或处理"}`,
         ),
       );
       button.addEventListener("click", () => locatePendingCenterItem(item));
@@ -2423,7 +2427,7 @@ function renderPendingCenter() {
         makeElement(
           "small",
           "pending-item-meta",
-          `${task.source_sequence ? `#${task.source_sequence} · ` : ""}${formatAge(task.age_seconds)}`,
+          `${task.source_room_sequence ? `#${task.source_room_sequence} · ` : ""}${formatAge(task.age_seconds)}`,
         ),
       );
       button.addEventListener("click", () => locatePendingCenterItem({
@@ -4310,7 +4314,7 @@ function openForwardDialog(message) {
     elements.forwardTargetRoom.append(option);
   }
   const sender = message.sender_display_name || message.sender_client_type;
-  elements.forwardSourcePreview.textContent = `来源「${message.conversation_id}」#${message.sequence} · ${sender}：${message.body.slice(0, 180)}`;
+  elements.forwardSourcePreview.textContent = `来源「${message.conversation_id}」#${roomSequence(message)} · ${sender}：${message.body.slice(0, 180)}`;
   elements.forwardMessageFeedback.textContent = "";
   elements.forwardMessageFeedback.classList.remove("error", "success");
   if (!targets.length) return;

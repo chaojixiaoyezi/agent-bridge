@@ -304,7 +304,8 @@ class ViewerRepository:
                     SELECT
                         conversation_id,
                         COUNT(*) AS message_count,
-                        MAX(sequence) AS last_sequence
+                        MAX(sequence) AS last_sequence,
+                        MAX(room_sequence) AS last_room_sequence
                     FROM messages
                     GROUP BY conversation_id
                 )
@@ -321,6 +322,7 @@ class ViewerRepository:
                     END AS online_count,
                     COALESCE(msgs.message_count, 0) AS message_count,
                     msgs.last_sequence,
+                    msgs.last_room_sequence,
                     latest.body AS latest_body,
                     latest.created_at AS latest_created_at,
                     sender.session_alias AS latest_sender_alias,
@@ -405,6 +407,11 @@ class ViewerRepository:
                 "last_sequence": (
                     int(row["last_sequence"])
                     if row["last_sequence"] is not None
+                    else None
+                ),
+                "last_room_sequence": (
+                    int(row["last_room_sequence"])
+                    if row["last_room_sequence"] is not None
                     else None
                 ),
                 "latest_body": str(row["latest_body"] or "")[:180],
@@ -499,6 +506,7 @@ class ViewerRepository:
                     claimant.display_name AS claimant_display_name,
                     source.conversation_id AS forwarded_source_conversation_id,
                     source.sequence AS forwarded_source_sequence,
+                    source.room_sequence AS forwarded_source_room_sequence,
                     source_sender.display_name AS forwarded_source_sender_display_name,
                     source_sender.client_type AS forwarded_source_sender_client_type,
                     grant.authority_kind AS authorization_kind,
@@ -665,7 +673,8 @@ class ViewerRepository:
         with self._connection() as connection:
             rows = connection.execute(
                 f"""
-                SELECT message.sequence, message.message_id,
+                SELECT message.sequence, message.room_sequence,
+                       message.message_id,
                        message.sender_participant_id, message.message_kind,
                        message.body, message.created_at,
                        sender.client_type AS sender_client_type,
@@ -688,6 +697,9 @@ class ViewerRepository:
             results.append(
                 {
                     "sequence": int(row["sequence"]),
+                    "room_sequence": int(
+                        row["room_sequence"] or row["sequence"]
+                    ),
                     "message_id": str(row["message_id"]),
                     "sender_participant_id": str(row["sender_participant_id"]),
                     "sender_client_type": str(row["sender_client_type"]),
@@ -871,7 +883,8 @@ class ViewerRepository:
                     WHERE reply_to IS NOT NULL
                 )
                 SELECT message.message_id, message.conversation_id,
-                       message.sequence, message.body, message.created_at,
+                       message.sequence, message.room_sequence,
+                       message.body, message.created_at,
                        message.sender_participant_id,
                        sender.client_type AS sender_client_type,
                        sender.display_name AS sender_display_name,
@@ -907,7 +920,9 @@ class ViewerRepository:
             ).fetchall()
             task_rows = connection.execute(
                 f"""
-                SELECT task.*, issuer.client_type AS issuer_client_type,
+                SELECT task.*, source_message.room_sequence
+                                   AS source_room_sequence,
+                       issuer.client_type AS issuer_client_type,
                        issuer.display_name AS issuer_display_name,
                        claimant.client_type AS claimant_client_type,
                        claimant.display_name AS claimant_display_name,
@@ -920,6 +935,8 @@ class ViewerRepository:
                   ON issuer.participant_id = task.issuer_participant_id
                 LEFT JOIN participants AS claimant
                   ON claimant.participant_id = task.claimed_by_participant_id
+                LEFT JOIN messages AS source_message
+                  ON source_message.message_id = task.source_message_id
                 WHERE {' AND '.join(task_where)}
                 ORDER BY CASE task.status
                              WHEN 'needs_input' THEN 0
@@ -952,6 +969,9 @@ class ViewerRepository:
                     "message_id": str(row["message_id"]),
                     "conversation_id": str(row["conversation_id"]),
                     "sequence": int(row["sequence"]),
+                    "room_sequence": int(
+                        row["room_sequence"] or row["sequence"]
+                    ),
                     "body_preview": body[:500],
                     "body_truncated": len(body) > 500,
                     "created_at": float(row["created_at"]),
@@ -999,6 +1019,11 @@ class ViewerRepository:
                     "source_sequence": (
                         int(row["source_sequence"])
                         if row["source_sequence"] is not None
+                        else None
+                    ),
+                    "source_room_sequence": (
+                        int(row["source_room_sequence"])
+                        if row["source_room_sequence"] is not None
                         else None
                     ),
                     "body_preview": body[:500],
@@ -1646,8 +1671,14 @@ class ViewerRepository:
 
     @staticmethod
     def _message_payload(row: sqlite3.Row) -> dict[str, Any]:
+        keys = set(row.keys())
         payload = {
             "sequence": int(row["sequence"]),
+            "room_sequence": (
+                int(row["room_sequence"])
+                if "room_sequence" in keys and row["room_sequence"] is not None
+                else int(row["sequence"])
+            ),
             "message_id": str(row["message_id"]),
             "conversation_id": str(row["conversation_id"]),
             "sender_participant_id": str(row["sender_participant_id"]),
@@ -1681,6 +1712,10 @@ class ViewerRepository:
                 "message_id": str(row["forwarded_from_message_id"]),
                 "conversation_id": str(row["forwarded_source_conversation_id"]),
                 "sequence": int(row["forwarded_source_sequence"]),
+                "room_sequence": int(
+                    row["forwarded_source_room_sequence"]
+                    or row["forwarded_source_sequence"]
+                ),
                 "sender_display_name": str(
                     row["forwarded_source_sender_display_name"] or ""
                 ),

@@ -326,6 +326,7 @@ CREATE TABLE IF NOT EXISTS memberships (
 
 CREATE TABLE IF NOT EXISTS messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_sequence INTEGER,
     message_id TEXT NOT NULL UNIQUE,
     conversation_id TEXT NOT NULL,
     sender_participant_id TEXT NOT NULL,
@@ -453,6 +454,57 @@ BEGIN
     UPDATE rooms
     SET last_activity_at = MAX(last_activity_at, NEW.created_at)
     WHERE conversation_id = NEW.conversation_id AND status = 'active';
+END;
+"""
+
+
+ROOM_MESSAGE_SEQUENCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS room_message_sequences (
+    conversation_id TEXT PRIMARY KEY,
+    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id)
+);
+
+DROP TRIGGER IF EXISTS trg_messages_assign_room_sequence;
+CREATE TRIGGER trg_messages_assign_room_sequence
+AFTER INSERT ON messages
+WHEN NEW.room_sequence IS NULL
+BEGIN
+    INSERT INTO room_message_sequences (conversation_id, last_sequence)
+    VALUES (NEW.conversation_id, 1)
+    ON CONFLICT(conversation_id) DO UPDATE
+    SET last_sequence = room_message_sequences.last_sequence + 1;
+
+    UPDATE messages
+    SET room_sequence = (
+        SELECT last_sequence
+        FROM room_message_sequences
+        WHERE conversation_id = NEW.conversation_id
+    )
+    WHERE sequence = NEW.sequence;
+END;
+
+DROP TRIGGER IF EXISTS trg_messages_sync_explicit_room_sequence;
+CREATE TRIGGER trg_messages_sync_explicit_room_sequence
+AFTER INSERT ON messages
+WHEN NEW.room_sequence IS NOT NULL
+BEGIN
+    INSERT INTO room_message_sequences (conversation_id, last_sequence)
+    VALUES (NEW.conversation_id, NEW.room_sequence)
+    ON CONFLICT(conversation_id) DO UPDATE
+    SET last_sequence = MAX(
+        room_message_sequences.last_sequence,
+        excluded.last_sequence
+    );
+END;
+
+DROP TRIGGER IF EXISTS trg_messages_room_sequence_immutable;
+CREATE TRIGGER trg_messages_room_sequence_immutable
+BEFORE UPDATE OF room_sequence ON messages
+WHEN OLD.room_sequence IS NOT NULL
+ AND NEW.room_sequence IS NOT OLD.room_sequence
+BEGIN
+    SELECT RAISE(ABORT, 'ROOM_MESSAGE_SEQUENCE_IMMUTABLE');
 END;
 """
 
@@ -1436,6 +1488,8 @@ class BridgeStore:
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(messages)").fetchall()
             }
+            if "room_sequence" not in message_columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN room_sequence INTEGER")
             if "authorized_session_id" not in message_columns:
                 conn.execute(
                     "ALTER TABLE messages ADD COLUMN authorized_session_id TEXT"
@@ -1485,6 +1539,11 @@ class BridgeStore:
                 )
             if schema_version < 8 or mentions_column_added:
                 self._backfill_implicit_participant_mentions(conn)
+            # Ensure even very old databases have room authority before the
+            # per-room counter is seeded. The later call remains an idempotent
+            # safety net for the rest of the legacy migration path.
+            self._backfill_legacy_rooms(conn)
+            self._initialize_room_message_sequences_locked(conn)
             conn.executescript(WEB_AUTH_SCHEMA)
             self._migrate_web_user_room_permissions(conn)
             conn.executescript(ROOM_GOVERNANCE_SCHEMA)
@@ -1621,7 +1680,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 30")
+            conn.execute("PRAGMA user_version = 31")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1645,6 +1704,94 @@ class BridgeStore:
                 f"NOT NULL DEFAULT {DEFAULT_WEB_USER_ROOM_LIMIT} "
                 f"CHECK (room_limit BETWEEN 1 AND {MAX_WEB_USER_ROOM_LIMIT})"
             )
+
+    @staticmethod
+    def _initialize_room_message_sequences_locked(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Backfill stable room-local labels without changing global cursors."""
+
+        conn.execute(
+            """
+            WITH ranked AS (
+                SELECT message_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY conversation_id ORDER BY sequence
+                       ) AS assigned_sequence
+                FROM messages
+            )
+            UPDATE messages
+            SET room_sequence = (
+                SELECT ranked.assigned_sequence
+                FROM ranked
+                WHERE ranked.message_id = messages.message_id
+            )
+            WHERE room_sequence IS NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS room_message_sequences (
+                conversation_id TEXT PRIMARY KEY,
+                last_sequence INTEGER NOT NULL DEFAULT 0
+                    CHECK (last_sequence >= 0),
+                FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO room_message_sequences (conversation_id, last_sequence)
+            SELECT conversation_id, MAX(room_sequence)
+            FROM messages
+            GROUP BY conversation_id
+            ON CONFLICT(conversation_id) DO UPDATE
+            SET last_sequence = MAX(
+                room_message_sequences.last_sequence,
+                excluded.last_sequence
+            )
+            """
+        )
+        conn.executescript(ROOM_MESSAGE_SEQUENCE_SCHEMA)
+        # An old process can insert in the narrow migration window before the
+        # trigger exists. Repair such rows once more, then seed counters from
+        # the authoritative room order before enforcing uniqueness.
+        conn.execute(
+            """
+            WITH ranked AS (
+                SELECT message_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY conversation_id ORDER BY sequence
+                       ) AS assigned_sequence
+                FROM messages
+            )
+            UPDATE messages
+            SET room_sequence = (
+                SELECT ranked.assigned_sequence
+                FROM ranked
+                WHERE ranked.message_id = messages.message_id
+            )
+            WHERE room_sequence IS NULL
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO room_message_sequences (conversation_id, last_sequence)
+            SELECT conversation_id, MAX(room_sequence)
+            FROM messages
+            GROUP BY conversation_id
+            ON CONFLICT(conversation_id) DO UPDATE
+            SET last_sequence = MAX(
+                room_message_sequences.last_sequence,
+                excluded.last_sequence
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_messages_conversation_room_sequence "
+            "ON messages(conversation_id, room_sequence)"
+        )
 
     @staticmethod
     def _backfill_room_web_members(conn: sqlite3.Connection) -> None:
@@ -8249,6 +8396,7 @@ class BridgeStore:
                 "memberships",
                 "agent_sessions",
                 "messages",
+                "room_message_sequences",
                 "agent_invitations",
                 "agent_connectors",
                 "agent_room_blocks",
@@ -11491,7 +11639,8 @@ class BridgeStore:
             )
             header = (
                 "【管理员显式转发 · 来源「"
-                f"{source['conversation_id']}」#{int(source['sequence'])} · "
+                f"{source['conversation_id']}」#"
+                f"{int(source['room_sequence'] or source['sequence'])} · "
                 f"{source_label}】"
             )
             sections = [header]
@@ -14020,8 +14169,14 @@ class BridgeStore:
     ) -> dict[str, Any]:
         if row is None:
             raise NotFoundError("message row disappeared")
+        keys = set(row.keys())
         payload = {
             "sequence": int(row["sequence"]),
+            "room_sequence": (
+                int(row["room_sequence"])
+                if "room_sequence" in keys and row["room_sequence"] is not None
+                else int(row["sequence"])
+            ),
             "message_id": str(row["message_id"]),
             "conversation_id": str(row["conversation_id"]),
             "sender_participant_id": str(row["sender_participant_id"]),
@@ -14054,7 +14209,6 @@ class BridgeStore:
             "claim_until": float(row["claim_until"]) if row["claim_until"] else None,
             "created_at": float(row["created_at"]),
         }
-        keys = set(row.keys())
         if (
             "forwarded_from_message_id" in keys
             and row["forwarded_from_message_id"] is not None

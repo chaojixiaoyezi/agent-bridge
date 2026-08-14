@@ -1339,6 +1339,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert malicious not in client.get("/").text
     payload = client.get("/api/rooms/room-one/messages").json()
     assert payload["messages"][-1]["body"] == malicious
+    assert [item["room_sequence"] for item in payload["messages"]] == [1, 2]
     incremental = client.get(
         f"/api/rooms/room-one/messages?after_sequence={payload['messages'][0]['sequence']}"
     ).json()
@@ -1391,8 +1392,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-9" in index_html
-    assert "app.css?v=20260814-9" in index_html
+    assert "app.js?v=20260814-10" in index_html
+    assert "app.css?v=20260814-10" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -1405,6 +1406,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert "webRegistrationMode" in javascript
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript
+    assert "function roomSequence" in javascript
     assert "/receipts?limit=" in javascript
     assert 'mode: taskMode ? "task" : "room"' in javascript
     assert "state_revisions" in javascript

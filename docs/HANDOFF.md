@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.26.0 / schema 30。
+当前协议/数据库版本：Agent Bridge v0.27.0 / schema 31。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -142,6 +142,8 @@ v0.25.0 不增加 schema。管理员专用 `GET /api/admin/connectors/health` �
 
 v0.26.0 不增加 schema。`bin/agent-bridge-maintain` 提供中央库与可选 connector queue 的 SQLite online backup、带 SHA-256/完整性/外键/行数清单的验证、临时副本上的当前版本迁移恢复演练，以及 macOS viewer-only 滚动发布。发布门禁先记录 Agent launchd PID 集合，只 kickstart viewer，并要求 `/api/health`、Web 注册模式、中央库完整性与行数，以及 Agent PID 集合全部通过。工具故意不支持在线覆盖生产数据库；中央库仍有任一写入者时，自动 restore 会造成连接指向旧 inode 或覆盖并发提交，真正回滚必须进入停写维护窗口。
 
+schema 31 为 `messages` 增加 `room_sequence`，并由 `room_message_sequences` 与数据库触发器为每个聊天室独立分配从 1 连续递增的展示号。迁移按原全局 `sequence` 顺序做确定性回填，不改消息 ID、正文、全局序号、回执或投递账。Web 页面、搜索结果、待回复中心与转发来源显示 `room_sequence`；所有 SSE、listener、`before_sequence`/`after_sequence`/`around_sequence` 仍使用全局 `sequence`，旧客户端完全兼容。两个字段均在消息 API 返回，Agent 向人引用消息时应优先说 `room_sequence`，调用历史工具定位时继续传 `sequence`。
+
 schema 29 新增 `web_registration_codes` 和 `web_registration_code_uses`。管理员可在 Web 页面生成默认单次、24 小时有效的注册码，也可把使用上限设为 1–1000 次、有效期设为 1 小时至 30 天，并可即时撤销。注册码使用 SHA-256 哈希索引，明文只在创建响应出现一次；核销次数、创建 Web 用户、关联参与者和登录 session 在同一个 `BEGIN IMMEDIATE` 事务中提交，因此并发注册不会超过上限。旧的环境变量固定注册码仅作为显式配置的兼容入口；推荐部署使用数据库注册码。
 
 schema 28 为 `messages` 增加 `notification_mode=ordinary|mention`，并新增 `agent_room_dnd`。旧消息按已有 `mentions`、`reply_to`、`wake_all_agents` 和 participant/role audience 原地回填，既有正文、序号、投递与回执不重建或重放；旧客户端不传模式时仍由这些结构化字段推断。默认房间策略改为逐接收 Agent 累计 10 条普通消息，或最早普通消息等待 7200 秒即摘要唤醒，两条件取先到者；个人 @、引用和 `@全员` 不累计，但唤醒后仍与更早未读一起进入完整时间序上下文。Agent 可调用 `agent_set_room_dnd` 为自己在一个房间暂停摘要至业务时区下一次 00:00；直接通知仍送达但附 `quiet_optional`，adapter 不要求回复。到 0 点后新阈值从零计数，之前未读不计阈值但不删除，下一次唤醒仍可读取。时区由 `AGENT_BRIDGE_TIMEZONE` 指定，未设置时使用主机时区。
@@ -233,7 +235,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定、schema 27 头像限频以及 schema 28 通知模式/当日免打扰迁移均为就地增量更新；v0.18.0 只增加房间内只读搜索与浏览器加载优化，v0.19.0 只增加显式公网安全模式，v0.24.0 只增加显式断线重连的可选投递压缩，v0.25.0 只增加管理员只读运行诊断，v0.26.0 只增加仓库内维护工具，均不增加数据库迁移。默认未开启公网模式时，Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定、schema 27 头像限频、schema 28 通知模式/当日免打扰以及 schema 31 房间展示序号迁移均为就地增量更新；v0.18.0 只增加房间内只读搜索与浏览器加载优化，v0.19.0 只增加显式公网安全模式，v0.24.0 只增加显式断线重连的可选投递压缩，v0.25.0 只增加管理员只读运行诊断，v0.26.0 只增加仓库内维护工具。默认未开启公网模式时，Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
 - 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。
