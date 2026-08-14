@@ -117,6 +117,7 @@ SESSION_COMPONENTS = CONNECTOR_COMPONENTS | {"a2a", "unknown"}
 MESSAGE_SENDER_SEATS = {"main", "shadow", "executor", "web", "a2a", "unknown"}
 ROOM_WAKE_MODES = {"mention", "digest", "all"}
 MESSAGE_NOTIFICATION_MODES = {"ordinary", "mention"}
+ROOM_MESSAGE_MARKER_KINDS = {"pin", "decision"}
 DEFAULT_ROOM_WAKE_MODE = "digest"
 DEFAULT_ROOM_DIGEST_MIN_MESSAGES = 10
 DEFAULT_ROOM_DIGEST_AFTER_SECONDS = 2 * 60 * 60
@@ -506,6 +507,30 @@ WHEN OLD.room_sequence IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'ROOM_MESSAGE_SEQUENCE_IMMUTABLE');
 END;
+"""
+
+
+ROOM_KNOWLEDGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS room_message_markers (
+    conversation_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    marker_kind TEXT NOT NULL CHECK (marker_kind IN ('pin', 'decision')),
+    note TEXT NOT NULL DEFAULT '',
+    created_by_web_user_id TEXT NOT NULL,
+    updated_by_web_user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (conversation_id, message_id, marker_kind),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
+    FOREIGN KEY (message_id) REFERENCES messages(message_id),
+    FOREIGN KEY (created_by_web_user_id) REFERENCES web_users(user_id),
+    FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_message_markers_room_kind_updated
+    ON room_message_markers(
+        conversation_id, marker_kind, updated_at DESC, message_id
+    );
 """
 
 
@@ -1547,6 +1572,7 @@ class BridgeStore:
             conn.executescript(WEB_AUTH_SCHEMA)
             self._migrate_web_user_room_permissions(conn)
             conn.executescript(ROOM_GOVERNANCE_SCHEMA)
+            conn.executescript(ROOM_KNOWLEDGE_SCHEMA)
             conn.executescript(ROOM_WAKE_POLICY_SCHEMA)
             conn.executescript(ROOM_TASK_SCHEMA)
             if schema_version < 30:
@@ -1680,7 +1706,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 31")
+            conn.execute("PRAGMA user_version = 32")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -8339,6 +8365,155 @@ class BridgeStore:
             ),
         }
 
+    @staticmethod
+    def _normalize_room_marker_kind(value: str) -> str:
+        normalized = str(value or "").strip().casefold()
+        if normalized not in ROOM_MESSAGE_MARKER_KINDS:
+            raise ValidationError("marker_kind must be pin or decision")
+        return normalized
+
+    @staticmethod
+    def _normalize_room_marker_note(value: str | None) -> str:
+        normalized = str(value or "").strip()
+        if len(normalized) > 2_000:
+            raise ValidationError("marker note must contain at most 2000 characters")
+        if any(
+            ord(character) < 32 and character not in "\t\n\r"
+            for character in normalized
+        ):
+            raise ValidationError("marker note contains invalid control characters")
+        return normalized
+
+    def set_room_message_marker(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        marker_kind: str,
+        note: str | None,
+        requesting_web_user_id: str,
+    ) -> dict[str, Any]:
+        """Pin a room message or retain it as an explicit decision record."""
+
+        conversation = validate_conversation_id(conversation_id)
+        message = opaque_id(message_id, field="message_id")
+        kind = self._normalize_room_marker_kind(marker_kind)
+        normalized_note = self._normalize_room_marker_note(note)
+        actor = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=actor,
+                conversation_id=conversation,
+            )
+            if not permissions["can_manage_highlights"]:
+                raise AuthorizationError(
+                    "只有管理员、聊天室创建者或聊天室管理员可以维护房间要点"
+                )
+            room_message = conn.execute(
+                "SELECT message_id FROM messages "
+                "WHERE message_id = ? AND conversation_id = ?",
+                (message, conversation),
+            ).fetchone()
+            if room_message is None:
+                raise NotFoundError(
+                    f"unknown message {message} in conversation {conversation}"
+                )
+            conn.execute(
+                """
+                INSERT INTO room_message_markers
+                    (conversation_id, message_id, marker_kind, note,
+                     created_by_web_user_id, updated_by_web_user_id,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id, message_id, marker_kind) DO UPDATE
+                SET note = excluded.note,
+                    updated_by_web_user_id = excluded.updated_by_web_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation,
+                    message,
+                    kind,
+                    normalized_note,
+                    actor,
+                    actor,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM room_message_markers "
+                "WHERE conversation_id = ? AND message_id = ? "
+                "AND marker_kind = ?",
+                (conversation, message, kind),
+            ).fetchone()
+        return self._room_message_marker_payload(row)
+
+    def remove_room_message_marker(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        marker_kind: str,
+        requesting_web_user_id: str,
+    ) -> dict[str, Any]:
+        conversation = validate_conversation_id(conversation_id)
+        message = opaque_id(message_id, field="message_id")
+        kind = self._normalize_room_marker_kind(marker_kind)
+        actor = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        with self._transaction() as conn:
+            permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=actor,
+                conversation_id=conversation,
+            )
+            if not permissions["can_manage_highlights"]:
+                raise AuthorizationError(
+                    "只有管理员、聊天室创建者或聊天室管理员可以维护房间要点"
+                )
+            row = conn.execute(
+                "SELECT * FROM room_message_markers "
+                "WHERE conversation_id = ? AND message_id = ? "
+                "AND marker_kind = ?",
+                (conversation, message, kind),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("room message marker does not exist")
+            conn.execute(
+                "DELETE FROM room_message_markers "
+                "WHERE conversation_id = ? AND message_id = ? "
+                "AND marker_kind = ?",
+                (conversation, message, kind),
+            )
+        payload = self._room_message_marker_payload(row)
+        payload["removed"] = True
+        return payload
+
+    @staticmethod
+    def _room_message_marker_payload(
+        row: sqlite3.Row | None,
+    ) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("room message marker disappeared")
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "message_id": str(row["message_id"]),
+            "marker_kind": str(row["marker_kind"]),
+            "note": str(row["note"] or ""),
+            "created_by_web_user_id": str(row["created_by_web_user_id"]),
+            "updated_by_web_user_id": str(row["updated_by_web_user_id"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
     def rename_room(
         self,
         *,
@@ -8397,6 +8572,7 @@ class BridgeStore:
                 "agent_sessions",
                 "messages",
                 "room_message_sequences",
+                "room_message_markers",
                 "agent_invitations",
                 "agent_connectors",
                 "agent_room_blocks",
@@ -13928,6 +14104,7 @@ class BridgeStore:
             "is_room_moderator": is_moderator,
             "can_wake_all": can_manage,
             "can_manage_wake_policy": can_manage,
+            "can_manage_highlights": can_manage,
             "can_manage_web_members": can_manage,
             "can_delegate_room_moderators": is_global_admin or is_room_owner,
             "can_invite_agents": can_manage,

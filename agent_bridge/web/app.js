@@ -62,6 +62,8 @@ const state = {
   roomSearchHasMore: false,
   roomSearchNextBefore: null,
   roomSearchTargetMessageId: null,
+  roomHighlights: { items: [], pins: [], decisions: [], count: 0 },
+  highlightsLoadedRoom: null,
   avatarCatalog: null,
   avatarByKey: new Map(),
   profileAvatarKey: "auto",
@@ -124,6 +126,7 @@ const elements = {
   repairResidents: document.querySelector("#repair-residents"),
   manageWakePolicy: document.querySelector("#manage-wake-policy"),
   manageTaskPermissions: document.querySelector("#manage-task-permissions"),
+  openRoomHighlights: document.querySelector("#open-room-highlights"),
   renameRoom: document.querySelector("#rename-room"),
   themeSelect: document.querySelector("#theme-select"),
   composerChatMode: document.querySelector("#composer-chat-mode"),
@@ -163,6 +166,16 @@ const elements = {
   pendingCenterSummary: document.querySelector("#pending-center-summary"),
   pendingCenterFeedback: document.querySelector("#pending-center-feedback"),
   pendingCenterList: document.querySelector("#pending-center-list"),
+  roomHighlightsDialog: document.querySelector("#room-highlights-dialog"),
+  closeRoomHighlights: document.querySelector("#close-room-highlights"),
+  roomHighlightsTitle: document.querySelector("#room-highlights-title"),
+  roomHighlightsFeedback: document.querySelector("#room-highlights-feedback"),
+  roomHighlightsList: document.querySelector("#room-highlights-list"),
+  messageThreadDialog: document.querySelector("#message-thread-dialog"),
+  closeMessageThread: document.querySelector("#close-message-thread"),
+  messageThreadTitle: document.querySelector("#message-thread-title"),
+  messageThreadFeedback: document.querySelector("#message-thread-feedback"),
+  messageThreadList: document.querySelector("#message-thread-list"),
   registrationCodeDialog: document.querySelector("#registration-code-dialog"),
   closeRegistrationCodes: document.querySelector("#close-registration-codes"),
   registrationCodeForm: document.querySelector("#registration-code-form"),
@@ -630,6 +643,8 @@ function showAuthScreen(message = "") {
   state.participants = [];
   state.hasEarlierMessages = false;
   state.hasLaterMessages = false;
+  state.roomHighlights = { items: [], pins: [], decisions: [], count: 0 };
+  state.highlightsLoadedRoom = null;
   state.pendingCenter = {
     pending_responses: [],
     active_tasks: [],
@@ -654,6 +669,8 @@ function showAuthScreen(message = "") {
     elements.memberManagementDialog,
     elements.agentAccessDialog,
     elements.pendingCenterDialog,
+    elements.roomHighlightsDialog,
+    elements.messageThreadDialog,
   ]) {
     if (dialog.open) dialog.close();
   }
@@ -697,6 +714,7 @@ function applyUserPermissions() {
   elements.manageTaskPermissions.hidden = !(
     activeRoom?.can_manage_task_permissions && activeRoom.status === "active"
   );
+  elements.openRoomHighlights.hidden = !activeRoom;
   elements.wakeAllAgents.hidden = !(activeRoom?.can_wake_all && activeRoom.status === "active");
   elements.openAccount.textContent = `${state.currentUser.display_name}${admin ? " · 管理员" : ""}`;
   const agentGlobal = state.messageRateLimits?.agent_global_cooldown_seconds ?? 15;
@@ -923,6 +941,7 @@ function senderSeatLabel(message) {
 function createMessageElement(message) {
   const article = makeElement("article", "message");
   article.dataset.messageId = message.message_id;
+  const messageMarkers = roomMarkersForMessage(message.message_id);
   const head = makeElement("div", "message-head");
   const senderLine = makeElement("div", "sender-line");
   senderLine.append(createAvatarElement({
@@ -943,6 +962,16 @@ function createMessageElement(message) {
   const signature = message.sender_signature || message.sender_alias || "未填写签名";
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
+  for (const marker of messageMarkers) {
+    const markerLabel = marker.marker_kind === "decision" ? "决策" : "置顶";
+    const markerBadge = makeElement(
+      "span",
+      `message-marker-badge ${marker.marker_kind}`,
+      markerLabel,
+    );
+    if (marker.note) markerBadge.title = marker.note;
+    senderLine.append(markerBadge);
+  }
   if (message.task) {
     const statusLabel = {
       queued: "等待领取",
@@ -1116,6 +1145,52 @@ function createMessageElement(message) {
     replyButton.addEventListener("click", () => startComposerReply(message));
     article.append(replyButton);
   }
+  const rootMessage = message.reply_to
+    ? state.messages.find((item) => item.message_id === message.reply_to)
+    : message;
+  const loadedReplyCount = state.messages.filter(
+    (item) => item.reply_to === (rootMessage?.message_id || message.message_id),
+  ).length;
+  const replyCount = Math.max(
+    loadedReplyCount,
+    Number(rootMessage?.reply_count || message.reply_count || 0),
+  );
+  if (message.reply_to || replyCount > 0) {
+    const threadButton = makeElement(
+      "button",
+      "message-reply-button message-thread-button",
+      replyCount > 0 ? `话题串 · ${replyCount}` : "查看话题串",
+    );
+    threadButton.type = "button";
+    threadButton.addEventListener("click", () => openMessageThread(message));
+    article.append(threadButton);
+  }
+  if (selectedRoom?.can_manage_highlights) {
+    const knowledgeActions = makeElement("span", "message-knowledge-actions");
+    for (const markerKind of ["pin", "decision"]) {
+      const active = messageMarkers.some((item) => item.marker_kind === markerKind);
+      const label = markerKind === "decision"
+        ? (active ? "取消决策" : "记为决策")
+        : (active ? "取消置顶" : "置顶");
+      const markerButton = makeElement(
+        "button",
+        `message-reply-button message-marker-button ${markerKind}${active ? " active" : ""}`,
+        label,
+      );
+      markerButton.type = "button";
+      markerButton.addEventListener("click", async () => {
+        markerButton.disabled = true;
+        try {
+          await toggleRoomMarker(message, markerKind);
+        } catch (error) {
+          window.alert(`${markerKind === "decision" ? "决策" : "置顶"}操作失败：${error.message}`);
+          markerButton.disabled = false;
+        }
+      });
+      knowledgeActions.append(markerButton);
+    }
+    article.append(knowledgeActions);
+  }
   if (isAdmin() && message.message_kind !== "forward" && state.rooms.some(
     (room) => room.status === "active" && room.conversation_id !== message.conversation_id
   )) {
@@ -1139,7 +1214,7 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${item.reply_count || 0}`).join("|")}`;
 }
 
 function renderMessages(
@@ -2076,6 +2151,10 @@ function cacheActiveRoomSnapshot() {
     scrollTop: elements.timeline.scrollTop,
     nearBottom: isNearTimelineBottom(),
     searchTargetMessageId: state.roomSearchTargetMessageId,
+    roomHighlights: state.highlightsLoadedRoom === roomId
+      ? state.roomHighlights
+      : { items: [], pins: [], decisions: [], count: 0 },
+    highlightsLoaded: state.highlightsLoadedRoom === roomId,
     cachedAt: Date.now(),
   };
   state.roomSnapshots.delete(roomId);
@@ -2098,6 +2177,9 @@ function restoreRoomSnapshot(roomId) {
   state.hasLaterMessages = Boolean(snapshot.hasLaterMessages);
   state.unreadMessages = snapshot.unreadMessages;
   state.roomSearchTargetMessageId = snapshot.searchTargetMessageId || null;
+  state.roomHighlights = snapshot.roomHighlights
+    || { items: [], pins: [], decisions: [], count: 0 };
+  state.highlightsLoadedRoom = snapshot.highlightsLoaded ? roomId : null;
   state.roomSnapshotRestoredAt = Number(snapshot.cachedAt || 0);
   state.participantRenderSignature = "";
   renderParticipants(state.participants);
@@ -2150,6 +2232,8 @@ async function selectRoom(roomId) {
     state.hasLaterMessages = false;
     state.unreadMessages = 0;
     state.roomSnapshotRestoredAt = 0;
+    state.roomHighlights = { items: [], pins: [], decisions: [], count: 0 };
+    state.highlightsLoadedRoom = null;
     renderParticipants([]);
     renderMessages([]);
   }
@@ -2159,6 +2243,7 @@ async function selectRoom(roomId) {
   refreshActiveRoom(!restored, !restored, {
     refreshParticipants: !snapshotFresh,
     refreshReceipts: restored && !snapshotFresh,
+    refreshHighlights: !snapshotFresh,
   }).catch((error) => {
     if (error.name !== "AbortError") console.error(error);
   });
@@ -2507,6 +2592,174 @@ elements.pendingCenterDialog.addEventListener("click", (event) => {
   if (event.target === elements.pendingCenterDialog) elements.pendingCenterDialog.close();
 });
 
+function roomMarkersForMessage(messageId) {
+  if (state.highlightsLoadedRoom !== state.selectedRoom) return [];
+  return (state.roomHighlights.items || []).filter(
+    (item) => item.message_id === messageId,
+  );
+}
+
+function roomHighlightSignature() {
+  if (state.highlightsLoadedRoom !== state.selectedRoom) return "";
+  return (state.roomHighlights.items || [])
+    .map((item) => `${item.message_id}:${item.marker_kind}:${item.marker_updated_at}:${item.note}`)
+    .sort()
+    .join("|");
+}
+
+async function loadRoomHighlights(roomId = state.selectedRoom) {
+  if (!roomId) return null;
+  const payload = await fetchJson(
+    `/api/rooms/${encodeURIComponent(roomId)}/highlights?limit=200`,
+  );
+  if (state.selectedRoom !== roomId) return payload;
+  state.roomHighlights = payload;
+  state.highlightsLoadedRoom = roomId;
+  state.messageRenderSignature = "";
+  return payload;
+}
+
+function renderRoomHighlights() {
+  elements.roomHighlightsList.replaceChildren();
+  const items = state.roomHighlights.items || [];
+  elements.roomHighlightsTitle.textContent = state.selectedRoom
+    ? `${state.selectedRoom} · 房间要点`
+    : "房间要点";
+  if (!items.length) {
+    elements.roomHighlightsList.append(makeElement(
+      "p",
+      "muted-copy",
+      "还没有置顶或决策记录。聊天室管理者可从任意消息下方添加。",
+    ));
+    return;
+  }
+  for (const kind of ["decision", "pin"]) {
+    const group = items.filter((item) => item.marker_kind === kind);
+    if (!group.length) continue;
+    elements.roomHighlightsList.append(makeElement(
+      "h3",
+      "room-highlight-section-title",
+      kind === "decision" ? `决策 · ${group.length}` : `置顶 · ${group.length}`,
+    ));
+    for (const item of group) {
+      const button = makeElement("button", `room-highlight-item ${kind}`);
+      button.type = "button";
+      const heading = makeElement("span", "room-highlight-heading");
+      heading.append(
+        makeElement("strong", "", `#${roomSequence(item)} · ${item.sender_display_name || item.sender_client_type}`),
+        makeElement("small", "", fullTime(item.message_created_at)),
+      );
+      button.append(heading);
+      if (item.note) button.append(makeElement("span", "room-highlight-note", item.note));
+      button.append(makeElement(
+        "span",
+        "room-highlight-body",
+        `${item.body_preview}${item.body_truncated ? "…" : ""}`,
+      ));
+      button.addEventListener("click", async () => {
+        elements.roomHighlightsDialog.close();
+        await locatePendingCenterItem(item);
+      });
+      elements.roomHighlightsList.append(button);
+    }
+  }
+}
+
+async function toggleRoomMarker(message, markerKind) {
+  const room = state.rooms.find(
+    (item) => item.conversation_id === message.conversation_id,
+  );
+  if (!room?.can_manage_highlights) return;
+  const existing = roomMarkersForMessage(message.message_id).find(
+    (item) => item.marker_kind === markerKind,
+  );
+  let note = existing?.note || "";
+  if (!existing && markerKind === "decision") {
+    const proposed = window.prompt(
+      "填写决策说明（可留空，原消息仍会完整保留）：",
+      "",
+    );
+    if (proposed === null) return;
+    note = proposed;
+  }
+  const endpoint = `/api/rooms/${encodeURIComponent(message.conversation_id)}/messages/${encodeURIComponent(message.message_id)}/markers/${encodeURIComponent(markerKind)}`;
+  await fetchJson(endpoint, {
+    method: existing ? "DELETE" : "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Agent-Bridge-Intent": "manage-room-highlight",
+    },
+    ...(existing ? {} : { body: JSON.stringify({ note }) }),
+  });
+  await loadRoomHighlights(message.conversation_id);
+  renderMessages(state.messages);
+  renderRoomHighlights();
+}
+
+async function openMessageThread(message) {
+  const roomId = message.conversation_id;
+  elements.messageThreadTitle.textContent = `${roomId} · 话题串`;
+  elements.messageThreadFeedback.classList.remove("error", "success");
+  elements.messageThreadFeedback.textContent = "正在读取话题…";
+  elements.messageThreadList.replaceChildren();
+  if (!elements.messageThreadDialog.open) elements.messageThreadDialog.showModal();
+  try {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/threads/${encodeURIComponent(message.message_id)}?limit=200`,
+    );
+    if (state.selectedRoom !== roomId) return;
+    for (const item of payload.messages || []) {
+      const article = makeElement(
+        "article",
+        `message-thread-item${item.reply_to ? " reply" : " root"}`,
+      );
+      const heading = makeElement("div", "message-thread-heading");
+      heading.append(
+        createAvatarElement({
+          avatarKey: item.sender_avatar_key,
+          clientType: item.sender_client_type,
+          label: item.sender_display_name,
+          className: "compact-avatar",
+        }),
+        makeElement("strong", "", item.sender_display_name || item.sender_client_type),
+        makeElement("small", "", `#${roomSequence(item)} · ${fullTime(item.created_at)}`),
+      );
+      article.append(heading, makeElement("p", "message-thread-body", item.body));
+      elements.messageThreadList.append(article);
+    }
+    elements.messageThreadFeedback.textContent = payload.has_more
+      ? "话题较长，当前显示前 200 条回复。"
+      : `${payload.reply_count || 0} 条回复。`;
+  } catch (error) {
+    elements.messageThreadFeedback.classList.add("error");
+    elements.messageThreadFeedback.textContent = `话题读取失败：${error.message}`;
+  }
+}
+
+elements.openRoomHighlights.addEventListener("click", async () => {
+  elements.roomHighlightsFeedback.classList.remove("error", "success");
+  elements.roomHighlightsFeedback.textContent = "正在读取房间要点…";
+  if (!elements.roomHighlightsDialog.open) elements.roomHighlightsDialog.showModal();
+  try {
+    await loadRoomHighlights();
+    renderRoomHighlights();
+    elements.roomHighlightsFeedback.textContent = state.roomHighlights.count
+      ? `已同步 ${state.roomHighlights.count} 条房间要点。`
+      : "当前还没有房间要点。";
+  } catch (error) {
+    elements.roomHighlightsFeedback.classList.add("error");
+    elements.roomHighlightsFeedback.textContent = `载入失败：${error.message}`;
+  }
+});
+elements.closeRoomHighlights.addEventListener("click", () => elements.roomHighlightsDialog.close());
+elements.roomHighlightsDialog.addEventListener("click", (event) => {
+  if (event.target === elements.roomHighlightsDialog) elements.roomHighlightsDialog.close();
+});
+elements.closeMessageThread.addEventListener("click", () => elements.messageThreadDialog.close());
+elements.messageThreadDialog.addEventListener("click", (event) => {
+  if (event.target === elements.messageThreadDialog) elements.messageThreadDialog.close();
+});
+
 elements.roomMessageSearchForm.addEventListener("submit", (event) => {
   event.preventDefault();
   searchRoomMessagesPage();
@@ -2599,6 +2852,7 @@ async function refreshActiveRoom(
     refreshParticipants = true,
     refreshTaskState = false,
     refreshReceipts = false,
+    refreshHighlights = false,
   } = {},
 ) {
   if (!state.selectedRoom) return;
@@ -2637,6 +2891,12 @@ async function refreshActiveRoom(
         { signal: controller.signal },
       )
     : Promise.resolve(null);
+  const highlightRequest = initialLoad || refreshHighlights
+    ? fetchJson(
+        `/api/rooms/${encodedRoom}/highlights?limit=200`,
+        { signal: controller.signal },
+      )
+    : Promise.resolve(null);
   let responses;
   try {
     responses = await Promise.all([
@@ -2648,6 +2908,7 @@ async function refreshActiveRoom(
           )
         : Promise.resolve(null),
       receiptRequest,
+      highlightRequest,
     ]);
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -2657,10 +2918,15 @@ async function refreshActiveRoom(
       state.roomRequestController = null;
     }
   }
-  const [messagePayload, participantPayload, receiptPayload] = responses;
+  const [messagePayload, participantPayload, receiptPayload, highlightPayload] = responses;
   if (requestVersion !== state.requestVersion) return;
   renderActiveRoomHeader(selectedRoom);
   if (participantPayload) renderParticipants(participantPayload.participants);
+  if (highlightPayload) {
+    state.roomHighlights = highlightPayload;
+    state.highlightsLoadedRoom = selectedRoom;
+    state.messageRenderSignature = "";
+  }
   if (messagePayload) {
     let addedCount = 0;
     let appendedMessages = [];
@@ -2690,6 +2956,7 @@ async function refreshActiveRoom(
     }
     const appendOnly = !initialLoad
       && !refreshTaskState
+      && !highlightPayload
       && appendedMessages.length > 0
       && appendedMessages.every((message) => Number(message.sequence) > lastLoadedSequence);
     if (appendOnly) {
@@ -2710,6 +2977,9 @@ async function refreshActiveRoom(
       return receipt ? { ...message, ...receipt } : message;
     });
     updateReceiptLabels(state.messages);
+    if (highlightPayload) renderMessages(state.messages);
+  } else if (highlightPayload) {
+    renderMessages(state.messages);
   } else if (forceScroll) {
     window.requestAnimationFrame(() => {
       elements.timeline.scrollTop = elements.timeline.scrollHeight;
@@ -2737,6 +3007,9 @@ function mergeRefreshOptions(current, incoming) {
       || incomingMode === "task"
     ),
     refreshReceipts: Boolean(current.refreshReceipts || incoming.refreshReceipts),
+    refreshHighlights: Boolean(
+      current.refreshHighlights || incoming.refreshHighlights,
+    ),
     forceDiagnostics: Boolean(
       current.forceDiagnostics || incoming.forceDiagnostics,
     ),
@@ -2824,6 +3097,7 @@ async function refresh(options = {}) {
           refreshParticipants: refreshPresence,
           refreshTaskState: mode === "task" || options.refreshTaskState === true,
           refreshReceipts: options.refreshReceipts === true,
+          refreshHighlights: options.refreshHighlights === true,
         },
       );
     }
@@ -4639,8 +4913,8 @@ function refreshModeForEvent(changedFacets) {
   if (!changedFacets.length) return null;
   const changed = new Set(changedFacets);
   const onlyContains = (allowed) => [...changed].every((item) => allowed.has(item));
-  if (onlyContains(new Set(["messages", "rooms", "receipts"]))) return "room";
-  if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts"]))) return "task";
+  if (onlyContains(new Set(["messages", "rooms", "receipts", "highlights"]))) return "room";
+  if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts", "highlights"]))) return "task";
   if (["participants", "memberships", "online", "sessions", "connectors"].some(
     (facet) => changed.has(facet),
   )) {
@@ -4702,6 +4976,7 @@ function connectOwnerEvents() {
           refreshTaskState: changedFacets.includes("nicknames")
             || changedFacets.includes("participants"),
           refreshReceipts: changedFacets.includes("receipts"),
+          refreshHighlights: changedFacets.includes("highlights"),
         });
       }
     }

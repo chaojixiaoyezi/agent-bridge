@@ -63,6 +63,7 @@ class ViewerRepository:
                     "room_task_policies",
                     "room_task_grants",
                     "room_tasks",
+                    "room_message_markers",
                 )
             }
             room_states = {
@@ -568,6 +569,10 @@ class ViewerRepository:
                         WHERE task_input.source_message_id = m.message_id
                     ) AS body_input_last_applied_at,
                     (
+                        SELECT COUNT(*) FROM messages AS reply
+                        WHERE reply.reply_to = m.message_id
+                    ) AS reply_count,
+                    (
                         SELECT COUNT(*) FROM receipts AS r
                         WHERE r.message_id = m.message_id AND r.state = 'acked'
                     ) AS ack_count,
@@ -601,6 +606,171 @@ class ViewerRepository:
         )
         result = [self._message_payload(row) for row in ordered_rows]
         return result
+
+    def message_thread(
+        self,
+        conversation_id: str,
+        message_id: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Return one root message plus direct replies in room order."""
+
+        conversation = validate_conversation_id(conversation_id)
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id or len(normalized_message_id) > 200:
+            raise ValueError("message_id is invalid")
+        normalized_limit = max(2, min(int(limit), 500))
+        with self._connection() as connection:
+            selected = connection.execute(
+                "SELECT message_id, reply_to FROM messages "
+                "WHERE conversation_id = ? AND message_id = ?",
+                (conversation, normalized_message_id),
+            ).fetchone()
+            if selected is None:
+                raise ValueError("message does not exist in this room")
+            root_message_id = str(selected["reply_to"] or selected["message_id"])
+            total_reply_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE conversation_id = ? AND reply_to = ?",
+                    (conversation, root_message_id),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT message.sequence, message.room_sequence,
+                       message.message_id, message.reply_to,
+                       message.sender_participant_id, message.sender_seat,
+                       message.message_kind, message.body, message.created_at,
+                       sender.client_type AS sender_client_type,
+                       sender.display_name AS sender_display_name,
+                       sender.signature AS sender_signature,
+                       sender.avatar_key AS sender_avatar_key
+                FROM messages AS message
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                WHERE message.conversation_id = ?
+                  AND (message.message_id = ? OR message.reply_to = ?)
+                ORDER BY message.sequence
+                LIMIT ?
+                """,
+                (
+                    conversation,
+                    root_message_id,
+                    root_message_id,
+                    normalized_limit + 1,
+                ),
+            ).fetchall()
+        has_more = total_reply_count + 1 > normalized_limit
+        page = rows[:normalized_limit]
+        messages = [self._thread_message_payload(row) for row in page]
+        return {
+            "conversation_id": conversation,
+            "root_message_id": root_message_id,
+            "messages": messages,
+            "reply_count": total_reply_count,
+            "has_more": has_more,
+        }
+
+    def room_highlights(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        conversation = validate_conversation_id(conversation_id)
+        normalized_limit = max(1, min(int(limit), 500))
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT marker.*, message.sequence, message.room_sequence,
+                       message.body, message.message_kind,
+                       message.sender_participant_id,
+                       message.created_at AS message_created_at,
+                       sender.client_type AS sender_client_type,
+                       sender.display_name AS sender_display_name,
+                       sender.avatar_key AS sender_avatar_key,
+                       creator.username AS created_by_username,
+                       creator.display_name AS created_by_display_name,
+                       updater.username AS updated_by_username,
+                       updater.display_name AS updated_by_display_name
+                FROM room_message_markers AS marker
+                JOIN messages AS message
+                  ON message.message_id = marker.message_id
+                 AND message.conversation_id = marker.conversation_id
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                JOIN web_users AS creator
+                  ON creator.user_id = marker.created_by_web_user_id
+                JOIN web_users AS updater
+                  ON updater.user_id = marker.updated_by_web_user_id
+                WHERE marker.conversation_id = ?
+                ORDER BY CASE marker.marker_kind
+                             WHEN 'decision' THEN 0 ELSE 1
+                         END,
+                         marker.updated_at DESC,
+                         message.sequence DESC
+                LIMIT ?
+                """,
+                (conversation, normalized_limit),
+            ).fetchall()
+        items = [self._room_highlight_payload(row) for row in rows]
+        return {
+            "conversation_id": conversation,
+            "items": items,
+            "pins": [item for item in items if item["marker_kind"] == "pin"],
+            "decisions": [
+                item for item in items if item["marker_kind"] == "decision"
+            ],
+            "count": len(items),
+        }
+
+    @staticmethod
+    def _thread_message_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "sequence": int(row["sequence"]),
+            "room_sequence": int(row["room_sequence"] or row["sequence"]),
+            "message_id": str(row["message_id"]),
+            "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
+            "sender_participant_id": str(row["sender_participant_id"]),
+            "sender_seat": str(row["sender_seat"] or "unknown"),
+            "sender_client_type": str(row["sender_client_type"]),
+            "sender_display_name": str(row["sender_display_name"]),
+            "sender_signature": str(row["sender_signature"]),
+            "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
+            "message_kind": str(row["message_kind"] or "message"),
+            "body": str(row["body"]),
+            "created_at": float(row["created_at"]),
+        }
+
+    @staticmethod
+    def _room_highlight_payload(row: sqlite3.Row) -> dict[str, Any]:
+        body = str(row["body"])
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "message_id": str(row["message_id"]),
+            "sequence": int(row["sequence"]),
+            "room_sequence": int(row["room_sequence"] or row["sequence"]),
+            "marker_kind": str(row["marker_kind"]),
+            "note": str(row["note"] or ""),
+            "message_kind": str(row["message_kind"] or "message"),
+            "body_preview": body[:1_000],
+            "body_truncated": len(body) > 1_000,
+            "sender_participant_id": str(row["sender_participant_id"]),
+            "sender_client_type": str(row["sender_client_type"]),
+            "sender_display_name": str(row["sender_display_name"]),
+            "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
+            "message_created_at": float(row["message_created_at"]),
+            "created_by_web_user_id": str(row["created_by_web_user_id"]),
+            "created_by_username": str(row["created_by_username"]),
+            "created_by_display_name": str(row["created_by_display_name"]),
+            "updated_by_web_user_id": str(row["updated_by_web_user_id"]),
+            "updated_by_username": str(row["updated_by_username"]),
+            "updated_by_display_name": str(row["updated_by_display_name"]),
+            "marker_created_at": float(row["created_at"]),
+            "marker_updated_at": float(row["updated_at"]),
+        }
 
     def message_window_bounds(
         self,
@@ -1299,6 +1469,27 @@ class ViewerRepository:
                     "SELECT COALESCE(MAX(acked_at), 0) FROM receipts"
                 ).fetchone()[0]
             )
+            if visible is None:
+                highlight_revision: object = str(
+                    connection.execute(
+                        "SELECT CAST(COUNT(*) AS TEXT) || ':' || "
+                        "CAST(COALESCE(MAX(updated_at), 0) AS TEXT) "
+                        "FROM room_message_markers"
+                    ).fetchone()[0]
+                )
+            elif not visible:
+                highlight_revision = "0:0"
+            else:
+                placeholders = ",".join("?" for _ in visible)
+                highlight_revision = str(
+                    connection.execute(
+                        f"SELECT CAST(COUNT(*) AS TEXT) || ':' || "
+                        f"CAST(COALESCE(MAX(updated_at), 0) AS TEXT) "
+                        f"FROM room_message_markers "
+                        f"WHERE conversation_id IN ({placeholders})",
+                        sorted(visible),
+                    ).fetchone()[0]
+                )
         if not include_admin_state:
             pending_nicknames = 0
             nickname_revision = 0.0
@@ -1348,6 +1539,10 @@ class ViewerRepository:
                 task_permission_revision,
             )
             receipt_revision = private_revision("receipts", receipt_revision)
+            highlight_revision = private_revision(
+                "highlights",
+                highlight_revision,
+            )
             combined_task_revision: object = private_revision(
                 "task-state",
                 [task_revision, task_permission_revision],
@@ -1374,6 +1569,7 @@ class ViewerRepository:
             "tasks": task_revision,
             "task_permissions": task_permission_revision,
             "receipts": receipt_revision,
+            "highlights": highlight_revision,
             "rates": rate_revision,
         }
         return {
@@ -1398,6 +1594,7 @@ class ViewerRepository:
                 combined_task_revision,
                 rate_revision,
                 receipt_revision,
+                highlight_revision,
             ],
             "server_time": now,
         }
@@ -1706,6 +1903,8 @@ class ViewerRepository:
             "ack_count": int(row["ack_count"] or 0),
             "receipt_count": int(row["receipt_count"] or 0),
             "created_at": float(row["created_at"]),
+            "thread_root_message_id": str(row["reply_to"] or row["message_id"]),
+            "reply_count": int(row["reply_count"] or 0),
         }
         if row["forwarded_from_message_id"] is not None:
             payload["forwarded_from"] = {

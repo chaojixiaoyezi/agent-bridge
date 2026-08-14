@@ -552,6 +552,7 @@ def test_room_owner_delegates_scoped_moderator_controls(
     assert moderator_room["can_kick_agents"] is True
     assert moderator_room["can_wake_all"] is True
     assert moderator_room["can_manage_wake_policy"] is True
+    assert moderator_room["can_manage_highlights"] is True
     assert moderator_room["can_delegate_room_moderators"] is False
     assert moderator_room["can_rename_room"] is False
     assert moderator_room["can_manage_task_permissions"] is False
@@ -568,6 +569,7 @@ def test_room_owner_delegates_scoped_moderator_controls(
     assert member_room["can_manage_web_members"] is False
     assert member_room["can_invite_agents"] is False
     assert member_room["can_wake_all"] is False
+    assert member_room["can_manage_highlights"] is False
 
     cannot_delegate = moderator_client.put(
         f"/api/rooms/delegated-room/web-users/{outsider['user_id']}",
@@ -1367,6 +1369,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         "tasks",
         "task_permissions",
         "receipts",
+        "highlights",
         "rates",
     }
     assert event_snapshot["changed_rooms"] == [
@@ -1392,8 +1395,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-10" in index_html
-    assert "app.css?v=20260814-10" in index_html
+    assert "app.js?v=20260814-11" in index_html
+    assert "app.css?v=20260814-11" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -1407,6 +1410,10 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript
     assert "function roomSequence" in javascript
+    assert "function openMessageThread" in javascript
+    assert "function renderRoomHighlights" in javascript
+    assert 'id="open-room-highlights"' in index_html
+    assert 'id="message-thread-dialog"' in index_html
     assert "/receipts?limit=" in javascript
     assert 'mode: taskMode ? "task" : "room"' in javascript
     assert "state_revisions" in javascript
@@ -2757,6 +2764,95 @@ def test_lan_same_origin_user_can_chat_but_cannot_revoke_agent_session(
         },
     )
     assert cross_origin.status_code == 403
+
+
+def test_room_thread_and_highlight_routes_are_scoped_and_role_guarded(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "room-knowledge.db"
+    store, _sender, _receiver = seed(database)
+    admin_client = TestClient(make_app(database))
+    login_admin(admin_client)
+    root = ViewerRepository(database).messages("room-one")[0]
+    reply_response = admin_client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(admin_client, "send-message"),
+        json={
+            "body": "引用原消息补充结论。",
+            "reply_to": root["message_id"],
+        },
+    )
+    assert reply_response.status_code == 201
+    reply = reply_response.json()["message"]
+
+    thread = admin_client.get(
+        f"/api/rooms/room-one/threads/{reply['message_id']}"
+    )
+    assert thread.status_code == 200
+    assert thread.json()["root_message_id"] == root["message_id"]
+    assert thread.json()["reply_count"] == 1
+    assert [item["message_id"] for item in thread.json()["messages"]] == [
+        root["message_id"],
+        reply["message_id"],
+    ]
+
+    revision_before = ViewerRepository(database).event_snapshot()[
+        "state_revisions"
+    ]["highlights"]
+    pin = admin_client.put(
+        f"/api/rooms/room-one/messages/{root['message_id']}/markers/pin",
+        headers=intent_headers(admin_client, "manage-room-highlight"),
+        json={"note": "当前重点"},
+    )
+    assert pin.status_code == 200
+    decision = admin_client.put(
+        f"/api/rooms/room-one/messages/{root['message_id']}/markers/decision",
+        headers=intent_headers(admin_client, "manage-room-highlight"),
+        json={"note": "确认执行"},
+    )
+    assert decision.status_code == 200
+    highlights = admin_client.get("/api/rooms/room-one/highlights")
+    assert highlights.status_code == 200
+    assert highlights.json()["count"] == 2
+    assert [item["marker_kind"] for item in highlights.json()["items"]] == [
+        "decision",
+        "pin",
+    ]
+    assert highlights.json()["decisions"][0]["note"] == "确认执行"
+    assert ViewerRepository(database).event_snapshot()["state_revisions"][
+        "highlights"
+    ] != revision_before
+
+    member_client = TestClient(make_app(database))
+    member = register_web_user(member_client, username="knowledge-reader")
+    grant_web_room_access(database, user=member, room="room-one")
+    assert member_client.get("/api/rooms/room-one/highlights").status_code == 200
+    assert member_client.get(
+        f"/api/rooms/room-one/threads/{root['message_id']}"
+    ).status_code == 200
+    denied = member_client.put(
+        f"/api/rooms/room-one/messages/{root['message_id']}/markers/pin",
+        headers=intent_headers(member_client, "manage-room-highlight"),
+        json={"note": "越权修改"},
+    )
+    assert denied.status_code == 403
+    assert member_client.get("/api/rooms/room-two/highlights").status_code == 403
+
+    removed = admin_client.delete(
+        f"/api/rooms/room-one/messages/{root['message_id']}/markers/pin",
+        headers=intent_headers(admin_client, "manage-room-highlight"),
+    )
+    assert removed.status_code == 200
+    assert removed.json()["marker"]["removed"] is True
+    with store._connection() as connection:
+        original = connection.execute(
+            "SELECT body, sequence, room_sequence FROM messages "
+            "WHERE message_id = ?",
+            (root["message_id"],),
+        ).fetchone()
+    assert original["body"] == root["body"]
+    assert original["sequence"] == root["sequence"]
+    assert original["room_sequence"] == root["room_sequence"]
 
 
 def test_admin_manages_global_and_individual_message_rates(

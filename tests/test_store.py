@@ -284,12 +284,114 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
         ("迁移房间一", 2),
     ]
+
+
+def test_room_threads_and_highlights_preserve_original_messages_across_rename(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    root_sender = register(store, client="codex", name="决策发起人", room="决策群")
+    reply_sender = register(
+        store,
+        client="claude-code",
+        name="决策回复人",
+        room="决策群",
+    )
+    root = store.send(
+        authorized_session_id=root_sender["session_id"],
+        sender_participant_id=root_sender["participant_id"],
+        conversation_id="决策群",
+        body_text="采用方案 A，并保留原始讨论。",
+    )
+    reply = store.send(
+        authorized_session_id=reply_sender["session_id"],
+        sender_participant_id=reply_sender["participant_id"],
+        conversation_id="决策群",
+        body_text="同意，补充回滚检查。",
+        reply_to=root["message_id"],
+    )
+    admin_id = admin_web_user_id(store)
+    original_row = (
+        root["conversation_id"],
+        root["message_id"],
+        root["sequence"],
+        root["room_sequence"],
+        root["body"],
+    )
+
+    pin = store.set_room_message_marker(
+        conversation_id="决策群",
+        message_id=root["message_id"],
+        marker_kind="pin",
+        note="本周重点",
+        requesting_web_user_id=admin_id,
+    )
+    decision = store.set_room_message_marker(
+        conversation_id="决策群",
+        message_id=root["message_id"],
+        marker_kind="decision",
+        note="已确认采用方案 A",
+        requesting_web_user_id=admin_id,
+    )
+    assert pin["message_id"] == root["message_id"]
+    assert decision["note"] == "已确认采用方案 A"
+
+    repository = ViewerRepository(store.database)
+    thread = repository.message_thread("决策群", reply["message_id"])
+    assert thread["root_message_id"] == root["message_id"]
+    assert thread["reply_count"] == 1
+    assert [item["message_id"] for item in thread["messages"]] == [
+        root["message_id"],
+        reply["message_id"],
+    ]
+    highlights = repository.room_highlights("决策群")
+    assert highlights["count"] == 2
+    assert [item["marker_kind"] for item in highlights["items"]] == [
+        "decision",
+        "pin",
+    ]
+
+    renamed = store.rename_room(
+        conversation_id="决策群",
+        new_conversation_id="决策归档群",
+        renamed_by_web_user_id=admin_id,
+    )
+    assert renamed["conversation_id"] == "决策归档群"
+    renamed_highlights = repository.room_highlights("决策归档群")
+    assert renamed_highlights["count"] == 2
+    with store._connection() as connection:
+        row = connection.execute(
+            "SELECT conversation_id, message_id, sequence, room_sequence, body "
+            "FROM messages WHERE message_id = ?",
+            (root["message_id"],),
+        ).fetchone()
+    assert (
+        row["conversation_id"],
+        row["message_id"],
+        row["sequence"],
+        row["room_sequence"],
+        row["body"],
+    ) == (
+        "决策归档群",
+        *original_row[1:],
+    )
+
+    removed = store.remove_room_message_marker(
+        conversation_id="决策归档群",
+        message_id=root["message_id"],
+        marker_kind="pin",
+        requesting_web_user_id=admin_id,
+    )
+    assert removed["removed"] is True
+    assert ViewerRepository(store.database).room_highlights("决策归档群")[
+        "count"
+    ] == 1
 
 
 def test_structured_tasks_are_separate_from_chat_authorization_and_claim_once(
@@ -1069,7 +1171,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1141,7 +1243,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1370,7 +1472,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -2707,7 +2809,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 31
+    assert version == 32
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2779,7 +2881,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 31
+    assert version == 32
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2875,7 +2977,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 31
+    assert version == 32
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4728,7 +4830,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 32
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4783,7 +4885,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 31
+    assert version == 32
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5494,7 +5596,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

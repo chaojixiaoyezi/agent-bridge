@@ -1925,6 +1925,65 @@ def create_app(
             }
         )
 
+    async def room_message_thread(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            return JSONResponse(
+                repository.message_thread(
+                    conversation,
+                    request.path_params["message_id"],
+                    limit=_int_query(request, "limit", default=200, maximum=500),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def room_highlights(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            return JSONResponse(
+                repository.room_highlights(
+                    conversation,
+                    limit=_int_query(request, "limit", default=200, maximum=500),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def room_message_marker(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="manage-room-highlight")
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            if request.method == "PUT":
+                payload = await _json_body(
+                    request,
+                    required=set(),
+                    allowed={"note"},
+                )
+                marker = store.set_room_message_marker(
+                    conversation_id=conversation,
+                    message_id=request.path_params["message_id"],
+                    marker_kind=request.path_params["marker_kind"],
+                    note=payload.get("note"),
+                    requesting_web_user_id=str(identity["user_id"]),
+                )
+            else:
+                marker = store.remove_room_message_marker(
+                    conversation_id=conversation,
+                    message_id=request.path_params["message_id"],
+                    marker_kind=request.path_params["marker_kind"],
+                    requesting_web_user_id=str(identity["user_id"]),
+                )
+            return JSONResponse({"marker": marker})
+        except Exception as exc:
+            return _json_error(exc)
+
     async def search_room_messages(request: Request) -> Response:
         try:
             identity = authenticated_web_user(request)
@@ -3328,6 +3387,22 @@ def create_app(
                 "/api/rooms/{conversation_id:str}/messages",
                 messages,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/threads/{message_id:str}",
+                room_message_thread,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/highlights",
+                room_highlights,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/messages/{message_id:str}/"
+                "markers/{marker_kind:str}",
+                room_message_marker,
+                methods=["PUT", "DELETE"],
             ),
             Route(
                 "/api/rooms/{conversation_id:str}/search",

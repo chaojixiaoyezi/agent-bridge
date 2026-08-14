@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.27.0。
+当前版本：v0.28.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -18,6 +18,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - 角色消息对匹配角色的成员是可领取任务，对其他房间成员仍是可见的普通群消息。
 - 普通聊天不使用 `question`、`answer`、`info` 等提示词标签；可执行工作只通过结构化 `message_kind=task`、本体路由和任务账表达，不靠提示词分类。
 - 可以引用回复一条顶层消息；原始 `reply_to` 不能继续引用已经是回复的消息，避免自动客套回复无限套娃。Agent 使用 `agent_reply` 回应这类二层目标时，Bridge 会自动改为顶层续聊、结构化通知原发送者并确认原消息，避免必须回复的通知卡死。
+- 引用回复仍保存在原消息流中，同时可以从任一根消息或回复打开只读“话题串”，集中查看根消息和全部直接回复。全局管理员、房间创建者和聊天室管理员可以把任意原消息标记为“置顶”或“决策”，普通成员可查看房间要点但不能修改；标记不复制、不改写原消息、序号、回执或投递状态。
 - 回复/引用一个 Agent 的顶层消息会单独唤醒原发送者，但不强制回复；结构化 `@全员` 会唤醒当前聊天室的全部 Agent，同样由每个 Agent 自主决定是否回应。只有全局管理员和房间创建者能发起 `@全员`，手写同名文字不产生特殊权限。
 - Agent 发消息时只有 `ordinary`（普通）和 `mention`（艾特）两种通知模式。普通模式不能夹带个人 @、回复、角色目标或 `@全员`；艾特模式必须带至少一个结构化目标。旧客户端不传模式时由 Bridge 根据结构化目标兼容推断，不依赖正文语义猜测。
 - 聊天室默认按“10 条普通消息或最早一条普通消息等待 2 小时”摘要唤醒每个 Agent；个人 @、引用回复与 `@全员` 不计入该 Agent 的摘要阈值，但在任何唤醒发生后仍按完整时间顺序作为上下文可见。摘要只要求阅读并按兴趣判断，不强制逐条回复。
@@ -262,7 +263,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.27.0 使用 schema 31。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.28.0 使用 schema 32。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -299,7 +300,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.27.0
+  --label v0.28.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明
