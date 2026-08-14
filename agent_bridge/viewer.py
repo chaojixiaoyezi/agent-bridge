@@ -1795,6 +1795,34 @@ def create_app(
             },
         )
 
+    async def pending_responses(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            access_scope = web_room_access_scope(identity)
+            visible_rooms = access_scope["conversation_ids"]
+            if visible_rooms is None:
+                managed_rooms = None
+            else:
+                permissions = store.room_web_permissions_bulk(
+                    requesting_web_user_id=str(identity["user_id"]),
+                    conversation_ids=visible_rooms,
+                )
+                managed_rooms = [
+                    conversation_id
+                    for conversation_id, room_permissions in permissions.items()
+                    if room_permissions["can_manage_web_members"]
+                ]
+            return JSONResponse(
+                repository.pending_response_center(
+                    participant_id=str(identity["participant_id"]),
+                    visible_conversation_ids=visible_rooms,
+                    managed_conversation_ids=managed_rooms,
+                    limit=_int_query(request, "limit", default=100, maximum=200),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def messages(request: Request) -> Response:
         try:
             identity = authenticated_web_user(request)
@@ -3258,6 +3286,7 @@ def create_app(
             Route("/agent/tasks/inputs", agent_task_inputs, methods=["POST"]),
             Route("/agent/tasks/update", agent_task_update, methods=["POST"]),
             Route("/agent/tasks/delegate", agent_task_delegate, methods=["POST"]),
+            Route("/api/pending-responses", pending_responses, methods=["GET"]),
             Route(
                 "/api/rooms/{conversation_id:str}/messages",
                 messages,

@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-7">
-    <script src="/assets/app.js?v=20260814-7" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-8">
+    <script src="/assets/app.js?v=20260814-8" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -37,6 +37,10 @@
           <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
           <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
           <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
+          <button class="access-button pending-center-button" id="open-pending-center" type="button">
+            待回复
+            <span id="pending-center-badge" hidden>0</span>
+          </button>
           <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
           <span id="connection-label">正在连接</span>
@@ -684,6 +688,22 @@
           </div>
           <div class="session-list" id="nickname-request-list"></div>
         </section>
+      </div>
+    </dialog>
+
+    <dialog class="room-dialog pending-center-dialog" id="pending-center-dialog" aria-labelledby="pending-center-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">RESPONSE AND TASK INBOX</p>
+            <h2 id="pending-center-title">待回复中心</h2>
+          </div>
+          <button class="dialog-close" id="close-pending-center" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="field-help">只显示结构化的“必须回复”投递和仍在进行的任务；普通聊天、@全员及免打扰期间的可选通知不会被误算。点击条目可直接定位到原消息。</p>
+        <div class="pending-center-summary" id="pending-center-summary"></div>
+        <p class="form-feedback" id="pending-center-feedback" role="status" aria-live="polite"></p>
+        <div class="pending-center-list" id="pending-center-list"></div>
       </div>
     </dialog>
   </body>

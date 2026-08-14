@@ -626,6 +626,127 @@ def test_room_owner_delegates_scoped_moderator_controls(
     assert demoted.json()["user"]["access_role"] == "member"
 
 
+def test_pending_response_center_tracks_exact_replies_tasks_and_room_scope(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "pending-center.db"
+    store, sender, receiver = seed(database)
+    app = make_app(database)
+    admin_client = TestClient(app)
+    member_client = TestClient(app)
+    anonymous = TestClient(app)
+    login_admin(admin_client)
+    member = register_web_user(member_client, username="pending-member")
+    grant_web_room_access(database, user=member, room="room-one")
+
+    assert anonymous.get("/api/pending-responses").status_code == 401
+
+    requested = admin_client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(admin_client, "send-message"),
+        json={
+            "body": "请明确回复这条检查请求。",
+            "mentions": [receiver["participant_id"]],
+        },
+    )
+    assert requested.status_code == 201
+    requested_message = requested.json()["message"]
+
+    incoming_sender = store.register_agent_session(
+        conversation_id="room-one",
+        product="pi",
+        username="待回复发起人",
+        session_alias="待回复会话",
+    )
+    incoming = store.send(
+        authorized_session_id=incoming_sender["session_id"],
+        sender_participant_id=incoming_sender["participant_id"],
+        conversation_id="room-one",
+        body_text="请明确回复是否同意这个接口。",
+        mentions=[member["participant_id"]],
+        notification_mode="mention",
+    )
+    active_task = admin_client.post(
+        "/api/rooms/room-one/tasks",
+        headers=intent_headers(admin_client, "send-task"),
+        json={
+            "body": "核对待回复中心的边界。",
+            "target_participant_ids": [receiver["participant_id"]],
+        },
+    )
+    assert active_task.status_code == 201
+
+    hidden_target = store.register_agent_session(
+        conversation_id="room-two",
+        product="codex",
+        username="隐藏目标",
+        session_alias="隐藏会话",
+    )
+    hidden_sender = store.register_agent_session(
+        conversation_id="room-two",
+        product="claude-code",
+        username="隐藏发起人",
+        session_alias="隐藏发起会话",
+    )
+    hidden = store.send(
+        authorized_session_id=hidden_sender["session_id"],
+        sender_participant_id=hidden_sender["participant_id"],
+        conversation_id="room-two",
+        body_text="请明确回复隐藏聊天室的问题。",
+        mentions=[hidden_target["participant_id"]],
+        notification_mode="mention",
+    )
+
+    admin_center = admin_client.get("/api/pending-responses").json()
+    admin_items = {
+        (item["message_id"], item["target"]["participant_id"]): item
+        for item in admin_center["pending_responses"]
+    }
+    requested_key = (
+        requested_message["message_id"],
+        receiver["participant_id"],
+    )
+    assert admin_items[requested_key]["direction"] == "outgoing"
+    assert any(
+        item["conversation_id"] == "room-two"
+        for item in admin_center["pending_responses"]
+    )
+    assert any(
+        task["task_id"] == active_task.json()["message"]["task"]["task_id"]
+        for task in admin_center["active_tasks"]
+    )
+    assert admin_center["counts"]["total"] >= 3
+
+    member_center = member_client.get("/api/pending-responses").json()
+    member_ids = {
+        item["message_id"] for item in member_center["pending_responses"]
+    }
+    assert incoming["message_id"] in member_ids
+    assert hidden["message_id"] not in member_ids
+    incoming_item = next(
+        item
+        for item in member_center["pending_responses"]
+        if item["message_id"] == incoming["message_id"]
+    )
+    assert incoming_item["direction"] == "incoming"
+    assert all(
+        task["conversation_id"] == "room-one"
+        for task in member_center["active_tasks"]
+    )
+
+    store.reply(
+        authorized_session_id=receiver["session_id"],
+        participant_id=receiver["participant_id"],
+        message_id=requested_message["message_id"],
+        body_text="已明确回复：检查通过。",
+    )
+    after_reply = admin_client.get("/api/pending-responses").json()
+    assert requested_key not in {
+        (item["message_id"], item["target"]["participant_id"])
+        for item in after_reply["pending_responses"]
+    }
+
+
 def test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body(
     tmp_path: Path,
 ) -> None:
@@ -1224,8 +1345,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-7" in index_html
-    assert "app.css?v=20260814-7" in index_html
+    assert "app.js?v=20260814-8" in index_html
+    assert "app.css?v=20260814-8" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript

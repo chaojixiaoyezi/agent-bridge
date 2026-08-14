@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.22.0 / schema 30。
+当前协议/数据库版本：Agent Bridge v0.23.0 / schema 30。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -133,6 +133,8 @@ git diff --check
 schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 
 v0.22.0 不增加 schema。`room_web_members.access_role=moderator` 正式启用：房间所有者或全局管理员可以委派/降级管理员；聊天室管理员只能增删普通成员，不能改动创建者或其他管理员。服务端统一投影 `room_role` 与 `can_manage_web_members`、`can_invite_agents`、`can_kick_agents`、`can_manage_wake_policy`、`can_wake_all`、`can_rename_room`、`can_delegate_room_moderators`，页面只根据这些权威标志显示入口。Agent 邀请的创建、房间限定列表和撤销以及 Agent 踢出都会在 store 层再次校验房间角色；聊天室管理员不能无 conversation filter 枚举全局邀请。任务授权保持独立：只有所有者管理策略与授权，聊天室管理员必须另获 `room_task_grants` 才能布置或取消任务。
+
+v0.23.0 不增加 schema。`GET /api/pending-responses` 只读投影 `message_deliveries` 中原因明确为 `mention`/`agent_request`、状态仍为 `pending|delivered` 且没有目标本人精确引用回复的事项，并同时列出未终态 `room_tasks`。普通 Web 用户只能看自己的收件/发件事项；房主和聊天室管理员可关注所管理房间，全局管理员可关注全部房间，投影始终先套用 Web 房间 ACL。普通消息、礼貌 Agent 点名、`@全员`、引用唤醒和免打扰可选通知不进入中心。页面徽标随消息、回执和任务 SSE 修订刷新；点击只按房间与序号定位原文，不 ack、不催办、不修改任务状态。
 
 schema 29 新增 `web_registration_codes` 和 `web_registration_code_uses`。管理员可在 Web 页面生成默认单次、24 小时有效的注册码，也可把使用上限设为 1–1000 次、有效期设为 1 小时至 30 天，并可即时撤销。注册码使用 SHA-256 哈希索引，明文只在创建响应出现一次；核销次数、创建 Web 用户、关联参与者和登录 session 在同一个 `BEGIN IMMEDIATE` 事务中提交，因此并发注册不会超过上限。旧的环境变量固定注册码仅作为显式配置的兼容入口；推荐部署使用数据库注册码。
 

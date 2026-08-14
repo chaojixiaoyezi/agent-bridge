@@ -751,6 +751,350 @@ class ViewerRepository:
             for row in reversed(rows)
         ]
 
+    def pending_response_center(
+        self,
+        *,
+        participant_id: str,
+        visible_conversation_ids: Sequence[str] | None,
+        managed_conversation_ids: Sequence[str] | None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Project unresolved required replies and active room tasks.
+
+        Delivery reasons are the authority for whether a chat reply is required.
+        A linked reply from the exact target also resolves the projection for Web
+        users, whose browser does not consume the Agent delivery queue.
+        """
+
+        participant = str(participant_id or "").strip()
+        if not participant:
+            raise ValueError("participant_id is required")
+        normalized_limit = max(1, min(int(limit), 200))
+        visible = (
+            None
+            if visible_conversation_ids is None
+            else list(
+                dict.fromkeys(
+                    validate_conversation_id(value)
+                    for value in visible_conversation_ids
+                )
+            )
+        )
+        if visible == []:
+            return {
+                "pending_responses": [],
+                "active_tasks": [],
+                "counts": {
+                    "pending_responses": 0,
+                    "incoming": 0,
+                    "outgoing": 0,
+                    "oversight": 0,
+                    "active_tasks": 0,
+                    "needs_input_tasks": 0,
+                    "total": 0,
+                },
+                "has_more": False,
+            }
+        managed = (
+            None
+            if managed_conversation_ids is None
+            else list(
+                dict.fromkeys(
+                    validate_conversation_id(value)
+                    for value in managed_conversation_ids
+                )
+            )
+        )
+
+        room_clauses: list[str] = []
+        room_parameters: list[Any] = []
+        if visible is not None:
+            placeholders = ",".join("?" for _ in visible)
+            room_clauses.append(f"message.conversation_id IN ({placeholders})")
+            room_parameters.extend(visible)
+
+        access_clauses = [
+            "delivery.participant_id = ?",
+            "message.sender_participant_id = ?",
+        ]
+        access_parameters: list[Any] = [participant, participant]
+        if managed is None:
+            access_clauses.append("1 = 1")
+        elif managed:
+            placeholders = ",".join("?" for _ in managed)
+            access_clauses.append(
+                f"message.conversation_id IN ({placeholders})"
+            )
+            access_parameters.extend(managed)
+
+        response_where = [
+            "delivery.state IN ('pending', 'delivered')",
+            "(instr(delivery.reasons_json, '\"mention\"') > 0 "
+            "OR instr(delivery.reasons_json, '\"agent_request\"') > 0)",
+            "exact_reply.reply_to IS NULL",
+            f"({' OR '.join(access_clauses)})",
+            *room_clauses,
+        ]
+        response_parameters = [*access_parameters, *room_parameters, normalized_limit]
+
+        task_room_clauses: list[str] = []
+        task_room_parameters: list[Any] = []
+        if visible is not None:
+            placeholders = ",".join("?" for _ in visible)
+            task_room_clauses.append(f"task.conversation_id IN ({placeholders})")
+            task_room_parameters.extend(visible)
+        task_access_clauses = ["task.issuer_participant_id = ?"]
+        task_access_parameters: list[Any] = [participant]
+        if managed is None:
+            task_access_clauses.append("1 = 1")
+        elif managed:
+            placeholders = ",".join("?" for _ in managed)
+            task_access_clauses.append(f"task.conversation_id IN ({placeholders})")
+            task_access_parameters.extend(managed)
+        task_where = [
+            "task.status IN ('queued', 'claimed', 'running', 'needs_input')",
+            f"({' OR '.join(task_access_clauses)})",
+            *task_room_clauses,
+        ]
+        task_parameters = [
+            *task_access_parameters,
+            *task_room_parameters,
+            normalized_limit,
+        ]
+
+        with self._connection() as connection:
+            response_rows = connection.execute(
+                f"""
+                WITH exact_replies AS (
+                    SELECT DISTINCT reply_to, sender_participant_id
+                    FROM messages
+                    WHERE reply_to IS NOT NULL
+                )
+                SELECT message.message_id, message.conversation_id,
+                       message.sequence, message.body, message.created_at,
+                       message.sender_participant_id,
+                       sender.client_type AS sender_client_type,
+                       sender.display_name AS sender_display_name,
+                       sender.avatar_key AS sender_avatar_key,
+                       delivery.participant_id AS target_participant_id,
+                       target.client_type AS target_client_type,
+                       target.display_name AS target_display_name,
+                       target.avatar_key AS target_avatar_key,
+                       delivery.state AS delivery_state,
+                       delivery.reasons_json,
+                       delivery.first_delivered_at,
+                       delivery.last_delivered_at,
+                       COUNT(*) OVER() AS total_count
+                FROM message_deliveries AS delivery
+                JOIN messages AS message
+                  ON message.message_id = delivery.message_id
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                JOIN participants AS target
+                  ON target.participant_id = delivery.participant_id
+                LEFT JOIN exact_replies AS exact_reply
+                  ON exact_reply.reply_to = message.message_id
+                 AND exact_reply.sender_participant_id = delivery.participant_id
+                JOIN rooms AS room
+                  ON room.conversation_id = message.conversation_id
+                 AND room.status = 'active'
+                WHERE {' AND '.join(response_where)}
+                ORDER BY message.created_at, message.sequence,
+                         delivery.participant_id
+                LIMIT ?
+                """,
+                response_parameters,
+            ).fetchall()
+            task_rows = connection.execute(
+                f"""
+                SELECT task.*, issuer.client_type AS issuer_client_type,
+                       issuer.display_name AS issuer_display_name,
+                       claimant.client_type AS claimant_client_type,
+                       claimant.display_name AS claimant_display_name,
+                       COUNT(*) OVER() AS total_count
+                FROM room_tasks AS task
+                JOIN rooms AS room
+                  ON room.conversation_id = task.conversation_id
+                 AND room.status = 'active'
+                JOIN participants AS issuer
+                  ON issuer.participant_id = task.issuer_participant_id
+                LEFT JOIN participants AS claimant
+                  ON claimant.participant_id = task.claimed_by_participant_id
+                WHERE {' AND '.join(task_where)}
+                ORDER BY CASE task.status
+                             WHEN 'needs_input' THEN 0
+                             WHEN 'running' THEN 1
+                             WHEN 'claimed' THEN 2
+                             ELSE 3
+                         END,
+                         task.updated_at, task.created_at
+                LIMIT ?
+                """,
+                task_parameters,
+            ).fetchall()
+
+        now = time.time()
+        response_items: list[dict[str, Any]] = []
+        direction_counts = {"incoming": 0, "outgoing": 0, "oversight": 0}
+        for row in response_rows:
+            sender_id = str(row["sender_participant_id"])
+            target_id = str(row["target_participant_id"])
+            if target_id == participant:
+                direction = "incoming"
+            elif sender_id == participant:
+                direction = "outgoing"
+            else:
+                direction = "oversight"
+            direction_counts[direction] += 1
+            body = str(row["body"])
+            response_items.append(
+                {
+                    "message_id": str(row["message_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "sequence": int(row["sequence"]),
+                    "body_preview": body[:500],
+                    "body_truncated": len(body) > 500,
+                    "created_at": float(row["created_at"]),
+                    "age_seconds": max(0.0, now - float(row["created_at"])),
+                    "direction": direction,
+                    "sender": {
+                        "participant_id": sender_id,
+                        "client_type": str(row["sender_client_type"]),
+                        "display_name": str(row["sender_display_name"]),
+                        "avatar_key": str(row["sender_avatar_key"] or "auto"),
+                    },
+                    "target": {
+                        "participant_id": target_id,
+                        "client_type": str(row["target_client_type"]),
+                        "display_name": str(row["target_display_name"]),
+                        "avatar_key": str(row["target_avatar_key"] or "auto"),
+                    },
+                    "delivery_state": str(row["delivery_state"]),
+                    "delivery_reasons": json.loads(str(row["reasons_json"] or "[]")),
+                    "first_delivered_at": (
+                        float(row["first_delivered_at"])
+                        if row["first_delivered_at"] is not None
+                        else None
+                    ),
+                    "last_delivered_at": (
+                        float(row["last_delivered_at"])
+                        if row["last_delivered_at"] is not None
+                        else None
+                    ),
+                }
+            )
+
+        task_items: list[dict[str, Any]] = []
+        for row in task_rows:
+            body = str(row["body"])
+            task_items.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "source_message_id": (
+                        str(row["source_message_id"])
+                        if row["source_message_id"] is not None
+                        else None
+                    ),
+                    "source_sequence": (
+                        int(row["source_sequence"])
+                        if row["source_sequence"] is not None
+                        else None
+                    ),
+                    "body_preview": body[:500],
+                    "body_truncated": len(body) > 500,
+                    "status": str(row["status"]),
+                    "issuer_participant_id": str(row["issuer_participant_id"]),
+                    "issuer_display_name": str(row["issuer_display_name"]),
+                    "issuer_client_type": str(row["issuer_client_type"]),
+                    "claimed_by_participant_id": (
+                        str(row["claimed_by_participant_id"])
+                        if row["claimed_by_participant_id"] is not None
+                        else None
+                    ),
+                    "claimant_display_name": str(row["claimant_display_name"] or ""),
+                    "claimant_client_type": str(row["claimant_client_type"] or ""),
+                    "created_at": float(row["created_at"]),
+                    "updated_at": float(row["updated_at"]),
+                    "age_seconds": max(0.0, now - float(row["created_at"])),
+                }
+            )
+
+        response_total = (
+            int(response_rows[0]["total_count"]) if response_rows else 0
+        )
+        task_total = int(task_rows[0]["total_count"]) if task_rows else 0
+        # Direction counts above cover the bounded page.  Count exact totals
+        # when a page was truncated so the top-bar badge never understates work.
+        if response_total > len(response_rows):
+            with self._connection() as connection:
+                grouped = connection.execute(
+                    f"""
+                    WITH exact_replies AS (
+                        SELECT DISTINCT reply_to, sender_participant_id
+                        FROM messages
+                        WHERE reply_to IS NOT NULL
+                    )
+                    SELECT CASE
+                               WHEN delivery.participant_id = ? THEN 'incoming'
+                               WHEN message.sender_participant_id = ? THEN 'outgoing'
+                               ELSE 'oversight'
+                           END AS direction,
+                           COUNT(*) AS count
+                    FROM message_deliveries AS delivery
+                    JOIN messages AS message
+                      ON message.message_id = delivery.message_id
+                    LEFT JOIN exact_replies AS exact_reply
+                      ON exact_reply.reply_to = message.message_id
+                     AND exact_reply.sender_participant_id = delivery.participant_id
+                    JOIN rooms AS room
+                      ON room.conversation_id = message.conversation_id
+                     AND room.status = 'active'
+                    WHERE {' AND '.join(response_where)}
+                    GROUP BY direction
+                    """,
+                    [participant, participant, *access_parameters, *room_parameters],
+                ).fetchall()
+            direction_counts = {
+                "incoming": 0,
+                "outgoing": 0,
+                "oversight": 0,
+            }
+            for row in grouped:
+                direction_counts[str(row["direction"])] = int(row["count"])
+
+        needs_input_tasks = sum(
+            1 for item in task_items if item["status"] == "needs_input"
+        )
+        if task_total > len(task_rows):
+            with self._connection() as connection:
+                needs_input_tasks = int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM room_tasks AS task "
+                        f"JOIN rooms AS room ON room.conversation_id = "
+                        f"task.conversation_id AND room.status = 'active' "
+                        f"WHERE {' AND '.join(task_where)} "
+                        "AND task.status = 'needs_input'",
+                        [*task_access_parameters, *task_room_parameters],
+                    ).fetchone()[0]
+                )
+
+        return {
+            "pending_responses": response_items,
+            "active_tasks": task_items,
+            "counts": {
+                "pending_responses": response_total,
+                **direction_counts,
+                "active_tasks": task_total,
+                "needs_input_tasks": needs_input_tasks,
+                "total": response_total + task_total,
+            },
+            "has_more": (
+                response_total > len(response_items)
+                or task_total > len(task_items)
+            ),
+        }
+
     def event_snapshot(
         self,
         *,

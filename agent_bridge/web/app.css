@@ -255,6 +255,21 @@ select option {
   cursor: pointer;
 }
 .access-button:hover { background: rgba(155,140,255,.17); }
+.pending-center-button { display: inline-flex; align-items: center; gap: 6px; }
+.pending-center-button span {
+  min-width: 17px;
+  height: 17px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0 4px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--danger);
+  font-size: 8px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.pending-center-button.has-pending { border-color: rgba(255,119,141,.3); }
 
 .account-button {
   max-width: 150px;
@@ -1131,6 +1146,102 @@ select option {
 .rate-override-wrap { margin-right: auto; }
 .rate-override-input { width: 128px !important; }
 .access-dialog { width: min(620px, calc(100vw - 32px)); max-height: min(820px, calc(100vh - 32px)); overflow-y: auto; }
+.pending-center-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: min(820px, calc(100vh - 32px));
+  overflow-y: auto;
+}
+.pending-center-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 17px;
+}
+.pending-summary-card {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-soft);
+}
+.pending-summary-card strong,
+.pending-summary-card small { display: block; }
+.pending-summary-card strong { color: var(--text); font-size: 16px; }
+.pending-summary-card small { margin-top: 3px; color: var(--muted); font-size: 8px; }
+.pending-summary-card.urgent strong { color: var(--danger); }
+.pending-summary-card.waiting strong { color: var(--cyan); }
+.pending-summary-card.task strong { color: var(--purple); }
+.pending-center-list { display: grid; gap: 8px; }
+.pending-section-title {
+  margin: 12px 0 1px;
+  color: var(--muted-strong);
+  font-size: 10px;
+  letter-spacing: .08em;
+}
+.pending-center-item {
+  width: 100%;
+  display: grid;
+  gap: 5px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text);
+  background: rgba(255,255,255,.025);
+  text-align: left;
+  cursor: pointer;
+  transition: 140ms ease;
+}
+.pending-center-item:hover {
+  border-color: var(--line-strong);
+  background: rgba(255,255,255,.055);
+  transform: translateY(-1px);
+}
+.pending-center-item.incoming { border-left: 3px solid var(--danger); }
+.pending-center-item.outgoing { border-left: 3px solid var(--cyan); }
+.pending-center-item.oversight { border-left: 3px solid var(--muted); }
+.pending-center-item.task { border-left: 3px solid var(--purple); }
+.pending-center-item.task.needs_input { border-left-color: var(--danger); }
+.pending-item-heading { display: flex; align-items: center; gap: 8px; }
+.pending-item-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  flex: 1;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pending-kind {
+  flex: none;
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: var(--muted-strong);
+  background: var(--surface-soft);
+  font-size: 8px;
+}
+.pending-kind.incoming,
+.pending-kind.task.needs_input { color: var(--danger); background: rgba(255,119,141,.08); }
+.pending-kind.outgoing { color: var(--cyan); background: var(--cyan-soft); }
+.pending-kind.task { color: var(--purple); background: rgba(155,140,255,.09); }
+.pending-item-route { color: var(--muted-strong); font-size: 9px; }
+.pending-item-body {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.55;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.pending-item-meta { color: var(--muted); font-size: 8px; }
+.pending-center-empty {
+  padding: 32px 20px;
+  border: 1px dashed var(--line);
+  border-radius: 13px;
+  text-align: center;
+}
+.pending-center-empty strong { color: var(--muted-strong); font-size: 12px; }
+.pending-center-empty p { margin: 7px 0 0; color: var(--muted); font-size: 9px; }
+.pending-center-truncated { margin: 8px 0 0; color: var(--muted); font-size: 9px; }
 .access-output {
   width: 100%;
   min-height: 190px;
@@ -1209,6 +1320,7 @@ select option {
   .rate-override-wrap { margin-right: 0; }
   .rate-override-input { width: 100% !important; }
   .lifecycle-form, .member-room-list, .wake-policy-digest { grid-template-columns: 1fr; }
+  .pending-center-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .lifecycle-form .form-actions { margin-top: 10px; }
 }
 

@@ -67,6 +67,12 @@ const state = {
   profileAvatarKey: "auto",
   timelineScrollFrame: null,
   forwardMessageId: null,
+  pendingCenter: {
+    pending_responses: [],
+    active_tasks: [],
+    counts: { total: 0 },
+    has_more: false,
+  },
 };
 
 const ROOM_SNAPSHOT_LIMIT = 4;
@@ -146,6 +152,13 @@ const elements = {
   openMessageRates: document.querySelector("#open-message-rates"),
   openRoomPermissions: document.querySelector("#open-room-permissions"),
   openRegistrationCodes: document.querySelector("#open-registration-codes"),
+  openPendingCenter: document.querySelector("#open-pending-center"),
+  pendingCenterBadge: document.querySelector("#pending-center-badge"),
+  pendingCenterDialog: document.querySelector("#pending-center-dialog"),
+  closePendingCenter: document.querySelector("#close-pending-center"),
+  pendingCenterSummary: document.querySelector("#pending-center-summary"),
+  pendingCenterFeedback: document.querySelector("#pending-center-feedback"),
+  pendingCenterList: document.querySelector("#pending-center-list"),
   registrationCodeDialog: document.querySelector("#registration-code-dialog"),
   closeRegistrationCodes: document.querySelector("#close-registration-codes"),
   registrationCodeForm: document.querySelector("#registration-code-form"),
@@ -495,6 +508,14 @@ function formatCooldown(value) {
   return `${Number.isInteger(seconds) ? seconds : Number(seconds.toFixed(3))} 秒`;
 }
 
+function formatAge(value) {
+  const seconds = Math.max(0, Number(value) || 0);
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
+}
+
 function dayLabel(timestamp) {
   return DATE_TIME_FORMATTERS.day.format(new Date(timestamp * 1000));
 }
@@ -596,6 +617,13 @@ function showAuthScreen(message = "") {
   state.participants = [];
   state.hasEarlierMessages = false;
   state.hasLaterMessages = false;
+  state.pendingCenter = {
+    pending_responses: [],
+    active_tasks: [],
+    counts: { total: 0 },
+    has_more: false,
+  };
+  renderPendingCenter();
   elements.appShell.hidden = true;
   for (const dialog of [
     elements.passwordDialog,
@@ -609,6 +637,7 @@ function showAuthScreen(message = "") {
     elements.messageRateDialog,
     elements.memberManagementDialog,
     elements.agentAccessDialog,
+    elements.pendingCenterDialog,
   ]) {
     if (dialog.open) dialog.close();
   }
@@ -2144,6 +2173,186 @@ async function jumpToRoomSearchResult(result) {
   }
 }
 
+function renderPendingCenter() {
+  const payload = state.pendingCenter || {};
+  const counts = payload.counts || {};
+  const total = Number(counts.total || 0);
+  elements.pendingCenterBadge.hidden = total === 0;
+  elements.pendingCenterBadge.textContent = total > 99 ? "99+" : String(total);
+  elements.openPendingCenter.classList.toggle("has-pending", total > 0);
+
+  elements.pendingCenterSummary.replaceChildren();
+  for (const [label, count, tone] of [
+    ["需要我回复", counts.incoming || 0, "urgent"],
+    ["等待对方", counts.outgoing || 0, "waiting"],
+    ["聊天室关注", counts.oversight || 0, "oversight"],
+    ["进行中任务", counts.active_tasks || 0, "task"],
+  ]) {
+    const card = makeElement("span", `pending-summary-card ${tone}`);
+    card.append(
+      makeElement("strong", "", String(count)),
+      makeElement("small", "", label),
+    );
+    elements.pendingCenterSummary.append(card);
+  }
+
+  elements.pendingCenterList.replaceChildren();
+  const responseItems = payload.pending_responses || [];
+  const taskItems = payload.active_tasks || [];
+  if (!responseItems.length && !taskItems.length) {
+    const empty = makeElement("div", "pending-center-empty");
+    empty.append(
+      makeElement("strong", "", "当前没有待处理事项"),
+      makeElement("p", "", "必须回复的消息已经回应，聊天室任务也都已结束。"),
+    );
+    elements.pendingCenterList.append(empty);
+    return;
+  }
+
+  if (responseItems.length) {
+    elements.pendingCenterList.append(makeElement("h3", "pending-section-title", "必须回复"));
+    for (const item of responseItems) {
+      const directionLabels = {
+        incoming: "需要我回复",
+        outgoing: "等待对方",
+        oversight: "聊天室关注",
+      };
+      const button = makeElement("button", `pending-center-item ${item.direction}`);
+      button.type = "button";
+      const heading = makeElement("span", "pending-item-heading");
+      heading.append(
+        makeElement("strong", "", item.conversation_id),
+        makeElement("span", `pending-kind ${item.direction}`, directionLabels[item.direction] || "待回复"),
+      );
+      const sender = item.sender?.display_name || item.sender?.client_type || "未知成员";
+      const target = item.target?.display_name || item.target?.client_type || "未知成员";
+      button.append(
+        heading,
+        makeElement("span", "pending-item-route", `${sender} → ${target}`),
+        makeElement(
+          "span",
+          "pending-item-body",
+          `${item.body_preview}${item.body_truncated ? "…" : ""}`,
+        ),
+        makeElement(
+          "small",
+          "pending-item-meta",
+          `#${item.sequence} · ${formatAge(item.age_seconds)} · ${item.delivery_state === "delivered" ? "已送达，等待回复" : "等待送达或处理"}`,
+        ),
+      );
+      button.addEventListener("click", () => locatePendingCenterItem(item));
+      elements.pendingCenterList.append(button);
+    }
+  }
+
+  if (taskItems.length) {
+    elements.pendingCenterList.append(makeElement("h3", "pending-section-title", "进行中任务"));
+    const taskLabels = {
+      queued: "等待领取",
+      claimed: "已领取",
+      running: "执行中",
+      needs_input: "等待补充",
+    };
+    for (const task of taskItems) {
+      const button = makeElement("button", `pending-center-item task ${task.status}`);
+      button.type = "button";
+      const heading = makeElement("span", "pending-item-heading");
+      heading.append(
+        makeElement("strong", "", task.conversation_id),
+        makeElement("span", `pending-kind task ${task.status}`, taskLabels[task.status] || task.status),
+      );
+      const claimant = task.claimant_display_name || task.claimant_client_type || "尚未领取";
+      button.append(
+        heading,
+        makeElement("span", "pending-item-route", `执行者：${claimant}`),
+        makeElement(
+          "span",
+          "pending-item-body",
+          `${task.body_preview}${task.body_truncated ? "…" : ""}`,
+        ),
+        makeElement(
+          "small",
+          "pending-item-meta",
+          `${task.source_sequence ? `#${task.source_sequence} · ` : ""}${formatAge(task.age_seconds)}`,
+        ),
+      );
+      button.addEventListener("click", () => locatePendingCenterItem({
+        conversation_id: task.conversation_id,
+        sequence: task.source_sequence,
+        message_id: task.source_message_id,
+      }));
+      elements.pendingCenterList.append(button);
+    }
+  }
+
+  if (payload.has_more) {
+    elements.pendingCenterList.append(makeElement(
+      "p",
+      "pending-center-truncated",
+      "当前只显示最早的 100 项；完成后列表会自动补入后续事项。",
+    ));
+  }
+}
+
+async function loadPendingCenter() {
+  const payload = await fetchJson("/api/pending-responses?limit=100");
+  state.pendingCenter = payload;
+  renderPendingCenter();
+  return payload;
+}
+
+async function locatePendingCenterItem(item) {
+  if (elements.pendingCenterDialog.open) elements.pendingCenterDialog.close();
+  const roomId = item.conversation_id;
+  if (!roomId) return;
+  if (state.selectedRoom !== roomId) await selectRoom(roomId);
+  if (!item.sequence || !item.message_id) return;
+  state.roomRequestController?.abort();
+  const controller = new AbortController();
+  state.roomRequestController = controller;
+  try {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}&around_sequence=${encodeURIComponent(item.sequence)}`,
+      { signal: controller.signal },
+    );
+    if (state.selectedRoom !== roomId || controller.signal.aborted) return;
+    state.messages = payload.messages;
+    state.hasEarlierMessages = Boolean(payload.has_earlier);
+    state.hasLaterMessages = Boolean(payload.has_later);
+    state.loadedRoom = roomId;
+    state.roomSearchTargetMessageId = item.message_id;
+    state.messageRenderSignature = "";
+    renderMessages(state.messages, { targetMessageId: item.message_id });
+    cacheActiveRoomSnapshot();
+  } catch (error) {
+    if (error.name !== "AbortError") console.error(error);
+  } finally {
+    if (state.roomRequestController === controller) {
+      state.roomRequestController = null;
+    }
+  }
+}
+
+elements.openPendingCenter.addEventListener("click", async () => {
+  elements.pendingCenterFeedback.classList.remove("error", "success");
+  elements.pendingCenterFeedback.textContent = "正在核对最新状态…";
+  renderPendingCenter();
+  if (!elements.pendingCenterDialog.open) elements.pendingCenterDialog.showModal();
+  try {
+    await loadPendingCenter();
+    elements.pendingCenterFeedback.textContent = state.pendingCenter.has_more
+      ? "事项较多，当前显示最早的 100 项。"
+      : "已同步最新状态。";
+  } catch (error) {
+    elements.pendingCenterFeedback.classList.add("error");
+    elements.pendingCenterFeedback.textContent = `载入失败：${error.message}`;
+  }
+});
+elements.closePendingCenter.addEventListener("click", () => elements.pendingCenterDialog.close());
+elements.pendingCenterDialog.addEventListener("click", (event) => {
+  if (event.target === elements.pendingCenterDialog) elements.pendingCenterDialog.close();
+});
+
 elements.roomMessageSearchForm.addEventListener("submit", (event) => {
   event.preventDefault();
   searchRoomMessagesPage();
@@ -2396,18 +2605,21 @@ async function refresh(options = {}) {
       : Promise.resolve(null);
     const healthRequest = mode === "full" ? fetchJson("/api/health") : Promise.resolve(null);
     const nicknameRequest = mode === "full" ? fetchNicknameRequests() : Promise.resolve(null);
+    const pendingCenterRequest = fetchJson("/api/pending-responses?limit=100");
     const [
       healthPayload,
       roomPayload,
       sessionPayload,
       nicknamePayload,
       invitationPayload,
+      pendingCenterPayload,
     ] = await Promise.all([
       healthRequest,
       fetchJson("/api/rooms?limit=200"),
       sessionRequest,
       nicknameRequest,
       invitationRequest,
+      pendingCenterRequest,
     ]);
     if (healthPayload) {
       state.messageRateLimits = healthPayload.message_rate_limits || null;
@@ -2420,6 +2632,7 @@ async function refresh(options = {}) {
     }
     if (nicknamePayload) state.nicknameRequests = nicknamePayload.requests;
     if (invitationPayload) state.agentInvitations = invitationPayload.invitations;
+    state.pendingCenter = pendingCenterPayload;
     if (!state.selectedRoom || !state.rooms.some((room) => room.conversation_id === state.selectedRoom)) {
       state.selectedRoom = state.rooms[0]?.conversation_id || null;
       if (state.selectedRoom) window.localStorage.setItem("agentBridgeSelectedRoom", state.selectedRoom);
@@ -2429,6 +2642,7 @@ async function refresh(options = {}) {
     renderSessions();
     renderAgentInvitations();
     renderNicknameRequests();
+    renderPendingCenter();
     applyUserPermissions();
     if (state.selectedRoom) {
       await refreshActiveRoom(
