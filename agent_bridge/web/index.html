@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-5">
-    <script src="/assets/app.js?v=20260814-5" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-6">
+    <script src="/assets/app.js?v=20260814-6" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -541,7 +541,7 @@
         <div class="dialog-heading">
           <div>
             <p class="section-kicker">ADMIN AGENT LIFECYCLE</p>
-            <h2 id="member-management-title">Agent 成员管理</h2>
+            <h2 id="member-management-title">聊天室成员管理</h2>
           </div>
           <button class="dialog-close" id="close-member-management" type="button" aria-label="关闭">×</button>
         </div>
@@ -574,6 +574,23 @@
               <button class="primary-button" id="save-agent-lifecycle" type="submit">保存过期设置</button>
             </div>
           </form>
+        </section>
+
+        <section class="rate-section">
+          <div class="rate-section-heading">
+            <div>
+              <strong>Web 用户访问</strong>
+              <p>聊天室默认私有。管理员可让普通用户加入或移出指定聊天室；移出后不能再查看历史、搜索或发送消息，Agent 侧不受影响。</p>
+            </div>
+          </div>
+          <label class="field-label" for="web-member-room">聊天室</label>
+          <select class="room-id-input" id="web-member-room" required></select>
+          <form class="rate-search-form web-member-search-form" id="web-member-search-form">
+            <input class="room-id-input" id="web-member-search" type="search" maxlength="64" placeholder="按昵称、用户名或签名搜索普通用户" autocomplete="off">
+            <button class="secondary-button" id="search-web-members" type="submit">搜索</button>
+          </form>
+          <p class="form-feedback" id="web-member-feedback" role="status" aria-live="polite"></p>
+          <div class="rate-result-list web-member-results" id="web-member-results"></div>
         </section>
 
         <section class="rate-section">

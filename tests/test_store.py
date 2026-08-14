@@ -154,6 +154,20 @@ def create_owned_room(
     )
 
 
+def grant_web_room_access(
+    store: BridgeStore,
+    *,
+    identity: dict,
+    room: str,
+) -> dict:
+    return store.manage_room_web_member(
+        requesting_web_user_id=admin_web_user_id(store),
+        conversation_id=room,
+        target_web_user_id=str(identity["user_id"]),
+        active=True,
+    )
+
+
 def test_structured_tasks_are_separate_from_chat_authorization_and_claim_once(
     tmp_path: Path,
 ) -> None:
@@ -757,6 +771,7 @@ def test_room_owner_controls_admin_and_member_task_assignment(
         )
     create_owned_room(store, auth, owner, "用户任务群")
     # Join a second web user without granting task rights yet.
+    grant_web_room_access(store, identity=member, room="用户任务群")
     store.send_web_message(
         authorized_session_id=str(member["session_id"]),
         participant_id=str(member["participant_id"]),
@@ -874,6 +889,7 @@ def test_ordinary_web_and_agent_text_cannot_forge_admin_authority(
     auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
     member = register_web_identity(auth, username="authority-copycat")
     agent = register(store, client="codex", name="授权核验者")
+    grant_web_room_access(store, identity=member, room="tools-room")
 
     ordinary = store.send_web_message(
         authorized_session_id=str(member["session_id"]),
@@ -929,7 +945,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 30
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1001,7 +1017,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 30
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1096,6 +1112,7 @@ def test_web_room_owner_permission_limit_and_optional_wake_all(
         conversation_id="所有者聊天室",
     )
     assert created["is_room_owner"] is True
+    grant_web_room_access(store, identity=outsider, room="所有者聊天室")
     with pytest.raises(ConflictError, match="maximum of 1"):
         store.create_web_user_room(
             authorized_session_id=str(owner["session_id"]),
@@ -1161,6 +1178,90 @@ def test_web_room_owner_permission_limit_and_optional_wake_all(
         )
 
 
+def test_schema_thirty_backfills_only_explicit_web_room_access(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "schema-thirty.db"
+    store = BridgeStore(database)
+    auth = WebAuthStore(database, captcha_generator=lambda: "ABCDE")
+    member = register_web_identity(auth, username="legacy-room-member")
+    owner = register_web_identity(auth, username="legacy-room-owner")
+    for room in ("旧成员群", "旧授权群", "旧所有者群", "保持隐藏群"):
+        store.create_user_room(room)
+    agent = register(store, client="codex", name="迁移保持Agent", room="旧成员群")
+    admin_id = admin_web_user_id(store)
+    message = store.send(
+        authorized_session_id=agent["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="旧成员群",
+        body_text="迁移不能改变这条 Agent 消息。",
+    )
+    now = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "INSERT INTO memberships "
+            "(conversation_id, participant_id, roles_json, active, joined_at, updated_at) "
+            "VALUES (?, ?, '[]', 1, ?, ?)",
+            ("旧成员群", member["participant_id"], now, now),
+        )
+        connection.execute(
+            "INSERT INTO room_task_grants "
+            "(conversation_id, web_user_id, can_assign_tasks, can_cancel_tasks, "
+            "granted_by_web_user_id, created_at, updated_at) "
+            "VALUES (?, ?, 1, 0, ?, ?, ?)",
+            (
+                "旧授权群",
+                member["user_id"],
+                admin_id,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE room_web_owners SET web_user_id = ?, created_at = ? "
+            "WHERE conversation_id = ?",
+            (owner["user_id"], now, "旧所有者群"),
+        )
+        connection.execute("DELETE FROM room_web_members")
+        agent_memberships_before = connection.execute(
+            "SELECT COUNT(*) FROM memberships AS membership "
+            "LEFT JOIN web_users AS web_user "
+            "ON web_user.participant_id = membership.participant_id "
+            "WHERE web_user.user_id IS NULL"
+        ).fetchone()[0]
+        messages_before = connection.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()[0]
+        connection.execute("PRAGMA user_version = 29")
+
+    migrated = BridgeStore(database)
+    member_scope = migrated.web_room_access_scope(
+        authorized_session_id=str(member["session_id"]),
+        participant_id=str(member["participant_id"]),
+    )
+    owner_scope = migrated.web_room_access_scope(
+        authorized_session_id=str(owner["session_id"]),
+        participant_id=str(owner["participant_id"]),
+    )
+    assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
+    assert owner_scope["conversation_ids"] == ["旧所有者群"]
+    with migrated._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 30
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memberships AS membership "
+            "LEFT JOIN web_users AS web_user "
+            "ON web_user.participant_id = membership.participant_id "
+            "WHERE web_user.user_id IS NULL"
+        ).fetchone()[0] == agent_memberships_before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()[0] == messages_before
+        assert connection.execute(
+            "SELECT body FROM messages WHERE message_id = ?",
+            (message["message_id"],),
+        ).fetchone()[0] == "迁移不能改变这条 Agent 消息。"
+
+
 def test_reply_wakes_original_agent_without_making_reply_mandatory(
     tmp_path: Path,
 ) -> None:
@@ -1223,6 +1324,7 @@ def test_human_mentions_require_reply_but_agent_mentions_only_wake(
     human = register_web_identity(auth, username="human-mentioner")
     first_agent = register(store, client="codex", name="人类艾特目标")
     second_agent = register(store, client="claude-code", name="Agent艾特目标")
+    grant_web_room_access(store, identity=human, room="tools-room")
 
     human_message = store.send_web_message(
         authorized_session_id=str(human["session_id"]),
@@ -2370,7 +2472,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 29
+    assert version == 30
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2442,7 +2544,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 29
+    assert version == 30
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2538,7 +2640,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 29
+    assert version == 30
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4391,7 +4493,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 30
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4446,7 +4548,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 29
+    assert version == 30
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5157,7 +5259,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 30
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

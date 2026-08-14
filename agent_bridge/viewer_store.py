@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -189,14 +190,37 @@ class ViewerRepository:
             "clearable_count": int(row["clearable_count"] or 0),
         }
 
-    def rooms(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    def rooms(
+        self,
+        *,
+        limit: int = 200,
+        visible_conversation_ids: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
         normalized_limit = max(1, min(int(limit), 500))
+        visible = (
+            None
+            if visible_conversation_ids is None
+            else list(
+                dict.fromkeys(
+                    validate_conversation_id(value)
+                    for value in visible_conversation_ids
+                )
+            )
+        )
+        if visible == []:
+            return []
+        visibility_clause = ""
+        if visible is not None:
+            placeholders = ",".join("?" for _ in visible)
+            visibility_clause = (
+                f"WHERE room.conversation_id IN ({placeholders})"
+            )
         now = time.time()
         online_after = now - 90.0
         connector_online_after = now - 75.0
         with self._connection() as connection:
             rows = connection.execute(
-                """
+                f"""
                 WITH membership_stats AS (
                     SELECT
                         m.conversation_id,
@@ -327,6 +351,7 @@ class ViewerRepository:
                   ON owner.user_id = ownership.web_user_id
                 LEFT JOIN room_task_policies AS task_policy
                   ON task_policy.conversation_id = room.conversation_id
+                {visibility_clause}
                 ORDER BY
                     CASE WHEN room.status = 'active' THEN 0 ELSE 1 END,
                     room.last_activity_at DESC,
@@ -341,6 +366,7 @@ class ViewerRepository:
                     now,
                     online_after,
                     connector_online_after,
+                    *(visible or []),
                     normalized_limit,
                 ),
             ).fetchall()
@@ -725,8 +751,22 @@ class ViewerRepository:
             for row in reversed(rows)
         ]
 
-    def event_snapshot(self, *, after_sequence: int = 0) -> dict[str, Any]:
+    def event_snapshot(
+        self,
+        *,
+        after_sequence: int = 0,
+        visible_conversation_ids: Sequence[str] | None = None,
+        include_admin_state: bool = True,
+    ) -> dict[str, Any]:
         requested_cursor = max(0, int(after_sequence))
+        visible = (
+            None
+            if visible_conversation_ids is None
+            else {
+                validate_conversation_id(value)
+                for value in visible_conversation_ids
+            }
+        )
         now = time.time()
         with self._connection() as connection:
             global_sequence = int(
@@ -754,7 +794,21 @@ class ViewerRepository:
                     """,
                     (cursor,),
                 ).fetchall()
+                if visible is None or str(row["conversation_id"]) in visible
             ]
+            if visible is None:
+                visible_message_revision = global_sequence
+            elif not visible:
+                visible_message_revision = 0
+            else:
+                placeholders = ",".join("?" for _ in visible)
+                visible_message_revision = int(
+                    connection.execute(
+                        f"SELECT COALESCE(MAX(sequence), 0) FROM messages "
+                        f"WHERE conversation_id IN ({placeholders})",
+                        sorted(visible),
+                    ).fetchone()[0]
+                )
             pending_nicknames = int(
                 connection.execute(
                     "SELECT COUNT(*) FROM nickname_requests WHERE status = 'pending'"
@@ -849,8 +903,12 @@ class ViewerRepository:
             )
             web_user_permission_revision = float(
                 connection.execute(
-                    "SELECT COALESCE(MAX(updated_at), 0) FROM web_users"
+                    "SELECT MAX(revision) FROM ("
+                    "SELECT COALESCE(MAX(updated_at), 0) AS revision FROM web_users "
+                    "UNION ALL SELECT COALESCE(MAX(updated_at), 0) "
+                    "FROM room_web_members)"
                 ).fetchone()[0]
+                or 0
             )
             task_revision = float(
                 connection.execute(
@@ -872,8 +930,66 @@ class ViewerRepository:
                     "SELECT COALESCE(MAX(acked_at), 0) FROM receipts"
                 ).fetchone()[0]
             )
+        if not include_admin_state:
+            pending_nicknames = 0
+            nickname_revision = 0.0
+
+            def private_revision(label: str, value: object) -> str:
+                encoded = json.dumps(
+                    [label, value],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                return hashlib.sha256(encoded).hexdigest()[:20]
+
+            participant_revision = private_revision(
+                "participants",
+                participant_revision,
+            )
+            membership_revision = private_revision(
+                "memberships",
+                membership_revision,
+            )
+            online_revision = private_revision("online", online_revision)
+            active_session_revision = private_revision(
+                "sessions",
+                active_session_revision,
+            )
+            session_revocation_revision = private_revision(
+                "session-revocations",
+                session_revocation_revision,
+            )
+            session_clear_revision = private_revision(
+                "session-clears",
+                session_clear_revision,
+            )
+            room_revision = private_revision("rooms", room_revision)
+            connector_revision = private_revision(
+                "connectors",
+                connector_revision,
+            )
+            web_user_permission_revision = private_revision(
+                "permissions",
+                web_user_permission_revision,
+            )
+            task_revision = private_revision("tasks", task_revision)
+            task_permission_revision = private_revision(
+                "task-permissions",
+                task_permission_revision,
+            )
+            receipt_revision = private_revision("receipts", receipt_revision)
+            combined_task_revision: object = private_revision(
+                "task-state",
+                [task_revision, task_permission_revision],
+            )
+        else:
+            combined_task_revision = max(
+                task_revision,
+                task_permission_revision,
+            )
         state_revisions = {
-            "messages": global_sequence,
+            "messages": visible_message_revision,
             "nicknames": nickname_revision,
             "participants": participant_revision,
             "memberships": membership_revision,
@@ -899,7 +1015,7 @@ class ViewerRepository:
             # newer clients named facets they can refresh independently.
             "state_revisions": state_revisions,
             "state_revision": [
-                global_sequence,
+                visible_message_revision,
                 nickname_revision,
                 participant_revision,
                 membership_revision,
@@ -910,7 +1026,7 @@ class ViewerRepository:
                 room_revision,
                 connector_revision,
                 web_user_permission_revision,
-                max(task_revision, task_permission_revision),
+                combined_task_revision,
                 rate_revision,
                 receipt_revision,
             ],

@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.20.0 / schema 29。
+当前协议/数据库版本：Agent Bridge v0.21.0 / schema 30。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -13,7 +13,7 @@
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
-8. 普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2），创建者只获得自己房间的结构化 `@全员` 权限。重命名、踢人、迁移、Agent session 和昵称审批仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
+8. Web 房间默认私有：全局管理员看全部房间，普通 Web 用户只看自己创建或被明确加入的房间。所有读取、搜索、回执、成员、策略、任务和发送入口都必须在服务端复核 `room_web_members`/`room_web_owners`，不能依赖侧栏隐藏；移出 Web 用户不得改动 Agent 成员、Agent session 或历史消息。普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2），创建者只获得自己房间的结构化 `@全员` 权限。重命名、踢人、迁移、Agent session 和昵称审批仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
 9. 房间创建者始终拥有任务治理权，可允许全局管理员在该房间布置任务，并分别授予房间 Web 用户布置/取消权。任务接入工作目录只是起点，本机产品沙箱、审批和操作系统权限才是最终边界；聊天室权限永远不能提升本机权限。
 10. 同一公开 Agent 身份的消息必须携带权威席位来源：`main` 是邀请所在 TUI/MCP 本体，`executor` 是持久本体执行席，`shadow` 只作无本机实施权的讨论兜底。个人本体请求一旦成功路由，不得再让影子抢答；影子也不得声称任务已落实、进度、cwd、权限或测试结论。
 
@@ -126,9 +126,11 @@ npm exec --yes --package=@biomejs/biome@2.3.5 -- biome check integrations/pi/age
 git diff --check
 ```
 
-中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
+中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认新普通用户初始房间列表为空，只有被管理员加入或自己获准创建的房间可读写；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 29。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 30。
+
+schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 
 schema 29 新增 `web_registration_codes` 和 `web_registration_code_uses`。管理员可在 Web 页面生成默认单次、24 小时有效的注册码，也可把使用上限设为 1–1000 次、有效期设为 1 小时至 30 天，并可即时撤销。注册码使用 SHA-256 哈希索引，明文只在创建响应出现一次；核销次数、创建 Web 用户、关联参与者和登录 session 在同一个 `BEGIN IMMEDIATE` 事务中提交，因此并发注册不会超过上限。旧的环境变量固定注册码仅作为显式配置的兼容入口；推荐部署使用数据库注册码。
 

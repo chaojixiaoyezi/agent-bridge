@@ -38,6 +38,7 @@ const state = {
   agentLifecycle: null,
   memberRooms: [],
   memberSelections: new Map(),
+  roomWebUsers: [],
   roomPermissionUsers: [],
   registrationCodes: [],
   generatedRegistrationCode: "",
@@ -206,6 +207,12 @@ const elements = {
   memberManagementFeedback: document.querySelector("#member-management-feedback"),
   memberSelectionCount: document.querySelector("#member-selection-count"),
   migrateMembers: document.querySelector("#migrate-members"),
+  webMemberRoom: document.querySelector("#web-member-room"),
+  webMemberSearchForm: document.querySelector("#web-member-search-form"),
+  webMemberSearch: document.querySelector("#web-member-search"),
+  searchWebMembers: document.querySelector("#search-web-members"),
+  webMemberFeedback: document.querySelector("#web-member-feedback"),
+  webMemberResults: document.querySelector("#web-member-results"),
   openAgentAccess: document.querySelector("#open-agent-access"),
   agentAccessDialog: document.querySelector("#agent-access-dialog"),
   closeAgentAccess: document.querySelector("#close-agent-access"),
@@ -2993,26 +3000,133 @@ async function loadMemberManagementData({ preserveTarget = true } = {}) {
     lifecycle.unactivated_inactivity_days || members.unactivated_inactivity_days || 3,
   );
   elements.memberTargetRoom.replaceChildren();
+  elements.webMemberRoom.replaceChildren();
   for (const room of state.memberRooms) {
     const option = makeElement("option", "", room.conversation_id);
     option.value = room.conversation_id;
     elements.memberTargetRoom.append(option);
+    const webOption = makeElement("option", "", room.conversation_id);
+    webOption.value = room.conversation_id;
+    elements.webMemberRoom.append(webOption);
   }
   if ([...elements.memberTargetRoom.options].some((option) => option.value === previousTarget)) {
     elements.memberTargetRoom.value = previousTarget;
   }
+  if ([...elements.webMemberRoom.options].some((option) => option.value === previousTarget)) {
+    elements.webMemberRoom.value = previousTarget;
+  }
   renderMemberRooms();
+  await loadRoomWebUsers();
+}
+
+function renderRoomWebUsers() {
+  elements.webMemberResults.replaceChildren();
+  if (!state.roomWebUsers.length) {
+    elements.webMemberResults.append(makeElement("p", "muted-copy", "没有匹配的普通用户。"));
+    return;
+  }
+  for (const user of state.roomWebUsers) {
+    const card = makeElement("article", "rate-result-card web-member-card");
+    const identity = makeElement("div", "rate-result-identity");
+    identity.append(makeElement("strong", "", user.display_name));
+    identity.append(makeElement(
+      "span",
+      "",
+      `${user.username} · ${user.signature || "未填写签名"}`,
+    ));
+    card.append(identity);
+
+    const status = makeElement(
+      "span",
+      `web-member-status ${user.has_room_access ? "active" : "inactive"}`,
+      user.is_room_owner ? "创建者" : user.has_room_access ? "已加入" : "未加入",
+    );
+    card.append(status);
+
+    if (!user.is_room_owner) {
+      const action = makeElement(
+        "button",
+        user.has_room_access ? "secondary-button compact-button danger-button" : "primary-button compact-button",
+        user.has_room_access ? "移出" : "加入",
+      );
+      action.type = "button";
+      action.addEventListener("click", async () => {
+        const room = elements.webMemberRoom.value;
+        const adding = !user.has_room_access;
+        if (!adding && !window.confirm(`确认将 ${user.display_name} 移出聊天室“${room}”？`)) return;
+        action.disabled = true;
+        elements.webMemberFeedback.classList.remove("error", "success");
+        elements.webMemberFeedback.textContent = adding ? "正在加入…" : "正在移出…";
+        try {
+          await fetchJson(
+            `/api/admin/rooms/${encodeURIComponent(room)}/web-users/${encodeURIComponent(user.user_id)}`,
+            {
+              method: adding ? "PUT" : "DELETE",
+              headers: {
+                "X-Agent-Bridge-Intent": adding
+                  ? "invite-room-web-user"
+                  : "remove-room-web-user",
+              },
+            },
+          );
+          await Promise.all([loadRoomWebUsers(), refresh({})]);
+          elements.webMemberFeedback.classList.add("success");
+          elements.webMemberFeedback.textContent = adding
+            ? `${user.display_name} 已加入 ${room}。`
+            : `${user.display_name} 已移出 ${room}，Agent 成员和历史消息未改变。`;
+        } catch (error) {
+          elements.webMemberFeedback.classList.add("error");
+          elements.webMemberFeedback.textContent = error.message;
+          action.disabled = false;
+        }
+      });
+      card.append(action);
+    }
+    elements.webMemberResults.append(card);
+  }
+}
+
+async function loadRoomWebUsers() {
+  const room = elements.webMemberRoom.value;
+  if (!room) {
+    state.roomWebUsers = [];
+    renderRoomWebUsers();
+    return;
+  }
+  const query = elements.webMemberSearch.value.trim();
+  elements.searchWebMembers.disabled = true;
+  elements.webMemberFeedback.classList.remove("error", "success");
+  elements.webMemberFeedback.textContent = "正在载入用户…";
+  try {
+    const payload = await fetchJson(
+      `/api/admin/rooms/${encodeURIComponent(room)}/web-users?query=${encodeURIComponent(query)}&limit=100`,
+    );
+    state.roomWebUsers = payload.users || [];
+    renderRoomWebUsers();
+    elements.webMemberFeedback.textContent = "";
+  } catch (error) {
+    state.roomWebUsers = [];
+    renderRoomWebUsers();
+    elements.webMemberFeedback.classList.add("error");
+    elements.webMemberFeedback.textContent = error.message;
+  } finally {
+    elements.searchWebMembers.disabled = false;
+  }
 }
 
 async function openMemberManagementDialog() {
   if (!isAdmin()) return;
   state.memberSelections = new Map();
   elements.memberSearch.value = "";
+  elements.webMemberSearch.value = "";
   elements.agentLifecycleFeedback.textContent = "正在载入设置…";
   elements.agentLifecycleFeedback.classList.remove("error", "success");
   elements.memberManagementFeedback.textContent = "";
   elements.memberManagementFeedback.classList.remove("error", "success");
+  elements.webMemberFeedback.textContent = "";
+  elements.webMemberFeedback.classList.remove("error", "success");
   elements.memberRoomList.replaceChildren();
+  elements.webMemberResults.replaceChildren();
   if (!elements.memberManagementDialog.open) elements.memberManagementDialog.showModal();
   try {
     await loadMemberManagementData({ preserveTarget: false });
@@ -3484,6 +3598,11 @@ elements.memberManagementDialog.addEventListener("click", (event) => {
 });
 elements.memberTargetRoom.addEventListener("change", renderMemberRooms);
 elements.memberSearch.addEventListener("input", renderMemberRooms);
+elements.webMemberRoom.addEventListener("change", loadRoomWebUsers);
+elements.webMemberSearchForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadRoomWebUsers();
+});
 elements.agentLifecycleForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!isAdmin() || !elements.agentLifecycleForm.reportValidity()) return;

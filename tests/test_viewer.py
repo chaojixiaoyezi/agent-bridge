@@ -115,6 +115,27 @@ def register_web_user(
     return response.json()["user"]
 
 
+def grant_web_room_access(
+    database: Path,
+    *,
+    user: dict,
+    room: str,
+) -> dict:
+    store = BridgeStore(database)
+    with store._connection() as connection:
+        admin_id = str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+    return store.manage_room_web_member(
+        requesting_web_user_id=admin_id,
+        conversation_id=room,
+        target_web_user_id=str(user["user_id"]),
+        active=True,
+    )
+
+
 def seed(database: Path) -> tuple[BridgeStore, dict, dict]:
     store = BridgeStore(database)
     sender_base = store.register(
@@ -296,6 +317,146 @@ def test_web_login_registration_password_policy_profile_and_roles(
         headers=intent_headers(member_client, "rename-room"),
         json={"new_conversation_id": "普通用户不能改"},
     ).status_code == 403
+
+
+def test_private_web_rooms_require_explicit_access_and_revocation_isolated(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "private-rooms.db"
+    store, _sender, _receiver = seed(database)
+    room_two_agent = store.register_agent_session(
+        conversation_id="room-two",
+        product="future-agent",
+        username="未来伙伴",
+        session_alias="另一个房间",
+    )
+    store.send(
+        authorized_session_id=room_two_agent["session_id"],
+        sender_participant_id=room_two_agent["participant_id"],
+        conversation_id="room-two",
+        body_text="这条隐藏消息不能泄露给 room-one 用户。",
+    )
+
+    admin_client = TestClient(make_app(database))
+    login_admin(admin_client)
+    member_client = TestClient(make_app(database))
+    member = register_web_user(member_client, username="private-member")
+
+    admin_rooms = {
+        room["conversation_id"]
+        for room in admin_client.get("/api/rooms").json()["rooms"]
+    }
+    assert {"room-one", "room-two"}.issubset(admin_rooms)
+    assert member_client.get("/api/rooms").json()["rooms"] == []
+    member_health = member_client.get("/api/health").json()
+    assert "database" not in member_health
+    assert "counts" not in member_health
+    assert "security" not in member_health
+    for path in (
+        "/api/rooms/room-one/messages",
+        "/api/rooms/room-one/search?q=事务",
+        "/api/rooms/room-one/receipts",
+        "/api/rooms/room-one/participants",
+        "/api/rooms/room-one/wake-policy",
+        "/api/rooms/room-one/task-permissions",
+    ):
+        assert member_client.get(path).status_code == 403
+    denied_send = member_client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(member_client, "send-message"),
+        json={"body": "不能通过猜 URL 加入。"},
+    )
+    assert denied_send.status_code == 403
+
+    candidates = admin_client.get(
+        "/api/admin/rooms/room-one/web-users",
+        params={"query": "private-member"},
+    )
+    assert candidates.status_code == 200
+    assert [item["user_id"] for item in candidates.json()["users"]] == [
+        member["user_id"]
+    ]
+    granted = admin_client.put(
+        f"/api/admin/rooms/room-one/web-users/{member['user_id']}",
+        headers=intent_headers(admin_client, "invite-room-web-user"),
+    )
+    assert granted.status_code == 200
+    assert granted.json()["user"]["has_room_access"] is True
+
+    visible = member_client.get("/api/rooms").json()["rooms"]
+    assert [room["conversation_id"] for room in visible] == ["room-one"]
+    assert member_client.get("/api/rooms/room-one/messages").status_code == 200
+    assert member_client.get("/api/rooms/room-two/messages").status_code == 403
+    sent = member_client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(member_client, "send-message"),
+        json={"body": "获准后可以正常聊天。"},
+    )
+    assert sent.status_code == 201
+
+    with sqlite3.connect(database) as connection:
+        agent_memberships_before = connection.execute(
+            "SELECT COUNT(*) FROM memberships AS membership "
+            "LEFT JOIN web_users AS web_user "
+            "ON web_user.participant_id = membership.participant_id "
+            "WHERE web_user.user_id IS NULL"
+        ).fetchone()[0]
+        messages_before = connection.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()[0]
+
+    revoked = admin_client.delete(
+        f"/api/admin/rooms/room-one/web-users/{member['user_id']}",
+        headers=intent_headers(admin_client, "remove-room-web-user"),
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["user"]["has_room_access"] is False
+    assert member_client.get("/api/rooms").json()["rooms"] == []
+    assert member_client.get("/api/rooms/room-one/messages").status_code == 403
+    convert_after_revocation = member_client.post(
+        f"/api/messages/{sent.json()['message']['message_id']}/convert-to-task",
+        headers=intent_headers(member_client, "convert-message-to-task"),
+        json={},
+    )
+    assert convert_after_revocation.status_code == 403
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM memberships AS membership "
+            "LEFT JOIN web_users AS web_user "
+            "ON web_user.participant_id = membership.participant_id "
+            "WHERE web_user.user_id IS NULL"
+        ).fetchone()[0] == agent_memberships_before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM messages"
+        ).fetchone()[0] == messages_before
+
+    room_permission = admin_client.patch(
+        f"/api/admin/web-users/{member['user_id']}/room-permission",
+        headers=intent_headers(admin_client, "manage-room-permission"),
+        json={"can_create_rooms": True, "room_limit": 1},
+    )
+    assert room_permission.status_code == 200
+    owned = member_client.post(
+        "/api/rooms",
+        headers=intent_headers(member_client, "create-room"),
+        json={"conversation_id": "private-member-owned"},
+    )
+    assert owned.status_code == 201
+    assert [
+        room["conversation_id"]
+        for room in member_client.get("/api/rooms").json()["rooms"]
+    ] == ["private-member-owned"]
+
+    scoped_event = ViewerRepository(database).event_snapshot(
+        after_sequence=0,
+        visible_conversation_ids=["room-one"],
+        include_admin_state=False,
+    )
+    assert [item["conversation_id"] for item in scoped_event["changed_rooms"]] == [
+        "room-one"
+    ]
+    assert "room-two" not in str(scoped_event)
+    assert "这条隐藏消息" not in str(scoped_event)
 
 
 def test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body(
@@ -896,8 +1057,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-5" in index_html
-    assert "app.css?v=20260814-5" in index_html
+    assert "app.js?v=20260814-6" in index_html
+    assert "app.css?v=20260814-6" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -2154,6 +2315,7 @@ def test_lan_same_origin_user_can_chat_but_cannot_revoke_agent_session(
         client=("192.168.1.50", 50000),
     )
     web_user = register_web_user(client, username="lan-member")
+    grant_web_room_access(database, user=web_user, room="room-one")
     registered = client.post(
         "/agent/register",
         json={
@@ -2220,6 +2382,7 @@ def test_admin_manages_global_and_individual_message_rates(
     admin = login_admin(admin_client)
     member_client = TestClient(make_app(database))
     member = register_web_user(member_client, username="rate-member")
+    grant_web_room_access(database, user=member, room="room-one")
 
     defaults = admin_client.get("/api/message-rates")
     assert defaults.status_code == 200

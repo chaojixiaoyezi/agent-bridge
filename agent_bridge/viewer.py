@@ -283,6 +283,22 @@ def create_app(
             raise WebAuthorizationError("此操作仅限管理员")
         return identity
 
+    def web_room_access_scope(identity: dict[str, object]) -> dict[str, object]:
+        return store.web_room_access_scope(
+            authorized_session_id=str(identity["session_id"]),
+            participant_id=str(identity["participant_id"]),
+        )
+
+    def require_web_room_access(
+        identity: dict[str, object],
+        conversation_id: str,
+    ) -> dict[str, object]:
+        return store.require_web_room_access(
+            authorized_session_id=str(identity["session_id"]),
+            participant_id=str(identity["participant_id"]),
+            conversation_id=conversation_id,
+        )
+
     def require_web_intent(request: Request, *, intent: str) -> None:
         if not _is_same_origin_intent(request, intent=intent, policy=policy):
             raise WebAuthorizationError("请求来源校验失败，请从当前网页重试")
@@ -550,19 +566,24 @@ def create_app(
             return _json_error(exc)
 
         def payload() -> dict:
-            result = repository.health()
+            result = (
+                repository.health()
+                if bool(identity["is_admin"])
+                else dict(public_health)
+            )
             result.update(public_health)
             result["current_user"] = _public_web_identity(
                 web_auth.authenticate(request.cookies.get(web_session_cookie))
             )
-            result["security"] = {
-                "public_mode": policy.public_mode,
-                "https_required": policy.public_mode,
-                "trusted_host_count": len(policy.allowed_hosts),
-                "web_registration_mode": policy.web_registration_mode,
-                "request_body_limit_bytes": MAX_REQUEST_BODY_BYTES,
-                "web_session_ttl_seconds": policy.web_session_ttl_seconds,
-            }
+            if bool(identity["is_admin"]):
+                result["security"] = {
+                    "public_mode": policy.public_mode,
+                    "https_required": policy.public_mode,
+                    "trusted_host_count": len(policy.allowed_hosts),
+                    "web_registration_mode": policy.web_registration_mode,
+                    "request_body_limit_bytes": MAX_REQUEST_BODY_BYTES,
+                    "web_session_ttl_seconds": policy.web_session_ttl_seconds,
+                }
             result["message_rate_limits"] = store.message_rate_summary(
                 web_participant_id=str(identity["participant_id"]),
                 web_role=str(identity["role"]),
@@ -697,8 +718,10 @@ def create_app(
             return _json_error(exc)
 
         def payload() -> dict:
+            access_scope = web_room_access_scope(identity)
             projected = repository.rooms(
-                limit=_int_query(request, "limit", default=200, maximum=500)
+                limit=_int_query(request, "limit", default=200, maximum=500),
+                visible_conversation_ids=access_scope["conversation_ids"],
             )
             user_id = str(identity["user_id"])
             admin = bool(identity["is_admin"])
@@ -837,6 +860,42 @@ def create_app(
                         target_web_user_id=request.path_params["user_id"],
                         can_create_rooms=payload["can_create_rooms"],
                         room_limit=payload["room_limit"],
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def room_web_users(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                store.search_room_web_users(
+                    requesting_web_user_id=str(identity["user_id"]),
+                    conversation_id=request.path_params["conversation_id"],
+                    query=str(request.query_params.get("query") or ""),
+                    limit=_int_query(request, "limit", default=100, maximum=200),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def update_room_web_user(request: Request) -> Response:
+        try:
+            intent = (
+                "invite-room-web-user"
+                if request.method == "PUT"
+                else "remove-room-web-user"
+            )
+            require_web_intent(request, intent=intent)
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "user": store.manage_room_web_member(
+                        requesting_web_user_id=str(identity["user_id"]),
+                        conversation_id=request.path_params["conversation_id"],
+                        target_web_user_id=request.path_params["user_id"],
+                        active=request.method == "PUT",
                     )
                 }
             )
@@ -1730,7 +1789,11 @@ def create_app(
 
     async def messages(request: Request) -> Response:
         try:
-            authenticated_web_user(request)
+            identity = authenticated_web_user(request)
+            require_web_room_access(
+                identity,
+                request.path_params["conversation_id"],
+            )
         except Exception as exc:
             return _json_error(exc)
         before = request.query_params.get("before_sequence")
@@ -1796,7 +1859,11 @@ def create_app(
 
     async def search_room_messages(request: Request) -> Response:
         try:
-            authenticated_web_user(request)
+            identity = authenticated_web_user(request)
+            require_web_room_access(
+                identity,
+                request.path_params["conversation_id"],
+            )
             if policy.public_mode:
                 enforce_rate(
                     request,
@@ -1826,7 +1893,11 @@ def create_app(
 
     async def message_receipts(request: Request) -> Response:
         try:
-            authenticated_web_user(request)
+            identity = authenticated_web_user(request)
+            require_web_room_access(
+                identity,
+                request.path_params["conversation_id"],
+            )
             after_raw = request.query_params.get("after_sequence")
             after = max(0, min(int(after_raw or 0), 2_147_483_647))
             limit = _int_query(request, "limit", default=500, maximum=1_000)
@@ -2077,7 +2148,11 @@ def create_app(
 
     async def participants(request: Request) -> Response:
         try:
-            authenticated_web_user(request)
+            identity = authenticated_web_user(request)
+            require_web_room_access(
+                identity,
+                request.path_params["conversation_id"],
+            )
             projected = repository.participants(
                 request.path_params["conversation_id"]
             )
@@ -2896,13 +2971,15 @@ def create_app(
                     window_seconds=60,
                 )
             session_token = request.cookies.get(web_session_cookie)
-            authenticated_web_user(request)
+            initial_identity = authenticated_web_user(request)
+            initial_scope = web_room_access_scope(initial_identity)
             cursor = _event_cursor(request.headers.get("last-event-id"))
         except Exception as exc:
             return _json_error(exc)
 
         async def stream():
             nonlocal cursor
+            access_scope = initial_scope
             previous_revision: list[object] | None = None
             last_output = time.monotonic()
             last_maintenance = 0.0
@@ -2920,12 +2997,28 @@ def create_app(
                         )
                         return
                     last_authentication = monotonic_now
+                try:
+                    # Re-evaluate the ACL before every event snapshot so an
+                    # open SSE connection cannot retain a revoked room scope.
+                    access_scope = await asyncio.to_thread(
+                        web_room_access_scope,
+                        initial_identity,
+                    )
+                except (WebAuthenticationError, AuthenticationError) as exc:
+                    yield _sse_event(
+                        "session_closed",
+                        {"error": str(exc)},
+                        event_id=cursor,
+                    )
+                    return
                 if monotonic_now - last_maintenance >= 60:
                     await asyncio.to_thread(store.clear_inactive_sessions)
                     last_maintenance = monotonic_now
                 snapshot = await asyncio.to_thread(
                     repository.event_snapshot,
                     after_sequence=cursor,
+                    visible_conversation_ids=access_scope["conversation_ids"],
+                    include_admin_state=bool(access_scope["is_admin"]),
                 )
                 revision = list(snapshot["state_revision"])
                 if previous_revision is None or revision != previous_revision:
@@ -3003,6 +3096,16 @@ def create_app(
                 "/api/admin/web-users/{user_id:str}/room-permission",
                 update_web_user_room_permission,
                 methods=["PATCH"],
+            ),
+            Route(
+                "/api/admin/rooms/{conversation_id:str}/web-users",
+                room_web_users,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}",
+                update_room_web_user,
+                methods=["PUT", "DELETE"],
             ),
             Route(
                 "/api/rooms/{conversation_id:str}",

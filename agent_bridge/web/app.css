@@ -979,6 +979,12 @@ select option {
 .member-agent-kick { min-width: auto; height: 28px; padding: 0 8px; color: var(--danger); border-color: rgba(255,119,141,.18); font-size: 8px; }
 .member-empty { margin: 0; color: var(--muted); font-size: 9px; }
 .selection-count { align-self: center; margin-right: auto; color: var(--cyan); font-size: 9px; }
+.web-member-search-form { margin-top: 10px; grid-template-columns: minmax(0, 1fr) auto; }
+.web-member-results { max-height: 290px; overflow-y: auto; }
+.web-member-card { grid-template-columns: minmax(0, 1fr) auto auto; }
+.web-member-status { color: var(--muted); font-size: 9px; white-space: nowrap; }
+.web-member-status.active { color: var(--cyan); }
+.danger-button { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 32%, var(--line)); }
 .rate-section + .rate-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
 .rate-section-heading { display: flex; justify-content: space-between; margin-bottom: 12px; }
 .rate-section-heading strong { display: block; font-size: 12px; }
