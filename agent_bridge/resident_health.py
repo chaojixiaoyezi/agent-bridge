@@ -127,6 +127,9 @@ def _launchd_services(home: Path) -> dict[str, dict[str, Any]]:
             "conversation_id": str(
                 environment.get("AGENT_BRIDGE_CONVERSATION_ID") or ""
             ).strip(),
+            "component": str(
+                environment.get("AGENT_BRIDGE_COMPONENT") or ""
+            ).strip().lower(),
             "state": "disabled" if label in disabled_labels else launchd_state,
             "launchd_state": launchd_state,
         }
@@ -166,12 +169,16 @@ def local_resident_snapshot(
         listener_running = any(item["state"] == "running" for item in listeners)
         worker_running = any(item["state"] == "running" for item in workers)
         task_running = any(item["state"] == "running" for item in tasks)
+        task_component_ready = any(
+            item.get("component") == "task" for item in tasks
+        )
         snapshot[identity] = {
             **detail,
             "listener_running": listener_running,
             "worker_running": worker_running,
             "task_configured": bool(tasks),
             "task_running": task_running,
+            "task_component_ready": task_component_ready,
             "resident_status": (
                 "online"
                 if listener_running and worker_running
@@ -214,6 +221,9 @@ def local_resident_snapshot(
                 item["state"] == "running" for item in connector_tasks
             )
             connector["task_configured"] = bool(connector_tasks)
+            connector["task_component_ready"] = any(
+                item.get("component") == "task" for item in connector_tasks
+            )
             connector["resident_status"] = (
                 "online"
                 if connector["listener_running"] and connector["worker_running"]

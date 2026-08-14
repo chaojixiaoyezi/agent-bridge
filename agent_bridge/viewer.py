@@ -18,6 +18,14 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from .a2a_gateway import (
+    A2A_PROTOCOL_VERSION,
+    A2ARequestError,
+    agent_card,
+    handle_jsonrpc,
+    jsonrpc_error,
+)
+from .avatars import avatar_catalog_payload
 from .config import BridgeConfig
 from .connector import adapter_kind_for_product, configure_resident_connector
 from .resident_health import (
@@ -146,12 +154,18 @@ def create_app(
                         chat_online = connector.get("resident_status") == "online"
                         task_configured = bool(connector.get("task_configured"))
                         task_running = bool(connector.get("task_running"))
-                        if chat_online and task_running:
+                        task_component_ready = bool(
+                            connector.get("task_component_ready")
+                        )
+                        if chat_online and task_running and task_component_ready:
                             continue
-                        if chat_online and not task_configured:
+                        if chat_online and (
+                            not task_configured or not task_component_ready
+                        ):
                             # Existing v0.11 connectors already keep chat healthy.
-                            # Install only the new task seat so an upgrade never
-                            # restarts listener/worker or interrupts room traffic.
+                            # Install or protocol-upgrade only the task seat so an
+                            # upgrade never restarts listener/worker or interrupts
+                            # room traffic.
                             await asyncio.to_thread(
                                 configure_existing_connector_from_disk,
                                 client_type,
@@ -364,13 +378,14 @@ def create_app(
             payload = await _json_body(
                 request,
                 required={"display_name", "signature"},
-                allowed={"display_name", "signature"},
+                allowed={"display_name", "signature", "avatar_key"},
             )
             updated = web_auth.update_profile(
                 user_id=str(identity["user_id"]),
                 session_id=str(identity["session_id"]),
                 display_name=payload["display_name"],
                 signature=payload["signature"],
+                avatar_key=payload.get("avatar_key"),
             )
             return JSONResponse({"user": _public_web_identity(updated)})
         except Exception as exc:
@@ -405,6 +420,118 @@ def create_app(
 
         return _json_call(payload)
 
+    async def avatars(request: Request) -> Response:
+        try:
+            authenticated_web_user(request, allow_password_change=True)
+            return JSONResponse(avatar_catalog_payload())
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def a2a_agent_card(request: Request) -> Response:
+        return JSONResponse(agent_card(str(request.base_url).rstrip("/")))
+
+    async def a2a_rpc(request: Request) -> Response:
+        request_id: object = None
+        try:
+            if request.headers.get("a2a-version", A2A_PROTOCOL_VERSION) != (
+                A2A_PROTOCOL_VERSION
+            ):
+                raise A2ARequestError(
+                    "unsupported A2A-Version; expected 1.0",
+                    code=-32600,
+                )
+            authorization = request.headers.get("authorization", "")
+            scheme, _, access_token = authorization.partition(" ")
+            if scheme.casefold() != "bearer" or not access_token.strip():
+                raise AuthenticationError("A2A bearer token is required")
+            raw = await request.body()
+            if not raw or len(raw) > 70_000:
+                raise A2ARequestError("invalid JSON-RPC request size", code=-32600)
+            try:
+                rpc_request = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise A2ARequestError("invalid JSON", code=-32700) from exc
+            if isinstance(rpc_request, dict):
+                request_id = rpc_request.get("id")
+            result = await asyncio.to_thread(
+                handle_jsonrpc,
+                store,
+                access_token=access_token.strip(),
+                request=rpc_request,
+            )
+            return JSONResponse(
+                result,
+                headers={"A2A-Version": A2A_PROTOCOL_VERSION},
+            )
+        except AuthenticationError as exc:
+            return JSONResponse(
+                jsonrpc_error(request_id=request_id, code=-32001, message=str(exc)),
+                status_code=401,
+                headers={"A2A-Version": A2A_PROTOCOL_VERSION},
+            )
+        except A2ARequestError as exc:
+            return JSONResponse(
+                jsonrpc_error(
+                    request_id=request_id,
+                    code=exc.code,
+                    message=str(exc),
+                ),
+                headers={"A2A-Version": A2A_PROTOCOL_VERSION},
+            )
+        except (NotFoundError, ConflictError, AuthorizationError) as exc:
+            return JSONResponse(
+                jsonrpc_error(request_id=request_id, code=-32002, message=str(exc)),
+                headers={"A2A-Version": A2A_PROTOCOL_VERSION},
+            )
+
+    async def a2a_grants(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            if request.method == "GET":
+                return JSONResponse(
+                    store.list_a2a_access_grants(
+                        requesting_web_user_id=str(identity["user_id"]),
+                        conversation_id=request.query_params.get("conversation_id"),
+                    )
+                )
+            require_web_intent(request, intent="create-a2a-grant")
+            payload = await _json_body(
+                request,
+                required={"conversation_id", "label"},
+                allowed={"conversation_id", "label", "ttl_seconds"},
+            )
+            return JSONResponse(
+                {
+                    "grant": store.create_a2a_access_grant(
+                        conversation_id=payload["conversation_id"],
+                        label=payload["label"],
+                        ttl_seconds=payload.get(
+                            "ttl_seconds",
+                            30 * 24 * 60 * 60,
+                        ),
+                        created_by_web_user_id=str(identity["user_id"]),
+                    )
+                },
+                status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def revoke_a2a_grant(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="revoke-a2a-grant")
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "grant": store.revoke_a2a_access_grant(
+                        grant_id=request.path_params["grant_id"],
+                        revoked_by_web_user_id=str(identity["user_id"]),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def rooms(request: Request) -> Response:
         try:
             identity = authenticated_web_user(request)
@@ -422,6 +549,9 @@ def create_app(
                 participant_id=str(identity["participant_id"]),
                 conversation_ids=[str(room["conversation_id"]) for room in projected],
             )
+            wake_policies = store.room_wake_policies_bulk(
+                conversation_ids=[str(room["conversation_id"]) for room in projected]
+            )
             for room in projected:
                 room["is_room_owner"] = room.get("owner_web_user_id") == user_id
                 room["can_wake_all"] = admin or bool(room["is_room_owner"])
@@ -436,6 +566,10 @@ def create_app(
                             "allow_global_admin",
                         )
                     }
+                )
+                room["wake_policy"] = wake_policies[str(room["conversation_id"])]
+                room["can_manage_wake_policy"] = admin or bool(
+                    room["is_room_owner"]
                 )
             return {"rooms": projected}
 
@@ -537,11 +671,14 @@ def create_app(
             payload = await _json_body(
                 request,
                 required={"inactivity_days"},
-                allowed={"inactivity_days"},
+                allowed={"inactivity_days", "unactivated_inactivity_days"},
             )
             return JSONResponse(
                 store.update_agent_lifecycle_configuration(
                     inactivity_days=payload["inactivity_days"],
+                    unactivated_inactivity_days=payload.get(
+                        "unactivated_inactivity_days"
+                    ),
                     updated_by_web_user_id=str(identity["user_id"]),
                 )
             )
@@ -553,6 +690,17 @@ def create_app(
             identity = authenticated_admin(request)
             return JSONResponse(
                 store.admin_room_agents(
+                    requesting_web_user_id=str(identity["user_id"]),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def connector_health(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                store.admin_connector_health(
                     requesting_web_user_id=str(identity["user_id"]),
                 )
             )
@@ -749,10 +897,20 @@ def create_app(
                 "x-agent-bridge-connector",
                 "",
             ).strip()
+            component = request.headers.get(
+                "x-agent-bridge-component",
+                "",
+            ).strip()
+            protocol_header = request.headers.get(
+                "x-agent-bridge-protocol",
+                "2",
+            ).strip()
             return _json_call(
                 lambda: store.register_agent_session_from_enrollment(
                     enrollment_token=enrollment_token,
                     connector_id=connector_id or None,
+                    connector_component=component or None,
+                    connector_protocol_version=int(protocol_header),
                     product=payload["product"],
                     username=payload["username"],
                     session_alias=payload.get("session_alias"),
@@ -861,11 +1019,12 @@ def create_app(
             request,
             store,
             required={"signature"},
-            allowed={"signature"},
+            allowed={"signature", "avatar_key"},
             operation=lambda auth, payload: store.update_profile(
                 participant_id=auth["participant_id"],
                 authorized_session_id=auth["session_id"],
                 signature=payload["signature"],
+                avatar_key=payload.get("avatar_key"),
             ),
         )
 
@@ -1164,6 +1323,54 @@ def create_app(
                 authorized_session_id=auth["session_id"],
                 wait_seconds=payload.get("wait_seconds", 20),
             )
+            if auth.get("connector_id"):
+                await asyncio.to_thread(
+                    store.touch_agent_connector,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    connector_id=auth["connector_id"],
+                )
+            return JSONResponse(result)
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def agent_task_inputs(request: Request) -> Response:
+        try:
+            auth = _authenticate_request(request, store)
+            payload = await _json_body(
+                request,
+                required={"task_id", "action"},
+                allowed={"task_id", "action", "input_ids", "limit"},
+            )
+            action = str(payload["action"] or "").strip().lower()
+            if action == "poll":
+                result = await asyncio.to_thread(
+                    store.poll_agent_task_inputs,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    task_id=payload["task_id"],
+                    limit=payload.get("limit", 50),
+                )
+            elif action == "ack":
+                input_ids = payload.get("input_ids")
+                if not isinstance(input_ids, list):
+                    raise ValidationError("input_ids must be a list")
+                result = await asyncio.to_thread(
+                    store.acknowledge_agent_task_inputs,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    task_id=payload["task_id"],
+                    input_ids=input_ids,
+                )
+            else:
+                raise ValidationError("unsupported task input action")
+            if auth.get("connector_id"):
+                await asyncio.to_thread(
+                    store.touch_agent_connector,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    connector_id=auth["connector_id"],
+                )
             return JSONResponse(result)
         except Exception as exc:
             return _json_error(exc)
@@ -1314,6 +1521,68 @@ def create_app(
                     )
                 },
                 status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def convert_web_message_to_task(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="convert-message-to-task")
+            identity = authenticated_web_user(request)
+            payload = await _json_body(
+                request,
+                required=set(),
+                allowed={"target_participant_ids"},
+            )
+            return JSONResponse(
+                {
+                    "message": store.convert_web_message_to_task(
+                        authorized_session_id=str(identity["session_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        message_id=request.path_params["message_id"],
+                        target_participant_ids=payload.get(
+                            "target_participant_ids"
+                        ),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def room_wake_policy(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            if request.method == "GET":
+                return JSONResponse(
+                    store.room_wake_policy(
+                        authorized_session_id=str(identity["session_id"]),
+                        participant_id=str(identity["participant_id"]),
+                        conversation_id=conversation,
+                    )
+                )
+            require_web_intent(request, intent="manage-wake-policy")
+            payload = await _json_body(
+                request,
+                required={"mode"},
+                allowed={
+                    "mode",
+                    "digest_min_messages",
+                    "digest_after_seconds",
+                },
+            )
+            return JSONResponse(
+                store.update_room_wake_policy(
+                    authorized_session_id=str(identity["session_id"]),
+                    participant_id=str(identity["participant_id"]),
+                    conversation_id=conversation,
+                    mode=payload["mode"],
+                    digest_min_messages=payload.get("digest_min_messages", 5),
+                    digest_after_seconds=payload.get(
+                        "digest_after_seconds",
+                        300,
+                    ),
+                )
             )
         except Exception as exc:
             return _json_error(exc)
@@ -1716,23 +1985,11 @@ def create_app(
                 )
                 continue
             try:
-                invitation = await asyncio.to_thread(
-                    store.create_agent_invitation,
-                    conversation_id=conversation_id,
-                    product=product,
-                    requested_mode="resident",
-                    adapter_kind=adapter_kind_for_product(product),
-                    created_by_web_user_id=str(web_identity["user_id"]),
-                )
-                invitation_token = str(invitation.pop("invitation_token"))
                 registration = await asyncio.to_thread(
-                    store.accept_agent_invitation,
-                    invitation_token=invitation_token,
-                    product=product,
-                    username=username,
-                    signature=str(participant["signature"]),
-                    roles=list(participant.get("roles") or []),
-                    capabilities=list(participant.get("capabilities") or []),
+                    store.provision_existing_agent_room_connector,
+                    conversation_id=conversation_id,
+                    participant_id=participant_id,
+                    created_by_web_user_id=str(web_identity["user_id"]),
                 )
                 local_port = int(os.environ.get("AGENT_BRIDGE_VIEWER_PORT", "8765"))
                 setup = await asyncio.to_thread(
@@ -1740,14 +1997,14 @@ def create_app(
                     connector_id=str(registration["connector_id"]),
                     enrollment_token=str(registration["enrollment_token"]),
                     bridge_url=f"http://127.0.0.1:{local_port}",
-                    product=product,
+                    product=str(registration["product"]),
                     username=str(registration.get("username") or username),
                     signature=str(participant["signature"]),
                     conversation_id=conversation_id,
-                    adapter_kind=adapter_kind_for_product(product),
-                    requested_mode="resident",
-                    roles=list(participant.get("roles") or []),
-                    capabilities=list(participant.get("capabilities") or []),
+                    adapter_kind=str(registration["adapter_kind"]),
+                    requested_mode=str(registration["requested_mode"]),
+                    roles=list(registration.get("roles") or []),
+                    capabilities=list(registration.get("capabilities") or []),
                     workspace_path=str(template.get("workspace_path") or PROJECT_ROOT),
                     activate=True,
                 )
@@ -2167,6 +2424,19 @@ def create_app(
             Route("/assets/app.css", stylesheet, methods=["GET"]),
             Route("/assets/app.js", javascript, methods=["GET"]),
             Route("/api/health", health, methods=["GET"]),
+            Route("/api/avatars", avatars, methods=["GET"]),
+            Route(
+                "/.well-known/agent-card.json",
+                a2a_agent_card,
+                methods=["GET"],
+            ),
+            Route("/a2a", a2a_rpc, methods=["POST"]),
+            Route("/api/a2a/grants", a2a_grants, methods=["GET", "POST"]),
+            Route(
+                "/api/a2a/grants/{grant_id:str}/revoke",
+                revoke_a2a_grant,
+                methods=["POST"],
+            ),
             Route("/api/auth/captcha", auth_captcha, methods=["GET"]),
             Route("/api/auth/register", auth_register, methods=["POST"]),
             Route("/api/auth/login", auth_login, methods=["POST"]),
@@ -2204,6 +2474,11 @@ def create_app(
             Route(
                 "/api/admin/room-members",
                 admin_room_members,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/connectors/health",
+                connector_health,
                 methods=["GET"],
             ),
             Route(
@@ -2296,6 +2571,7 @@ def create_app(
             ),
             Route("/agent/participants", agent_participants, methods=["POST"]),
             Route("/agent/tasks/next", agent_task_next, methods=["POST"]),
+            Route("/agent/tasks/inputs", agent_task_inputs, methods=["POST"]),
             Route("/agent/tasks/update", agent_task_update, methods=["POST"]),
             Route("/agent/tasks/delegate", agent_task_delegate, methods=["POST"]),
             Route(
@@ -2317,6 +2593,16 @@ def create_app(
                 "/api/rooms/{conversation_id:str}/tasks",
                 web_send_task,
                 methods=["POST"],
+            ),
+            Route(
+                "/api/messages/{message_id:str}/convert-to-task",
+                convert_web_message_to_task,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/wake-policy",
+                room_wake_policy,
+                methods=["GET", "PATCH"],
             ),
             Route(
                 "/api/rooms/{conversation_id:str}/task-permissions",
@@ -2379,6 +2665,7 @@ def _public_web_identity(identity: dict[str, object]) -> dict[str, object]:
         "participant_id",
         "display_name",
         "signature",
+        "avatar_key",
         "must_change_password",
         "can_create_rooms",
         "room_limit",

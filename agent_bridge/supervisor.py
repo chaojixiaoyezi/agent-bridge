@@ -16,6 +16,8 @@ from typing import Any, Sequence
 
 PRIORITIES = {"normal": 0, "important": 1, "mention": 2}
 MAX_RETRY_DELAY_SECONDS = 30.0
+HANDLED_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+DEFERRED_EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
@@ -186,7 +188,10 @@ def _validated_envelope(raw: bytes) -> tuple[dict[str, Any], bytes, str]:
     suffix = (
         str(event_id) if event_id is not None else hashlib.sha256(encoded).hexdigest()
     )
-    idempotency_key = f"{participant_id}:{event_name}:{suffix}"
+    # A digest can deliberately promote the same room cursor from normal to
+    # mention later.  Priority is part of the durable event identity so that
+    # this safe escalation is not mistaken for a duplicate.
+    idempotency_key = f"{participant_id}:{event_name}:{suffix}:{priority}"
     return payload, encoded, idempotency_key
 
 
@@ -247,6 +252,7 @@ def enqueue_event(database: Path, raw: bytes, *, now: float | None = None) -> bo
     payload, encoded, idempotency_key = _validated_envelope(raw)
     created_at = float(time.time() if now is None else now)
     with closing(_connect(database)) as connection:
+        _prune_old_events_locked(connection, now=created_at)
         cursor = connection.execute(
             """
             INSERT OR IGNORE INTO wake_events
@@ -270,6 +276,7 @@ def enqueue_event(database: Path, raw: bytes, *, now: float | None = None) -> bo
 
 def queue_status(database: Path) -> dict[str, Any]:
     with closing(_connect(database)) as connection:
+        now = time.time()
         counts = {
             str(row["state"]): int(row["count"])
             for row in connection.execute(
@@ -288,6 +295,14 @@ def queue_status(database: Path) -> dict[str, Any]:
                 """
             ).fetchone()["count"]
         )
+        oldest = {
+            str(row["state"]): float(row["oldest_created_at"])
+            for row in connection.execute(
+                "SELECT state, MIN(created_at) AS oldest_created_at "
+                "FROM wake_events GROUP BY state"
+            ).fetchall()
+            if row["oldest_created_at"] is not None
+        }
     return {
         "database": str(database.expanduser().resolve()),
         "counts": {
@@ -298,7 +313,31 @@ def queue_status(database: Path) -> dict[str, Any]:
         },
         "newest_event_id": newest["event_id"] if newest is not None else None,
         "active_adapter_runs": active_runs,
+        "oldest_age_seconds": {
+            state: max(0.0, now - created_at)
+            for state, created_at in oldest.items()
+        },
+        # Status is intentionally read-only. Retention runs on enqueue/claim,
+        # where a single consistent clock is already available.
+        "pruned": {"handled": 0, "deferred": 0},
     }
+
+
+def _prune_old_events_locked(
+    connection: sqlite3.Connection,
+    *,
+    now: float,
+) -> dict[str, int]:
+    handled = connection.execute(
+        "DELETE FROM wake_events WHERE state = 'handled' "
+        "AND COALESCE(handled_at, created_at) < ?",
+        (now - HANDLED_EVENT_RETENTION_SECONDS,),
+    ).rowcount
+    deferred = connection.execute(
+        "DELETE FROM wake_events WHERE state = 'deferred' AND created_at < ?",
+        (now - DEFERRED_EVENT_RETENTION_SECONDS,),
+    ).rowcount
+    return {"handled": int(handled), "deferred": int(deferred)}
 
 
 def _priority_allowed(priority: str, wake_policy: str) -> bool:
@@ -317,6 +356,7 @@ def _claim_batch(
 ) -> list[sqlite3.Row]:
     connection.execute("BEGIN IMMEDIATE")
     try:
+        _prune_old_events_locked(connection, now=now)
         connection.execute(
             """
             UPDATE wake_events

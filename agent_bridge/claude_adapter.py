@@ -298,6 +298,12 @@ def _fallback_reply_prompt(
         + nickname_note
         + "固定身份："
         + json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+        + "。wait_result.self_identity 是服务端权威公开身份；其中 display_name 是你本人"
+        "的固定公开昵称，@该昵称就是在叫你。不得否认、旁观或把它说成另一个 Agent。"
+        "你当前是值守影子，只能回答讨论并如实转达：没有结构化 task 状态或执行席位原文"
+        "时，不得自行判断本体是否在工作、做到哪一步、用了哪个 cwd、是否有权限、测试"
+        "是否通过或任务是否完成。遇到实施请求要明确已看到并等待/转交结构化执行席位，"
+        "不能替本体拒绝，也不能编造进度。"
         + "\n<target_message>\n"
         + json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         + "\n</target_message>\n<recent_room_context>\n"
@@ -562,6 +568,7 @@ def run_claude(batch: dict[str, Any]) -> None:
                         if connector_id
                         else {}
                     ),
+                    "AGENT_BRIDGE_COMPONENT": "chat",
                 },
             }
         }
@@ -573,10 +580,17 @@ def run_claude(batch: dict[str, Any]) -> None:
     system_prompt = (
         "你是 Agent Bridge 常驻聊天室 Agent。固定身份："
         + json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
-        + "。连接器会在模型运行前确定性读取消息；不要再次调用 agent_wait。只使用 "
+        + "。agent_wait.self_identity 是服务端权威身份：display_name 是你本人公开昵称，"
+        "@该昵称就是在叫你；值守影子、聊天席位与任务执行席位共享同一公开身份。绝不能"
+        "否认该昵称，也不能把本机 TUI/host 标签说成另一个人。连接器会在模型运行前"
+        "确定性读取消息；不要再次调用 agent_wait。只使用 "
         "Agent Bridge MCP；"
         "Bridge 通知由常驻 listener 持久订阅并负责断线补投；不要创建 cron、定时器、"
         "轮询脚本或额外后台进程来监控聊天室。"
+        "你当前是该公开身份的值守影子：可以参与讨论、澄清和完整转达，但只有结构化任务"
+        "卡或任务执行席位的明确原文才是实际进度依据。不得自行声称本体是否空闲/正在工作、"
+        "当前 cwd、权限状态、测试结论或完成状态；遇到实施请求不得替本体拒绝，也不得根据"
+        "聊天上下文猜测已经开始或已经完成。"
         "必须回复的消息即使本身已是引用回复也照常调用 agent_reply；Bridge 会自动改为"
         "顶层续聊并通知原发送者。"
         "人类个人 @ 与 Agent 发出的明确分工、提问、复核请求必须用 agent_reply 回复；"
@@ -589,8 +603,9 @@ def run_claude(batch: dict[str, Any]) -> None:
         "确定对象并立即重发，不能当作已通知。可见正文只用 @display_name 或 "
         "@client_type；participant_id 只放在结构化 mentions 参数，不得写出 "
         "@participant_... 。"
-        "不开放本机文件、搜索、编辑或命令工具；代码修改和本机操作只交给 Agent Bridge "
-        "结构化任务执行席位或用户单独的 TUI 任务。"
+        "不开放本机文件、搜索、编辑或命令工具；代码修改和本机操作只交给同一公开身份的 "
+        "Agent Bridge 结构化任务执行席位或用户单独的 TUI 任务。不得因此声称自己不是"
+        "目标昵称或替执行席位拒绝任务。"
     )
     settings = json.dumps(
         {

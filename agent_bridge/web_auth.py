@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from .avatars import normalize_avatar_key
 from .validation import (
     ValidationError,
     alias,
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS web_users (
     participant_id TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL COLLATE NOCASE,
     signature TEXT NOT NULL,
+    avatar_key TEXT NOT NULL DEFAULT 'auto',
     must_change_password INTEGER NOT NULL DEFAULT 0
         CHECK (must_change_password IN (0, 1)),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
@@ -383,6 +385,11 @@ class WebAuthStore:
                 f"NOT NULL DEFAULT {DEFAULT_WEB_USER_ROOM_LIMIT} "
                 f"CHECK (room_limit BETWEEN 1 AND {MAX_WEB_USER_ROOM_LIMIT})"
             )
+        if "avatar_key" not in columns:
+            connection.execute(
+                "ALTER TABLE web_users ADD COLUMN avatar_key TEXT "
+                "NOT NULL DEFAULT 'auto'"
+            )
 
     @staticmethod
     def _insert_participant_locked(
@@ -565,7 +572,8 @@ class WebAuthStore:
             row = connection.execute(
                 """
                 SELECT session.*, user.username, user.role, user.participant_id,
-                       user.display_name, user.signature, user.must_change_password,
+                       user.display_name, user.signature, user.avatar_key,
+                       user.must_change_password,
                        user.active, user.can_create_rooms, user.room_limit,
                        user.created_at AS user_created_at,
                        user.password_changed_at, user.last_login_at
@@ -674,11 +682,17 @@ class WebAuthStore:
         session_id: str,
         display_name: str,
         signature: str,
+        avatar_key: object | None = None,
     ) -> dict[str, object]:
         user = opaque_id(user_id, field="web_user_id")
         session = opaque_id(session_id, field="web_session_id")
         normalized_display = validate_display_name(display_name)
         normalized_signature = alias(signature, field="signature")
+        normalized_avatar = (
+            normalize_avatar_key(avatar_key)
+            if avatar_key is not None
+            else None
+        )
         now = time.time()
         try:
             with self._transaction() as connection:
@@ -697,16 +711,25 @@ class WebAuthStore:
                 if collision is not None:
                     raise WebConflictError("昵称已被使用")
                 connection.execute(
-                    "UPDATE web_users SET display_name = ?, signature = ?, updated_at = ? "
+                    "UPDATE web_users SET display_name = ?, signature = ?, "
+                    "avatar_key = COALESCE(?, avatar_key), updated_at = ? "
                     "WHERE user_id = ?",
-                    (normalized_display, normalized_signature, now, user),
-                )
-                connection.execute(
-                    "UPDATE participants SET display_name = ?, signature = ?, "
-                    "profile_updated_at = ?, last_seen = ? WHERE participant_id = ?",
                     (
                         normalized_display,
                         normalized_signature,
+                        normalized_avatar,
+                        now,
+                        user,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE participants SET display_name = ?, signature = ?, "
+                    "avatar_key = COALESCE(?, avatar_key), profile_updated_at = ?, "
+                    "last_seen = ? WHERE participant_id = ?",
+                    (
+                        normalized_display,
+                        normalized_signature,
+                        normalized_avatar,
                         now,
                         now,
                         str(row["participant_id"]),
@@ -824,6 +847,7 @@ class WebAuthStore:
             "participant_id": str(row["participant_id"]),
             "display_name": str(row["display_name"]),
             "signature": str(row["signature"]),
+            "avatar_key": str(row["avatar_key"] or "auto"),
             "must_change_password": bool(row["must_change_password"]),
             "can_create_rooms": (
                 True

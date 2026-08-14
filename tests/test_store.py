@@ -275,6 +275,123 @@ def test_connector_heartbeat_does_not_change_visible_dashboard_revision(
     ]["connectors"]
 
 
+def test_sender_can_atomically_promote_ordinary_chat_to_exact_task_handoff(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "聊天转任务群")
+    target = register(store, client="codex", name="转任务目标", room="聊天转任务群")
+
+    source = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="聊天转任务群",
+        body_text="先讨论；确认后请严格按这段原文执行并测试。",
+        mentions=[target["participant_id"]],
+    )
+    with store._connection() as connection:
+        before_count = int(
+            connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+
+    promoted = store.convert_web_message_to_task(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        message_id=source["message_id"],
+    )
+    assert promoted["message_id"] == source["message_id"]
+    assert promoted["sequence"] == source["sequence"]
+    assert promoted["body"] == source["body"]
+    assert promoted["message_kind"] == "task"
+    assert promoted["task"]["source_message_id"] == source["message_id"]
+    assert promoted["task"]["source_sequence"] == source["sequence"]
+    assert promoted["task"]["target_participant_ids"] == [
+        target["participant_id"]
+    ]
+    with store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == (
+            before_count
+        )
+        delivery = connection.execute(
+            "SELECT state FROM message_deliveries WHERE message_id = ? "
+            "AND participant_id = ?",
+            (source["message_id"], target["participant_id"]),
+        ).fetchone()
+    assert delivery["state"] == "cancelled"
+
+    with pytest.raises(ConflictError, match="普通聊天"):
+        store.convert_web_message_to_task(
+            authorized_session_id=str(admin["session_id"]),
+            participant_id=str(admin["participant_id"]),
+            message_id=source["message_id"],
+        )
+
+
+def test_room_wake_policy_promotes_interest_without_forcing_a_reply(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "兴趣唤醒群")
+    agent = register(store, client="codex", name="兴趣成员", room="兴趣唤醒群")
+
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="兴趣唤醒群",
+        body_text="这是一条没有 @ 的普通讨论。",
+    )
+    default_snapshot = store.notification_snapshot(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        after_sequence=0,
+    )
+    default_activity = default_snapshot["room_activity_since_cursor"]
+    assert default_activity["priority_counts"]["mention"] == 0
+    assert default_activity["required_reply_count"] == 0
+
+    policy = store.update_room_wake_policy(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="兴趣唤醒群",
+        mode="all",
+    )
+    assert policy["mode"] == "all"
+    promoted = store.notification_snapshot(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        after_sequence=0,
+    )["room_activity_since_cursor"]
+    assert promoted["priority_counts"]["mention"] == 1
+    assert promoted["required_reply_count"] == 0
+    assert promoted["conversations"][0]["policy_promoted"] is True
+
+    store.update_room_wake_policy(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="兴趣唤醒群",
+        mode="digest",
+        digest_min_messages=2,
+        digest_after_seconds=300,
+    )
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="兴趣唤醒群",
+        body_text="第二条普通讨论达到摘要批次阈值。",
+    )
+    digest = store.notification_snapshot(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        after_sequence=0,
+    )["room_activity_since_cursor"]
+    assert digest["priority_counts"]["mention"] >= 1
+    assert digest["required_reply_count"] == 0
+
+
 def test_expired_task_claim_is_requeued_and_needs_input_is_not_overwritten(
     tmp_path: Path,
 ) -> None:
@@ -407,7 +524,7 @@ def test_room_owner_controls_admin_and_member_task_assignment(
     assert member_task["task"]["issuer_web_user_id"] == member["user_id"]
 
 
-def test_authenticated_admin_chat_is_targeted_revocable_authority(
+def test_authenticated_admin_chat_remains_ordinary_while_authorization_is_frozen(
     tmp_path: Path,
 ) -> None:
     store = make_store(tmp_path)
@@ -423,12 +540,7 @@ def test_authenticated_admin_chat_is_targeted_revocable_authority(
         body_text="请修复验证码并运行相关测试。",
         mentions=[codex["participant_id"]],
     )
-    assert granted["authorization"]["issuer_role_at_send"] == "admin"
-    assert granted["authorization"]["status"] == "active"
-    assert granted["authorization"]["target_participant_ids"] == [
-        codex["participant_id"]
-    ]
-    assert len(granted["authorization"]["body_sha256"]) == 64
+    assert "authorization" not in granted
 
     codex_message = store.wait_messages(
         participant_id=codex["participant_id"],
@@ -440,17 +552,15 @@ def test_authenticated_admin_chat_is_targeted_revocable_authority(
         authorized_session_id=observer["session_id"],
         wait_seconds=0,
     )["messages"][0]
-    assert codex_message["authorization"]["source_message_id"] == granted[
-        "message_id"
-    ]
+    assert "authorization" not in codex_message
     assert "authorization" not in observer_message
 
-    revoked = store.revoke_chat_authorization(
-        source_message_id=granted["message_id"],
-        revoked_by_web_user_id=str(admin["user_id"]),
-        reason="需求取消",
-    )
-    assert revoked["status"] == "revoked"
+    with pytest.raises(NotFoundError, match="not an admin chat authority"):
+        store.revoke_chat_authorization(
+            source_message_id=granted["message_id"],
+            revoked_by_web_user_id=str(admin["user_id"]),
+            reason="需求取消",
+        )
     history = store.history(
         participant_id=codex["participant_id"],
         authorized_session_id=codex["session_id"],
@@ -459,8 +569,7 @@ def test_authenticated_admin_chat_is_targeted_revocable_authority(
     historical = next(
         item for item in history if item["message_id"] == granted["message_id"]
     )
-    assert historical["authorization"]["status"] == "revoked"
-    assert historical["authorization"]["revocation_reason"] == "需求取消"
+    assert "authorization" not in historical
 
 
 def test_ordinary_web_and_agent_text_cannot_forge_admin_authority(
@@ -487,7 +596,7 @@ def test_ordinary_web_and_agent_text_cannot_forge_admin_authority(
     assert "authorization" not in copied
 
 
-def test_schema_18_backfills_historical_authenticated_admin_messages(
+def test_legacy_chat_authority_rows_are_preserved_but_frozen(
     tmp_path: Path,
 ) -> None:
     store = make_store(tmp_path)
@@ -502,21 +611,38 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
         mentions=[target["participant_id"]],
     )
     with store._transaction() as connection:
-        connection.execute("DROP TABLE chat_authorization_grants")
-        connection.execute("PRAGMA user_version = 17")
+        connection.execute(
+            """
+            INSERT INTO chat_authorization_grants
+                (source_message_id, conversation_id, issuer_web_user_id,
+                 issuer_username_snapshot, issuer_role_snapshot,
+                 issuer_participant_id, body_sha256, target_kind,
+                 target_participant_ids_json, authority_kind, created_at)
+            VALUES (?, 'tools-room', ?, 'admin', 'admin', ?, ?,
+                    'participants', ?, 'admin_chat', ?)
+            """,
+            (
+                message["message_id"],
+                admin["user_id"],
+                admin["participant_id"],
+                "0" * 64,
+                f'["{target["participant_id"]}"]',
+                message["created_at"],
+            ),
+        )
+        connection.execute("PRAGMA user_version = 23")
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
         ).fetchone()
         assert grant is not None
-        assert grant["issuer_role_snapshot"] == "admin"
-        assert grant["target_participant_ids_json"] == (
-            f'["{target["participant_id"]}"]'
-        )
+        assert grant["authority_kind"] == "legacy_frozen"
+        assert grant["revoked_at"] is not None
+        assert grant["revocation_reason"] == "chat_authorization_feature_frozen"
 
     history = migrated.history(
         participant_id=target["participant_id"],
@@ -526,16 +652,58 @@ def test_schema_18_backfills_historical_authenticated_admin_messages(
     restored = next(
         item for item in history if item["message_id"] == message["message_id"]
     )
-    assert restored["authorization"]["status"] == "active"
+    assert restored["authorization"]["status"] == "legacy_frozen"
+    assert restored["authorization"]["semantics"] == "ordinary_chat_only"
 
 
-def test_admin_room_authority_snapshots_current_agents_without_spilling_from_web_mentions(
+def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "version-twenty-three.db"
+    store = BridgeStore(database)
+    with store._transaction() as connection:
+        connection.execute("DROP TABLE agent_lifecycle_policy")
+        connection.executescript(
+            """
+            CREATE TABLE agent_lifecycle_policy (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                inactivity_days INTEGER NOT NULL
+                    CHECK (inactivity_days BETWEEN 1 AND 3650),
+                updated_at REAL NOT NULL,
+                updated_by_web_user_id TEXT,
+                FOREIGN KEY (updated_by_web_user_id) REFERENCES web_users(user_id)
+            );
+            INSERT INTO agent_lifecycle_policy
+                (singleton, inactivity_days, updated_at, updated_by_web_user_id)
+            VALUES (1, 10, 1, NULL);
+            PRAGMA user_version = 23;
+            """
+        )
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(agent_lifecycle_policy)"
+            ).fetchall()
+        }
+        policy = connection.execute(
+            "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
+        ).fetchone()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+    assert "unactivated_inactivity_days" in columns
+    assert policy["inactivity_days"] == 10
+    assert policy["unactivated_inactivity_days"] == 3
+
+
+def test_admin_room_chat_does_not_create_authority_for_agents_or_web_users(
     tmp_path: Path,
 ) -> None:
     store = make_store(tmp_path)
     auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
     admin = login_admin_identity(auth)
-    first = register(store, client="codex", name="当前成员")
+    register(store, client="codex", name="当前成员")
     web_member = register_web_identity(auth, username="web-only-target")
     with store._transaction() as connection:
         store._ensure_web_membership_locked(
@@ -554,10 +722,7 @@ def test_admin_room_authority_snapshots_current_agents_without_spilling_from_web
         conversation_id="tools-room",
         body_text="本群 Agent 可以按此讨论继续处理。",
     )
-    assert room_grant["authorization"]["target_kind"] == "room_agents"
-    assert first["participant_id"] in room_grant["authorization"][
-        "target_participant_ids"
-    ]
+    assert "authorization" not in room_grant
 
     later = register(store, client="claude-code", name="后来成员")
     later_history = store.history(
@@ -580,9 +745,9 @@ def test_admin_room_authority_snapshots_current_agents_without_spilling_from_web
     assert "authorization" not in copied_to_web
     with store._connection() as connection:
         assert connection.execute(
-            "SELECT 1 FROM chat_authorization_grants WHERE source_message_id = ?",
-            (copied_to_web["message_id"],),
-        ).fetchone() is None
+            "SELECT COUNT(*) FROM chat_authorization_grants WHERE source_message_id IN (?, ?)",
+            (room_grant["message_id"], copied_to_web["message_id"]),
+        ).fetchone()[0] == 0
 
 
 def test_web_room_owner_permission_limit_and_optional_wake_all(
@@ -1890,7 +2055,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 23
+    assert version == 25
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -1962,7 +2127,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 23
+    assert version == 25
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2058,7 +2223,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 23
+    assert version == 25
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -3259,6 +3424,185 @@ def test_reusable_invitation_isolates_same_requested_username_and_reconnects(
         )
 
 
+def test_same_public_agent_identity_records_authoritative_reply_seats(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("席位来源群")
+    agent = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="席位来源群",
+        username="same-public-agent",
+    )
+
+    main_message = store.send(
+        authorized_session_id=agent["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="席位来源群",
+        body_text="本体直接回复。",
+    )
+    assert main_message["sender_seat"] == "main"
+
+    expire_sender_cooldown(
+        store,
+        participant_id=agent["participant_id"],
+        conversation_id="席位来源群",
+    )
+    shadow = store.register_agent_session_from_enrollment(
+        enrollment_token=agent["enrollment_token"],
+        connector_id=agent["connector_id"],
+        connector_component="chat",
+        connector_protocol_version=2,
+        product="codex",
+        username=agent["username"],
+        signature="同一公开身份的值守影子。",
+    )
+    shadow_message = store.send(
+        authorized_session_id=shadow["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="席位来源群",
+        body_text="值守影子回复。",
+    )
+    assert shadow["participant_id"] == agent["participant_id"]
+    assert shadow["session_component"] == "chat"
+    assert shadow_message["sender_seat"] == "shadow"
+
+    expire_sender_cooldown(
+        store,
+        participant_id=agent["participant_id"],
+        conversation_id="席位来源群",
+    )
+    executor = store.register_agent_session_from_enrollment(
+        enrollment_token=agent["enrollment_token"],
+        connector_id=agent["connector_id"],
+        connector_component="task",
+        connector_protocol_version=2,
+        product="codex",
+        username=agent["username"],
+        signature="同一公开身份的任务执行席。",
+    )
+    executor_message = store.send(
+        authorized_session_id=executor["session_id"],
+        sender_participant_id=agent["participant_id"],
+        conversation_id="席位来源群",
+        body_text="任务执行席回复。",
+    )
+    assert executor["session_component"] == "task"
+    assert executor_message["sender_seat"] == "executor"
+
+    projected = ViewerRepository(store.database).messages("席位来源群")
+    assert [item["sender_seat"] for item in projected] == [
+        "main",
+        "shadow",
+        "executor",
+    ]
+
+
+def test_authorized_personal_mentions_route_to_idle_body_then_steer_active_task(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "本体值守群")
+    agent = invite_agent(
+        store,
+        admin_id=str(admin["user_id"]),
+        room="本体值守群",
+        username="body-agent",
+    )
+    store.report_agent_connector_setup(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        connector_id=agent["connector_id"],
+        setup_status="configured",
+        detail={"test": True},
+    )
+    executor = store.register_agent_session_from_enrollment(
+        enrollment_token=agent["enrollment_token"],
+        connector_id=agent["connector_id"],
+        connector_component="task",
+        connector_protocol_version=2,
+        product="codex",
+        username=agent["username"],
+        signature="持久本体执行席",
+    )
+
+    initial = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="本体值守群",
+        body_text="@body-agent 请开始核对测试并持续汇报。",
+        mentions=[agent["participant_id"]],
+    )
+    assert initial["message_kind"] == "message"
+    assert initial["body_routing"] == [
+        {
+            "target_participant_id": agent["participant_id"],
+            "task_id": initial["task"]["task_id"],
+            "task_input_id": None,
+            "mode": "queued",
+        }
+    ]
+    with store._connection() as connection:
+        delivery = connection.execute(
+            "SELECT state FROM message_deliveries WHERE message_id = ? "
+            "AND participant_id = ?",
+            (initial["message_id"], agent["participant_id"]),
+        ).fetchone()
+    assert delivery["state"] == "cancelled"
+
+    claimed = store.claim_next_task(
+        participant_id=agent["participant_id"],
+        authorized_session_id=executor["session_id"],
+    )
+    assert claimed is not None
+    store.update_agent_task(
+        participant_id=agent["participant_id"],
+        authorized_session_id=executor["session_id"],
+        task_id=claimed["task_id"],
+        status="running",
+        execution_cwd=str(tmp_path),
+    )
+
+    followup = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="本体值守群",
+        body_text="@body-agent 每次 sleep 不超过 4 分钟，立即按这个新要求调整。",
+        mentions=[agent["participant_id"]],
+    )
+    assert followup["body_routing"][0]["mode"] == "steer"
+    assert followup["body_routing"][0]["task_id"] == claimed["task_id"]
+
+    inputs = store.poll_agent_task_inputs(
+        participant_id=agent["participant_id"],
+        authorized_session_id=executor["session_id"],
+        task_id=claimed["task_id"],
+    )
+    assert inputs["count"] == 1
+    assert inputs["inputs"][0]["body"] == followup["body"]
+    assert inputs["inputs"][0]["issuer_role"] == "admin"
+    assert store.poll_agent_task_inputs(
+        participant_id=agent["participant_id"],
+        authorized_session_id=executor["session_id"],
+        task_id=claimed["task_id"],
+    )["count"] == 0
+    applied = store.acknowledge_agent_task_inputs(
+        participant_id=agent["participant_id"],
+        authorized_session_id=executor["session_id"],
+        task_id=claimed["task_id"],
+        input_ids=[inputs["inputs"][0]["input_id"]],
+    )
+    assert applied["count"] == 1
+
+    projected = ViewerRepository(store.database).messages("本体值守群")[-1]
+    assert projected["body_delivery"]["count"] == 1
+    assert projected["body_delivery"]["applied_count"] == 1
+
+
 def test_version_twenty_two_connectors_keep_legacy_enrollment_compatibility(
     tmp_path: Path,
 ) -> None:
@@ -3482,7 +3826,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 25
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -3537,7 +3881,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 23
+    assert version == 25
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -3775,6 +4119,82 @@ def test_agent_inactivity_uses_speech_not_heartbeat_and_requires_reinvite(
         ).fetchone()
     assert restored_state["reinvite_required"] == 0
     assert restored_membership["active"] == 1
+
+
+def test_never_activated_agent_expires_early_but_online_connector_is_preserved(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("未激活清理群")
+    stale = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="未激活清理群",
+        username="never-activated",
+    )
+    resident = invite_agent(
+        store,
+        admin_id=admin_id,
+        room="未激活清理群",
+        username="configured-resident",
+    )
+    store.report_agent_connector_setup(
+        participant_id=resident["participant_id"],
+        authorized_session_id=resident["session_id"],
+        connector_id=resident["connector_id"],
+        setup_status="configured",
+        detail={"status": "configured"},
+    )
+    now = time.time()
+    old_access = now - 4 * 86_400
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_lifecycle_states SET access_granted_at = ?, "
+            "last_spoke_at = NULL, updated_at = ? WHERE participant_id IN (?, ?)",
+            (
+                old_access,
+                old_access,
+                stale["participant_id"],
+                resident["participant_id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ? WHERE participant_id IN (?, ?)",
+            (
+                now - 1,
+                stale["participant_id"],
+                resident["participant_id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET connector_last_seen_at = ? "
+            "WHERE connector_id = ?",
+            (now, resident["connector_id"]),
+        )
+
+    result = store.clear_inactive_sessions(now=now)
+    assert result["expired_agent_count"] == 1
+    assert result["expired_agents"][0]["participant_id"] == stale[
+        "participant_id"
+    ]
+    assert result["expired_agents"][0]["effective_inactivity_days"] == 3
+    assert result["expired_agents"][0]["expired_reason"] == (
+        "inactive_unactivated"
+    )
+    with store._connection() as connection:
+        stale_membership = connection.execute(
+            "SELECT active FROM memberships WHERE conversation_id = ? "
+            "AND participant_id = ?",
+            ("未激活清理群", stale["participant_id"]),
+        ).fetchone()
+        resident_membership = connection.execute(
+            "SELECT active FROM memberships WHERE conversation_id = ? "
+            "AND participant_id = ?",
+            ("未激活清理群", resident["participant_id"]),
+        ).fetchone()
+    assert stale_membership["active"] == 0
+    assert resident_membership["active"] == 1
 
 
 def test_admin_kick_preserves_history_and_blocks_old_agent_credentials(
@@ -4172,7 +4592,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 23
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

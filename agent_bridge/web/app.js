@@ -86,6 +86,7 @@ const elements = {
   inviteAgent: document.querySelector("#invite-agent"),
   manageMembers: document.querySelector("#manage-members"),
   repairResidents: document.querySelector("#repair-residents"),
+  manageWakePolicy: document.querySelector("#manage-wake-policy"),
   manageTaskPermissions: document.querySelector("#manage-task-permissions"),
   renameRoom: document.querySelector("#rename-room"),
   themeSelect: document.querySelector("#theme-select"),
@@ -126,6 +127,16 @@ const elements = {
   allowGlobalAdminTasks: document.querySelector("#allow-global-admin-tasks"),
   taskPermissionFeedback: document.querySelector("#task-permission-feedback"),
   taskPermissionResults: document.querySelector("#task-permission-results"),
+  wakePolicyDialog: document.querySelector("#wake-policy-dialog"),
+  wakePolicyForm: document.querySelector("#wake-policy-form"),
+  closeWakePolicy: document.querySelector("#close-wake-policy"),
+  wakePolicyRoom: document.querySelector("#wake-policy-room"),
+  wakePolicyMode: document.querySelector("#wake-policy-mode"),
+  wakePolicyDigestFields: document.querySelector("#wake-policy-digest-fields"),
+  wakeDigestMinMessages: document.querySelector("#wake-digest-min-messages"),
+  wakeDigestAfterMinutes: document.querySelector("#wake-digest-after-minutes"),
+  wakePolicyFeedback: document.querySelector("#wake-policy-feedback"),
+  saveWakePolicy: document.querySelector("#save-wake-policy"),
   roomPermissionSearchForm: document.querySelector("#room-permission-search-form"),
   roomPermissionSearch: document.querySelector("#room-permission-search"),
   searchRoomPermissions: document.querySelector("#search-room-permissions"),
@@ -148,6 +159,7 @@ const elements = {
   closeMemberManagement: document.querySelector("#close-member-management"),
   agentLifecycleForm: document.querySelector("#agent-lifecycle-form"),
   agentInactivityDays: document.querySelector("#agent-inactivity-days"),
+  unactivatedAgentInactivityDays: document.querySelector("#unactivated-agent-inactivity-days"),
   agentLifecycleFeedback: document.querySelector("#agent-lifecycle-feedback"),
   saveAgentLifecycle: document.querySelector("#save-agent-lifecycle"),
   memberMigrationForm: document.querySelector("#member-migration-form"),
@@ -396,6 +408,7 @@ function showAuthScreen(message = "") {
     elements.renameRoomDialog,
     elements.forwardMessageDialog,
     elements.taskPermissionDialog,
+    elements.wakePolicyDialog,
     elements.messageRateDialog,
     elements.memberManagementDialog,
     elements.agentAccessDialog,
@@ -430,6 +443,9 @@ function applyUserPermissions() {
   elements.inviteAgent.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.manageMembers.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.repairResidents.hidden = !(admin && activeRoom && activeRoom.status === "active");
+  elements.manageWakePolicy.hidden = !(
+    activeRoom?.can_manage_wake_policy && activeRoom.status === "active"
+  );
   elements.manageTaskPermissions.hidden = !(
     activeRoom?.can_manage_task_permissions && activeRoom.status === "active"
   );
@@ -634,12 +650,31 @@ function participantName(participantId) {
   return participant?.display_name || participant?.client_type || participantId;
 }
 
+function senderSeatLabel(message) {
+  if (message.sender_client_type === "web-user" || message.sender_seat === "web") return null;
+  return {
+    main: { label: "本体", className: "main" },
+    shadow: { label: "值守影子", className: "shadow" },
+    executor: { label: "本体执行", className: "executor" },
+    a2a: { label: "A2A 接入", className: "a2a" },
+    unknown: { label: "历史来源未标记", className: "unknown" },
+  }[message.sender_seat || "unknown"];
+}
+
 function createMessageElement(message) {
   const article = makeElement("article", "message");
   article.dataset.messageId = message.message_id;
   const head = makeElement("div", "message-head");
   const senderLine = makeElement("div", "sender-line");
   senderLine.append(makeElement("strong", "", message.sender_display_name || message.sender_client_type));
+  const seat = senderSeatLabel(message);
+  if (seat) {
+    const seatBadge = makeElement("span", `sender-seat-badge ${seat.className}`, seat.label);
+    seatBadge.title = seat.className === "shadow"
+      ? "同一公开身份的聊天室值守影子：参与讨论和转达，不代表本体任务进度"
+      : seat.label;
+    senderLine.append(seatBadge);
+  }
   const signature = message.sender_signature || message.sender_alias || "未填写签名";
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
@@ -713,6 +748,23 @@ function createMessageElement(message) {
     article.append(taskCard);
   }
 
+  if (message.body_delivery) {
+    const delivery = message.body_delivery;
+    const applied = Number(delivery.applied_count || 0);
+    const delivered = Number(delivery.delivered_count || 0);
+    const total = Number(delivery.count || 0);
+    const label = applied >= total
+      ? `本体已接收并纳入当前任务 · ${applied}/${total}`
+      : delivered > 0
+        ? `已送达本体执行席，等待本轮落实 · ${delivered}/${total}`
+        : `正在投递本体执行席 · 0/${total}`;
+    article.append(makeElement(
+      "p",
+      `body-delivery-label ${applied >= total ? "applied" : "pending"}`,
+      label,
+    ));
+  }
+
   if (message.forwarded_from) {
     const source = message.forwarded_from;
     const sourceSender = source.sender_display_name || source.sender_client_type;
@@ -763,6 +815,36 @@ function createMessageElement(message) {
     article.append(refs);
   }
   const selectedRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
+  if (
+    selectedRoom?.status === "active"
+    && selectedRoom?.can_assign_tasks
+    && message.sender_participant_id === state.currentUser?.participant_id
+    && message.message_kind === "message"
+    && !message.task
+  ) {
+    const promoteButton = makeElement("button", "message-reply-button task-promote", "转为任务");
+    promoteButton.type = "button";
+    promoteButton.title = "保留这条消息的原文、序号和附近上下文，交给任务执行席";
+    promoteButton.addEventListener("click", async () => {
+      if (!window.confirm("把这条普通聊天转为结构化任务？原文和序号保持不变，之前的聊天通知会停止，改由任务执行席领取。")) return;
+      promoteButton.disabled = true;
+      try {
+        await fetchJson(`/api/messages/${encodeURIComponent(message.message_id)}/convert-to-task`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Agent-Bridge-Intent": "convert-message-to-task",
+          },
+          body: JSON.stringify({}),
+        });
+        await refresh({ fullRoom: true });
+      } catch (error) {
+        window.alert(`转为任务失败：${error.message}`);
+        promoteButton.disabled = false;
+      }
+    });
+    article.append(promoteButton);
+  }
   if (!message.reply_to && selectedRoom?.status === "active") {
     const replyButton = makeElement("button", "message-reply-button", "回复");
     replyButton.type = "button";
@@ -792,7 +874,7 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.task?.updated_at || item.updated_at || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
 }
 
 function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) {
@@ -2168,6 +2250,34 @@ async function openTaskPermissionDialog() {
   }
 }
 
+function updateWakePolicyFields() {
+  elements.wakePolicyDigestFields.hidden = elements.wakePolicyMode.value !== "digest";
+}
+
+async function openWakePolicyDialog() {
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!room?.can_manage_wake_policy) return;
+  elements.wakePolicyRoom.textContent = `当前聊天室：${room.conversation_id}`;
+  elements.wakePolicyFeedback.classList.remove("error", "success");
+  elements.wakePolicyFeedback.textContent = "正在载入策略…";
+  if (!elements.wakePolicyDialog.open) elements.wakePolicyDialog.showModal();
+  try {
+    const policy = await fetchJson(
+      `/api/rooms/${encodeURIComponent(room.conversation_id)}/wake-policy`,
+    );
+    elements.wakePolicyMode.value = policy.mode || "mention";
+    elements.wakeDigestMinMessages.value = String(policy.digest_min_messages || 5);
+    elements.wakeDigestAfterMinutes.value = String(
+      Math.max(0.5, Number(policy.digest_after_seconds || 300) / 60),
+    );
+    updateWakePolicyFields();
+    elements.wakePolicyFeedback.textContent = "";
+  } catch (error) {
+    elements.wakePolicyFeedback.classList.add("error");
+    elements.wakePolicyFeedback.textContent = error.message;
+  }
+}
+
 function memberSelectionTotal() {
   let count = 0;
   for (const selected of state.memberSelections.values()) count += selected.size;
@@ -2260,6 +2370,11 @@ async function loadMemberManagementData({ preserveTarget = true } = {}) {
   elements.agentInactivityDays.min = String(lifecycle.minimum_days || 1);
   elements.agentInactivityDays.max = String(lifecycle.maximum_days || 3650);
   elements.agentInactivityDays.value = String(lifecycle.inactivity_days || members.inactivity_days || 10);
+  elements.unactivatedAgentInactivityDays.min = String(lifecycle.minimum_days || 1);
+  elements.unactivatedAgentInactivityDays.max = String(lifecycle.maximum_days || 3650);
+  elements.unactivatedAgentInactivityDays.value = String(
+    lifecycle.unactivated_inactivity_days || members.unactivated_inactivity_days || 3,
+  );
   elements.memberTargetRoom.replaceChildren();
   for (const room of state.memberRooms) {
     const option = makeElement("option", "", room.conversation_id);
@@ -2485,6 +2600,46 @@ elements.refreshButton.addEventListener("click", () => refresh({ fullRoom: true 
 elements.openMessageRates.addEventListener("click", openMessageRateDialog);
 elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
 elements.manageTaskPermissions.addEventListener("click", openTaskPermissionDialog);
+elements.manageWakePolicy.addEventListener("click", openWakePolicyDialog);
+elements.closeWakePolicy.addEventListener("click", () => elements.wakePolicyDialog.close());
+elements.wakePolicyDialog.addEventListener("click", (event) => {
+  if (event.target === elements.wakePolicyDialog) elements.wakePolicyDialog.close();
+});
+elements.wakePolicyMode.addEventListener("change", updateWakePolicyFields);
+elements.wakePolicyForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!room?.can_manage_wake_policy || !elements.wakePolicyForm.reportValidity()) return;
+  elements.saveWakePolicy.disabled = true;
+  elements.wakePolicyFeedback.classList.remove("error", "success");
+  elements.wakePolicyFeedback.textContent = "正在保存…";
+  try {
+    const policy = await fetchJson(
+      `/api/rooms/${encodeURIComponent(room.conversation_id)}/wake-policy`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agent-Bridge-Intent": "manage-wake-policy",
+        },
+        body: JSON.stringify({
+          mode: elements.wakePolicyMode.value,
+          digest_min_messages: Number(elements.wakeDigestMinMessages.value),
+          digest_after_seconds: Number(elements.wakeDigestAfterMinutes.value) * 60,
+        }),
+      },
+    );
+    room.wake_policy = policy;
+    elements.wakePolicyFeedback.classList.add("success");
+    const labels = { mention: "只在 @ 时唤醒", digest: "成批唤醒", all: "每条普通消息唤醒" };
+    elements.wakePolicyFeedback.textContent = `已保存：${labels[policy.mode] || policy.mode}；仍不强制回复。`;
+  } catch (error) {
+    elements.wakePolicyFeedback.classList.add("error");
+    elements.wakePolicyFeedback.textContent = error.message;
+  } finally {
+    elements.saveWakePolicy.disabled = false;
+  }
+});
 elements.closeTaskPermissions.addEventListener("click", () => elements.taskPermissionDialog.close());
 elements.taskPermissionDialog.addEventListener("click", (event) => {
   if (event.target === elements.taskPermissionDialog) elements.taskPermissionDialog.close();
@@ -2644,7 +2799,10 @@ elements.agentLifecycleForm.addEventListener("submit", async (event) => {
         "Content-Type": "application/json",
         "X-Agent-Bridge-Intent": "update-agent-lifecycle",
       },
-      body: JSON.stringify({ inactivity_days: Number(elements.agentInactivityDays.value) }),
+      body: JSON.stringify({
+        inactivity_days: Number(elements.agentInactivityDays.value),
+        unactivated_inactivity_days: Number(elements.unactivatedAgentInactivityDays.value),
+      }),
     });
     state.agentLifecycle = payload;
     state.memberSelections = new Map();
@@ -2654,8 +2812,8 @@ elements.agentLifecycleForm.addEventListener("submit", async (event) => {
     ]);
     elements.agentLifecycleFeedback.classList.add("success");
     elements.agentLifecycleFeedback.textContent = payload.expired_count > 0
-      ? `已保存为 ${payload.inactivity_days} 天，并处理 ${payload.expired_count} 个过期 Agent。`
-      : `已保存为 ${payload.inactivity_days} 天；当前没有新增过期 Agent。`;
+      ? `已保存：正常成员 ${payload.inactivity_days} 天、未激活成员 ${payload.unactivated_inactivity_days} 天，并处理 ${payload.expired_count} 个过期 Agent。`
+      : `已保存：正常成员 ${payload.inactivity_days} 天、未激活成员 ${payload.unactivated_inactivity_days} 天；当前没有新增过期 Agent。`;
   } catch (error) {
     elements.agentLifecycleFeedback.classList.add("error");
     elements.agentLifecycleFeedback.textContent = error.message;

@@ -445,6 +445,7 @@ class ViewerRepository:
                     sender.client_type AS sender_client_type,
                     sender.display_name AS sender_display_name,
                     sender.signature AS sender_signature,
+                    sender.avatar_key AS sender_avatar_key,
                     claimant.session_alias AS claimant_alias,
                     claimant.display_name AS claimant_display_name,
                     source.conversation_id AS forwarded_source_conversation_id,
@@ -485,6 +486,30 @@ class ViewerRepository:
                     task.execution_thread_id AS room_task_execution_thread_id,
                     task.created_at AS room_task_created_at,
                     task.updated_at AS room_task_updated_at,
+                    (
+                        SELECT COUNT(*) FROM room_task_inputs AS task_input
+                        WHERE task_input.source_message_id = m.message_id
+                    ) AS body_input_count,
+                    (
+                        SELECT COUNT(*) FROM room_task_inputs AS task_input
+                        WHERE task_input.source_message_id = m.message_id
+                          AND task_input.first_delivered_at IS NOT NULL
+                    ) AS body_input_delivered_count,
+                    (
+                        SELECT COUNT(*) FROM room_task_inputs AS task_input
+                        WHERE task_input.source_message_id = m.message_id
+                          AND task_input.applied_at IS NOT NULL
+                    ) AS body_input_applied_count,
+                    (
+                        SELECT MAX(task_input.last_delivered_at)
+                        FROM room_task_inputs AS task_input
+                        WHERE task_input.source_message_id = m.message_id
+                    ) AS body_input_last_delivered_at,
+                    (
+                        SELECT MAX(task_input.applied_at)
+                        FROM room_task_inputs AS task_input
+                        WHERE task_input.source_message_id = m.message_id
+                    ) AS body_input_last_applied_at,
                     (
                         SELECT COUNT(*) FROM receipts AS r
                         WHERE r.message_id = m.message_id AND r.state = 'acked'
@@ -771,7 +796,34 @@ class ViewerRepository:
                                     lifecycle.access_granted_at,
                                     m.joined_at
                                 )
-                            ) + policy.inactivity_days * 86400.0
+                            ) + (
+                                CASE
+                                    WHEN lifecycle.last_spoke_at IS NULL
+                                     AND NOT EXISTS (
+                                         SELECT 1
+                                         FROM agent_sessions AS life_session
+                                         WHERE life_session.participant_id =
+                                               p.participant_id
+                                           AND life_session.cleared_at IS NULL
+                                           AND life_session.revoked_at IS NULL
+                                           AND life_session.expires_at > ?
+                                     )
+                                     AND NOT EXISTS (
+                                         SELECT 1
+                                         FROM agent_connectors AS life_connector
+                                         WHERE life_connector.accepted_participant_id =
+                                               p.participant_id
+                                           AND life_connector.revoked_at IS NULL
+                                           AND life_connector.setup_status = 'configured'
+                                           AND COALESCE(
+                                               life_connector.connector_last_seen_at,
+                                               0
+                                           ) >= ?
+                                     )
+                                    THEN policy.unactivated_inactivity_days
+                                    ELSE policy.inactivity_days
+                                END
+                            ) * 86400.0
                         ELSE NULL
                     END AS inactivity_expires_at,
                     (
@@ -856,6 +908,8 @@ class ViewerRepository:
                 """,
                 (
                     now,
+                    connector_online_after,
+                    now,
                     now,
                     online_after,
                     now,
@@ -872,6 +926,7 @@ class ViewerRepository:
                 "session_alias": str(row["session_alias"]),
                 "display_name": str(row["display_name"]),
                 "signature": str(row["signature"]),
+                "avatar_key": str(row["avatar_key"] or "auto"),
                 "roles": json.loads(str(row["roles_json"])),
                 "capabilities": json.loads(str(row["capabilities_json"])),
                 "status": (
@@ -944,12 +999,15 @@ class ViewerRepository:
             "message_id": str(row["message_id"]),
             "conversation_id": str(row["conversation_id"]),
             "sender_participant_id": str(row["sender_participant_id"]),
+            "sender_seat": str(row["sender_seat"] or "unknown"),
             "sender_alias": str(row["sender_alias"]),
             "sender_client_type": str(row["sender_client_type"]),
             "sender_display_name": str(row["sender_display_name"]),
             "sender_signature": str(row["sender_signature"]),
+            "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
             "audience_kind": str(row["audience_kind"]),
             "audience_value": str(row["audience_value"]),
+            "message_kind": str(row["message_kind"] or "message"),
             "body": str(row["body"]),
             "refs": json.loads(str(row["refs_json"])),
             "mentions": json.loads(str(row["mentions_json"] or "[]")),
@@ -967,7 +1025,6 @@ class ViewerRepository:
             "created_at": float(row["created_at"]),
         }
         if row["forwarded_from_message_id"] is not None:
-            payload["message_kind"] = "forward"
             payload["forwarded_from"] = {
                 "message_id": str(row["forwarded_from_message_id"]),
                 "conversation_id": str(row["forwarded_source_conversation_id"]),
@@ -1000,7 +1057,11 @@ class ViewerRepository:
                     str(row["authorization_target_participant_ids_json"] or "[]")
                 ),
                 "issued_at": float(row["authorization_issued_at"]),
-                "status": "revoked" if revoked_at is not None else "active",
+                "status": (
+                    "legacy_frozen"
+                    if str(row["authorization_kind"]) == "legacy_frozen"
+                    else ("revoked" if revoked_at is not None else "active")
+                ),
                 "revoked_at": revoked_at,
                 "revoked_by_web_user_id": (
                     str(row["authorization_revoked_by_web_user_id"])
@@ -1012,10 +1073,13 @@ class ViewerRepository:
                     if row["authorization_revocation_reason"] is not None
                     else None
                 ),
-                "semantics": "natural_language_minimum_necessary",
+                "semantics": (
+                    "ordinary_chat_only"
+                    if str(row["authorization_kind"]) == "legacy_frozen"
+                    else "natural_language_minimum_necessary"
+                ),
             }
         if row["room_task_id"] is not None:
-            payload["message_kind"] = "task"
             payload["task"] = {
                 "task_id": str(row["room_task_id"]),
                 "parent_task_id": (
@@ -1071,5 +1135,22 @@ class ViewerRepository:
                 ),
                 "created_at": float(row["room_task_created_at"]),
                 "updated_at": float(row["room_task_updated_at"]),
+            }
+        body_input_count = int(row["body_input_count"] or 0)
+        if body_input_count:
+            payload["body_delivery"] = {
+                "count": body_input_count,
+                "delivered_count": int(row["body_input_delivered_count"] or 0),
+                "applied_count": int(row["body_input_applied_count"] or 0),
+                "last_delivered_at": (
+                    float(row["body_input_last_delivered_at"])
+                    if row["body_input_last_delivered_at"] is not None
+                    else None
+                ),
+                "last_applied_at": (
+                    float(row["body_input_last_applied_at"])
+                    if row["body_input_last_applied_at"] is not None
+                    else None
+                ),
             }
         return payload

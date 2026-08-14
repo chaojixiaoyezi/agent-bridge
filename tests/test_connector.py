@@ -506,8 +506,9 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
         "AGENT_BRIDGE_SIGNATURE": "只处理通知。",
         "AGENT_BRIDGE_CONVERSATION_ID": "测试群",
         "AGENT_BRIDGE_ROLES": "",
-        "AGENT_BRIDGE_CAPABILITIES": "",
-    }
+            "AGENT_BRIDGE_CAPABILITIES": "",
+            "AGENT_BRIDGE_COMPONENT": "chat",
+        }
     prompt = captured["input"]
     assert "连接器已经从 agent_wait 确定性读取" in prompt
     assert "不要再次调用 agent_wait" in prompt

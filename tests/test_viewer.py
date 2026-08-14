@@ -357,8 +357,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260813-2" in index_html
-    assert "app.css?v=20260813-1" in index_html
+    assert "app.js?v=20260813-3" in index_html
+    assert "app.css?v=20260813-3" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "function appendMessages" in javascript
@@ -836,7 +836,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         ).fetchone()[0] == 4
 
 
-def test_dashboard_projects_and_revokes_admin_chat_authority(
+def test_dashboard_keeps_admin_chat_ordinary_while_authorization_is_frozen(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "bridge.db"
@@ -867,22 +867,21 @@ def test_dashboard_projects_and_revokes_admin_chat_authority(
     )
     assert sent.status_code == 201
     message = sent.json()["message"]
-    assert message["authorization"]["status"] == "active"
+    assert "authorization" not in message
 
     projected = client.get(
         "/api/rooms/%E6%8E%88%E6%9D%83%E8%81%8A%E5%A4%A9%E5%AE%A4/messages"
     )
     assert projected.status_code == 200
     dashboard_message = projected.json()["messages"][-1]
-    assert dashboard_message["authorization"]["issuer_username"] == "admin"
+    assert "authorization" not in dashboard_message
 
     revoked = client.post(
         f"/api/messages/{message['message_id']}/authorization/revoke",
         headers=intent_headers(client, "revoke-chat-authorization"),
         json={"reason": "方案取消"},
     )
-    assert revoked.status_code == 200
-    assert revoked.json()["authorization"]["status"] == "revoked"
+    assert revoked.status_code == 404
 
     agent_auth = {"Authorization": f"Bearer {agent['access_token']}"}
     history = client.post(
@@ -890,9 +889,7 @@ def test_dashboard_projects_and_revokes_admin_chat_authority(
         headers=agent_auth,
         json={"conversation_id": "授权聊天室"},
     )
-    authority = history.json()["messages"][-1]["authorization"]
-    assert authority["status"] == "revoked"
-    assert authority["revocation_reason"] == "方案取消"
+    assert "authorization" not in history.json()["messages"][-1]
 
 
 def test_dashboard_separates_abandoned_rooms_and_retains_history(
@@ -1399,7 +1396,7 @@ def test_open_registration_owner_chat_and_authenticated_agent_http_flow(
     )
     assert sent.status_code == 200
     assert sent.json()["body"] == "大家好，我是小团子。"
-    assert "message_kind" not in sent.json()
+    assert sent.json()["message_kind"] == "message"
 
     owner_headers = intent_headers(client, "send-message")
     owner_sent = client.post(
@@ -1917,11 +1914,16 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert 'd="M12 4v14m-6-6 6 6 6-6"' in html
     assert 'id="member-management-dialog"' in html
     assert 'id="repair-residents"' in html
+    assert 'id="manage-wake-policy"' in html
+    assert 'id="wake-policy-dialog"' in html
+    assert 'id="unactivated-agent-inactivity-days"' in html
+    assert "本体优先，影子兜底" in html
     assert "复制加入目标群" in html
     assert "state.messages.length > 0 && !isNearTimelineBottom()" in javascript
     assert 'behavior: "smooth"' in javascript
     assert "/api/room-memberships/migrate" in javascript
     assert ".new-message-indicator svg" in stylesheet
+    assert ".body-delivery-label" in stylesheet
     assert ':root[data-theme="ocean"]' in stylesheet
     assert "color-scheme: dark" in stylesheet
     assert "select option {" in stylesheet
@@ -1934,7 +1936,121 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     assert "await refreshActiveRoom(!restored, !restored" in javascript
     assert "timelineNodes: [...elements.timeline.childNodes]" in javascript
     assert "elements.timeline.replaceChildren(...snapshot.timelineNodes)" in javascript
-    assert 'state.selectedRoom || ""' not in javascript[
+    assert "本体已接收并纳入当前任务" in javascript
+    assert "convert-message-to-task" in javascript
+    room_render_source = javascript[
         javascript.index("function renderRooms()"):
         javascript.index("function isNearTimelineBottom()")
     ]
+    assert 'state.selectedRoom || ""' not in room_render_source
+
+
+def test_room_scoped_a2a_gateway_creates_standard_structured_task(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    client = TestClient(make_app(database), base_url="http://bridge.test")
+    login_admin(client)
+    assert client.post(
+        "/api/rooms",
+        headers=intent_headers(client, "create-room"),
+        json={"conversation_id": "A2A任务群"},
+    ).status_code == 201
+    target = client.post(
+        "/agent/register",
+        json={
+            "product": "codex",
+            "username": "a2a-target",
+            "signature": "处理 A2A 任务。",
+            "conversation_id": "A2A任务群",
+        },
+    ).json()
+    created = client.post(
+        "/api/a2a/grants",
+        headers=intent_headers(client, "create-a2a-grant"),
+        json={
+            "conversation_id": "A2A任务群",
+            "label": "外部审计系统",
+            "ttl_seconds": 3600,
+        },
+    )
+    assert created.status_code == 201
+    grant = created.json()["grant"]
+    access_token = grant["access_token"]
+
+    card = client.get("/.well-known/agent-card.json")
+    assert card.status_code == 200
+    assert card.json()["protocolVersion"] == "1.0"
+    assert card.json()["supportedInterfaces"][0]["url"] == (
+        "http://bridge.test/a2a"
+    )
+
+    rpc_headers = {
+        "Authorization": f"Bearer {access_token}",
+        "A2A-Version": "1.0",
+    }
+    sent = client.post(
+        "/a2a",
+        headers=rpc_headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": "request-1",
+            "method": "SendMessage",
+            "params": {
+                "message": {
+                    "messageId": "external-message-1",
+                    "contextId": "external-context-1",
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "核对变更并提供测试证据。"}],
+                    "metadata": {
+                        "targetParticipantIds": [target["participant_id"]]
+                    },
+                }
+            },
+        },
+    )
+    assert sent.status_code == 200
+    task = sent.json()["result"]
+    assert task["status"]["state"] == "TASK_STATE_SUBMITTED"
+    assert task["status"]["timestamp"].endswith("Z")
+    assert task["contextId"] == "external-context-1"
+    assert task["metadata"]["agentBridgeConversationId"] == "A2A任务群"
+    assert task["metadata"]["targetParticipantIds"] == [
+        target["participant_id"]
+    ]
+
+    fetched = client.post(
+        "/a2a",
+        headers=rpc_headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": "request-2",
+            "method": "GetTask",
+            "params": {"id": task["id"]},
+        },
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["result"]["id"] == task["id"]
+
+    projected = client.get(
+        "/api/rooms/A2A%E4%BB%BB%E5%8A%A1%E7%BE%A4/messages"
+    ).json()["messages"][-1]
+    assert projected["sender_seat"] == "a2a"
+    assert projected["message_kind"] == "task"
+
+    revoked = client.post(
+        f"/api/a2a/grants/{grant['grant_id']}/revoke",
+        headers=intent_headers(client, "revoke-a2a-grant"),
+    )
+    assert revoked.status_code == 200
+    denied = client.post(
+        "/a2a",
+        headers=rpc_headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": "request-3",
+            "method": "GetTask",
+            "params": {"id": task["id"]},
+        },
+    )
+    assert denied.status_code == 401

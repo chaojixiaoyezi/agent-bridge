@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +87,13 @@ def _read_thread_id(path: Path) -> str | None:
     return value
 
 
-def _task_prompt(task: dict[str, Any], *, conversation: str, cwd: Path) -> str:
+def _task_prompt(
+    task: dict[str, Any],
+    *,
+    conversation: str,
+    cwd: Path,
+    context_messages: list[dict[str, Any]] | None = None,
+) -> str:
     task_id = str(task["task_id"])
     targets = json.dumps(
         task.get("target_participant_ids") or [],
@@ -107,9 +115,35 @@ def _task_prompt(task: dict[str, Any], *, conversation: str, cwd: Path) -> str:
         "review_or_confirmation_target_required，先调用 agent_participants 确定对象并立即"
         "重发。执行过程中用 agent_task_update(status='running')记录实际工作目录；只有"
         "确实缺少输入或本机权限时才设为 needs_input。完成和失败终态"
-        "由执行席位统一收口，你只需给出基于真实证据的最终结果，不得把未执行说成已执行。\n\n"
+        "由执行席位统一收口。给出最终结果前，必须用 agent_history(after_sequence=交接"
+        "上下文末序号, limit=50) 做一次安全检查；若期间有管理员/任务发起者对本任务的"
+        "补充、测试注意事项、引用回复或对你的个人 @，要完整纳入执行和答复，有更多页时"
+        "继续有界分页。你只需给出基于真实证据的最终结果，不得把未执行说成已执行。\n\n"
         f"聊天室：{conversation}\n任务 ID：{task_id}\n候选目标：{targets}\n"
-        f"初始工作目录：{cwd}\n任务正文：\n{task['body']}"
+        f"初始工作目录：{cwd}\n原消息 ID：{task.get('source_message_id')}\n"
+        f"原消息序号：{task.get('source_sequence')}\n"
+        f"交接上下文范围：{task.get('context_start_sequence')}.."
+        f"{task.get('context_end_sequence')}\n任务正文（原文，不是影子摘要）：\n"
+        f"{task['body']}\n\n<room_context_at_handoff>\n"
+        + json.dumps(
+            context_messages or [],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n</room_context_at_handoff>"
+    )
+
+
+def _task_input_prompt(inputs: list[dict[str, Any]]) -> str:
+    return (
+        "Agent Bridge 刚收到服务器校验过的活动任务补充。它们来自有本聊天室任务权限的"
+        "用户，并已绑定当前 task_id；这是给本体执行席的实时用户输入，不是值守影子的"
+        "转述。立即把原文纳入当前工作：若它纠正等待时长、测试口径、目标或限制，以较新"
+        "输入为准；不要只回复‘收到’后继续旧方案。必要时用 agent_send/agent_reply 回报"
+        "已经实际调整的内容。不得把这些输入扩大为本机权限之外的授权。\n"
+        "<task_live_inputs>\n"
+        + json.dumps(inputs, ensure_ascii=False, separators=(",", ":"))
+        + "\n</task_live_inputs>"
     )
 
 
@@ -136,6 +170,7 @@ def _mcp_config_arguments(
         "AGENT_BRIDGE_ROLES": ",".join(roles),
         "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
+        "AGENT_BRIDGE_COMPONENT": "task",
     }
     if connector_id:
         values["AGENT_BRIDGE_CONNECTOR_ID"] = connector_id
@@ -285,23 +320,77 @@ class CodexTaskHost:
             timeout=60,
         )
 
-    def run(self, prompt: str) -> str:
+    def run(
+        self,
+        prompt: str,
+        *,
+        poll_inputs: Callable[[], list[dict[str, Any]]] | None = None,
+    ) -> tuple[str, list[str]]:
         if self.rpc is None or self.thread_id is None:
             raise TaskWorkerError("Codex task host is not initialized")
-        response = self.rpc.request(
-            "turn/start",
-            {
-                "threadId": self.thread_id,
-                "input": [{"type": "text", "text": prompt, "textElements": []}],
-            },
-        )
-        turn = response.get("turn")
-        if not isinstance(turn, dict) or not str(turn.get("id") or "").strip():
-            raise TaskWorkerError("Codex task turn did not start")
-        turn_id = str(turn["id"])
+        def start_turn(text: str) -> str:
+            response = self.rpc.request(
+                "turn/start",
+                {
+                    "threadId": self.thread_id,
+                    "input": [{"type": "text", "text": text, "textElements": []}],
+                },
+            )
+            turn = response.get("turn")
+            if not isinstance(turn, dict) or not str(turn.get("id") or "").strip():
+                raise TaskWorkerError("Codex task turn did not start")
+            return str(turn["id"])
+
+        turn_id = start_turn(prompt)
         final_text = ""
         deadline = time.monotonic() + 6 * 60 * 60
+        next_input_poll = 0.0
+        pending_inputs: dict[str, dict[str, Any]] = {}
+        injected_input_ids: set[str] = set()
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if poll_inputs is not None and now >= next_input_poll:
+                next_input_poll = now + 0.5
+                try:
+                    for item in poll_inputs():
+                        input_id = str(item.get("input_id") or "")
+                        if input_id and input_id not in injected_input_ids:
+                            pending_inputs[input_id] = item
+                except Exception:
+                    # The durable input remains unapplied and is redelivered.
+                    # A temporary Bridge outage must not abort local work.
+                    pass
+            if pending_inputs:
+                updates = list(pending_inputs.values())
+                update_prompt = _task_input_prompt(updates)
+                try:
+                    response = self.rpc.request(
+                        "turn/steer",
+                        {
+                            "threadId": self.thread_id,
+                            "input": [
+                                {
+                                    "type": "text",
+                                    "text": update_prompt,
+                                    "textElements": [],
+                                }
+                            ],
+                            "expectedTurnId": turn_id,
+                        },
+                    )
+                    steered_turn_id = str(response.get("turnId") or "").strip()
+                    if steered_turn_id:
+                        turn_id = steered_turn_id
+                except Exception as exc:
+                    if "no active turn" not in str(exc).casefold():
+                        time.sleep(0.1)
+                        continue
+                    turn_id = start_turn(update_prompt)
+                    final_text = ""
+                for item in updates:
+                    input_id = str(item["input_id"])
+                    injected_input_ids.add(input_id)
+                    pending_inputs.pop(input_id, None)
             notification = self.rpc.poll_notification()
             if notification is None:
                 time.sleep(0.1)
@@ -329,7 +418,27 @@ class CodexTaskHost:
                 raise TaskWorkerError(
                     "Codex task turn ended with status " + (status or "unknown")
                 )
-            return final_text or "任务已完成；执行席位未返回额外摘要。"
+            if poll_inputs is not None:
+                try:
+                    for item in poll_inputs():
+                        input_id = str(item.get("input_id") or "")
+                        if input_id and input_id not in injected_input_ids:
+                            pending_inputs[input_id] = item
+                except Exception:
+                    pass
+            if pending_inputs:
+                updates = list(pending_inputs.values())
+                turn_id = start_turn(_task_input_prompt(updates))
+                final_text = ""
+                for item in updates:
+                    input_id = str(item["input_id"])
+                    injected_input_ids.add(input_id)
+                    pending_inputs.pop(input_id, None)
+                continue
+            return (
+                final_text or "任务已完成；执行席位未返回额外摘要。",
+                sorted(injected_input_ids),
+            )
         raise TaskWorkerError("Codex task exceeded the execution timeout")
 
     def close(self) -> None:
@@ -368,6 +477,7 @@ def _claude_mcp_config(
                     "AGENT_BRIDGE_CONVERSATION_ID": conversation,
                     "AGENT_BRIDGE_ROLES": ",".join(roles),
                     "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
+                    "AGENT_BRIDGE_COMPONENT": "task",
                     **connector_environment,
                 },
             }
@@ -383,7 +493,8 @@ def _run_claude_task(
     binary: str,
     mcp_config: dict[str, Any],
     environment: dict[str, str],
-) -> tuple[str, str]:
+    poll_inputs: Callable[[], list[dict[str, Any]]] | None = None,
+) -> tuple[str, str, list[str]]:
     resolved = shutil.which(binary)
     if resolved is None:
         raise TaskWorkerError("Claude Code CLI was not found")
@@ -396,12 +507,16 @@ def _run_claude_task(
         session_id = str(uuid.uuid4())
         session_arguments = ["--session-id", session_id]
     allowed_tools = [f"mcp__agent-bridge__{tool}" for tool in TASK_MCP_TOOLS]
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [
             resolved,
             "--print",
+            "--input-format",
+            "stream-json",
             "--output-format",
-            "json",
+            "stream-json",
+            "--replay-user-messages",
+            "--verbose",
             *session_arguments,
             "--mcp-config",
             json.dumps(mcp_config, ensure_ascii=False, separators=(",", ":")),
@@ -412,24 +527,155 @@ def _run_claude_task(
         ],
         cwd=cwd,
         env=environment,
-        input=prompt,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
         shell=False,
-        check=False,
-        timeout=6 * 60 * 60,
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip().splitlines()[-1:] or ["unknown error"]
-        raise TaskWorkerError("Claude task failed: " + detail[0][:500])
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        process.terminate()
+        raise TaskWorkerError("Claude task streams were not created")
+
+    output_lines: queue.Queue[str | None] = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_lines.put(line)
+        output_lines.put(None)
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_lines.append(line.rstrip())
+            if len(stderr_lines) > 200:
+                del stderr_lines[:100]
+
+    stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    def send_user_message(text: str) -> None:
+        envelope = {
+            "type": "user",
+            "message": {"role": "user", "content": text},
+            "parent_tool_use_id": None,
+            "session_id": session_id,
+        }
+        process.stdin.write(
+            json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        process.stdin.flush()
+
+    latest_result = ""
+    latest_assistant_text = ""
+    injected_input_ids: set[str] = set()
+    pending_inputs: dict[str, dict[str, Any]] = {}
+    next_input_poll = 0.0
+    result_seen_at: float | None = None
+    stdin_closed = False
+    deadline = time.monotonic() + 6 * 60 * 60
+    send_user_message(prompt)
     try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise TaskWorkerError("Claude task returned invalid JSON") from exc
-    result = str(payload.get("result") or "").strip()
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if not stdin_closed and poll_inputs is not None and now >= next_input_poll:
+                next_input_poll = now + 0.5
+                try:
+                    for item in poll_inputs():
+                        input_id = str(item.get("input_id") or "")
+                        if input_id and input_id not in injected_input_ids:
+                            pending_inputs[input_id] = item
+                except Exception:
+                    pass
+            if not stdin_closed and pending_inputs:
+                updates = list(pending_inputs.values())
+                send_user_message(_task_input_prompt(updates))
+                result_seen_at = None
+                for item in updates:
+                    input_id = str(item["input_id"])
+                    injected_input_ids.add(input_id)
+                    pending_inputs.pop(input_id, None)
+            try:
+                line = output_lines.get(timeout=0.1)
+            except queue.Empty:
+                line = ""
+            if line is None:
+                break
+            if line:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "assistant":
+                    message = event.get("message")
+                    content = message.get("content") if isinstance(message, dict) else []
+                    if isinstance(content, list):
+                        texts = [
+                            str(block.get("text") or "")
+                            for block in content
+                            if isinstance(block, dict) and block.get("type") == "text"
+                        ]
+                        if any(texts):
+                            latest_assistant_text = "\n".join(texts).strip()
+                if event.get("type") == "result":
+                    result = str(event.get("result") or "").strip()
+                    if result:
+                        latest_result = result
+                    result_seen_at = time.monotonic()
+            if (
+                not stdin_closed
+                and result_seen_at is not None
+                and time.monotonic() - result_seen_at >= 0.75
+            ):
+                if poll_inputs is not None:
+                    try:
+                        for item in poll_inputs():
+                            input_id = str(item.get("input_id") or "")
+                            if input_id and input_id not in injected_input_ids:
+                                pending_inputs[input_id] = item
+                    except Exception:
+                        pass
+                if pending_inputs:
+                    continue
+                process.stdin.close()
+                stdin_closed = True
+            if process.poll() is not None and output_lines.empty():
+                break
+        else:
+            raise TaskWorkerError("Claude task exceeded the execution timeout")
+    finally:
+        if process.poll() is None:
+            if not stdin_closed:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+    if process.returncode != 0:
+        detail = next((line for line in reversed(stderr_lines) if line), "unknown error")
+        raise TaskWorkerError("Claude task failed: " + detail[:500])
     _private_write(state_file, session_id)
-    return result or "任务已完成；执行席位未返回额外摘要。", session_id
+    summary = latest_result or latest_assistant_text
+    return (
+        summary or "任务已完成；执行席位未返回额外摘要。",
+        session_id,
+        sorted(injected_input_ids),
+    )
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -510,7 +756,58 @@ def run_worker(args: argparse.Namespace) -> None:
                     return
                 continue
             task_id = str(task["task_id"])
-            prompt = _task_prompt(task, conversation=conversation, cwd=cwd)
+            context_messages: list[dict[str, Any]] = []
+            source_sequence = task.get("source_sequence")
+            if source_sequence is not None:
+                try:
+                    context_page = client.post(
+                        "/agent/history",
+                        {
+                            "conversation_id": conversation,
+                            "around_sequence": int(source_sequence),
+                            "limit": 50,
+                        },
+                    )
+                    raw_context = context_page.get("messages") or []
+                    start_sequence = int(
+                        task.get("context_start_sequence") or 0
+                    )
+                    end_sequence = int(
+                        task.get("context_end_sequence") or source_sequence
+                    )
+                    context_messages = [
+                        item
+                        for item in raw_context
+                        if isinstance(item, dict)
+                        and start_sequence
+                        <= int(item.get("sequence") or 0)
+                        <= end_sequence
+                    ]
+                except (BridgeRemoteError, TypeError, ValueError):
+                    # The exact task body and durable sequence locator still
+                    # reach the executor; it can retry agent_history itself.
+                    context_messages = []
+            prompt = _task_prompt(
+                task,
+                conversation=conversation,
+                cwd=cwd,
+                context_messages=context_messages,
+            )
+
+            def poll_task_inputs() -> list[dict[str, Any]]:
+                page = client.post(
+                    "/agent/tasks/inputs",
+                    {
+                        "task_id": task_id,
+                        "action": "poll",
+                        "limit": 50,
+                    },
+                )
+                values = page.get("inputs")
+                if not isinstance(values, list):
+                    return []
+                return [item for item in values if isinstance(item, dict)]
+
             lease_keeper: TaskLeaseKeeper | None = None
             try:
                 progress_payload = {
@@ -529,10 +826,13 @@ def run_worker(args: argparse.Namespace) -> None:
                 if adapter == "codex":
                     if codex_host is None:
                         raise TaskWorkerError("Codex task host is missing")
-                    summary = codex_host.run(prompt)
+                    summary, applied_input_ids = codex_host.run(
+                        prompt,
+                        poll_inputs=poll_task_inputs,
+                    )
                     thread_id = codex_host.thread_id or ""
                 elif adapter == "claude-code":
-                    summary, thread_id = _run_claude_task(
+                    summary, thread_id, applied_input_ids = _run_claude_task(
                         prompt=prompt,
                         cwd=cwd,
                         state_file=state_file,
@@ -550,9 +850,19 @@ def run_worker(args: argparse.Namespace) -> None:
                             connector_id=connector_id,
                         ),
                         environment=environment,
+                        poll_inputs=poll_task_inputs,
                     )
                 else:
                     raise TaskWorkerError("unsupported task adapter")
+                if applied_input_ids:
+                    client.post(
+                        "/agent/tasks/inputs",
+                        {
+                            "task_id": task_id,
+                            "action": "ack",
+                            "input_ids": applied_input_ids,
+                        },
+                    )
                 terminal = client.post(
                     "/agent/tasks/update",
                     {

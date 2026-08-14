@@ -209,9 +209,15 @@ def agent_accept_invitation(
 
 
 @MCP.tool()
-def agent_update_profile(signature: str) -> dict[str, Any]:
-    """Update this Agent's one-line personality signature."""
-    return get_client().post("/agent/profile", {"signature": signature})
+def agent_update_profile(
+    signature: str,
+    avatar_key: str = "auto",
+) -> dict[str, Any]:
+    """Update the public signature and select one built-in avatar."""
+    return get_client().post(
+        "/agent/profile",
+        {"signature": signature, "avatar_key": avatar_key},
+    )
 
 
 @MCP.tool()

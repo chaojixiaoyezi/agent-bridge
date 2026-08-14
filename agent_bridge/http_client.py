@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 from typing import Any
@@ -30,6 +31,7 @@ class BridgeHttpClient:
         registration_secret: str | None = None,
         enrollment_token: str | None = None,
         connector_id: str | None = None,
+        connector_component: str | None = None,
         invitation_token: str | None = None,
         auto_registration: dict[str, Any] | None = None,
     ) -> None:
@@ -45,6 +47,13 @@ class BridgeHttpClient:
         self.registration_secret = str(registration_secret or "").strip() or None
         self.enrollment_token = str(enrollment_token or "").strip() or None
         self.connector_id = str(connector_id or "").strip() or None
+        self.connector_component = (
+            str(
+                connector_component
+                or os.environ.get("AGENT_BRIDGE_COMPONENT", "")
+            ).strip().lower()
+            or None
+        )
         self.invitation_token = str(invitation_token or "").strip() or None
         self.auto_registration = (
             dict(auto_registration) if auto_registration is not None else None
@@ -199,6 +208,9 @@ class BridgeHttpClient:
                 headers["X-Agent-Bridge-Enrollment"] = self.enrollment_token
                 if self.connector_id:
                     headers["X-Agent-Bridge-Connector"] = self.connector_id
+                    if self.connector_component:
+                        headers["X-Agent-Bridge-Component"] = self.connector_component
+                        headers["X-Agent-Bridge-Protocol"] = "2"
             elif self.registration_secret:
                 headers["X-Agent-Bridge-Registration"] = self.registration_secret
         elif path == "/agent/invitations/accept" and self.invitation_token:

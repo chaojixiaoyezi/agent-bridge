@@ -396,6 +396,7 @@ def configure_resident_connector(
     task_thread_file = state_directory / "task-execution-thread"
     listener_environment = {
         **common,
+        "AGENT_BRIDGE_COMPONENT": "listener",
         "AGENT_BRIDGE_CURSOR_FILE": str(cursor_file),
         "AGENT_BRIDGE_WAKE_POLICY": "all",
         "AGENT_BRIDGE_WAKE_COMMAND_JSON": json.dumps(
@@ -424,6 +425,7 @@ def configure_resident_connector(
         codex_binary = shutil.which("codex")
         worker_environment = {
             **common,
+            "AGENT_BRIDGE_COMPONENT": "chat",
             "AGENT_BRIDGE_AGENT_WAKE_POLICY": "mention",
             "AGENT_BRIDGE_AGENT_WAKE_DEBOUNCE": "3",
             "AGENT_BRIDGE_CODEX_CWD": str(workspace),
@@ -460,6 +462,7 @@ def configure_resident_connector(
         claude_binary = shutil.which("claude")
         worker_environment = {
             **common,
+            "AGENT_BRIDGE_COMPONENT": "chat",
             "AGENT_BRIDGE_CLAUDE_CWD": str(workspace),
             "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
             "PATH": merged_path,
@@ -470,6 +473,7 @@ def configure_resident_connector(
     task_arguments = [str(PROJECT_ROOT / "bin" / "agent-bridge-task-worker")]
     task_environment = {
         **common,
+        "AGENT_BRIDGE_COMPONENT": "task",
         "AGENT_BRIDGE_TASK_ADAPTER": adapter,
         "AGENT_BRIDGE_TASK_CWD": str(workspace),
         "AGENT_BRIDGE_TASK_THREAD_STATE_FILE": str(task_thread_file),

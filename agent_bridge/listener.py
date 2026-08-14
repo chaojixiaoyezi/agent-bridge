@@ -468,6 +468,8 @@ def _register(
         headers["X-Agent-Bridge-Enrollment"] = enrollment_token
         if connector_id:
             headers["X-Agent-Bridge-Connector"] = connector_id
+            headers["X-Agent-Bridge-Component"] = "listener"
+            headers["X-Agent-Bridge-Protocol"] = "2"
     elif registration_secret:
         headers["X-Agent-Bridge-Registration"] = registration_secret
     request = Request(
