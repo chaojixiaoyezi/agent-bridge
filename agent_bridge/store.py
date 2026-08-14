@@ -14,7 +14,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from .avatars import normalize_avatar_key
+from .avatars import (
+    AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS,
+    normalize_avatar_key,
+)
 from .validation import (
     MAX_AGENT_USERNAME_CHARS,
     MAX_CLIENT_IDENTITY_CHARS,
@@ -217,6 +220,15 @@ class NicknameRateLimitError(ConflictError):
         )
 
 
+class AvatarRateLimitError(ConflictError):
+    def __init__(self, *, retry_after_seconds: float) -> None:
+        self.retry_after_seconds = max(0.0, float(retry_after_seconds))
+        super().__init__(
+            "Agent avatars may be changed at most once every 24 hours; "
+            f"retry after {self.retry_after_seconds:.3f} seconds"
+        )
+
+
 class AuthenticationError(BridgeError):
     pass
 
@@ -263,6 +275,7 @@ CREATE TABLE IF NOT EXISTS participants (
     display_name TEXT NOT NULL,
     signature TEXT NOT NULL,
     avatar_key TEXT NOT NULL DEFAULT 'auto',
+    avatar_changed_at REAL,
     profile_updated_at REAL NOT NULL,
     capabilities_json TEXT NOT NULL DEFAULT '[]',
     status TEXT NOT NULL DEFAULT 'online',
@@ -1277,6 +1290,10 @@ class BridgeStore:
                     "ALTER TABLE participants ADD COLUMN avatar_key TEXT "
                     "NOT NULL DEFAULT 'auto'"
                 )
+            if "avatar_changed_at" not in participant_columns:
+                conn.execute(
+                    "ALTER TABLE participants ADD COLUMN avatar_changed_at REAL"
+                )
             conn.execute(
                 "UPDATE participants SET display_name = client_type "
                 "WHERE display_name IS NULL OR trim(display_name) = ''"
@@ -1498,7 +1515,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 26")
+            conn.execute("PRAGMA user_version = 27")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -5349,6 +5366,7 @@ class BridgeStore:
         product: str,
         username: str,
         signature: str,
+        avatar_key: object = "auto",
         roles: Sequence[str] | None = None,
         capabilities: Sequence[str] | None = None,
         enrollment_token: str | None = None,
@@ -5364,6 +5382,7 @@ class BridgeStore:
         )
         normalized_product = token(product, field="product_name")
         requested_username = agent_username(username)
+        normalized_avatar = normalize_avatar_key(avatar_key)
         normalized_tui_endpoint = (
             opaque_id(tui_endpoint_id, field="tui_endpoint_id")
             if str(tui_endpoint_id or "").strip()
@@ -5657,6 +5676,41 @@ class BridgeStore:
                     invitation_grant=True,
                     now=now,
                 )
+                avatar_profile = conn.execute(
+                    "SELECT avatar_key, avatar_changed_at FROM participants "
+                    "WHERE participant_id = ?",
+                    (registered["participant_id"],),
+                ).fetchone()
+                avatar_warning = None
+                try:
+                    next_avatar_changed_at = self._next_avatar_changed_at(
+                        current_avatar=str(avatar_profile["avatar_key"] or "auto"),
+                        current_changed_at=avatar_profile["avatar_changed_at"],
+                        next_avatar=normalized_avatar,
+                        now=now,
+                    )
+                except AvatarRateLimitError as exc:
+                    # Joining another room must not fail just because this
+                    # shared identity picked another avatar too recently.
+                    avatar_warning = str(exc)
+                else:
+                    if normalized_avatar != str(
+                        avatar_profile["avatar_key"] or "auto"
+                    ):
+                        conn.execute(
+                            "UPDATE participants SET avatar_key = ?, "
+                            "avatar_changed_at = ?, profile_updated_at = ? "
+                            "WHERE participant_id = ?",
+                            (
+                                normalized_avatar,
+                                next_avatar_changed_at,
+                                now,
+                                registered["participant_id"],
+                            ),
+                        )
+                        registered["avatar_key"] = normalized_avatar
+                if avatar_warning is not None:
+                    registered["avatar_selection_warning"] = avatar_warning
                 setup_status = (
                     "awaiting_setup"
                     if str(invitation["requested_mode"]) == "resident"
@@ -7468,7 +7522,8 @@ class BridgeStore:
             )
         owned_count = self._agent_active_room_count(conn, participant_id)
         profile = conn.execute(
-            "SELECT session_alias, display_name, signature FROM participants "
+            "SELECT session_alias, display_name, signature, avatar_key "
+            "FROM participants "
             "WHERE participant_id = ?",
             (participant_id,),
         ).fetchone()
@@ -7480,6 +7535,7 @@ class BridgeStore:
             "session_alias": str(profile["session_alias"]),
             "display_name": str(profile["display_name"]),
             "signature": str(profile["signature"]),
+            "avatar_key": str(profile["avatar_key"] or "auto"),
             "conversation_id": conversation,
             "roles": normalized_roles,
             "capabilities": normalized_capabilities,
@@ -7822,12 +7878,18 @@ class BridgeStore:
         *,
         participant_id: str,
         authorized_session_id: str,
-        signature: str,
+        signature: object | None = None,
         avatar_key: object | None = None,
     ) -> dict[str, Any]:
         participant = opaque_id(participant_id, field="participant_id")
         session = opaque_id(authorized_session_id, field="authorized_session_id")
-        normalized_signature = alias(signature, field="signature")
+        if signature is None and avatar_key is None:
+            raise ValidationError("signature or avatar_key is required")
+        normalized_signature = (
+            alias(signature, field="signature")
+            if signature is not None
+            else None
+        )
         normalized_avatar = (
             normalize_avatar_key(avatar_key)
             if avatar_key is not None
@@ -7841,12 +7903,36 @@ class BridgeStore:
                 participant_id=participant,
                 now=now,
             )
+            current = conn.execute(
+                "SELECT * FROM participants WHERE participant_id = ?",
+                (participant,),
+            ).fetchone()
+            if current is None:
+                raise NotFoundError(f"unknown participant: {participant}")
+            next_avatar_changed_at = (
+                self._next_avatar_changed_at(
+                    current_avatar=str(current["avatar_key"] or "auto"),
+                    current_changed_at=current["avatar_changed_at"],
+                    next_avatar=normalized_avatar,
+                    now=now,
+                )
+                if normalized_avatar is not None
+                else current["avatar_changed_at"]
+            )
             updated = conn.execute(
-                "UPDATE participants SET signature = ?, "
-                "avatar_key = COALESCE(?, avatar_key), profile_updated_at = ?, "
+                "UPDATE participants SET signature = COALESCE(?, signature), "
+                "avatar_key = COALESCE(?, avatar_key), avatar_changed_at = ?, "
+                "profile_updated_at = ?, "
                 "last_seen = ? "
                 "WHERE participant_id = ?",
-                (normalized_signature, normalized_avatar, now, now, participant),
+                (
+                    normalized_signature,
+                    normalized_avatar,
+                    next_avatar_changed_at,
+                    now,
+                    now,
+                    participant,
+                ),
             ).rowcount
             if not updated:
                 raise NotFoundError(f"unknown participant: {participant}")
@@ -7855,6 +7941,34 @@ class BridgeStore:
                 (participant,),
             ).fetchone()
         return self._participant_profile_payload(row)
+
+    @staticmethod
+    def _next_avatar_changed_at(
+        *,
+        current_avatar: str,
+        current_changed_at: object | None,
+        next_avatar: str,
+        now: float,
+    ) -> float | None:
+        changed_at = (
+            float(current_changed_at)
+            if current_changed_at is not None
+            else None
+        )
+        if next_avatar == current_avatar:
+            return changed_at
+        if changed_at is not None:
+            retry_after = (
+                changed_at + AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS - now
+            )
+            if retry_after > 0:
+                raise AvatarRateLimitError(retry_after_seconds=retry_after)
+        # Picking an avatar for an identity still using ``auto`` is
+        # initialization, not its first daily change. Every later different
+        # selection starts a rolling 24-hour cooldown.
+        if current_avatar == "auto" and changed_at is None:
+            return None
+        return now
 
     def request_nickname(
         self,
@@ -12234,11 +12348,31 @@ class BridgeStore:
     def _participant_profile_payload(row: sqlite3.Row | None) -> dict[str, Any]:
         if row is None:
             raise NotFoundError("participant row disappeared")
+        avatar_changed_at = (
+            float(row["avatar_changed_at"])
+            if row["avatar_changed_at"] is not None
+            else None
+        )
+        avatar_change_available_at = (
+            avatar_changed_at + AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS
+            if avatar_changed_at is not None
+            else None
+        )
         return {
             "participant_id": str(row["participant_id"]),
             "client_type": str(row["client_type"]),
             "display_name": str(row["display_name"]),
             "signature": str(row["signature"]),
+            "avatar_key": str(row["avatar_key"] or "auto"),
+            "avatar_changed_at": avatar_changed_at,
+            "avatar_change_available_at": avatar_change_available_at,
+            "avatar_change_remaining_seconds": max(
+                0.0,
+                (avatar_change_available_at or 0.0) - time.time(),
+            ),
+            "avatar_change_cooldown_seconds": (
+                AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS
+            ),
             "session_alias": str(row["session_alias"]),
             "status": str(row["status"]),
             "last_seen": float(row["last_seen"]),

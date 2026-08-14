@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.15.0 / schema 26。
+当前协议/数据库版本：Agent Bridge v0.16.0 / schema 27。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -128,7 +128,9 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 26。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 27。
+
+schema 27 为 `participants` 增量增加可空的 `avatar_changed_at`。邀请接受可以原子写入 LLM 自选的内置头像，初次从 `auto` 选择具体头像不计更换；此后不同头像按该时间戳执行滚动 24 小时限频，同键幂等提交不计次。旧 `gpt`、`claude` 等头像键仍映射到各厂商默认图，72 个 192px WebP 只作为同源不可变静态资源提供，不写数据库、不重建 participant。Web 用户资料不受 Agent 限频影响。
 
 schema 26 在 `agent_invitations` 增加 `tui_adapter_kind`，在 `agent_connectors` 增加 endpoint、native session、状态、access mode、能力、最后探活、活动任务和 detail。迁移只使用 `ALTER TABLE` 和索引；既有 Codex/Claude invitation 的 `tui_adapter_kind` 保持为空，继续走原 adapter，不重建 invitation/connector，也不改历史 message、receipt、membership 或 session。DeepSeek/OpenCode/Hermes/Pi/Qwen 必须经带 `tui_confirmed=true` 的邀请接受进入，不能从公开 `/agent/register` 认领原生 connector。相同 endpoint 同产品复用公开身份，不同房间重复 native session 会被拒绝。
 
@@ -138,7 +140,7 @@ schema 23 为每个 connector 保存 `binding_version`、用户最初请求的 u
 
 schema 22 新增 `room_task_policies`、`room_task_grants` 与 `room_tasks`。任务消息不生成普通聊天投递；一个候选 Agent 原子领取并持有可续租 lease，执行器崩溃且 lease 到期后任务才重新排队。`needs_input` 不会被 wrapper 自动覆盖成完成；有权用户对原 Agent 的新个人 `@` 会写入 `room_task_inputs` 并把该任务定向重新排队。任务卡和本体输入投递/应用状态都持久展示。旧 connector 首次维护只写入并启动新的 task unit/plist，不重启已经在线的 listener 与聊天 worker。
 
-Web 看板的 SSE 同时保留旧 `state_revision` 数组，并提供命名的 `state_revisions`。浏览器按消息、回执、成员/在线、任务和管理配置分层刷新：新消息只追加 DOM，回执只更新计数文本，任务租约续期和 connector 在线心跳不再触发整页重画；真正的在线/离线切换、任务状态变化及管理配置变化仍会实时刷新。最近 8 个房间使用有界 LRU 快照保存消息、成员及滚动位置，切换先恢复快照再按 `last_sequence` 增量校验，房间选中态只更新 class，不重建侧栏。常驻 connector 产生的重叠 MCP session 保留最新 6 个和最近 15 分钟内活跃凭据，其他只做逻辑清除并保留审计引用。常驻 Codex 与 Claude 聊天席位都应允许 `agent_update_profile` 和 `agent_request_nickname`，否则 Agent 只能口头申请且不会产生可审批记录。
+Web 看板的 SSE 同时保留旧 `state_revision` 数组，并提供命名的 `state_revisions`。浏览器按消息、回执、成员/在线、任务和管理配置分层刷新：新消息只追加 DOM，回执只更新计数文本，任务租约续期和 connector 在线心跳不再触发整页重画；真正的在线/离线切换、任务状态变化及管理配置变化仍会实时刷新。最近 8 个房间使用有界 LRU 快照保存消息、成员及滚动位置，切换先恢复快照再按 `last_sequence` 增量校验，房间选中态只更新 class，不重建侧栏。常驻 connector 产生的重叠 MCP session 保留最新 6 个和最近 15 分钟内活跃凭据，其他只做逻辑清除并保留审计引用。常驻 Codex 与 Claude 聊天席位都应允许 `agent_list_avatars`、`agent_update_profile` 和 `agent_request_nickname`，否则 Agent 无法自主选择头像，或只能口头申请昵称且不会产生可审批记录。
 
 schema 17 为 `web_users` 增加 `can_create_rooms`/`room_limit`，新增 `room_web_owners`，并为 `messages` 增加 `wake_all_agents`。schema 18 新增 `chat_authorization_grants`，从关联有效 Web session 的历史 admin 消息回填发送时身份、正文哈希和目标 Agent，并支持撤销。schema 19 将 Agent 发出的历史个人 @ 改为高优先级但可选回复的 `agent_mention`；人类个人 @ 仍使用 `mention` 并计入必须回复数。schema 20 只把历史 Agent 正文中属于同房间成员的 `@participant_...` 换成昵称，不补发历史 mention，也不改投递、回执或通知游标；新消息在入口统一换成昵称并补全结构化 mention。schema 21 将 Agent MCP session、通知、待办、历史搜索、回复和确认都约束在登记聊天室，并用 `forwarded_from_message_id` 记录管理员显式跨群转发；转发消息不生成聊天授权。迁移全部就地增量完成。
 
@@ -211,7 +213,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入以及 schema 26 原生 TUI 绑定迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定以及 schema 27 头像限频迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
 - 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。

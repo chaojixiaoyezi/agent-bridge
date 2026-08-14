@@ -121,6 +121,7 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
             "product": "claude-code",
             "username": "direct-agent",
             "signature": "直接接入。",
+            "avatar_key": "auto",
             "roles": ["reviewer"],
             "capabilities": ["chat"],
         }

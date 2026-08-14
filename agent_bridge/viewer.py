@@ -25,7 +25,11 @@ from .a2a_gateway import (
     handle_jsonrpc,
     jsonrpc_error,
 )
-from .avatars import avatar_catalog_payload
+from .avatars import (
+    avatar_asset_path,
+    avatar_catalog_payload,
+    avatar_invitation_payload,
+)
 from .config import BridgeConfig
 from .connector import (
     adapter_kind_for_product,
@@ -41,6 +45,7 @@ from .resident_health import (
     split_supported_identity,
 )
 from .store import (
+    AvatarRateLimitError,
     AuthenticationError,
     AuthorizationError,
     BridgeStore,
@@ -122,6 +127,15 @@ def create_app(
             WEB_ROOT / "app.js",
             media_type="application/javascript",
         )
+
+    async def avatar_asset(request: Request) -> Response:
+        path = avatar_asset_path(
+            request.path_params["vendor"],
+            request.path_params["filename"],
+        )
+        if path is None:
+            return Response(status_code=404)
+        return FileResponse(path, media_type="image/webp")
 
     required_registration_secret = (
         str(registration_secret or "").strip() or None
@@ -963,6 +977,7 @@ def create_app(
                     "product",
                     "username",
                     "signature",
+                    "avatar_key",
                     "roles",
                     "capabilities",
                     "enrollment_token",
@@ -981,6 +996,7 @@ def create_app(
                 product=payload["product"],
                 username=payload["username"],
                 signature=payload["signature"],
+                avatar_key=payload.get("avatar_key", "auto"),
                 roles=payload.get("roles"),
                 capabilities=payload.get("capabilities"),
                 enrollment_token=payload.get("enrollment_token"),
@@ -1067,13 +1083,24 @@ def create_app(
         return await _agent_json_call(
             request,
             store,
-            required={"signature"},
+            required=set(),
             allowed={"signature", "avatar_key"},
             operation=lambda auth, payload: store.update_profile(
                 participant_id=auth["participant_id"],
                 authorized_session_id=auth["session_id"],
-                signature=payload["signature"],
+                signature=payload.get("signature"),
                 avatar_key=payload.get("avatar_key"),
+            ),
+        )
+
+    async def agent_avatars(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required=set(),
+            allowed={"vendor"},
+            operation=lambda _auth, payload: avatar_catalog_payload(
+                vendor=payload.get("vendor"),
             ),
         )
 
@@ -2148,6 +2175,7 @@ def create_app(
                     f"conversation {conversation} is {room['status']} and cannot accept Agents"
                 )
             normalized_product = token(payload["product"], field="product_name")
+            avatar_selection = avatar_invitation_payload(normalized_product)
             requested_mode = str(payload.get("mode") or "resident").strip().lower()
             reusable = payload.get("reusable", False)
             adapter_kind = adapter_kind_for_product(normalized_product)
@@ -2172,6 +2200,10 @@ def create_app(
             agent_supplied_fields = {
                 "username": "由 Agent 自己选择长期稳定用户名（必填）",
                 "signature": "由 Agent 自己填写一句话签名（必填）",
+                "avatar_key": (
+                    "由 Agent 从邀请中的头像候选里自主选择；不填则自动匹配，"
+                    f"推荐默认值 {avatar_selection['default_key']}"
+                ),
                 "roles": "由 Agent 根据职责自行选择，可留空",
                 "capabilities": "由 Agent 根据能力自行选择，可留空",
                 "workspace_path": "由 Agent 填写自己的工作目录；不填则使用安全默认目录",
@@ -2239,7 +2271,8 @@ def create_app(
             if normalized_product == "claude-code":
                 acceptance_prompt = (
                     "明确接受这份 Agent Bridge 邀请。自行选择长期稳定的 username 和"
-                    "一句 signature，并在当前工作目录执行下列 agent-bridge-accept 命令；"
+                    "一句 signature，再从邀请候选中自主选择 avatar_key，并在当前工作"
+                    "目录执行下列 agent-bridge-accept 命令；"
                     "邀请令牌通过标准输入传入。成功后简要报告结果。不要修改全局 MCP "
                     "配置，也不要要求用户重启现有 Claude Code 会话。"
                 )
@@ -2253,6 +2286,8 @@ def create_app(
                     "<由 Claude Code 自行选择>",
                     "--signature",
                     "<由 Claude Code 自行填写>",
+                    "--avatar-key",
+                    f"<从候选中选择；推荐 {avatar_selection['default_key']}>",
                 ]
                 direct_command = (
                     "printf %s "
@@ -2348,6 +2383,8 @@ def create_app(
                     "<由 Agent 自行选择；同一端点后续自动复用>",
                     "--signature",
                     "<由 Agent 自行填写>",
+                    "--avatar-key",
+                    f"<从候选中选择；推荐 {avatar_selection['default_key']}>",
                     "--tui-adapter",
                     tui_adapter_kind,
                     "--tui-endpoint-id",
@@ -2416,6 +2453,16 @@ def create_app(
                     expiry_note,
                     "连接后由 Agent 提供 username、signature、工作目录，并按职责决定 roles/capabilities；"
                     "实际机器 username 由 Bridge 返回并固定到该 connector，同名时自动隔离。",
+                    "头像也由 Agent 自主选择。接受邀请时把 avatar_key 一并交给 "
+                    "agent_accept_invitation；当前产品的建议候选如下：",
+                    json.dumps(
+                        avatar_selection["choices"],
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    "若暂时不选可使用 auto；接入后可调用 agent_list_avatars 查看完整"
+                    "目录，再调用 agent_update_profile 单独换头像。初次选择不占换头像"
+                    "次数，此后不同头像按滚动 24 小时最多更换一次。",
                     "请明确调用 agent_accept_invitation；不要先调用 agent_register：",
                     "Agent 自行填写字段：",
                     json.dumps(agent_supplied_fields, ensure_ascii=False, indent=2),
@@ -2502,6 +2549,7 @@ def create_app(
                         "quick_start": quick_start,
                         "native_tui_binding_template": native_binding_template,
                         "native_tui_startup_note": native_startup_note,
+                        "avatar_selection": avatar_selection,
                         "registration_secret_required": (
                             required_registration_secret is not None
                         ),
@@ -2604,6 +2652,11 @@ def create_app(
             Route("/", index, methods=["GET"]),
             Route("/assets/app.css", stylesheet, methods=["GET"]),
             Route("/assets/app.js", javascript, methods=["GET"]),
+            Route(
+                "/assets/avatars/{vendor:str}/{filename:str}",
+                avatar_asset,
+                methods=["GET"],
+            ),
             Route("/api/health", health, methods=["GET"]),
             Route("/api/avatars", avatars, methods=["GET"]),
             Route(
@@ -2735,6 +2788,7 @@ def create_app(
             ),
             Route("/agent/heartbeat", agent_heartbeat, methods=["POST"]),
             Route("/agent/profile", agent_update_profile, methods=["POST"]),
+            Route("/agent/avatars", agent_avatars, methods=["POST"]),
             Route(
                 "/agent/nickname/request",
                 agent_request_nickname,
@@ -2876,7 +2930,7 @@ def _json_call(
         return JSONResponse({"error": str(exc)}, status_code=401)
     except (AuthorizationError, WebAuthorizationError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=403)
-    except (RateLimitError, NicknameRateLimitError) as exc:
+    except (RateLimitError, NicknameRateLimitError, AvatarRateLimitError) as exc:
         return JSONResponse(
             {
                 "error": str(exc),
@@ -2991,7 +3045,10 @@ def _json_error(exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=401)
     if isinstance(exc, (AuthorizationError, WebAuthorizationError)):
         return JSONResponse({"error": str(exc)}, status_code=403)
-    if isinstance(exc, (RateLimitError, NicknameRateLimitError)):
+    if isinstance(
+        exc,
+        (RateLimitError, NicknameRateLimitError, AvatarRateLimitError),
+    ):
         return JSONResponse(
             {
                 "error": str(exc),

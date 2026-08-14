@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .avatars import normalize_avatar_key
 from .connector import ConnectorSetupError, configure_resident_connector
 from .http_client import BridgeHttpClient, BridgeRemoteError
 from .tui_adapter import NativeTuiError, validate_native_tui_binding
@@ -54,6 +55,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     product = token(args.product, field="product_name")
     username = agent_username(args.username)
     signature = alias(args.signature, field="signature")
+    avatar_key = normalize_avatar_key(getattr(args, "avatar_key", "auto"))
     roles = string_tokens(args.role, field="roles")
     capabilities = string_tokens(args.capability, field="capabilities")
     tui_transport: dict[str, object] | None = None
@@ -91,6 +93,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
         "product": product,
         "username": username,
         "signature": signature,
+        "avatar_key": avatar_key,
         "roles": roles,
         "capabilities": capabilities,
     }
@@ -185,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--product", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--signature", required=True)
+    parser.add_argument("--avatar-key", default="auto")
     parser.add_argument("--workspace", default=os.getcwd())
     parser.add_argument("--role", action="append", default=[])
     parser.add_argument("--capability", action="append", default=[])

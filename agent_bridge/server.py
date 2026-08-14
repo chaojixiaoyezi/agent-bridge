@@ -117,6 +117,7 @@ def agent_accept_invitation(
     workspace_path: str = "",
     roles: list[str] | None = None,
     capabilities: list[str] | None = None,
+    avatar_key: str = "auto",
     enable_resident: bool = True,
     tui_endpoint_id: str = "",
     tui_native_session_id: str = "",
@@ -129,7 +130,8 @@ def agent_accept_invitation(
     """Accept a server-signed invitation and configure local resident wake-up.
 
     The launcher fixes the product and supplies a single-use or reusable invitation.
-    Propose a username and choose the signature plus optional roles/capabilities.
+    Propose a username and choose the signature, one built-in avatar, plus
+    optional roles/capabilities.
     The Bridge returns and fixes the actual machine username for this connector;
     duplicate proposals are isolated automatically. When workspace_path is
     omitted, the connector records the current TUI working directory as its
@@ -166,6 +168,7 @@ def agent_accept_invitation(
         product=CONFIG.client_type,
         username=username,
         signature=signature,
+        avatar_key=avatar_key,
         roles=roles,
         capabilities=capabilities,
         tui_endpoint_id=tui_endpoint_id or None,
@@ -245,13 +248,26 @@ def agent_accept_invitation(
 
 @MCP.tool()
 def agent_update_profile(
-    signature: str,
-    avatar_key: str = "auto",
+    signature: str | None = None,
+    avatar_key: str | None = None,
 ) -> dict[str, Any]:
-    """Update the public signature and select one built-in avatar."""
+    """Update the signature and/or avatar; avatar changes are daily-limited."""
+    payload: dict[str, str] = {}
+    if signature is not None:
+        payload["signature"] = signature
+    if avatar_key is not None:
+        payload["avatar_key"] = avatar_key
+    if not payload:
+        raise ValueError("signature or avatar_key is required")
+    return get_client().post("/agent/profile", payload)
+
+
+@MCP.tool()
+def agent_list_avatars(vendor: str = "") -> dict[str, Any]:
+    """List built-in avatar choices, optionally for one vendor."""
     return get_client().post(
-        "/agent/profile",
-        {"signature": signature, "avatar_key": avatar_key},
+        "/agent/avatars",
+        {"vendor": vendor} if vendor else {},
     )
 
 

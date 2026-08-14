@@ -208,7 +208,22 @@ def test_web_login_registration_password_policy_profile_and_roles(
         },
     )
     assert joined.status_code == 201
-    assert joined.json()["access_token"]
+    joined_payload = joined.json()
+    assert joined_payload["access_token"]
+    agent_avatars = anonymous_agent.post(
+        "/agent/avatars",
+        headers={"Authorization": f"Bearer {joined_payload['access_token']}"},
+        json={"vendor": "gpt"},
+    )
+    assert agent_avatars.status_code == 200
+    assert len(agent_avatars.json()["groups"][0]["avatars"]) == 8
+    avatar_profile = anonymous_agent.post(
+        "/agent/profile",
+        headers={"Authorization": f"Bearer {joined_payload['access_token']}"},
+        json={"avatar_key": "gpt-04-skeptical"},
+    )
+    assert avatar_profile.status_code == 200
+    assert avatar_profile.json()["avatar_key"] == "gpt-04-skeptical"
 
     member_client = TestClient(make_app(database))
     bad_registration = member_client.post(
@@ -227,11 +242,16 @@ def test_web_login_registration_password_policy_profile_and_roles(
     profile = member_client.patch(
         "/api/auth/profile",
         headers=intent_headers(member_client, "update-profile"),
-        json={"display_name": "普通成员", "signature": "这是我的签名。"},
+        json={
+            "display_name": "普通成员",
+            "signature": "这是我的签名。",
+            "avatar_key": "qwen-03-curious-question",
+        },
     )
     assert profile.status_code == 200
     assert profile.json()["user"]["display_name"] == "普通成员"
     assert profile.json()["user"]["signature"] == "这是我的签名。"
+    assert profile.json()["user"]["avatar_key"] == "qwen-03-curious-question"
     assert member_client.post(
         "/api/rooms",
         headers=intent_headers(member_client, "create-room"),
@@ -260,6 +280,35 @@ def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None
     assert "default-src 'self'" in index.headers["content-security-policy"]
     assert "form-action 'self'" in index.headers["content-security-policy"]
     assert index.headers["cache-control"] == "no-store"
+
+    avatars = client.get("/api/avatars")
+    assert avatars.status_code == 200
+    avatar_catalog = avatars.json()
+    assert {group["key"] for group in avatar_catalog["groups"]} == {
+        "neutral",
+        "deepseek",
+        "gpt",
+        "claude",
+        "grok",
+        "gemini",
+        "kimi",
+        "minimax",
+        "glm",
+        "qwen",
+    }
+    illustrated = [
+        avatar
+        for avatar in avatar_catalog["avatars"]
+        if avatar.get("expression")
+    ]
+    assert len(illustrated) == 72
+    avatar_asset = client.get(illustrated[0]["image_url"])
+    assert avatar_asset.status_code == 200
+    assert avatar_asset.headers["content-type"] == "image/webp"
+    assert avatar_asset.headers["cache-control"] == (
+        "public, max-age=31536000, immutable"
+    )
+    assert client.get("/assets/avatars/gpt/not-an-avatar.webp").status_code == 404
 
     rooms = client.get("/api/rooms").json()["rooms"]
     assert {room["conversation_id"] for room in rooms} == {"room-one", "room-two"}
@@ -357,8 +406,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260813-3" in index_html
-    assert "app.css?v=20260813-3" in index_html
+    assert "app.js?v=20260814-1" in index_html
+    assert "app.css?v=20260814-1" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "function appendMessages" in javascript
@@ -372,6 +421,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert 'id="participant-search"' in index_html
     assert ".filter((person) => !isDormantParticipant(person))" in javascript
     assert "participantMatchesQuery" in javascript
+    assert "function createAvatarElement" in javascript
+    assert "profileAvatarVendor" in javascript
     mention_menu_start = javascript.index("function updateMentionMenu")
     mention_candidates = javascript.index(
         "const candidates = state.participants",
@@ -697,6 +748,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert set(generated["agent_supplied_fields"]) == {
         "username",
         "signature",
+        "avatar_key",
         "roles",
         "capabilities",
         "workspace_path",
@@ -719,6 +771,10 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert "实际机器 username 由 Bridge 返回并固定到该 connector" in generated[
         "instructions"
     ]
+    assert generated["avatar_selection"]["recommended_vendor"] == "gpt"
+    assert len(generated["avatar_selection"]["choices"]) == 8
+    assert "avatar_key" in generated["agent_supplied_fields"]
+    assert "agent_list_avatars" in generated["instructions"]
 
     access_html = client.get("/").text
     assert '<select class="room-id-input" id="access-room" required>' in access_html
@@ -753,6 +809,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert claude_access["quick_start"]["kind"] == "claude-code-direct-accept"
     assert claude_access["quick_start"]["requires_mcp_restart"] is False
     assert "agent-bridge-accept" in claude_access["quick_start"]["command"]
+    assert "--avatar-key" in claude_access["quick_start"]["command"]
     assert "printf %s" in claude_access["quick_start"]["command"]
     assert "无需重启现有 TUI/MCP" in claude_access["instructions"]
 
@@ -771,6 +828,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         "deepseek-harness-cordis-patch"
     )
     assert deepseek_access["quick_start"]["hot_reload"] is True
+    assert deepseek_access["avatar_selection"]["recommended_vendor"] == "deepseek"
     deepseek_row = deepseek_access["quick_start"]["patch"][0]["insert"][0]
     assert deepseek_row["name"] == "@deepseek-ai/dsh-mcp-client"
     assert deepseek_row["config"]["serverName"].startswith("agent-bridge-")
@@ -1046,6 +1104,7 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
             "product": "codex",
             "username": "invitee",
             "signature": "只处理明确通知。",
+            "avatar_key": "gpt-05-determined-fist",
             "roles": ["reviewer"],
             "enrollment_token": proposed_enrollment,
         },
@@ -1057,6 +1116,7 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
     connector_id = registration["connector_id"]
     agent_headers = {"Authorization": f"Bearer {registration['access_token']}"}
     assert registration["client_type"] == "codex-invitee"
+    assert registration["avatar_key"] == "gpt-05-determined-fist"
     assert registration["setup_status"] == "awaiting_setup"
     assert client.post(
         "/agent/invitations/accept",

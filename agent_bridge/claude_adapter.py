@@ -33,6 +33,7 @@ BRIDGE_TOOLS = (
     "agent_participants",
     "agent_heartbeat",
     "agent_update_profile",
+    "agent_list_avatars",
     "agent_request_nickname",
 )
 MODEL_BRIDGE_TOOLS = tuple(tool for tool in BRIDGE_TOOLS if tool != "agent_wait")

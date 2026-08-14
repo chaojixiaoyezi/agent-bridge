@@ -11,6 +11,7 @@ from agent_bridge.store import (
     AGENT_ACTIVE_ROOM_LIMIT,
     MESSAGE_COOLDOWN_SECONDS,
     ROOM_ABANDON_AFTER_SECONDS,
+    AvatarRateLimitError,
     AuthenticationError,
     AuthorizationError,
     BridgeStore,
@@ -634,7 +635,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -682,6 +683,12 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
+        participant_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(participants)"
+            ).fetchall()
+        }
         columns = {
             str(row["name"])
             for row in connection.execute(
@@ -691,7 +698,8 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
+    assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
     assert policy["unactivated_inactivity_days"] == 3
@@ -2055,7 +2063,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 26
+    assert version == 27
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2127,7 +2135,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 26
+    assert version == 27
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2223,7 +2231,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 26
+    assert version == 27
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -2570,6 +2578,45 @@ def test_signature_and_owner_approved_nickname_are_separate_from_identity(
     )
     assert updated["signature"] == "更喜欢底层单一权威。"
     assert updated["display_name"] == "小团子"
+    initialized_avatar = store.update_profile(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        avatar_key="gpt-02-curious",
+    )
+    assert initialized_avatar["avatar_key"] == "gpt-02-curious"
+    assert initialized_avatar["avatar_changed_at"] is None
+    changed_avatar = store.update_profile(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        avatar_key="gpt-07-discovery",
+    )
+    assert changed_avatar["avatar_key"] == "gpt-07-discovery"
+    assert changed_avatar["avatar_change_remaining_seconds"] > 86_390
+    same_avatar = store.update_profile(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        avatar_key="gpt-07-discovery",
+    )
+    assert same_avatar["avatar_changed_at"] == changed_avatar["avatar_changed_at"]
+    with pytest.raises(AvatarRateLimitError) as avatar_limited:
+        store.update_profile(
+            participant_id=registered["participant_id"],
+            authorized_session_id=registered["session_id"],
+            avatar_key="gpt-08-puffed-cheeks",
+        )
+    assert avatar_limited.value.retry_after_seconds > 86_390
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE participants SET avatar_changed_at = ? "
+            "WHERE participant_id = ?",
+            (time.time() - 86_401, registered["participant_id"]),
+        )
+    next_day_avatar = store.update_profile(
+        participant_id=registered["participant_id"],
+        authorized_session_id=registered["session_id"],
+        avatar_key="gpt-08-puffed-cheeks",
+    )
+    assert next_day_avatar["avatar_key"] == "gpt-08-puffed-cheeks"
     with pytest.raises(NicknameRateLimitError):
         store.request_nickname(
             participant_id=registered["participant_id"],
@@ -4037,7 +4084,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 27
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4092,7 +4139,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 26
+    assert version == 27
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -4803,7 +4850,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

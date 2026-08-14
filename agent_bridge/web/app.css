@@ -576,6 +576,7 @@ select option {
 .message:last-child { padding-bottom: 5px; }
 .message-head { justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .sender-line { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.message-avatar { width: 27px; height: 27px; border-radius: 9px; }
 .sender-line strong { color: var(--text); font-size: 12px; }
 .client-label { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; }
 .sender-seat-badge { padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted-strong); background: var(--surface-soft); font-size: 8px; font-weight: 750; }
@@ -673,7 +674,9 @@ select option {
   background: rgba(255,255,255,.045);
   font-size: 11px;
   font-weight: 700;
+  overflow: hidden;
 }
+.avatar img { width: 100%; height: 100%; display: block; object-fit: cover; }
 .avatar.online { color: var(--cyan); border-color: rgba(85,214,199,.2); background: rgba(85,214,199,.07); }
 .person-name { min-width: 0; flex: 1; }
 .person-name strong, .person-name span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -801,6 +804,27 @@ select option {
 }
 .captcha-input { text-transform: uppercase; letter-spacing: .16em; }
 .account-identity { margin: -10px 0 18px; color: var(--cyan); font-size: 11px; }
+.profile-avatar-section { margin: 0 0 18px; }
+.profile-avatar-row { display: flex; align-items: center; gap: 13px; margin-bottom: 10px; }
+.profile-avatar-current { flex: none; }
+.profile-avatar-current .avatar { width: 58px; height: 58px; border-radius: 17px; font-size: 18px; }
+.profile-avatar-vendor-field { min-width: 0; flex: 1; }
+.profile-avatar-vendor-field .field-label { margin-top: 0; }
+.profile-avatar-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+.profile-avatar-option {
+  min-width: 0;
+  padding: 6px 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  color: var(--muted);
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+.profile-avatar-option:hover { color: var(--text); border-color: color-mix(in srgb, var(--cyan) 30%, var(--line)); }
+.profile-avatar-option.selected { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 52%, var(--line)); background: var(--cyan-soft); }
+.profile-avatar-option .avatar { width: 46px; height: 46px; margin: 0 auto 5px; border-radius: 13px; font-size: 15px; }
+.profile-avatar-option span { display: block; overflow: hidden; font-size: 8px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.profile-avatar-section .field-help { margin: 8px 0 0; }
 .account-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
 .account-actions .primary-button { margin-left: auto; }
 .danger-button { color: var(--danger); border-color: rgba(255,119,141,.2); }

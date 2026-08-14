@@ -49,6 +49,9 @@ const state = {
   participantFilter: "",
   expandedDormantRooms: new Set(),
   roomSnapshots: new Map(),
+  avatarCatalog: null,
+  avatarByKey: new Map(),
+  profileAvatarKey: "auto",
   timelineScrollFrame: null,
   forwardMessageId: null,
 };
@@ -224,6 +227,10 @@ const elements = {
   profileForm: document.querySelector("#profile-form"),
   closeAccount: document.querySelector("#close-account"),
   accountIdentity: document.querySelector("#account-identity"),
+  profileAvatarCurrent: document.querySelector("#profile-avatar-current"),
+  profileAvatarVendor: document.querySelector("#profile-avatar-vendor"),
+  profileAvatarOptions: document.querySelector("#profile-avatar-options"),
+  profileAvatarHelp: document.querySelector("#profile-avatar-help"),
   profileDisplayName: document.querySelector("#profile-display-name"),
   profileSignature: document.querySelector("#profile-signature"),
   profileFeedback: document.querySelector("#profile-feedback"),
@@ -237,6 +244,135 @@ function makeElement(tag, className, text) {
   if (className) element.className = className;
   if (text !== undefined && text !== null) element.textContent = String(text);
   return element;
+}
+
+function avatarInitial(label, clientType = "") {
+  const source = String(label || clientType || "A").trim();
+  return Array.from(source)[0] || "A";
+}
+
+function canonicalAvatarKey(key) {
+  const normalized = String(key || "auto");
+  return state.avatarByKey.get(normalized)?.resolved_key || normalized;
+}
+
+function avatarCatalogItem(avatarKey, clientType = "") {
+  const normalizedKey = String(avatarKey || "auto");
+  const direct = state.avatarByKey.get(normalizedKey);
+  if (direct?.image_url) return direct;
+  if (normalizedKey !== "auto" || !state.avatarCatalog) return direct || null;
+  const normalizedClient = String(clientType || "").trim().toLocaleLowerCase("en-US");
+  const defaults = Object.entries(state.avatarCatalog.product_defaults || {})
+    .sort(([left], [right]) => right.length - left.length);
+  for (const [product, defaultKey] of defaults) {
+    if (normalizedClient === product || normalizedClient.startsWith(`${product}-`)) {
+      return state.avatarByKey.get(defaultKey) || null;
+    }
+  }
+  return direct || null;
+}
+
+function createAvatarElement({
+  avatarKey = "auto",
+  clientType = "",
+  label = "",
+  status = "",
+  className = "",
+} = {}) {
+  const classes = ["avatar", status, className].filter(Boolean).join(" ");
+  const wrapper = makeElement("div", classes);
+  const initial = avatarInitial(label, clientType);
+  const item = avatarCatalogItem(avatarKey, clientType);
+  if (!item?.image_url) {
+    wrapper.textContent = item?.mark || initial;
+    return wrapper;
+  }
+  const image = document.createElement("img");
+  image.src = item.image_url;
+  image.alt = "";
+  image.loading = "lazy";
+  image.decoding = "async";
+  image.addEventListener("error", () => {
+    image.remove();
+    wrapper.textContent = item.mark || initial;
+  }, { once: true });
+  wrapper.append(image);
+  wrapper.title = `${item.vendor_label || "内置"} · ${item.label}`;
+  return wrapper;
+}
+
+async function loadAvatarCatalog() {
+  if (state.avatarCatalog) return state.avatarCatalog;
+  const payload = await fetchJson("/api/avatars");
+  state.avatarCatalog = payload;
+  state.avatarByKey = new Map(
+    (payload.avatars || []).map((item) => [item.key, item]),
+  );
+  return payload;
+}
+
+function renderProfileAvatarCurrent() {
+  const key = state.profileAvatarKey || "auto";
+  const item = state.avatarByKey.get(key);
+  elements.profileAvatarCurrent.replaceChildren(createAvatarElement({
+    avatarKey: key,
+    clientType: state.currentUser?.username || "web-user",
+    label: state.currentUser?.display_name || "用户",
+  }));
+  elements.profileAvatarHelp.textContent = item
+    ? `已选：${item.vendor_label ? `${item.vendor_label} · ` : ""}${item.label}。Web 用户可随时更换；每次只加载当前系列。`
+    : "每次只加载当前系列，节省流量。";
+}
+
+function renderProfileAvatarOptions(groupKey) {
+  const group = (state.avatarCatalog?.groups || [])
+    .find((item) => item.key === groupKey);
+  elements.profileAvatarOptions.replaceChildren();
+  if (!group) return;
+  for (const item of group.avatars || []) {
+    const key = canonicalAvatarKey(item.key);
+    const selected = key === canonicalAvatarKey(state.profileAvatarKey);
+    const button = makeElement(
+      "button",
+      `profile-avatar-option${selected ? " selected" : ""}`,
+    );
+    button.type = "button";
+    button.setAttribute("role", "radio");
+    button.setAttribute("aria-checked", String(selected));
+    button.title = `${group.label} · ${item.label}`;
+    button.append(createAvatarElement({
+      avatarKey: key,
+      clientType: state.currentUser?.username || "web-user",
+      label: item.label,
+    }));
+    button.append(makeElement("span", "", item.label));
+    button.addEventListener("click", () => {
+      state.profileAvatarKey = key;
+      renderProfileAvatarCurrent();
+      renderProfileAvatarOptions(group.key);
+    });
+    elements.profileAvatarOptions.append(button);
+  }
+}
+
+function populateProfileAvatarPicker() {
+  const groups = state.avatarCatalog?.groups || [];
+  elements.profileAvatarVendor.replaceChildren();
+  for (const group of groups) {
+    const option = makeElement("option", "", group.label);
+    option.value = group.key;
+    elements.profileAvatarVendor.append(option);
+  }
+  state.profileAvatarKey = canonicalAvatarKey(
+    state.currentUser?.avatar_key || "auto",
+  );
+  const selectedItem = state.avatarByKey.get(state.profileAvatarKey);
+  const selectedGroup = groups.some((group) => group.key === selectedItem?.vendor)
+    ? selectedItem.vendor
+    : "neutral";
+  elements.profileAvatarVendor.value = selectedGroup;
+  renderProfileAvatarCurrent();
+  renderProfileAvatarOptions(selectedGroup);
 }
 
 const THEMES = new Set(["paper", "mist", "aurora", "ocean", "violet", "ember"]);
@@ -483,6 +619,11 @@ async function enterApplication() {
   if (elements.passwordDialog.open) elements.passwordDialog.close();
   applyUserPermissions();
   elements.appShell.hidden = false;
+  try {
+    await loadAvatarCatalog();
+  } catch (error) {
+    console.error("avatar catalog unavailable", error);
+  }
   await refresh({ fullRoom: true });
   connectOwnerEvents();
 }
@@ -666,6 +807,12 @@ function createMessageElement(message) {
   article.dataset.messageId = message.message_id;
   const head = makeElement("div", "message-head");
   const senderLine = makeElement("div", "sender-line");
+  senderLine.append(createAvatarElement({
+    avatarKey: message.sender_avatar_key,
+    clientType: message.sender_client_type,
+    label: message.sender_display_name,
+    className: "message-avatar",
+  }));
   senderLine.append(makeElement("strong", "", message.sender_display_name || message.sender_client_type));
   const seat = senderSeatLabel(message);
   if (seat) {
@@ -874,7 +1021,7 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}`).join("|")}`;
 }
 
 function renderMessages(messages, { forceBottom = false, addedCount = 0 } = {}) {
@@ -1023,7 +1170,12 @@ function createParticipantCard(person) {
     ? person.client_type.slice(person.client_type.indexOf("-") + 1)
     : person.client_type;
   const initial = Array.from(username)[0] || "A";
-  head.append(makeElement("div", `avatar ${person.status}`, initial));
+  head.append(createAvatarElement({
+    avatarKey: person.avatar_key,
+    clientType: person.client_type,
+    label: person.display_name || initial,
+    status: person.status,
+  }));
   const name = makeElement("div", "person-name");
   name.append(makeElement("strong", "", person.display_name || person.client_type));
   name.append(makeElement("span", "", person.signature || "未填写签名"));
@@ -1118,6 +1270,7 @@ function renderParticipants(participants) {
     item.inactivity_expires_at || "",
     item.display_name,
     item.signature,
+    item.avatar_key || "auto",
   ].join(":")).join("|")}`;
   if (signature === state.participantRenderSignature) return;
   state.participantRenderSignature = signature;
@@ -2547,14 +2700,25 @@ elements.passwordForm.addEventListener("submit", async (event) => {
   }
 });
 
-elements.openAccount.addEventListener("click", () => {
+elements.openAccount.addEventListener("click", async () => {
   if (!state.currentUser) return;
   elements.accountIdentity.textContent = `${state.currentUser.username} · ${isAdmin() ? "管理员" : "普通用户"}`;
+  state.profileAvatarKey = state.currentUser.avatar_key || "auto";
   elements.profileDisplayName.value = state.currentUser.display_name;
   elements.profileSignature.value = state.currentUser.signature;
   elements.profileFeedback.textContent = "";
   elements.profileFeedback.classList.remove("error", "success");
   elements.accountDialog.showModal();
+  try {
+    await loadAvatarCatalog();
+    populateProfileAvatarPicker();
+  } catch (error) {
+    elements.profileFeedback.classList.add("error");
+    elements.profileFeedback.textContent = `头像目录加载失败：${error.message}`;
+  }
+});
+elements.profileAvatarVendor.addEventListener("change", () => {
+  renderProfileAvatarOptions(elements.profileAvatarVendor.value);
 });
 elements.closeAccount.addEventListener("click", () => elements.accountDialog.close());
 elements.accountDialog.addEventListener("click", (event) => {
@@ -2576,12 +2740,13 @@ elements.profileForm.addEventListener("submit", async (event) => {
       body: JSON.stringify({
         display_name: elements.profileDisplayName.value.trim(),
         signature: elements.profileSignature.value.trim(),
+        avatar_key: state.profileAvatarKey,
       }),
     });
     state.currentUser = payload.user;
     applyUserPermissions();
     elements.profileFeedback.classList.add("success");
-    elements.profileFeedback.textContent = "昵称和签名已保存。";
+    elements.profileFeedback.textContent = "昵称、签名和头像已保存。";
     await refresh({ fullRoom: true });
   } catch (error) {
     elements.profileFeedback.classList.add("error");

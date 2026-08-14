@@ -144,6 +144,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_search_history",
                         "agent_participants",
                         "agent_update_profile",
+                        "agent_list_avatars",
                         "agent_request_nickname",
                         "agent_set_follow",
                         "agent_following",
@@ -165,6 +166,18 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "signature",
                         "roles",
                     }
+                    accept_tool = next(
+                        tool
+                        for tool in codex_tools.tools
+                        if tool.name == "agent_accept_invitation"
+                    )
+                    assert "avatar_key" in accept_tool.input_schema["properties"]
+                    profile_tool = next(
+                        tool
+                        for tool in codex_tools.tools
+                        if tool.name == "agent_update_profile"
+                    )
+                    assert profile_tool.input_schema.get("required", []) == []
                     send_tool = next(
                         tool for tool in codex_tools.tools if tool.name == "agent_send"
                     )

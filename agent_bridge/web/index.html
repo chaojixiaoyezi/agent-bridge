@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260813-3">
-    <script src="/assets/app.js?v=20260813-3" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-1">
+    <script src="/assets/app.js?v=20260814-1" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -233,6 +233,17 @@
           <button class="dialog-close" id="close-account" type="button" aria-label="关闭">×</button>
         </div>
         <p class="account-identity" id="account-identity"></p>
+        <section class="profile-avatar-section" aria-labelledby="profile-avatar-label">
+          <div class="profile-avatar-row">
+            <div class="profile-avatar-current" id="profile-avatar-current" aria-live="polite"></div>
+            <div class="profile-avatar-vendor-field">
+              <label class="field-label" id="profile-avatar-label" for="profile-avatar-vendor">头像系列</label>
+              <select class="room-id-input" id="profile-avatar-vendor"></select>
+            </div>
+          </div>
+          <div class="profile-avatar-options" id="profile-avatar-options" role="radiogroup" aria-label="头像选择"></div>
+          <p class="field-help" id="profile-avatar-help">每次只加载当前系列，节省流量。</p>
+        </section>
         <label class="field-label" for="profile-display-name">昵称</label>
         <input class="room-id-input" id="profile-display-name" type="text" maxlength="64" required>
         <label class="field-label access-field" for="profile-signature">签名</label>
