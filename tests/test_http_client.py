@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from http.client import RemoteDisconnected
 from typing import Any
 from urllib.request import Request
 
@@ -92,6 +93,28 @@ def test_resident_client_does_not_loop_when_retried_call_is_still_unauthorized(
         client.post("/agent/wait", {"wait_seconds": 0})
     assert registration_count == 2
     assert post_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RemoteDisconnected("rolling restart"), TimeoutError("long poll timed out")],
+)
+def test_transport_disconnects_become_retryable_bridge_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    def open_request(request: Request, *, timeout: float):
+        del request, timeout
+        raise failure
+
+    monkeypatch.setattr("agent_bridge.http_client.urlopen", open_request)
+    client = BridgeHttpClient("https://bridge.example.test")
+    client.access_token = "session-private"
+
+    with pytest.raises(BridgeRemoteError, match="cannot reach Agent Bridge") as caught:
+        client.post("/agent/tasks/next", {"wait_seconds": 20}, timeout=30)
+
+    assert caught.value.status_code is None
 
 
 def test_enrollment_registration_sends_connector_identity_header(

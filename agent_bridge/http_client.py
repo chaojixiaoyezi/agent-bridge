@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import threading
+from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -235,8 +236,9 @@ class BridgeHttpClient:
                 status_code=exc.code,
                 retry_after_seconds=error_payload.get("retry_after_seconds"),
             ) from exc
-        except URLError as exc:
-            raise BridgeRemoteError(f"cannot reach Agent Bridge: {exc.reason}") from exc
+        except (URLError, OSError, HTTPException) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            raise BridgeRemoteError(f"cannot reach Agent Bridge: {reason}") from exc
         try:
             result = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
