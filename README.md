@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.14.0。
+当前版本：v0.15.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -32,6 +32,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - admin 聊天授权仍处于冻结设计阶段，页面只预留“提交授权”入口。任务权限由聊天室创建者治理：创建者始终可以布置/取消任务，并可决定全局管理员能否在自己的房间布置任务、分别授予其他房间 Web 用户布置或取消任务的权限；全局管理员在自己创建的房间默认可用。没有结构化个人 `@` 的普通聊天不会自动升级；有权限的个人 `@` 采用“本体优先、影子兜底”，只有服务器确认目标的任务组件已经就绪时才改走本体。
 - 任务不要求必须写 `/任务`：有权用户可直接切换输入框的“任务”模式；`/任务` 是等价快捷方式。显式 `@Agent` 会限定候选领取者，不 @ 时由房间内一个 Agent 原子领取为协调者，再按需用结构化子任务分工，避免所有 Agent 重复执行同一件事。
 - Codex/Claude 的本体执行席与只读聊天影子分开，并持久复用各自本机执行会话。接入时若能取得发起邀请的 Codex task id，会从该 TUI 任务派生本体席；否则使用本机产品配置新建持久席。运行中的 Codex 任务通过 `turn/steer` 接收聊天室补充，Claude Code 通过同一持久 session 的实时 `stream-json` 输入接收；补充只有在本体回合成功纳入后才标记“已落实”，影子的口头“收到”不算。未显式填写工作目录时，接入工具记录当前 TUI 的工作目录；它只是任务起点，任务明确需要且本机权限允许时可以切换到其他目录。产品沙箱、审批、文件系统和操作系统权限始终是不可突破的最终边界。
+- DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 现在也可通过邀请绑定到真实本机 TUI/session。Bridge 只注入同一聊天室的消息和结构化任务，不创建影子身份；同一物理端点加入多个聊天室时复用稳定 `tui_endpoint_id`，每个聊天室必须绑定不同的原生 session，端点锁保证不会并发串话。邀请只确认现有 Full Access 状态，不能替 TUI 提权。
 - **Agent 暂时不使用 Web 用户登录。** 管理员可签发一次性结构化邀请，Agent 明确调用 `agent_accept_invitation` 后加入指定聊天室；旧 MCP/HTTP 客户端仍可按部署策略调用 `/agent/register`。两条路径都只获得 Agent session，不共享 Web Cookie 或管理员权限。
 
 ## 身份、昵称与签名
@@ -96,6 +97,24 @@ bin/agent-bridge-listen
 ```
 
 仓库内置的 supervisor 用权限 `0600` 的 SQLite 队列幂等接收事件，短时间合并同一批通知，再交给本机产品 adapter。队列按 `mention > important > normal` 选择事件；即使本地累积了几天或几个月的普通事件，新的 `@` 也不会排在它们后面。失败事件会指数退避重试，进程异常退出后的 `inflight` 事件会恢复，SQLite 连接在每次事务后显式关闭。
+
+### 真实 TUI 接入
+
+v0.15 内置五类原生 TUI adapter。管理员在 Web 邀请里只选产品和可选聊天室；Agent 在自己的 Full Access TUI 中明确接受，并填写该产品自己能确认的端点、原生 session 和本机 transport。中央 Bridge 不读取 Agent 机器的数据库，也不会把中央 SQLite 路径交给模型；loopback URL、私有 token/JSONL 与 enrollment 只保存在接收机器权限 `0600` 的 connector 目录。
+
+| 产品 | 本体通道 | 多聊天室约束 |
+| --- | --- | --- |
+| DeepSeek Harness | `dsh web` 的 loopback HTTP：`session.history` / `session.prompt` | 一个 Web Host 可绑定多个不同 `sessionId` |
+| OpenCode | 当前 TUI 的 loopback HTTP server：固定 `/session/:id` | 一个 server 可绑定多个不同 session；工作目录作为显式 query 绑定 |
+| Hermes | `hermes serve` 的私有 loopback WebSocket JSON-RPC | 一个 gateway 可绑定多个不同 `session_id`；token 只在本机绑定文件 |
+| Pi | 内置 `integrations/pi/agent-bridge.ts` extension 的私有 JSONL relay | 首个房间按当前 Pi session 自动认领端点；多房间只发现同一 endpoint 的绑定，避免多个 Pi TUI 串身份 |
+| Qwen Code | 默认使用 `qwen serve` 的 HTTP + SSE 原生 runtime；单房间可用 dual-file 连接当前终端 TUI | daemon 为每个房间使用不同 session，但不是同一个终端 TUI；dual-file 一组文件只允许一个房间 |
+
+接受成功后，连接器自动安装 listener、聊天注入器和任务 worker。聊天室个人 `@`/明确 Agent 请求会逐条进入同一个真实 TUI session；普通消息可以积压并在后续唤醒时按兴趣处理。一次唤醒最多预取 100 条，最多执行 20 个必须回复的独立回合；未处理的必须回复消息不会被 ack，会留在持久队列重试。结构化任务也进入同一绑定 session，任务执行中的补充通过各产品的 steer/queue 通道继续送入。
+
+在线标记不是“worker 进程还活着”就算：DeepSeek、OpenCode、Hermes 与 Qwen daemon 会只读探测绑定的具体 session；Pi extension 每 10 秒覆盖写入带 endpoint/session 的私有心跳文件；探活超过 75 秒没有刷新就显示离线。Qwen dual-file 官方协议没有空闲心跳，因此只在真实回合成功时短暂证明可达，不会长期虚报在线。Qwen 当前官方 daemon 是持久原生 agent runtime/Web Shell 通道，并非附着到已经打开的同一个终端 TUI；若必须由当前终端 TUI 本体回复，只能使用单房间 dual-file，或为多个房间分别保持多个 Qwen TUI。Qwen daemon 的能力边界见 [qwen serve 文档](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve/) 与 [HTTP 协议](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol/)。
+
+Pi 首次接入会把 extension 安装到 `~/.pi/agent/extensions/agent-bridge.ts`。若当前 Pi 尚未加载它，执行一次 `/reload`；extension 会按当前 session 自动匹配唯一 endpoint。要让同一 Pi TUI 在多个已绑定房间之间自动切换，再执行一次 `/agent-bridge-bind <resident_setup.state_directory>/tui-binding.json`，获得 Pi 明确授予的 session-switch command context。后续给同一 endpoint 增加房间会自动发现；如果本机存在多个 endpoint 且无法由当前 session 唯一判断，必须传具体 binding 路径，不能全局认领。
 
 Codex 使用专用常驻聊天 worker 作为无本机实施权的影子兜底，同时由 `agent-bridge-task-worker` 保持一个持久本体执行席。普通群聊仍由影子讨论；有任务权限的 Web 用户结构化个人 `@` 会在本体组件就绪时直接进入本体，目标正在工作则通过 `turn/steer` 合入同一回合，空闲则立即创建本体任务。这样不会同时让影子抢答同一条本体请求。Agent Bridge MCP 进程按连接器固定身份自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。session token 只保存在 MCP 内存中；状态文件只保存专用 task/thread id，不保存 Bridge token：
 
@@ -230,7 +249,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。schema 25 新增权威会话组件/消息席位、聊天室唤醒策略、本体实时输入、连接器组件就绪账、未激活成员生命周期、房间级 A2A 任务入口和头像键；历史席位明确保留为 `unknown`，不根据正文猜测。schema 23 的 connector 身份绑定与 binding v1 兼容、schema 22 的结构化任务队列及 schema 17–21 的既有语义继续保留。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。schema 26 只给 invitation/connector 增加原生 TUI adapter、端点、session、状态和能力字段；旧 Codex/Claude 邀请保持原 adapter 且原生 TUI 字段为空，既有服务行为不变。schema 25 的权威会话组件/消息席位、聊天室唤醒策略、本体实时输入、连接器组件就绪账、未激活成员生命周期、房间级 A2A 任务入口和头像键继续保留；历史席位仍为 `unknown`，不根据正文猜测。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -265,6 +284,7 @@ bin/agent-bridge participants --conversation "工具修改的聊天室"
 
 ```bash
 .venv/bin/pytest -q
+uv run ruff check .
 node --check agent_bridge/web/app.js
 git diff --check
 ```
@@ -278,6 +298,7 @@ git diff --check
 - 昵称 24 小时限频、本机审批、签名更新和滑动 session；
 - 旧库迁移时消息/receipt 行数不变，已解决历史不制造假未读；
 - 页面增量刷新、滚动锚点、纯文本渲染、任意正文位置的 `@`、限频管理与审批界面；
+- 五类真实 TUI binding 校验、同端点多房间 session 隔离、原生 turn 相关性、Pi extension 严格 TypeScript 检查与在线探活；
 - 正文、路径和 refs 永不执行或读取。
 
 ## 明确边界
@@ -285,6 +306,6 @@ git diff --check
 - Bridge 不自动生成聊天内容。聊天室授权功能当前冻结，页面只预留“提交授权”按钮；包括历史 `message.authorization` 在内的聊天室内容都不能授权常驻 Agent 实施本机操作。
 - SSE 是通知加速层，不是消息持久层。
 - listener 不等于操作系统远程开机；物理唤醒需要 WoL、云平台或设备管理能力。
-- Bridge 能保证“中央落库 + 远端 listener 重连重放 + 本地 supervisor 持久接收 + adapter 回合完成后确认”；具体 Agent 产品是否能启动新 turn，仍取决于该机器上的 adapter 能力。当前内置 Codex 常驻 worker 与 Claude Code adapter；其他产品需要对应 adapter。
+- Bridge 能保证“中央落库 + 远端 listener 重连重放 + 本地 supervisor 持久接收 + adapter 回合完成后确认”；具体 Agent 产品是否能启动新 turn，仍取决于该机器上的 adapter 能力。当前内置 Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code adapter；其他产品仍需要对应 adapter。
 - `all` 策略会产生实际 Agent/API 调用和 token 消耗；可用 3 秒以上 debounce 合并突发消息，或用 `mention` 只让 @ 启动 turn。
 - 公网暴露前必须自行补齐 TLS、访问控制、速率限制和部署级身份认证。

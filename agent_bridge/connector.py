@@ -21,12 +21,31 @@ from .validation import (
     string_tokens,
     token,
 )
+from .tui_adapter import (
+    NativeTuiBinding,
+    NativeTuiError,
+    endpoint_lock_path,
+    validate_native_tui_binding,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SUPPORTED_RESIDENT_ADAPTERS = {
     "codex": "codex",
     "claude-code": "claude-code",
+}
+SUPPORTED_NATIVE_TUI_ADAPTERS = {
+    "deepseek": "deepseek-harness",
+    "deepseek-harness": "deepseek-harness",
+    "dsh": "deepseek-harness",
+    "opencode": "opencode",
+    "hermes": "hermes",
+    "hermes-agent": "hermes",
+    "pi": "pi",
+    "pi-agent": "pi",
+    "qcode": "qwen-code",
+    "qwen": "qwen-code",
+    "qwen-code": "qwen-code",
 }
 
 
@@ -63,6 +82,11 @@ class ConnectorSetupResult:
 def adapter_kind_for_product(product: str) -> str:
     normalized = token(product, field="product_name").casefold()
     return SUPPORTED_RESIDENT_ADAPTERS.get(normalized, "manual")
+
+
+def tui_adapter_kind_for_product(product: str) -> str | None:
+    normalized = token(product, field="product_name").casefold()
+    return SUPPORTED_NATIVE_TUI_ADAPTERS.get(normalized)
 
 
 def _validated_bridge_url(value: str) -> str:
@@ -275,6 +299,12 @@ def configure_resident_connector(
     conversation_id: str,
     adapter_kind: str,
     requested_mode: str,
+    tui_adapter_kind: str | None = None,
+    tui_endpoint_id: str | None = None,
+    tui_native_session_id: str | None = None,
+    tui_access_mode: str = "unknown",
+    tui_capabilities: list[str] | None = None,
+    tui_transport: dict[str, Any] | None = None,
     roles: list[str] | None = None,
     capabilities: list[str] | None = None,
     workspace_path: str | None = None,
@@ -303,6 +333,27 @@ def configure_resident_connector(
     mode = str(requested_mode or "").strip().lower()
     if mode not in {"basic", "resident"}:
         raise ConnectorSetupError("unsupported invitation mode")
+    native_adapter = str(tui_adapter_kind or "").strip().lower() or None
+    native_binding_requested = bool(
+        str(tui_endpoint_id or "").strip()
+        or str(tui_native_session_id or "").strip()
+        or str(tui_access_mode or "unknown").strip().lower() != "unknown"
+        or tui_transport
+        or tui_capabilities
+    )
+    native_binding: NativeTuiBinding | None = None
+    if native_adapter is not None and (mode == "resident" or native_binding_requested):
+        try:
+            native_binding = validate_native_tui_binding(
+                adapter_kind=native_adapter,
+                endpoint_id=str(tui_endpoint_id or ""),
+                native_session_id=str(tui_native_session_id or ""),
+                access_mode=tui_access_mode,
+                capabilities=tui_capabilities,
+                transport=tui_transport,
+            )
+        except NativeTuiError as exc:
+            raise ConnectorSetupError(str(exc)) from exc
     host_system = system_name or platform.system()
     user_home = (home or Path.home()).expanduser().resolve()
     state_directory = _state_root(user_home, host_system) / connector
@@ -313,6 +364,7 @@ def configure_resident_connector(
     os.chmod(logs_directory, 0o700)
     enrollment_file = state_directory / "enrollment.token"
     manifest_file = state_directory / "connector.json"
+    tui_binding_file = state_directory / "tui-binding.json"
     if manifest_file.exists():
         try:
             existing_manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -326,6 +378,14 @@ def configure_resident_connector(
             "product": normalized_product,
             "username": normalized_username,
         }
+        if native_binding is not None:
+            expected_identity.update(
+                {
+                    "tui_adapter_kind": native_binding.adapter_kind,
+                    "tui_endpoint_id": native_binding.endpoint_id,
+                    "tui_native_session_id": native_binding.native_session_id,
+                }
+            )
         for field, expected in expected_identity.items():
             if str(existing_manifest.get(field) or "") != expected:
                 raise ConnectorSetupError(
@@ -365,6 +425,11 @@ def configure_resident_connector(
         "conversation_id": conversation,
         "requested_mode": mode,
         "adapter_kind": adapter,
+        "tui_adapter_kind": native_adapter,
+        "tui_endpoint_id": native_binding.endpoint_id if native_binding else None,
+        "tui_native_session_id": (
+            native_binding.native_session_id if native_binding else None
+        ),
         "roles": list(normalized_roles),
         "capabilities": list(normalized_capabilities),
         "workspace_path": str(workspace),
@@ -375,12 +440,35 @@ def configure_resident_connector(
         manifest_file,
         (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
     )
+    if native_binding is not None:
+        _atomic_private_write(
+            tui_binding_file,
+            (
+                json.dumps(native_binding.payload(), ensure_ascii=False, indent=2)
+                + "\n"
+            ).encode("utf-8"),
+        )
+        if native_binding.adapter_kind == "pi":
+            pi_extension = (
+                user_home / ".pi" / "agent" / "extensions" / "agent-bridge.ts"
+            )
+            try:
+                extension_bytes = (
+                    PROJECT_ROOT / "integrations" / "pi" / "agent-bridge.ts"
+                ).read_bytes()
+            except OSError as exc:
+                raise ConnectorSetupError("bundled Pi extension is missing") from exc
+            _atomic_private_write(pi_extension, extension_bytes)
 
-    if not enable_resident or mode != "resident" or adapter == "manual":
+    if (
+        not enable_resident
+        or mode != "resident"
+        or (adapter == "manual" and native_binding is None)
+    ):
         return ConnectorSetupResult(
             status="manual",
             platform=host_system,
-            adapter_kind=adapter,
+            adapter_kind=native_adapter or adapter,
             connector_id=connector,
             state_directory=str(state_directory),
             listener_service=None,
@@ -410,6 +498,12 @@ def configure_resident_connector(
             separators=(",", ":"),
         ),
     }
+    local_bin = str((user_home / ".local" / "bin").expanduser().resolve())
+    merged_path = os.pathsep.join(
+        [local_bin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    )
+    codex_binary: str | None = None
+    claude_binary: str | None = None
     if adapter == "codex":
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-codex-worker"),
@@ -418,10 +512,6 @@ def configure_resident_connector(
         ]
         # launchd 的默认 PATH 不包含 Homebrew 或用户本地 bin；优先把安装时
         # 探测到的 Codex 绝对路径交给 worker，PATH 只作为可迁移的后备入口。
-        local_bin = str((user_home / ".local" / "bin").expanduser().resolve())
-        merged_path = os.pathsep.join(
-            [local_bin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-        )
         codex_binary = shutil.which("codex")
         worker_environment = {
             **common,
@@ -436,7 +526,7 @@ def configure_resident_connector(
         }
         if codex_binary:
             worker_environment["AGENT_BRIDGE_CODEX_BINARY"] = codex_binary
-    else:
+    elif adapter == "claude-code":
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-supervisor"),
             "run",
@@ -455,10 +545,6 @@ def configure_resident_connector(
         # launchd 默认 PATH 不含 ~/.local/bin，claude 常装在 ~/.local/bin。
         # 显式把用户本地 bin 并入 PATH，并优先注入探测到的 claude 绝对路径，
         # 避免 adapter 报 "Claude Code CLI was not found"。
-        local_bin = str((user_home / ".local" / "bin").expanduser().resolve())
-        merged_path = os.pathsep.join(
-            [local_bin, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-        )
         claude_binary = shutil.which("claude")
         worker_environment = {
             **common,
@@ -469,16 +555,53 @@ def configure_resident_connector(
         }
         if claude_binary:
             worker_environment["AGENT_BRIDGE_CLAUDE_BINARY"] = claude_binary
+    elif native_binding is not None:
+        shared_lock = endpoint_lock_path(
+            native_binding,
+            state_root=_state_root(user_home, host_system),
+        )
+        native_environment = {
+            "AGENT_BRIDGE_TUI_BINDING_FILE": str(tui_binding_file),
+            "AGENT_BRIDGE_TUI_LOCK_FILE": str(shared_lock),
+            "AGENT_BRIDGE_TUI_ADAPTER": native_binding.adapter_kind,
+            "AGENT_BRIDGE_TUI_ENDPOINT_ID": native_binding.endpoint_id,
+            "AGENT_BRIDGE_TUI_NATIVE_SESSION_ID": native_binding.native_session_id,
+            "AGENT_BRIDGE_TUI_ACCESS_MODE": native_binding.access_mode,
+        }
+        worker_arguments = [
+            str(PROJECT_ROOT / "bin" / "agent-bridge-supervisor"),
+            "run",
+            "--database",
+            str(queue_database),
+            "--adapter-command-json",
+            json.dumps(
+                [str(PROJECT_ROOT / "bin" / "agent-bridge-tui-wake")],
+                separators=(",", ":"),
+            ),
+            "--wake-policy",
+            "mention",
+            "--debounce",
+            "3",
+        ]
+        worker_environment = {
+            **common,
+            **native_environment,
+            "AGENT_BRIDGE_COMPONENT": "chat",
+            "PATH": merged_path,
+        }
+    else:
+        raise ConnectorSetupError("resident adapter configuration is incomplete")
 
     task_arguments = [str(PROJECT_ROOT / "bin" / "agent-bridge-task-worker")]
     task_environment = {
         **common,
         "AGENT_BRIDGE_COMPONENT": "task",
-        "AGENT_BRIDGE_TASK_ADAPTER": adapter,
+        "AGENT_BRIDGE_TASK_ADAPTER": native_adapter or adapter,
         "AGENT_BRIDGE_TASK_CWD": str(workspace),
         "AGENT_BRIDGE_TASK_THREAD_STATE_FILE": str(task_thread_file),
         "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
         "PATH": merged_path,
+        **(native_environment if native_binding is not None else {}),
     }
     if source_thread_id:
         task_environment["AGENT_BRIDGE_TASK_SOURCE_THREAD_ID"] = source_thread_id
@@ -536,13 +659,17 @@ def configure_resident_connector(
         return ConnectorSetupResult(
             status="configured",
             platform=host_system,
-            adapter_kind=adapter,
+            adapter_kind=native_adapter or adapter,
             connector_id=connector,
             state_directory=str(state_directory),
             listener_service=listener_label,
             worker_service=worker_label,
             task_service=task_label,
-            detail="listener、聊天值守和任务执行席位已配置为当前用户的常驻服务。",
+            detail=(
+                "真实 TUI listener、聊天值守和任务执行席位已配置为当前用户的常驻服务。"
+                if native_binding is not None
+                else "listener、聊天值守和任务执行席位已配置为当前用户的常驻服务。"
+            ),
         )
 
     if host_system == "Linux":
@@ -588,19 +715,23 @@ def configure_resident_connector(
         return ConnectorSetupResult(
             status="configured",
             platform=host_system,
-            adapter_kind=adapter,
+            adapter_kind=native_adapter or adapter,
             connector_id=connector,
             state_directory=str(state_directory),
             listener_service=listener_name,
             worker_service=worker_name,
             task_service=task_name,
-            detail="listener、聊天值守和任务执行席位已配置为当前用户的 systemd 服务。",
+            detail=(
+                "真实 TUI listener、聊天值守和任务执行席位已配置为当前用户的 systemd 服务。"
+                if native_binding is not None
+                else "listener、聊天值守和任务执行席位已配置为当前用户的 systemd 服务。"
+            ),
         )
 
     return ConnectorSetupResult(
         status="manual",
         platform=host_system,
-        adapter_kind=adapter,
+        adapter_kind=native_adapter or adapter,
         connector_id=connector,
         state_directory=str(state_directory),
         listener_service=None,

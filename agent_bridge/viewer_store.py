@@ -97,7 +97,10 @@ class ViewerRepository:
                        participant.signature,
                        connector.setup_status AS connector_setup_status,
                        connector.connector_last_seen_at,
-                       invitation.adapter_kind AS connector_adapter_kind
+                       COALESCE(
+                           invitation.tui_adapter_kind,
+                           invitation.adapter_kind
+                       ) AS connector_adapter_kind
                 FROM agent_sessions AS session
                 JOIN participants AS participant
                   ON participant.participant_id = session.participant_id
@@ -668,9 +671,16 @@ class ViewerRepository:
                     "setup_status || ':' || "
                     "CASE WHEN connector_last_seen_at >= ? THEN 'online' "
                     "ELSE 'offline' END || ':' || "
+                    "COALESCE(tui_state, 'unbound') || ':' || "
+                    "CASE WHEN tui_last_seen_at >= ? THEN 'fresh' "
+                    "ELSE 'stale' END || ':' || "
+                    "COALESCE(tui_active_task_id, '') || ':' || "
                     "COALESCE(CAST(revoked_at AS TEXT), '') AS connector_state "
                     "FROM agent_connectors ORDER BY connector_state)",
-                    (now - CONNECTOR_ONLINE_WINDOW_SECONDS,),
+                    (
+                        now - CONNECTOR_ONLINE_WINDOW_SECONDS,
+                        now - CONNECTOR_ONLINE_WINDOW_SECONDS,
+                    ),
                 ).fetchone()[0]
             )
             session_revocation_revision = float(
@@ -781,9 +791,18 @@ class ViewerRepository:
                     m.active AS membership_active,
                     room.status AS room_status,
                     connector.connector_id,
-                    invitation.adapter_kind AS connector_adapter_kind,
+                    COALESCE(
+                        invitation.tui_adapter_kind,
+                        invitation.adapter_kind
+                    ) AS connector_adapter_kind,
                     connector.setup_status AS connector_setup_status,
                     connector.connector_last_seen_at,
+                    connector.tui_endpoint_id,
+                    connector.tui_native_session_id,
+                    connector.tui_state,
+                    connector.tui_access_mode,
+                    connector.tui_last_seen_at,
+                    connector.tui_active_task_id,
                     CASE
                         WHEN lifecycle.participant_id IS NOT NULL THEN
                             MAX(
@@ -974,6 +993,38 @@ class ViewerRepository:
                     if row["connector_last_seen_at"] is not None
                     else None
                 ),
+                "native_tui": {
+                    "endpoint_id": (
+                        str(row["tui_endpoint_id"])
+                        if row["tui_endpoint_id"] is not None
+                        else None
+                    ),
+                    "native_session_id": (
+                        str(row["tui_native_session_id"])
+                        if row["tui_native_session_id"] is not None
+                        else None
+                    ),
+                    "state": (
+                        "offline"
+                        if str(row["tui_state"] or "unbound") in {"online", "busy"}
+                        and (
+                            row["tui_last_seen_at"] is None
+                            or float(row["tui_last_seen_at"]) < connector_online_after
+                        )
+                        else str(row["tui_state"] or "unbound")
+                    ),
+                    "access_mode": str(row["tui_access_mode"] or "unknown"),
+                    "last_seen_at": (
+                        float(row["tui_last_seen_at"])
+                        if row["tui_last_seen_at"] is not None
+                        else None
+                    ),
+                    "active_task_id": (
+                        str(row["tui_active_task_id"])
+                        if row["tui_active_task_id"] is not None
+                        else None
+                    ),
+                },
                 "resident_status": (
                     "online"
                     if str(row["connector_setup_status"] or "") == "configured"

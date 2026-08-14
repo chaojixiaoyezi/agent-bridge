@@ -634,7 +634,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -691,7 +691,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
     assert policy["unactivated_inactivity_days"] == 3
@@ -2055,7 +2055,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 25
+    assert version == 26
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2127,7 +2127,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 25
+    assert version == 26
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2223,7 +2223,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 25
+    assert version == 26
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -3332,6 +3332,215 @@ def test_reusable_invitation_accepts_distinct_agents_concurrently(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("native-room-a")
+    store.create_user_room("native-room-b")
+
+    def invitation(room: str) -> dict:
+        return store.create_agent_invitation(
+            conversation_id=room,
+            product="opencode",
+            requested_mode="resident",
+            adapter_kind="manual",
+            tui_adapter_kind="opencode",
+            created_by_web_user_id=admin_id,
+            reusable=True,
+        )
+
+    first_invitation = invitation("native-room-a")
+    first_enrollment = "enroll_" + "a" * 64
+    first = store.accept_agent_invitation(
+        invitation_token=str(first_invitation["invitation_token"]),
+        product="opencode",
+        username="native-owner",
+        signature="真实 TUI 本体。",
+        tui_endpoint_id="tui-opencode-stable-one",
+        tui_native_session_id="session-native-room-a",
+        tui_access_mode="full",
+        tui_confirmed=True,
+        enrollment_token=first_enrollment,
+    )
+    retried = store.accept_agent_invitation(
+        invitation_token=str(first_invitation["invitation_token"]),
+        product="opencode",
+        username="native-owner",
+        signature="真实 TUI 本体。",
+        tui_endpoint_id="tui-opencode-stable-one",
+        tui_native_session_id="session-native-room-a",
+        tui_access_mode="full",
+        tui_confirmed=True,
+        enrollment_token=first_enrollment,
+    )
+    assert retried["connector_id"] == first["connector_id"]
+    with pytest.raises(ConflictError, match="distinct native TUI session"):
+        store.accept_agent_invitation(
+            invitation_token=str(first_invitation["invitation_token"]),
+            product="opencode",
+            username="native-owner",
+            signature="不能创建重复绑定。",
+            tui_endpoint_id="tui-opencode-stable-one",
+            tui_native_session_id="session-native-room-a",
+            tui_access_mode="full",
+            tui_confirmed=True,
+            enrollment_token="enroll_" + "b" * 64,
+        )
+    second_invitation = invitation("native-room-b")
+    second = store.accept_agent_invitation(
+        invitation_token=str(second_invitation["invitation_token"]),
+        product="opencode",
+        username="a-different-proposal-is-ignored",
+        signature="同一个真实 TUI 本体。",
+        tui_endpoint_id="tui-opencode-stable-one",
+        tui_native_session_id="session-native-room-b",
+        tui_access_mode="full",
+        tui_confirmed=True,
+    )
+
+    assert second["participant_id"] == first["participant_id"]
+    assert second["username"] == first["username"]
+    assert second["connector_id"] != first["connector_id"]
+    with store._connection() as connection:
+        bindings = connection.execute(
+            "SELECT conversation_id, tui_native_session_id, tui_state, "
+            "tui_last_seen_at "
+            "FROM agent_connectors WHERE tui_endpoint_id = ? "
+            "ORDER BY conversation_id",
+            ("tui-opencode-stable-one",),
+        ).fetchall()
+    assert [tuple(row) for row in bindings] == [
+        ("native-room-a", "session-native-room-a", "offline", None),
+        ("native-room-b", "session-native-room-b", "offline", None),
+    ]
+
+    state = store.report_agent_tui_state(
+        participant_id=first["participant_id"],
+        authorized_session_id=first["session_id"],
+        connector_id=first["connector_id"],
+        tui_endpoint_id="tui-opencode-stable-one",
+        tui_native_session_id="session-native-room-a",
+        state="busy",
+        access_mode="full",
+        capabilities=["steer", "multi-room"],
+        active_task_id="task-native-one",
+    )
+    assert state["tui"]["state"] == "busy"
+    assert state["tui"]["room_binding_count"] == 2
+    assert state["tui"]["active_task_id"] == "task-native-one"
+
+
+def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("native-confirm-a")
+    store.create_user_room("native-confirm-b")
+    first_invitation = store.create_agent_invitation(
+        conversation_id="native-confirm-a",
+        product="hermes",
+        requested_mode="resident",
+        adapter_kind="manual",
+        tui_adapter_kind="hermes",
+        created_by_web_user_id=admin_id,
+    )
+    with pytest.raises(ConflictError, match="explicit TUI confirmation"):
+        store.accept_agent_invitation(
+            invitation_token=str(first_invitation["invitation_token"]),
+            product="hermes",
+            username="hermes-owner",
+            signature="等待确认。",
+        )
+    first = store.accept_agent_invitation(
+        invitation_token=str(first_invitation["invitation_token"]),
+        product="hermes",
+        username="hermes-owner",
+        signature="已经确认。",
+        tui_endpoint_id="tui-hermes-stable",
+        tui_native_session_id="hermes-session-one",
+        tui_access_mode="full",
+        tui_confirmed=True,
+    )
+    second_invitation = store.create_agent_invitation(
+        conversation_id="native-confirm-b",
+        product="hermes",
+        requested_mode="resident",
+        adapter_kind="manual",
+        tui_adapter_kind="hermes",
+        created_by_web_user_id=admin_id,
+    )
+    with pytest.raises(ConflictError, match="distinct native TUI session"):
+        store.accept_agent_invitation(
+            invitation_token=str(second_invitation["invitation_token"]),
+            product="hermes",
+            username="hermes-owner",
+            signature="错误复用 session。",
+            tui_endpoint_id="tui-hermes-stable",
+            tui_native_session_id="hermes-session-one",
+            tui_access_mode="full",
+            tui_confirmed=True,
+        )
+    with pytest.raises(AuthenticationError, match="binding does not match"):
+        store.report_agent_tui_state(
+            participant_id=first["participant_id"],
+            authorized_session_id=first["session_id"],
+            connector_id=first["connector_id"],
+            tui_endpoint_id="tui-hermes-stable",
+            tui_native_session_id="another-session",
+            state="online",
+            access_mode="full",
+        )
+
+    ordinary = store.create_agent_invitation(
+        conversation_id="native-confirm-b",
+        product="codex",
+        requested_mode="resident",
+        adapter_kind="codex",
+        created_by_web_user_id=admin_id,
+    )
+    with pytest.raises(ConflictError, match="does not accept"):
+        store.accept_agent_invitation(
+            invitation_token=str(ordinary["invitation_token"]),
+            product="codex",
+            username="ordinary-codex",
+            signature="不能伪装原生绑定。",
+            tui_endpoint_id="fake-native-endpoint",
+            tui_native_session_id="fake-native-session",
+            tui_access_mode="full",
+            tui_confirmed=True,
+        )
+
+    basic_invitation = store.create_agent_invitation(
+        conversation_id="native-confirm-b",
+        product="hermes",
+        requested_mode="basic",
+        adapter_kind="manual",
+        tui_adapter_kind="hermes",
+        created_by_web_user_id=admin_id,
+        reusable=True,
+    )
+    basic = store.accept_agent_invitation(
+        invitation_token=str(basic_invitation["invitation_token"]),
+        product="hermes",
+        username="basic-hermes",
+        signature="基础接入不绑定 TUI。",
+    )
+    assert basic["setup_status"] == "manual"
+    assert basic["tui_endpoint_id"] is None
+    with pytest.raises(ConflictError, match="explicit TUI confirmation"):
+        store.accept_agent_invitation(
+            invitation_token=str(basic_invitation["invitation_token"]),
+            product="hermes",
+            username="partial-hermes",
+            signature="不完整绑定应拒绝。",
+            tui_endpoint_id="partial-endpoint",
+            enrollment_token="enroll_" + "p" * 64,
+        )
+
+
 def test_reusable_invitation_isolates_same_requested_username_and_reconnects(
     tmp_path: Path,
 ) -> None:
@@ -3811,6 +4020,8 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     assert accepted["use_count"] == 1
     assert accepted["connector_count"] == 1
     assert accepted["setup_status"] == "configured"
+    assert accepted["tui_adapter_kind"] is None
+    assert accepted["effective_adapter_kind"] == "codex"
     renewed = migrated.register_agent_session_from_enrollment(
         enrollment_token=enrollment_token,
         product="codex",
@@ -3826,7 +4037,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 26
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -3881,7 +4092,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 25
+    assert version == 26
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -4592,7 +4803,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 25
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 26
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

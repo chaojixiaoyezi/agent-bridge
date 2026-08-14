@@ -1058,6 +1058,18 @@ function createParticipantCard(person) {
   let authLabel;
   if (isWebUser) {
     authLabel = "网页用户";
+  } else if (person.native_tui?.state === "busy") {
+    authLabel = `真实 TUI 执行中 · ${person.connector_adapter_kind}`;
+  } else if (person.native_tui?.state === "waiting_approval") {
+    authLabel = `真实 TUI 等待本机确认 · ${person.connector_adapter_kind}`;
+  } else if (person.native_tui?.state === "online") {
+    authLabel = `真实 TUI 值守在线 · ${person.connector_adapter_kind}`;
+  } else if (person.native_tui?.state === "error") {
+    authLabel = `真实 TUI 异常 · ${person.connector_adapter_kind}`;
+  } else if (person.native_tui?.state === "offline" && person.native_tui?.endpoint_id) {
+    authLabel = `真实 TUI 当前离线 · listener 仍会保留消息 · ${person.connector_adapter_kind}`;
+  } else if (person.native_tui?.state === "awaiting_confirmation") {
+    authLabel = `真实 TUI 等待本机确认绑定 · ${person.connector_adapter_kind}`;
   } else if (person.resident_status === "online") {
     authLabel = person.local_resident?.task_running
       ? `聊天与任务值守在线 · ${person.connector_adapter_kind}`
@@ -1099,6 +1111,8 @@ function renderParticipants(participants) {
     item.resident_status,
     item.local_resident?.task_configured || false,
     item.local_resident?.task_running || false,
+    item.native_tui?.state || "",
+    item.native_tui?.active_task_id || "",
     item.active_session_count,
     item.connector_id || "",
     item.inactivity_expires_at || "",
@@ -1275,7 +1289,7 @@ function renderAgentInvitations() {
     main.append(makeElement(
       "span",
       "",
-      `${invitation.conversation_id} · ${invitation.requested_mode === "resident" ? "自动值守" : "基础接入"} · ${invitation.reusable ? "多人复用" : "单次使用"} · ${invitation.adapter_kind}`,
+      `${invitation.conversation_id} · ${invitation.requested_mode === "resident" ? "自动值守" : "基础接入"} · ${invitation.reusable ? "多人复用" : "单次使用"} · ${invitation.effective_adapter_kind || invitation.tui_adapter_kind || invitation.adapter_kind}`,
     ));
     main.append(makeElement("small", "", invitationStatusLabel(invitation)));
     card.append(main);

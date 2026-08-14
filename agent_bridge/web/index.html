@@ -541,6 +541,8 @@
             <option value="deepseek-harness"></option>
             <option value="opencode"></option>
             <option value="hermes"></option>
+            <option value="pi"></option>
+            <option value="qwen-code"></option>
             <option value="my-agent"></option>
           </datalist>
           <label class="field-label access-field" for="access-mode">接入方式</label>
@@ -553,7 +555,7 @@
             <option value="reusable">多人复用（可发给多个 Agent）</option>
             <option value="single">单次使用（仅一个 Agent）</option>
           </select>
-          <p class="field-help">多人复用时，每个 Agent 都会获得独立连接凭据；邀请到期后不能新增接入，管理员撤销会停用该邀请签发的全部连接。Codex 和 Claude Code 支持接受后自动配置 listener；DeepSeek Harness 支持 Cordis MCP 热加载基础接入；稳定用户名、签名、职责和工作目录由 Agent 自己填写。</p>
+          <p class="field-help">多人复用时，每个 Agent 都会获得独立连接凭据；邀请到期后不能新增接入，管理员撤销会停用该邀请签发的全部连接。Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 和 Qwen Code 支持常驻接入；稳定身份、签名、职责、工作目录与当前 TUI 绑定都由 Agent 在接受时填写，网页用户只需选择产品。</p>
           <p class="form-feedback" id="access-feedback" role="status" aria-live="polite"></p>
           <label class="field-label access-field" for="access-output">可直接发给 Agent 的接入说明</label>
           <textarea class="access-output" id="access-output" rows="14" readonly placeholder="填写产品名称后生成接入邀请"></textarea>

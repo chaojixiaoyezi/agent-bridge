@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.14.0 / schema 25。
+当前协议/数据库版本：Agent Bridge v0.15.0 / schema 26。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -44,8 +44,10 @@
 | 通用 supervisor | `bin/agent-bridge-supervisor` | 任意产品 adapter 的持久本机队列和同步兼容入口 |
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
 | Claude adapter | `bin/agent-bridge-claude-wake` | 启动隔离 Claude Code 回合并核验成功工具结果与逐条 mention 回复 |
+| Native TUI adapter | `bin/agent-bridge-tui-wake`、`agent_bridge/tui_adapter.py` | 把同房间消息和任务注入 DeepSeek/OpenCode/Hermes/Pi/Qwen 的指定真实 session，并校验回合相关性 |
+| Pi extension | `integrations/pi/agent-bridge.ts` | 在一个 Pi TUI 内按 endpoint 隔离发现多房间 session、切换 session、steer、回传结果和心跳 |
 | connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
-| body/task executor | `bin/agent-bridge-task-worker` | 本体优先地原子领取结构化任务；Codex 用 `turn/steer`、Claude 用同 session 实时 `stream-json` 接收活动任务补充 |
+| body/task executor | `bin/agent-bridge-task-worker` | 本体优先地原子领取结构化任务；Codex 用 `turn/steer`、Claude 用同 session 实时 `stream-json`，Native TUI 用产品原生 queue/steer 接收活动任务补充 |
 
 不要同时让旧 `agent-bridge-codex-wake` 和新 Codex worker消费同一个队列。旧入口只用于迁移兼容。
 
@@ -61,13 +63,17 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
 - 聊天 adapter 不得把普通聊天室正文直接转成宿主命令，也不得解释旧聊天授权元数据来实施。只有本体 executor 可执行已领取的结构化任务或服务端校验过的个人本体输入；执行范围取原文的自然必要范围，并受本机产品权限硬约束。纯讨论、无结构化目标的疑问或“先别动手”不触发实施。
 
-Codex 与 Claude Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，Codex/Claude worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
+Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP、私有文件 relay 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，各 worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
 
-管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。`codex` 和 `claude-code` 可自动值守，自定义产品及 `basic` 模式只生成私有状态。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
+管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。七类内置产品可自动值守，自定义产品及 `basic` 模式只生成私有状态。原生 TUI 邀请还必须显式提交 Full Access、稳定 endpoint、该房间独占的 native session 与 loopback/file transport；Bridge 只确认这些现有边界，不能替产品提权。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
 
 跨机器时，每台机器各自运行 listener、队列和 adapter，并只需向中央 Bridge 发起出站 TLS/VPN 连接。中央服务不需要反向连接远端机器。远端暂时离线时，中央投递账保留消息；远端 listener 已收到但 Agent 暂不可用时，本机队列保留事件。
 
-listener 是产品无关的统一通知层；内置 Codex/Claude adapter 禁止再生成 cron、定时器或聊天室历史轮询器。自定义产品可以把 listener 的 metadata-only SSE 交给本地 argv/webhook adapter，但只有该产品提供稳定的“启动一个回合”入口时才能标记为自动值守。迁移旧轮询器前必须先确认 connector、cursor 和本地队列归属，避免两个消费者重复唤醒。
+listener 是产品无关的统一通知层；全部内置 adapter 禁止再生成 cron、定时器或聊天室历史轮询器。自定义产品可以把 listener 的 metadata-only SSE 交给本地 argv/webhook adapter，但只有该产品提供稳定的“启动一个回合”入口时才能标记为自动值守。迁移旧轮询器前必须先确认 connector、cursor 和本地队列归属，避免两个消费者重复唤醒。
+
+原生 TUI 绑定遵守额外不变量：同一物理端点跨房间复用同一个 `tui_endpoint_id` 和公开 participant，但每个房间必须使用不同 `tui_native_session_id`；端点级文件锁串行所有房间 turn。服务端只保存 ID、状态和能力，不保存本机 transport；私有 `tui-binding.json` 才保存 loopback URL、Hermes/Qwen token 文件或 Pi/Qwen JSONL 路径。模型和 adapter 子进程都不继承 `AGENT_BRIDGE_DB`/`AGENT_BRIDGE_HOME`。Pi extension 只发现与当前 endpoint 相同的 binding；本机出现多个 endpoint 时必须用具体 `tui-binding.json` 明确选择，禁止全局认领。
+
+状态必须来自真实可达性，而不是 task worker 存活：DeepSeek 调 `session.history`，OpenCode 读 `/session/:id`，Hermes 调 JSON-RPC `session.history`，Qwen daemon 读 `/session/:id/status`，Pi extension 每 10 秒按 endpoint/session 覆盖写私有心跳文件。75 秒未刷新时页面把 `online`/`busy` 降为 `offline`。Qwen dual-file 没有空闲探活协议，只能在成功 turn 后短暂证明可达，不能伪装成长久在线；Qwen daemon 是官方持久原生 runtime/Web Shell 通道，不等于用户已经打开的同一终端 TUI，后者只能用单房间 dual-file 或多个 TUI 进程。
 
 ## 4. 优先级、积压和 token 成本
 
@@ -114,13 +120,17 @@ Claude adapter 使用 `--strict-mcp-config`，禁用内置工具，并只允许 
 cd /absolute/path/.agent-bridge
 uv sync --dev
 .venv/bin/pytest -q
+uv run ruff check .
 node --check agent_bridge/web/app.js
+npm exec --yes --package=@biomejs/biome@2.3.5 -- biome check integrations/pi/agent-bridge.ts
 git diff --check
 ```
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 25。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 26。
+
+schema 26 在 `agent_invitations` 增加 `tui_adapter_kind`，在 `agent_connectors` 增加 endpoint、native session、状态、access mode、能力、最后探活、活动任务和 detail。迁移只使用 `ALTER TABLE` 和索引；既有 Codex/Claude invitation 的 `tui_adapter_kind` 保持为空，继续走原 adapter，不重建 invitation/connector，也不改历史 message、receipt、membership 或 session。DeepSeek/OpenCode/Hermes/Pi/Qwen 必须经带 `tui_confirmed=true` 的邀请接受进入，不能从公开 `/agent/register` 认领原生 connector。相同 endpoint 同产品复用公开身份，不同房间重复 native session 会被拒绝。
 
 schema 25 新增 `agent_sessions.component`、`messages.sender_seat`、`room_wake_policies`、`room_task_inputs`、`connector_component_readiness`、未激活成员独立生命周期、房间级 A2A grant/task 映射和头像键。历史 session/message 一律回填 `unknown`，不能根据正文猜来源；新连接器只有组件登记成功才进入本体优先路由。聊天室唤醒策略默认 `mention`，可选达到条数/等待时长的 `digest` 或每条普通消息唤醒的 `all`，三者都不把普通消息变成强制回复。schema 24/25 迁移只增量加列、表和索引，不重写历史正文、序号、receipt 或 membership。
 
@@ -170,6 +180,8 @@ launchctl print gui/$(id -u)/com.example.agent-bridge-supervisor
 6. 聊天室出现引用该 @ 的真实回复；
 7. 重启 listener/worker 后没有丢消息，队列没有永久 `inflight`。
 8. 新邀请只在接受后创建 connector，页面能区分 session 有效、resident 在线、resident 离线和手动适配；撤销后旧 enrollment 返回 401。
+9. 原生 TUI 邀请在未确认、非 Full Access、endpoint 跨产品复用或房间复用同一 native session 时失败；合法多房间绑定复用 participant 且 session 各自隔离。
+10. 关闭一个真实 TUI endpoint 后 75 秒内页面显示离线，中央 listener 和未确认投递仍保留；恢复同一 endpoint/session 后无需访问中央数据库即可继续消费。
 
 ## 7. 快速诊断
 
@@ -199,9 +211,9 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离以及 schema 25 本体席位/输入迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入以及 schema 26 原生 TUI 绑定迁移均为就地增量更新；Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
-- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter。
+- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。
 
 ## 9. 发布前维护者检查表

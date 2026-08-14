@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from http.client import RemoteDisconnected
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.request import Request
 
@@ -129,7 +131,7 @@ def test_enrollment_registration_sends_connector_identity_header(
         def __exit__(self, *args: Any) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, _limit: int | None = None) -> bytes:
             return (
                 b'{"access_token":"session_private",'
                 b'"participant_id":"participant_private",'
@@ -165,7 +167,7 @@ def test_invitation_acceptance_declares_strict_connector_binding(
         def __exit__(self, *args: Any) -> None:
             return None
 
-        def read(self) -> bytes:
+        def read(self, _limit: int | None = None) -> bytes:
             enrollment = captured["payload"]["enrollment_token"]
             return json.dumps(
                 {
@@ -196,3 +198,49 @@ def test_invitation_acceptance_declares_strict_connector_binding(
     assert captured["payload"]["connector_binding_version"] == 2
     assert accepted["connector_id"] == "connector_private"
     assert client.connector_id == "connector_private"
+
+
+def test_bridge_client_does_not_forward_session_tokens_through_redirects() -> None:
+    target_headers: list[dict[str, str]] = []
+
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            target_headers.append(dict(self.headers.items()))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target.server_port}/escaped",
+            )
+            self.end_headers()
+
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+    redirect = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (target, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        client = BridgeHttpClient(f"http://127.0.0.1:{redirect.server_port}")
+        client.access_token = "session-private"
+        with pytest.raises(BridgeRemoteError, match="HTTP 302"):
+            client.post("/agent/wait", {"wait_seconds": 0})
+        assert target_headers == []
+    finally:
+        redirect.shutdown()
+        target.shutdown()
+        redirect.server_close()
+        target.server_close()

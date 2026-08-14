@@ -133,6 +133,14 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     assert result["resident_setup"]["status"] == "configured"
 
 
+def test_direct_invitation_cli_allows_https_remote_but_rejects_remote_http() -> None:
+    assert invitation_cli._supported_bridge_url("https://bridge.example.test/") == (
+        "https://bridge.example.test"
+    )
+    with pytest.raises(invitation_cli.InvitationCliError, match="requires HTTPS"):
+        invitation_cli._supported_bridge_url("http://bridge.example.test")
+
+
 def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -254,6 +262,136 @@ def test_custom_product_acceptance_stays_manual_without_installing_services(
     assert result.status == "manual"
     assert result.listener_service is None
     assert not (tmp_path / "Library" / "LaunchAgents").exists()
+
+
+def test_opencode_native_tui_connector_installs_shared_endpoint_workers(
+    tmp_path: Path,
+) -> None:
+    result = configure_resident_connector(
+        connector_id="connector_opencode123456",
+        enrollment_token="enroll_opencode-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="opencode",
+        username="native-owner",
+        signature="真实 TUI 值守。",
+        conversation_id="OpenCode群",
+        adapter_kind="manual",
+        tui_adapter_kind="opencode",
+        tui_endpoint_id="tui-opencode-stable",
+        tui_native_session_id="opencode-room-session",
+        tui_access_mode="full",
+        tui_capabilities=["steer", "multi-room"],
+        tui_transport={
+            "kind": "opencode-http",
+            "base_url": "http://127.0.0.1:9201",
+            "directory": str(tmp_path),
+        },
+        requested_mode="resident",
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    assert result.status == "configured"
+    assert result.adapter_kind == "opencode"
+    state_directory = Path(result.state_directory)
+    binding = json.loads(
+        (state_directory / "tui-binding.json").read_text(encoding="utf-8")
+    )
+    assert binding["endpoint_id"] == "tui-opencode-stable"
+    assert binding["native_session_id"] == "opencode-room-session"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    worker = plistlib.loads(
+        (launch_agents / f"{result.worker_service}.plist").read_bytes()
+    )
+    task = plistlib.loads((launch_agents / f"{result.task_service}.plist").read_bytes())
+    assert "agent-bridge-tui-wake" in json.dumps(worker["ProgramArguments"])
+    assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "opencode"
+    assert task["EnvironmentVariables"]["AGENT_BRIDGE_TUI_ENDPOINT_ID"] == (
+        "tui-opencode-stable"
+    )
+    assert (
+        task["EnvironmentVariables"]["AGENT_BRIDGE_TUI_LOCK_FILE"]
+        == (worker["EnvironmentVariables"]["AGENT_BRIDGE_TUI_LOCK_FILE"])
+    )
+
+
+def test_basic_native_product_can_join_without_installing_a_tui_binding(
+    tmp_path: Path,
+) -> None:
+    result = configure_resident_connector(
+        connector_id="connector_basicnative123",
+        enrollment_token="enroll_basic-native-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="opencode",
+        username="basic-native",
+        signature="只做基础接入。",
+        conversation_id="基础原生群",
+        adapter_kind="manual",
+        tui_adapter_kind="opencode",
+        requested_mode="basic",
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    assert result.status == "manual"
+    state_directory = Path(result.state_directory)
+    assert not (state_directory / "tui-binding.json").exists()
+    manifest = json.loads(
+        (state_directory / "connector.json").read_text(encoding="utf-8")
+    )
+    assert manifest["tui_adapter_kind"] == "opencode"
+    assert manifest["tui_endpoint_id"] is None
+
+
+def test_pi_native_tui_connector_installs_private_extension(
+    tmp_path: Path,
+) -> None:
+    relay_directory = tmp_path / "pi-relay"
+    relay_directory.mkdir()
+    session_file = relay_directory / "room-session.jsonl"
+    session_file.touch()
+    result = configure_resident_connector(
+        connector_id="connector_pi123456",
+        enrollment_token="enroll_pi-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="pi",
+        username="pi-owner",
+        signature="Pi 真实本体。",
+        conversation_id="Pi群",
+        adapter_kind="manual",
+        tui_adapter_kind="pi",
+        tui_endpoint_id="tui-pi-stable",
+        tui_native_session_id="pi-room-session",
+        tui_access_mode="full",
+        tui_transport={
+            "kind": "pi-extension",
+            "command_file": str(relay_directory / "commands.jsonl"),
+            "event_file": str(relay_directory / "events.jsonl"),
+            "session_file": str(session_file),
+        },
+        requested_mode="resident",
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    extension = tmp_path / ".pi" / "agent" / "extensions" / "agent-bridge.ts"
+    assert (
+        extension.read_bytes()
+        == (
+            Path(__file__).parents[1] / "integrations" / "pi" / "agent-bridge.ts"
+        ).read_bytes()
+    )
+    assert extension.stat().st_mode & 0o777 == 0o600
+    binding = json.loads(
+        (Path(result.state_directory) / "tui-binding.json").read_text(encoding="utf-8")
+    )
+    assert binding["transport"]["session_file"] == str(session_file)
 
 
 def test_task_only_upgrade_does_not_restart_existing_chat_services(

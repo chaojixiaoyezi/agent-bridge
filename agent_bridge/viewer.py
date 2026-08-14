@@ -27,7 +27,11 @@ from .a2a_gateway import (
 )
 from .avatars import avatar_catalog_payload
 from .config import BridgeConfig
-from .connector import adapter_kind_for_product, configure_resident_connector
+from .connector import (
+    adapter_kind_for_product,
+    configure_resident_connector,
+    tui_adapter_kind_for_product,
+)
 from .resident_health import (
     configure_existing_connector_from_disk,
     local_connector_template,
@@ -963,6 +967,10 @@ def create_app(
                     "capabilities",
                     "enrollment_token",
                     "connector_binding_version",
+                    "tui_endpoint_id",
+                    "tui_native_session_id",
+                    "tui_access_mode",
+                    "tui_confirmed",
                 },
             )
         except HttpInputError as exc:
@@ -980,6 +988,10 @@ def create_app(
                     "connector_binding_version",
                     1,
                 ),
+                tui_endpoint_id=payload.get("tui_endpoint_id"),
+                tui_native_session_id=payload.get("tui_native_session_id"),
+                tui_access_mode=payload.get("tui_access_mode", "unknown"),
+                tui_confirmed=payload.get("tui_confirmed", False),
             ),
             success_status=201,
         )
@@ -996,6 +1008,43 @@ def create_app(
                     authorized_session_id=auth["session_id"],
                     connector_id=payload["connector_id"],
                     setup_status=payload["setup_status"],
+                    detail=payload.get("detail"),
+                )
+            },
+        )
+
+    async def report_agent_tui_state(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "tui_endpoint_id",
+                "tui_native_session_id",
+                "state",
+                "access_mode",
+            },
+            allowed={
+                "connector_id",
+                "tui_endpoint_id",
+                "tui_native_session_id",
+                "state",
+                "access_mode",
+                "capabilities",
+                "active_task_id",
+                "detail",
+            },
+            operation=lambda auth, payload: {
+                "connector": store.report_agent_tui_state(
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    connector_id=payload["connector_id"],
+                    tui_endpoint_id=payload["tui_endpoint_id"],
+                    tui_native_session_id=payload["tui_native_session_id"],
+                    state=payload["state"],
+                    access_mode=payload["access_mode"],
+                    capabilities=payload.get("capabilities"),
+                    active_task_id=payload.get("active_task_id"),
                     detail=payload.get("detail"),
                 )
             },
@@ -1815,7 +1864,9 @@ def create_app(
                                 )
                                 setup = await asyncio.to_thread(
                                     configure_resident_connector,
-                                    connector_id=str(registration["connector_id"]),
+                                    connector_id=str(
+                                        registration["connector_id"]
+                                    ),
                                     enrollment_token=str(
                                         registration["enrollment_token"]
                                     ),
@@ -2100,11 +2151,14 @@ def create_app(
             requested_mode = str(payload.get("mode") or "resident").strip().lower()
             reusable = payload.get("reusable", False)
             adapter_kind = adapter_kind_for_product(normalized_product)
+            tui_adapter_kind = tui_adapter_kind_for_product(normalized_product)
+            effective_adapter_kind = tui_adapter_kind or adapter_kind
             invitation = store.create_agent_invitation(
                 conversation_id=conversation,
                 product=normalized_product,
                 requested_mode=requested_mode,
                 adapter_kind=adapter_kind,
+                tui_adapter_kind=tui_adapter_kind,
                 created_by_web_user_id=str(identity["user_id"]),
                 reusable=reusable,
             )
@@ -2125,6 +2179,63 @@ def create_app(
             command = str(PROJECT_ROOT / "bin" / "agent-bridge-mcp")
             quick_start: dict[str, object] | None = None
             direct_accept_command = str(PROJECT_ROOT / "bin" / "agent-bridge-accept")
+            native_binding_templates: dict[str, dict[str, object]] = {
+                "deepseek-harness": {
+                    "kind": "deepseek-http",
+                    "base_url": "http://127.0.0.1:<Harness Web Host 端口>",
+                },
+                "opencode": {
+                    "kind": "opencode-http",
+                    "base_url": "http://127.0.0.1:<OpenCode server 端口>",
+                    "directory": "<当前 TUI 工作目录>",
+                },
+                "hermes": {
+                    "kind": "hermes-websocket",
+                    "websocket_url": "ws://127.0.0.1:<Hermes 端口>/api/ws?token=<本机 token>",
+                },
+                "pi": {
+                    "kind": "pi-extension",
+                    "command_file": "<本机私有绝对路径>/commands.jsonl",
+                    "event_file": "<本机私有绝对路径>/events.jsonl",
+                    "session_file": "<当前房间对应的 Pi 会话 JSONL 绝对路径>",
+                },
+                "qwen-code": {
+                    "kind": "qwen-daemon",
+                    "base_url": "http://127.0.0.1:4170",
+                },
+            }
+            native_startup_notes = {
+                "deepseek-harness": (
+                    "先以固定 loopback 端口运行 dsh web --host 127.0.0.1 "
+                    "--port <端口>，并使用该 Harness 真实 sessionId。"
+                ),
+                "opencode": (
+                    "用 opencode <项目目录> --hostname 127.0.0.1 --port <固定端口> "
+                    "保持当前 TUI；填写它实际使用的 OpenCode session ID。"
+                ),
+                "hermes": (
+                    "Hermes 先以固定私有 token 启动 hermes serve --host 127.0.0.1 "
+                    "--port 9119，再让当前 TUI 通过 HERMES_TUI_GATEWAY_URL 连接同一 "
+                    "ws://127.0.0.1:9119/api/ws?token=<token>；token 只写入本机私有绑定。"
+                ),
+                "pi": (
+                    "接受后若 extension 尚未加载，执行一次 /reload；它会按当前 Pi session "
+                    "自动选择唯一 endpoint。多房间自动切换再执行一次 "
+                    "/agent-bridge-bind <resident_setup.state_directory>/tui-binding.json。"
+                ),
+                "qwen-code": (
+                    "多聊天室推荐在工作目录运行 qwen serve（默认 127.0.0.1:4170）并为"
+                    "各房间使用不同 session ID；这是官方持久 runtime/Web Shell，不是当前"
+                    "终端 TUI。必须由当前终端本体回复时，单聊天室使用 qwen --json-file "
+                    "<events> --input-file <input>，多聊天室则分别保持多个 Qwen TUI。"
+                ),
+            }
+            native_binding_template = (
+                native_binding_templates.get(tui_adapter_kind or "")
+                if tui_adapter_kind
+                else None
+            )
+            native_startup_note = native_startup_notes.get(tui_adapter_kind or "")
             if normalized_product == "claude-code":
                 acceptance_prompt = (
                     "明确接受这份 Agent Bridge 邀请。自行选择长期稳定的 username 和"
@@ -2220,15 +2331,56 @@ def create_app(
                     ),
                     "patch": deepseek_patch,
                     "stable_patch_template": deepseek_stable_patch,
+                    "native_tui_binding_template": native_binding_template,
                     "apply_note": (
                         "把 insert 项合并进当前 DeepSeek Harness profile 的 "
                         "cordis.patch.yml；HMR 会加载 MCP 工具，无需重启 Harness。"
                     ),
                 }
-            if requested_mode == "resident" and adapter_kind != "manual":
-                setup_note = (
-                    f"本邀请支持 {adapter_kind} 自动值守；接受后会在本机安装当前用户级 listener 和产品适配器。"
+            elif tui_adapter_kind and native_binding_template:
+                native_arguments = [
+                    direct_accept_command,
+                    "--bridge-url",
+                    bridge_url,
+                    "--product",
+                    normalized_product,
+                    "--username",
+                    "<由 Agent 自行选择；同一端点后续自动复用>",
+                    "--signature",
+                    "<由 Agent 自行填写>",
+                    "--tui-adapter",
+                    tui_adapter_kind,
+                    "--tui-endpoint-id",
+                    "<当前物理 TUI 的长期稳定 ID>",
+                    "--tui-session-id",
+                    "<本聊天室独占的原生 session ID>",
+                    "--tui-access-mode",
+                    "full",
+                    "--tui-transport-json",
+                    json.dumps(native_binding_template, ensure_ascii=False),
+                    "--confirm-tui-binding",
+                ]
+                native_command = (
+                    "printf %s "
+                    + shlex.quote(invitation_token)
+                    + " | "
+                    + shlex.join(native_arguments)
                 )
+                quick_start = {
+                    "kind": "native-tui-direct-accept",
+                    "adapter_kind": tui_adapter_kind,
+                    "requires_mcp_restart": False,
+                    "command_template": native_command,
+                    "native_tui_binding_template": native_binding_template,
+                    "agent_prompt": (
+                        "在当前 Full Access TUI 中确认接受邀请。识别当前物理 TUI 的稳定端点 ID，"
+                        "为这个聊天室创建或选择一个独占原生 session，填写本机 loopback/file "
+                        "transport 后执行下面命令。不要访问 Bridge 数据库，也不要复用其他房间的"
+                        "原生 session。\n" + native_command
+                    ),
+                }
+            if requested_mode == "resident" and effective_adapter_kind != "manual":
+                setup_note = f"本邀请支持 {effective_adapter_kind} 自动值守；接受后会在本机安装当前用户级 listener、真实 TUI 注入器和任务 worker。"
             elif requested_mode == "resident":
                 setup_note = (
                     "该自定义产品暂无内置唤醒适配器；接受后完成基础接入，并生成私有连接配置，"
@@ -2284,18 +2436,43 @@ def create_app(
                 instruction_lines.extend(
                     [
                         "DeepSeek Harness 原生 Cordis MCP 配置（合并到当前 profile 的 cordis.patch.yml；HMR 热加载，无需重启）：",
+                        str(native_startup_note or ""),
                         json.dumps(
                             quick_start["patch"],
                             ensure_ascii=False,
                             indent=2,
                         ),
                         f"工具出现后调用 {quick_start['accept_tool']}。接受成功后必须用下面的长期配置替换临时 insert 项：把返回的 resident_setup.state_directory 和自己选定的身份字段填入；长期配置只读取私有 enrollment.token，不再保存邀请令牌。",
+                        "调用接受工具时同时填写 confirm_tui_binding=true、当前物理 TUI 的长期稳定 tui_endpoint_id、当前房间独占的 tui_native_session_id、tui_access_mode=full，以及下面的 tui_transport：",
+                        json.dumps(
+                            quick_start["native_tui_binding_template"],
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                         json.dumps(
                             quick_start["stable_patch_template"],
                             ensure_ascii=False,
                             indent=2,
                         ),
-                        "当前 DeepSeek 集成为原生 MCP 基础接入；常驻自动唤醒适配器尚未启用。",
+                        "接受时必须提交当前 Harness 的稳定端点 ID、原生 session ID、Full Access 状态及 loopback Web Host 地址；随后自动启用真实 TUI 常驻唤醒。",
+                    ]
+                )
+            elif quick_start and quick_start["kind"] == "native-tui-direct-accept":
+                instruction_lines.extend(
+                    [
+                        f"{tui_adapter_kind} 真实 TUI 快速接入（在当前 TUI 的 Full Access 环境执行；无需重启 MCP）：",
+                        str(native_startup_note or ""),
+                        str(quick_start["agent_prompt"]),
+                        "同一个物理 TUI 加入多个聊天室时必须复用 tui_endpoint_id，并为每个聊天室使用不同的原生 session ID；Bridge 会复用公开身份并串行注入，防止跨群串话。",
+                        (
+                            "Pi 首次接入会安装内置 extension；当前 Pi 若尚未加载它，执行一次 /reload。extension 会按当前 session 自动认领唯一 endpoint；要在多个房间间自动切换，再执行一次 /agent-bridge-bind <resident_setup.state_directory>/tui-binding.json。之后只自动发现同一 endpoint 的新增房间，多个 Pi TUI 不会互相认领。"
+                            if tui_adapter_kind == "pi"
+                            else (
+                                "Qwen Code 默认使用 qwen serve 的官方 daemon 协议，适合一个本机原生 runtime 承载多个独立 session，但它不是当前终端 TUI；先在工作目录运行 qwen serve，再填写实际 session ID。若必须由当前终端本体回复，可手工改用 qwen-dual-file，并以同一组 --json-file/--input-file 路径启动当前 TUI；dual-file 文件对只绑定一个房间，多房间需要多个 Qwen TUI。"
+                                if tui_adapter_kind == "qwen-code"
+                                else "连接器只访问本机 loopback 端点或私有 JSONL 文件，不访问 Bridge 数据库。"
+                            )
+                        ),
                     ]
                 )
             instructions = "\n".join(instruction_lines)
@@ -2315,12 +2492,16 @@ def create_app(
                         "invitation": invitation,
                         "requested_mode": requested_mode,
                         "adapter_kind": adapter_kind,
-                        "resident_capable": adapter_kind != "manual",
+                        "tui_adapter_kind": tui_adapter_kind,
+                        "effective_adapter_kind": effective_adapter_kind,
+                        "resident_capable": effective_adapter_kind != "manual",
                         "reusable": reusable,
                         "agent_register_arguments": fixed_register_arguments,
                         "http_registration_payload": fixed_http_registration_payload,
                         "agent_supplied_fields": agent_supplied_fields,
                         "quick_start": quick_start,
+                        "native_tui_binding_template": native_binding_template,
+                        "native_tui_startup_note": native_startup_note,
                         "registration_secret_required": (
                             required_registration_secret is not None
                         ),
@@ -2545,6 +2726,11 @@ def create_app(
             Route(
                 "/agent/connector/setup",
                 report_agent_connector_setup,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/connector/tui-state",
+                report_agent_tui_state,
                 methods=["POST"],
             ),
             Route("/agent/heartbeat", agent_heartbeat, methods=["POST"]),

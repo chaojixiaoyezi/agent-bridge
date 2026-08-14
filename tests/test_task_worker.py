@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from argparse import Namespace
 from pathlib import Path
 
 import agent_bridge.task_worker as task_worker
@@ -12,6 +13,7 @@ from agent_bridge.task_worker import (
     _task_poll_retry_delay,
     _task_prompt,
 )
+from agent_bridge.tui_adapter import validate_native_tui_binding
 
 
 THREAD = "019f0000-0000-7000-8000-000000000001"
@@ -228,3 +230,107 @@ for line in sys.stdin:
     assert (tmp_path / "claude-task-session").read_text(
         encoding="utf-8"
     ).strip() == session_id
+
+
+def test_native_tui_task_worker_executes_in_bound_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    enrollment = tmp_path / "enrollment.token"
+    enrollment.write_text("enroll_test\n", encoding="utf-8")
+    mcp = tmp_path / "agent-bridge-mcp"
+    mcp.write_text("#!/bin/sh\n", encoding="utf-8")
+    binding_file = tmp_path / "tui-binding.json"
+    binding_value = validate_native_tui_binding(
+        adapter_kind="opencode",
+        endpoint_id="tui-opencode-task",
+        native_session_id="native-session-task",
+        access_mode="full",
+        transport={
+            "kind": "opencode-http",
+            "base_url": "http://127.0.0.1:9201",
+        },
+    )
+    binding_file.write_text(
+        __import__("json").dumps(binding_value.payload()),
+        encoding="utf-8",
+    )
+    sent: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def post(self, path: str, payload: dict, **_kwargs):
+            sent.append((path, payload))
+            if path == "/agent/tasks/next":
+                return {
+                    "task": {
+                        "task_id": "task_native",
+                        "body": "检查当前工程并报告。",
+                        "source_message_id": "message_native",
+                        "target_participant_ids": ["participant_native"],
+                    }
+                }
+            if path == "/agent/tasks/inputs":
+                return {"inputs": []}
+            if path == "/agent/tasks/update":
+                return {"task": {"status": payload["status"]}}
+            return {}
+
+    prompts: list[str] = []
+
+    class FakeNativeClient:
+        def __init__(self, configured) -> None:
+            assert configured.native_session_id == "native-session-task"
+
+        def probe(self, **_kwargs):
+            return {"online": True, "transport": "opencode-http"}
+
+        def run_turn(self, prompt: str, **_kwargs):
+            prompts.append(prompt)
+            return "真实 TUI 已完成。", []
+
+    class FakeLeaseKeeper:
+        def __init__(self, _renew) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        task_worker, "resident_http_client", lambda **_kwargs: FakeClient()
+    )
+    monkeypatch.setattr(task_worker, "NativeTuiClient", FakeNativeClient)
+    monkeypatch.setattr(task_worker, "TaskLeaseKeeper", FakeLeaseKeeper)
+    environment = {
+        "AGENT_BRIDGE_URL": "http://127.0.0.1:8765",
+        "AGENT_BRIDGE_PRODUCT": "opencode",
+        "AGENT_BRIDGE_USERNAME": "native-owner",
+        "AGENT_BRIDGE_SIGNATURE": "真实本体。",
+        "AGENT_BRIDGE_CONVERSATION_ID": "native-room",
+        "AGENT_BRIDGE_TASK_ADAPTER": "opencode",
+        "AGENT_BRIDGE_TASK_CWD": str(tmp_path),
+        "AGENT_BRIDGE_TASK_THREAD_STATE_FILE": str(tmp_path / "thread"),
+        "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment),
+        "AGENT_BRIDGE_MCP_COMMAND": str(mcp),
+        "AGENT_BRIDGE_CONNECTOR_ID": "connector_native_task",
+        "AGENT_BRIDGE_TUI_BINDING_FILE": str(binding_file),
+        "AGENT_BRIDGE_TUI_LOCK_FILE": str(tmp_path / "endpoint.lock"),
+    }
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+
+    task_worker.run_worker(Namespace(once=True))
+
+    assert "检查当前工程并报告" in prompts[0]
+    completed = [
+        payload
+        for path, payload in sent
+        if path == "/agent/tasks/update" and payload["status"] == "completed"
+    ]
+    assert completed[0]["execution_thread_id"] == "native-session-task"
+    assert any(
+        path == "/agent/send" and payload["body"] == "真实 TUI 已完成。"
+        for path, payload in sent
+    )

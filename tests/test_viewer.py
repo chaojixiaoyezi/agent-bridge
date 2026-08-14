@@ -764,7 +764,9 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert deepseek_product.status_code == 200
     deepseek_access = deepseek_product.json()["access"]
     assert deepseek_access["adapter_kind"] == "manual"
-    assert deepseek_access["resident_capable"] is False
+    assert deepseek_access["tui_adapter_kind"] == "deepseek-harness"
+    assert deepseek_access["effective_adapter_kind"] == "deepseek-harness"
+    assert deepseek_access["resident_capable"] is True
     assert deepseek_access["quick_start"]["kind"] == (
         "deepseek-harness-cordis-patch"
     )
@@ -783,10 +785,36 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     stable_env = stable_deepseek_row["config"]["env"]
     assert "AGENT_BRIDGE_INVITATION_TOKEN" not in stable_env
     assert "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE" in stable_env
+    assert deepseek_access["native_tui_binding_template"] == {
+        "kind": "deepseek-http",
+        "base_url": "http://127.0.0.1:<Harness Web Host 端口>",
+    }
+    assert "confirm_tui_binding=true" in deepseek_access["instructions"]
+
+    for product, adapter in (
+        ("opencode", "opencode"),
+        ("hermes", "hermes"),
+        ("pi", "pi"),
+        ("qwen-code", "qwen-code"),
+    ):
+        native_product = client.post(
+            "/api/agent-access",
+            headers=intent_headers(client, "generate-agent-access"),
+            json={"conversation_id": "old-room", "product": product},
+        )
+        assert native_product.status_code == 200
+        native_access = native_product.json()["access"]
+        assert native_access["tui_adapter_kind"] == adapter
+        assert native_access["resident_capable"] is True
+        assert native_access["quick_start"]["kind"] == "native-tui-direct-accept"
+        assert native_access["quick_start"]["requires_mcp_restart"] is False
+        assert (
+            "--confirm-tui-binding" in native_access["quick_start"]["command_template"]
+        )
     assert "AGENT_BRIDGE_CONNECTOR_ID" in stable_env
     assert stable_env["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert "HMR 热加载" in deepseek_access["instructions"]
-    assert "常驻自动唤醒适配器尚未启用" in deepseek_access["instructions"]
+    assert "随后自动启用真实 TUI 常驻唤醒" in deepseek_access["instructions"]
 
     user_identity_rejected = client.post(
         "/api/agent-access",
@@ -833,7 +861,7 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         assert connection.execute(
             "SELECT COUNT(*) FROM agent_invitations "
             "WHERE conversation_id = 'new-room'"
-        ).fetchone()[0] == 4
+        ).fetchone()[0] == 8
 
 
 def test_dashboard_keeps_admin_chat_ordinary_while_authorization_is_frozen(

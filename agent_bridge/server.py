@@ -9,8 +9,10 @@ from .config import BridgeConfig
 from .connector import (
     ConnectorSetupError,
     configure_resident_connector,
+    tui_adapter_kind_for_product,
     validate_connector_preflight,
 )
+from .tui_adapter import NativeTuiError, validate_native_tui_binding
 from .http_client import BridgeHttpClient
 
 
@@ -116,6 +118,12 @@ def agent_accept_invitation(
     roles: list[str] | None = None,
     capabilities: list[str] | None = None,
     enable_resident: bool = True,
+    tui_endpoint_id: str = "",
+    tui_native_session_id: str = "",
+    tui_access_mode: str = "full",
+    tui_capabilities: list[str] | None = None,
+    tui_transport: dict[str, Any] | None = None,
+    confirm_tui_binding: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Accept a server-signed invitation and configure local resident wake-up.
@@ -134,6 +142,21 @@ def agent_accept_invitation(
         bridge_url=CONFIG.server_url,
         workspace_path=workspace_path or None,
     )
+    proposed_tui_adapter = tui_adapter_kind_for_product(CONFIG.client_type)
+    if proposed_tui_adapter and (
+        tui_endpoint_id or tui_native_session_id or confirm_tui_binding or tui_transport
+    ):
+        try:
+            validate_native_tui_binding(
+                adapter_kind=proposed_tui_adapter,
+                endpoint_id=tui_endpoint_id,
+                native_session_id=tui_native_session_id,
+                access_mode=tui_access_mode,
+                capabilities=tui_capabilities,
+                transport=tui_transport,
+            )
+        except NativeTuiError as exc:
+            raise ConnectorSetupError(str(exc)) from exc
     client = get_client()
     source_thread_id = ""
     if ctx is not None:
@@ -145,6 +168,10 @@ def agent_accept_invitation(
         signature=signature,
         roles=roles,
         capabilities=capabilities,
+        tui_endpoint_id=tui_endpoint_id or None,
+        tui_native_session_id=tui_native_session_id or None,
+        tui_access_mode=tui_access_mode,
+        tui_confirmed=bool(confirm_tui_binding),
     )
     enrollment_token = str(accepted.pop("_enrollment_token", ""))
     connector_id = str(accepted["connector_id"])
@@ -161,6 +188,12 @@ def agent_accept_invitation(
             conversation_id=str(accepted["conversation_id"]),
             adapter_kind=str(accepted["adapter_kind"]),
             requested_mode=str(accepted["requested_mode"]),
+            tui_adapter_kind=accepted.get("tui_adapter_kind"),
+            tui_endpoint_id=tui_endpoint_id or None,
+            tui_native_session_id=tui_native_session_id or None,
+            tui_access_mode=tui_access_mode,
+            tui_capabilities=tui_capabilities,
+            tui_transport=tui_transport,
             roles=list(accepted.get("roles") or []),
             capabilities=list(accepted.get("capabilities") or []),
             workspace_path=str(validated_workspace),
@@ -172,7 +205,9 @@ def agent_accept_invitation(
         setup_payload = {
             "status": "failed",
             "platform": "unknown",
-            "adapter_kind": str(accepted["adapter_kind"]),
+            "adapter_kind": str(
+                accepted.get("tui_adapter_kind") or accepted["adapter_kind"]
+            ),
             "connector_id": connector_id,
             "state_directory": "",
             "listener_service": None,

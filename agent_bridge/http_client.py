@@ -8,7 +8,31 @@ from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+MAX_BRIDGE_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+_BRIDGE_OPENER = build_opener(_RejectRedirects())
+
+
+def urlopen(request: Request, *, timeout: float):
+    """Open one API request without forwarding credentials through redirects."""
+
+    return _BRIDGE_OPENER.open(request, timeout=timeout)
+
+
+def _response_bytes(response: Any) -> bytes:
+    raw = response.read(MAX_BRIDGE_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_BRIDGE_RESPONSE_BYTES:
+        raise BridgeRemoteError("Agent Bridge response exceeded the safety limit")
+    return raw
 
 
 class BridgeRemoteError(RuntimeError):
@@ -114,6 +138,10 @@ class BridgeHttpClient:
         signature: str,
         roles: list[str] | None = None,
         capabilities: list[str] | None = None,
+        tui_endpoint_id: str | None = None,
+        tui_native_session_id: str | None = None,
+        tui_access_mode: str = "unknown",
+        tui_confirmed: bool = False,
     ) -> dict[str, Any]:
         if not self.invitation_token:
             raise BridgeRemoteError(
@@ -133,6 +161,16 @@ class BridgeHttpClient:
                 "capabilities": capabilities or [],
                 "enrollment_token": proposed_enrollment,
                 "connector_binding_version": 2,
+                **(
+                    {
+                        "tui_endpoint_id": tui_endpoint_id,
+                        "tui_native_session_id": tui_native_session_id,
+                        "tui_access_mode": tui_access_mode,
+                        "tui_confirmed": tui_confirmed,
+                    }
+                    if tui_endpoint_id or tui_native_session_id or tui_confirmed
+                    else {}
+                ),
             },
             authenticated=False,
         )
@@ -224,9 +262,9 @@ class BridgeHttpClient:
         )
         try:
             with urlopen(request, timeout=max(1.0, float(timeout))) as response:
-                raw = response.read()
+                raw = _response_bytes(response)
         except HTTPError as exc:
-            raw = exc.read()
+            raw = _response_bytes(exc)
             try:
                 error_payload = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):

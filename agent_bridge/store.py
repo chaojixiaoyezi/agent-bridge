@@ -78,6 +78,23 @@ MIN_AGENT_INACTIVITY_DAYS = 1
 MAX_AGENT_INACTIVITY_DAYS = 3650
 INVITATION_MODES = {"basic", "resident"}
 INVITATION_ADAPTERS = {"codex", "claude-code", "manual"}
+NATIVE_TUI_ADAPTERS = {
+    "deepseek-harness",
+    "opencode",
+    "hermes",
+    "pi",
+    "qwen-code",
+}
+TUI_STATES = {
+    "unbound",
+    "awaiting_confirmation",
+    "online",
+    "busy",
+    "waiting_approval",
+    "offline",
+    "error",
+}
+TUI_ACCESS_MODES = {"unknown", "standard", "full"}
 INVITATION_STATUSES = {"active", "exhausted", "revoked", "expired"}
 CONNECTOR_SETUP_STATUSES = {
     "awaiting_setup",
@@ -812,6 +829,7 @@ CREATE TABLE IF NOT EXISTS agent_invitations (
         CHECK (requested_mode IN ('basic', 'resident')),
     adapter_kind TEXT NOT NULL
         CHECK (adapter_kind IN ('codex', 'claude-code', 'manual')),
+    tui_adapter_kind TEXT,
     reuse_policy TEXT NOT NULL DEFAULT 'single'
         CHECK (reuse_policy IN ('single', 'reusable')),
     max_uses INTEGER
@@ -851,6 +869,14 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     bound_client_type TEXT,
     bound_roles_json TEXT,
     bound_capabilities_json TEXT,
+    tui_endpoint_id TEXT,
+    tui_native_session_id TEXT,
+    tui_state TEXT NOT NULL DEFAULT 'unbound',
+    tui_access_mode TEXT NOT NULL DEFAULT 'unknown',
+    tui_capabilities_json TEXT NOT NULL DEFAULT '[]',
+    tui_last_seen_at REAL,
+    tui_active_task_id TEXT,
+    tui_detail_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     revoked_at REAL,
     updated_at REAL NOT NULL,
@@ -873,7 +899,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_connectors_participant
     ON agent_connectors(accepted_participant_id, revoked_at, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_connectors_setup_seen
     ON agent_connectors(setup_status, connector_last_seen_at);
-
 CREATE TABLE IF NOT EXISTS connector_component_readiness (
     connector_id TEXT NOT NULL,
     component TEXT NOT NULL
@@ -1365,6 +1390,7 @@ class BridgeStore:
             self._migrate_agent_connector_conversations(conn)
             conn.executescript(INVITATION_SCHEMA)
             self._migrate_connector_identity_bindings(conn)
+            self._migrate_native_tui_bindings(conn)
             if schema_version < 21:
                 self._repair_connector_room_bindings(conn)
             lifecycle_table_exists = conn.execute(
@@ -1472,7 +1498,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 25")
+            conn.execute("PRAGMA user_version = 26")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1833,6 +1859,53 @@ class BridgeStore:
                 "connector identity migration left "
                 f"{incomplete} incomplete binding(s)"
             )
+
+    @staticmethod
+    def _migrate_native_tui_bindings(conn: sqlite3.Connection) -> None:
+        """Add native-TUI state without rebuilding live invitation tables."""
+
+        invitation_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(agent_invitations)"
+            ).fetchall()
+        }
+        if "tui_adapter_kind" not in invitation_columns:
+            conn.execute(
+                "ALTER TABLE agent_invitations ADD COLUMN tui_adapter_kind TEXT"
+            )
+        # This column is reserved for the native-session bridge. Early v26
+        # development builds briefly copied first-party adapter names here;
+        # clear them so legacy Codex/Claude invitations keep their unchanged
+        # resident path after an in-place upgrade.
+        conn.execute(
+            "UPDATE agent_invitations SET tui_adapter_kind = NULL "
+            "WHERE tui_adapter_kind IN ('codex', 'claude-code')"
+        )
+
+        connector_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(agent_connectors)").fetchall()
+        }
+        additions = {
+            "tui_endpoint_id": "TEXT",
+            "tui_native_session_id": "TEXT",
+            "tui_state": "TEXT NOT NULL DEFAULT 'unbound'",
+            "tui_access_mode": "TEXT NOT NULL DEFAULT 'unknown'",
+            "tui_capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
+            "tui_last_seen_at": "REAL",
+            "tui_active_task_id": "TEXT",
+            "tui_detail_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, declaration in additions.items():
+            if name not in connector_columns:
+                conn.execute(
+                    f"ALTER TABLE agent_connectors ADD COLUMN {name} {declaration}"
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_connectors_tui_endpoint "
+            "ON agent_connectors(tui_endpoint_id, revoked_at, tui_last_seen_at DESC)"
+        )
 
     @staticmethod
     def _repair_connector_room_bindings(conn: sqlite3.Connection) -> None:
@@ -4578,7 +4651,8 @@ class BridgeStore:
             template = conn.execute(
                 """
                 SELECT connector.*, invitation.product,
-                       invitation.requested_mode, invitation.adapter_kind
+                       invitation.requested_mode, invitation.adapter_kind,
+                       invitation.tui_adapter_kind
                 FROM agent_connectors AS connector
                 JOIN agent_invitations AS invitation
                   ON invitation.invitation_id = connector.invitation_id
@@ -4608,11 +4682,12 @@ class BridgeStore:
                 """
                 INSERT INTO agent_invitations
                     (invitation_id, token_hash, conversation_id, product,
-                     requested_mode, adapter_kind, reuse_policy, max_uses,
+                     requested_mode, adapter_kind, tui_adapter_kind,
+                     reuse_policy, max_uses,
                      use_count, status, created_by_web_user_id,
                      created_at, expires_at, first_accepted_at,
                      last_accepted_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'single', 1, 1, 'exhausted',
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'single', 1, 1, 'exhausted',
                         ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -4622,6 +4697,7 @@ class BridgeStore:
                     product,
                     str(template["requested_mode"]),
                     str(template["adapter_kind"]),
+                    template["tui_adapter_kind"],
                     administrator,
                     now,
                     now + DEFAULT_INVITATION_TTL_SECONDS,
@@ -4659,9 +4735,10 @@ class BridgeStore:
                      setup_status, setup_updated_at, binding_version,
                      requested_username, bound_client_type,
                      bound_roles_json, bound_capabilities_json,
+                     tui_endpoint_id, tui_state, tui_access_mode,
                      created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_setup', ?, 2,
-                        ?, ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, 'awaiting_confirmation', ?, ?, ?)
                 """,
                 (
                     connector_id,
@@ -4676,6 +4753,8 @@ class BridgeStore:
                     str(profile["client_type"]),
                     compact_json(roles),
                     compact_json(capabilities),
+                    template["tui_endpoint_id"],
+                    str(template["tui_access_mode"] or "unknown"),
                     now,
                     now,
                 ),
@@ -4709,6 +4788,11 @@ class BridgeStore:
             "access_token": access_token,
             "enrollment_token": enrollment_token,
             "adapter_kind": str(template["adapter_kind"]),
+            "tui_adapter_kind": (
+                str(template["tui_adapter_kind"])
+                if template["tui_adapter_kind"] is not None
+                else None
+            ),
             "requested_mode": str(template["requested_mode"]),
             "identity_binding_version": 2,
         }
@@ -4727,6 +4811,15 @@ class BridgeStore:
             raise ValidationError(
                 "invitation adapter must be codex, claude-code, or manual"
             )
+        return adapter
+
+    @staticmethod
+    def _normalize_tui_adapter(value: str | None) -> str | None:
+        adapter = str(value or "").strip().lower()
+        if not adapter:
+            return None
+        if adapter not in NATIVE_TUI_ADAPTERS:
+            raise ValidationError("unsupported native TUI adapter")
         return adapter
 
     @staticmethod
@@ -4828,13 +4921,21 @@ class BridgeStore:
             else None
         )
         use_count = int(row["use_count"])
+        tui_adapter_kind = (
+            str(row["tui_adapter_kind"])
+            if "tui_adapter_kind" in keys and row["tui_adapter_kind"] is not None
+            else None
+        )
+        effective_adapter_kind = tui_adapter_kind or str(row["adapter_kind"])
         return {
             "invitation_id": str(row["invitation_id"]),
             "conversation_id": str(row["conversation_id"]),
             "product": str(row["product"]),
             "requested_mode": str(row["requested_mode"]),
             "adapter_kind": str(row["adapter_kind"]),
-            "resident_capable": str(row["adapter_kind"]) != "manual",
+            "tui_adapter_kind": tui_adapter_kind,
+            "effective_adapter_kind": effective_adapter_kind,
+            "resident_capable": effective_adapter_kind != "manual",
             "reuse_policy": str(row["reuse_policy"]),
             "reusable": str(row["reuse_policy"]) == "reusable",
             "max_uses": max_uses,
@@ -4886,7 +4987,9 @@ class BridgeStore:
             "connector_last_seen_at": latest_seen,
             "resident_status": resident_status,
             "revoked_at": (
-                float(row["revoked_at"]) if row["revoked_at"] is not None else None
+                float(row["revoked_at"])
+                if row["revoked_at"] is not None
+                else None
             ),
             "updated_at": float(row["updated_at"]),
         }
@@ -4975,12 +5078,20 @@ class BridgeStore:
             resident_status = "offline"
         else:
             resident_status = setup_status
+        keys = set(row.keys())
+        tui_adapter_kind = (
+            str(row["tui_adapter_kind"])
+            if "tui_adapter_kind" in keys and row["tui_adapter_kind"] is not None
+            else None
+        )
         return {
             "connector_id": str(row["connector_id"]),
             "invitation_id": str(row["invitation_id"]),
             "conversation_id": str(row["conversation_id"]),
             "product": str(row["product"]),
             "adapter_kind": str(row["adapter_kind"]),
+            "tui_adapter_kind": tui_adapter_kind,
+            "effective_adapter_kind": tui_adapter_kind or str(row["adapter_kind"]),
             "accepted_participant_id": str(row["accepted_participant_id"]),
             "setup_status": setup_status,
             "setup_detail": json.loads(str(row["setup_detail_json"] or "{}")),
@@ -4991,10 +5102,34 @@ class BridgeStore:
             ),
             "connector_last_seen_at": last_seen,
             "resident_status": resident_status,
+            "tui": {
+                "endpoint_id": (
+                    str(row["tui_endpoint_id"])
+                    if row["tui_endpoint_id"] is not None
+                    else None
+                ),
+                "native_session_id": (
+                    str(row["tui_native_session_id"])
+                    if row["tui_native_session_id"] is not None
+                    else None
+                ),
+                "state": str(row["tui_state"] or "unbound"),
+                "access_mode": str(row["tui_access_mode"] or "unknown"),
+                "capabilities": json.loads(str(row["tui_capabilities_json"] or "[]")),
+                "last_seen_at": (
+                    float(row["tui_last_seen_at"])
+                    if row["tui_last_seen_at"] is not None
+                    else None
+                ),
+                "active_task_id": (
+                    str(row["tui_active_task_id"])
+                    if row["tui_active_task_id"] is not None
+                    else None
+                ),
+                "detail": json.loads(str(row["tui_detail_json"] or "{}")),
+            },
             "revoked_at": (
-                float(row["revoked_at"])
-                if row["revoked_at"] is not None
-                else None
+                float(row["revoked_at"]) if row["revoked_at"] is not None else None
             ),
             "updated_at": float(row["updated_at"]),
         }
@@ -5006,6 +5141,7 @@ class BridgeStore:
         product: str,
         requested_mode: str,
         adapter_kind: str,
+        tui_adapter_kind: str | None = None,
         created_by_web_user_id: str,
         reusable: bool = False,
         ttl_seconds: float = DEFAULT_INVITATION_TTL_SECONDS,
@@ -5014,6 +5150,7 @@ class BridgeStore:
         normalized_product = token(product, field="product_name")
         mode = self._normalize_invitation_mode(requested_mode)
         adapter = self._normalize_invitation_adapter(adapter_kind)
+        tui_adapter = self._normalize_tui_adapter(tui_adapter_kind)
         creator = opaque_id(created_by_web_user_id, field="created_by_web_user_id")
         if not isinstance(reusable, bool):
             raise ValidationError("reusable must be a boolean")
@@ -5039,11 +5176,12 @@ class BridgeStore:
                 """
                 INSERT INTO agent_invitations
                     (invitation_id, token_hash, conversation_id, product,
-                     requested_mode, adapter_kind, reuse_policy, max_uses,
+                     requested_mode, adapter_kind, tui_adapter_kind,
+                     reuse_policy, max_uses,
                      use_count, status,
                      created_by_web_user_id, created_at, expires_at,
                      updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?, ?)
                 """,
                 (
                     invitation_id,
@@ -5052,6 +5190,7 @@ class BridgeStore:
                     normalized_product,
                     mode,
                     adapter,
+                    tui_adapter,
                     reuse_policy,
                     max_uses,
                     creator,
@@ -5080,7 +5219,9 @@ class BridgeStore:
             field="requesting_web_user_id",
         )
         conversation = (
-            validate_conversation_id(conversation_id) if conversation_id else None
+            validate_conversation_id(conversation_id)
+            if conversation_id
+            else None
         )
         normalized_limit = max(1, min(int(limit), 500))
         now = time.time()
@@ -5212,6 +5353,10 @@ class BridgeStore:
         capabilities: Sequence[str] | None = None,
         enrollment_token: str | None = None,
         connector_binding_version: object = 2,
+        tui_endpoint_id: str | None = None,
+        tui_native_session_id: str | None = None,
+        tui_access_mode: str = "unknown",
+        tui_confirmed: bool = False,
     ) -> dict[str, Any]:
         normalized_invitation_token = opaque_id(
             invitation_token,
@@ -5219,6 +5364,21 @@ class BridgeStore:
         )
         normalized_product = token(product, field="product_name")
         requested_username = agent_username(username)
+        normalized_tui_endpoint = (
+            opaque_id(tui_endpoint_id, field="tui_endpoint_id")
+            if str(tui_endpoint_id or "").strip()
+            else None
+        )
+        normalized_tui_session = (
+            opaque_id(tui_native_session_id, field="tui_native_session_id")
+            if str(tui_native_session_id or "").strip()
+            else None
+        )
+        normalized_tui_access = str(tui_access_mode or "unknown").strip().lower()
+        if normalized_tui_access not in TUI_ACCESS_MODES:
+            raise ValidationError("unsupported TUI access mode")
+        if not isinstance(tui_confirmed, bool):
+            raise ValidationError("tui_confirmed must be a boolean")
         if isinstance(connector_binding_version, bool):
             raise ValidationError("connector_binding_version must be 1 or 2")
         try:
@@ -5264,6 +5424,75 @@ class BridgeStore:
                 str(invitation["product"]),
             ):
                 raise AuthenticationError("Agent invitation product does not match")
+            invitation_tui_adapter = str(invitation["tui_adapter_kind"] or "").strip()
+            native_tui_invitation = invitation_tui_adapter in NATIVE_TUI_ADAPTERS
+            native_tui_required = (
+                str(invitation["requested_mode"]) == "resident"
+                and native_tui_invitation
+            )
+            tui_binding_supplied = bool(
+                tui_confirmed
+                or normalized_tui_endpoint is not None
+                or normalized_tui_session is not None
+                or normalized_tui_access != "unknown"
+            )
+            if not native_tui_invitation and tui_binding_supplied:
+                raise ConflictError(
+                    "this invitation does not accept a native TUI binding"
+                )
+            native_tui_binding_expected = native_tui_required or tui_binding_supplied
+            if native_tui_invitation and native_tui_binding_expected and (
+                not tui_confirmed
+                or normalized_tui_endpoint is None
+                or normalized_tui_session is None
+            ):
+                raise ConflictError(
+                    "native-TUI bindings require explicit TUI "
+                    "confirmation, endpoint identity, and native session identity"
+                )
+            if (
+                native_tui_invitation
+                and native_tui_binding_expected
+                and normalized_tui_access != "full"
+            ):
+                raise ConflictError(
+                    "this native-TUI connector currently requires the local TUI "
+                    "to already be in full-access mode"
+                )
+            endpoint_owner = None
+            duplicate_session = None
+            if normalized_tui_endpoint is not None:
+                endpoint_owner = conn.execute(
+                    """
+                    SELECT connector.accepted_participant_id,
+                           connector.bound_client_type,
+                           connector.tui_access_mode,
+                           invitation.product
+                    FROM agent_connectors AS connector
+                    JOIN agent_invitations AS invitation
+                      ON invitation.invitation_id = connector.invitation_id
+                    WHERE connector.tui_endpoint_id = ?
+                      AND connector.revoked_at IS NULL
+                      AND invitation.status != 'revoked'
+                    ORDER BY connector.updated_at DESC
+                    LIMIT 1
+                    """,
+                    (normalized_tui_endpoint,),
+                ).fetchone()
+                if endpoint_owner is not None and not secrets.compare_digest(
+                    normalized_product,
+                    str(endpoint_owner["product"]),
+                ):
+                    raise ConflictError(
+                        "native TUI endpoint is already bound to another product identity"
+                    )
+                if normalized_tui_session is not None:
+                    duplicate_session = conn.execute(
+                        "SELECT connector_id FROM agent_connectors "
+                        "WHERE tui_endpoint_id = ? AND tui_native_session_id = ? "
+                        "AND revoked_at IS NULL LIMIT 1",
+                        (normalized_tui_endpoint, normalized_tui_session),
+                    ).fetchone()
             existing_connector = None
             if normalized_enrollment is not None:
                 existing_connector = conn.execute(
@@ -5276,6 +5505,14 @@ class BridgeStore:
                     """,
                     (self._secret_hash(normalized_enrollment),),
                 ).fetchone()
+            if duplicate_session is not None and (
+                existing_connector is None
+                or str(duplicate_session["connector_id"])
+                != str(existing_connector["connector_id"])
+            ):
+                raise ConflictError(
+                    "each room binding requires a distinct native TUI session"
+                )
             if existing_connector is not None:
                 if str(existing_connector["invitation_id"]) != str(
                     invitation["invitation_id"]
@@ -5285,6 +5522,22 @@ class BridgeStore:
                     )
                 if existing_connector["revoked_at"] is not None:
                     raise ConflictError("Agent connector is revoked")
+                for field, supplied in (
+                    ("tui_endpoint_id", normalized_tui_endpoint),
+                    ("tui_native_session_id", normalized_tui_session),
+                ):
+                    bound_value = str(existing_connector[field] or "")
+                    if (
+                        supplied is not None
+                        and bound_value
+                        and not self._constant_time_eq(
+                            supplied,
+                            bound_value,
+                        )
+                    ):
+                        raise AuthenticationError(
+                            "Agent invitation retry native TUI binding does not match"
+                        )
                 bound_identity = str(
                     existing_connector["bound_client_type"]
                     or existing_connector["client_type"]
@@ -5346,7 +5599,12 @@ class BridgeStore:
                         f"Agent invitation is {invitation_status}"
                     )
                 connector_id = f"connector_{uuid.uuid4().hex}"
-                if requested_binding_version >= 2:
+                if endpoint_owner is not None:
+                    assigned_username = self._username_from_bound_identity(
+                        product=normalized_product,
+                        client_type=str(endpoint_owner["bound_client_type"]),
+                    )
+                elif requested_binding_version >= 2:
                     assigned_username = self._allocate_connector_username_locked(
                         conn,
                         product=normalized_product,
@@ -5402,7 +5660,10 @@ class BridgeStore:
                 setup_status = (
                     "awaiting_setup"
                     if str(invitation["requested_mode"]) == "resident"
-                    and str(invitation["adapter_kind"]) != "manual"
+                    and (
+                        str(invitation["adapter_kind"]) != "manual"
+                        or invitation["tui_adapter_kind"] is not None
+                    )
                     else "manual"
                 )
                 conn.execute(
@@ -5415,8 +5676,11 @@ class BridgeStore:
                          setup_updated_at, binding_version,
                          requested_username, bound_client_type,
                          bound_roles_json, bound_capabilities_json,
+                         tui_endpoint_id, tui_native_session_id,
+                         tui_state, tui_access_mode, tui_last_seen_at,
                          created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?)
                     """,
                     (
                         connector_id,
@@ -5433,6 +5697,19 @@ class BridgeStore:
                         str(registration["identity"]),
                         compact_json(registration["roles"]),
                         compact_json(registration["capabilities"]),
+                        normalized_tui_endpoint,
+                        normalized_tui_session,
+                        (
+                            "offline"
+                            if native_tui_invitation and native_tui_binding_expected
+                            else (
+                                "awaiting_confirmation"
+                                if invitation_tui_adapter in NATIVE_TUI_ADAPTERS
+                                else "unbound"
+                            )
+                        ),
+                        normalized_tui_access,
+                        None,
                         now,
                         now,
                     ),
@@ -5460,6 +5737,11 @@ class BridgeStore:
                 "invitation_id": str(invitation["invitation_id"]),
                 "requested_mode": str(invitation["requested_mode"]),
                 "adapter_kind": str(invitation["adapter_kind"]),
+                "tui_adapter_kind": (
+                    str(invitation["tui_adapter_kind"])
+                    if invitation["tui_adapter_kind"] is not None
+                    else None
+                ),
                 "reuse_policy": str(invitation["reuse_policy"]),
                 "invitation_reusable": (
                     str(invitation["reuse_policy"]) == "reusable"
@@ -5467,6 +5749,9 @@ class BridgeStore:
                 "enrollment_token": normalized_enrollment,
                 "setup_status": setup_status,
                 "identity_binding_version": binding_version,
+                "tui_endpoint_id": normalized_tui_endpoint,
+                "tui_native_session_id": normalized_tui_session,
+                "tui_access_mode": normalized_tui_access,
             }
         )
         return registered
@@ -5559,9 +5844,12 @@ class BridgeStore:
 
     @staticmethod
     def _connector_required_components(connector: sqlite3.Row) -> set[str]:
-        if (
-            str(connector["requested_mode"]) == "resident"
-            and str(connector["adapter_kind"]) in {"codex", "claude-code"}
+        if str(connector["requested_mode"]) == "resident" and (
+            str(connector["adapter_kind"]) in {"codex", "claude-code"}
+            or (
+                "tui_adapter_kind" in connector.keys()
+                and str(connector["tui_adapter_kind"] or "") in NATIVE_TUI_ADAPTERS
+            )
         ):
             return {"listener", "chat", "task"}
         return {"mcp"}
@@ -5749,6 +6037,11 @@ class BridgeStore:
             )
         registered["invitation_id"] = str(invitation["invitation_id"])
         registered["adapter_kind"] = str(invitation["adapter_kind"])
+        registered["tui_adapter_kind"] = (
+            str(invitation["tui_adapter_kind"])
+            if invitation["tui_adapter_kind"] is not None
+            else None
+        )
         registered["identity_binding_version"] = binding_version
         registered["ready_components"] = ready_components
         registered["missing_components"] = missing_components
@@ -5810,6 +6103,7 @@ class BridgeStore:
             row = conn.execute(
                 """
                 SELECT connector.*, invitation.product, invitation.adapter_kind,
+                       invitation.tui_adapter_kind,
                        invitation.status AS invitation_status
                 FROM agent_connectors AS connector
                 JOIN agent_invitations AS invitation
@@ -5862,6 +6156,7 @@ class BridgeStore:
             row = conn.execute(
                 """
                 SELECT connector.*, invitation.product, invitation.adapter_kind,
+                       invitation.tui_adapter_kind,
                        invitation.status AS invitation_status
                 FROM agent_connectors AS connector
                 JOIN agent_invitations AS invitation
@@ -5871,6 +6166,119 @@ class BridgeStore:
                 (connector,),
             ).fetchone()
         return self._agent_connector_payload(row, now=now)
+
+    def report_agent_tui_state(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        tui_endpoint_id: str,
+        tui_native_session_id: str,
+        state: str,
+        access_mode: str,
+        capabilities: Sequence[str] | None = None,
+        active_task_id: str | None = None,
+        detail: object = None,
+    ) -> dict[str, Any]:
+        """Heartbeat one immutable room-to-native-session binding."""
+
+        participant = opaque_id(participant_id, field="participant_id")
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        endpoint = opaque_id(tui_endpoint_id, field="tui_endpoint_id")
+        native_session = opaque_id(
+            tui_native_session_id,
+            field="tui_native_session_id",
+        )
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in TUI_STATES - {"unbound", "awaiting_confirmation"}:
+            raise ValidationError("unsupported native TUI state")
+        normalized_access = str(access_mode or "").strip().lower()
+        if normalized_access not in TUI_ACCESS_MODES:
+            raise ValidationError("unsupported TUI access mode")
+        normalized_capabilities = string_tokens(
+            capabilities,
+            field="tui_capabilities",
+        )
+        task_id = (
+            opaque_id(active_task_id, field="active_task_id")
+            if str(active_task_id or "").strip()
+            else None
+        )
+        normalized_detail = self._connector_detail(detail)
+        now = time.time()
+        with self._transaction() as conn:
+            live_session = self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            if str(live_session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            bound = conn.execute(
+                "SELECT tui_endpoint_id, tui_native_session_id "
+                "FROM agent_connectors WHERE connector_id = ? "
+                "AND accepted_participant_id = ? AND revoked_at IS NULL",
+                (connector, participant),
+            ).fetchone()
+            if bound is None:
+                raise NotFoundError("active connector invitation was not found")
+            if not self._constant_time_eq(
+                endpoint,
+                str(bound["tui_endpoint_id"] or ""),
+            ) or not self._constant_time_eq(
+                native_session,
+                str(bound["tui_native_session_id"] or ""),
+            ):
+                raise AuthenticationError("native TUI binding does not match")
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET tui_state = ?, tui_access_mode = ?,
+                    tui_capabilities_json = ?, tui_last_seen_at = ?,
+                    tui_active_task_id = ?, tui_detail_json = ?,
+                    connector_last_seen_at = ?, updated_at = ?
+                WHERE connector_id = ?
+                """,
+                (
+                    normalized_state,
+                    normalized_access,
+                    compact_json(normalized_capabilities),
+                    now,
+                    task_id,
+                    compact_json(normalized_detail),
+                    now,
+                    now,
+                    connector,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT connector.*, invitation.product, invitation.adapter_kind,
+                       invitation.tui_adapter_kind,
+                       invitation.status AS invitation_status
+                FROM agent_connectors AS connector
+                JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
+                WHERE connector.connector_id = ?
+                """,
+                (connector,),
+            ).fetchone()
+            endpoint_room_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM agent_connectors "
+                    "WHERE tui_endpoint_id = ? AND revoked_at IS NULL",
+                    (endpoint,),
+                ).fetchone()[0]
+            )
+        payload = self._agent_connector_payload(row, now=now)
+        payload["tui"]["room_binding_count"] = endpoint_room_count
+        return payload
 
     def admin_connector_health(
         self,
@@ -5888,6 +6296,7 @@ class BridgeStore:
                 """
                 SELECT connector.*, invitation.product,
                        invitation.requested_mode, invitation.adapter_kind,
+                       invitation.tui_adapter_kind,
                        invitation.status AS invitation_status,
                        participant.client_type, participant.display_name,
                        MAX(session.last_seen) AS session_last_seen_at,
@@ -5963,6 +6372,14 @@ class BridgeStore:
                     "display_name": str(row["display_name"]),
                     "product": str(row["product"]),
                     "adapter_kind": str(row["adapter_kind"]),
+                    "tui_adapter_kind": (
+                        str(row["tui_adapter_kind"])
+                        if row["tui_adapter_kind"] is not None
+                        else None
+                    ),
+                    "effective_adapter_kind": str(
+                        row["tui_adapter_kind"] or row["adapter_kind"]
+                    ),
                     "setup_status": str(row["setup_status"]),
                     "online": bool(
                         str(row["setup_status"]) == "configured"
@@ -5989,6 +6406,30 @@ class BridgeStore:
                     "binding_version": int(row["binding_version"] or 1),
                     "ready_components": ready,
                     "missing_components": sorted(set(required) - set(ready)),
+                    "native_tui": {
+                        "endpoint_id": (
+                            str(row["tui_endpoint_id"])
+                            if row["tui_endpoint_id"] is not None
+                            else None
+                        ),
+                        "native_session_id": (
+                            str(row["tui_native_session_id"])
+                            if row["tui_native_session_id"] is not None
+                            else None
+                        ),
+                        "state": str(row["tui_state"] or "unbound"),
+                        "access_mode": str(row["tui_access_mode"] or "unknown"),
+                        "last_seen_at": (
+                            float(row["tui_last_seen_at"])
+                            if row["tui_last_seen_at"] is not None
+                            else None
+                        ),
+                        "active_task_id": (
+                            str(row["tui_active_task_id"])
+                            if row["tui_active_task_id"] is not None
+                            else None
+                        ),
+                    },
                 }
             )
         return {

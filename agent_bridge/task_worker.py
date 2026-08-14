@@ -17,6 +17,13 @@ from typing import Any
 from .codex_worker import JsonRpcProcess
 from .http_client import BridgeRemoteError
 from .resident_completion import resident_http_client
+from .tui_adapter import (
+    NATIVE_TUI_ADAPTERS,
+    NativeTuiClient,
+    NativeTuiError,
+    endpoint_turn_lock,
+    load_native_tui_binding,
+)
 
 
 THREAD_ID_PATTERN = re.compile(
@@ -56,6 +63,77 @@ def _required_env(name: str) -> str:
 
 def _split_tokens(name: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, "").split(",") if item.strip()]
+
+
+def _report_native_tui_state(
+    client: Any,
+    *,
+    connector_id: str,
+    binding: Any,
+    state: str,
+    active_task_id: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    client.post(
+        "/agent/connector/tui-state",
+        {
+            "connector_id": connector_id,
+            "tui_endpoint_id": binding.endpoint_id,
+            "tui_native_session_id": binding.native_session_id,
+            "state": state,
+            "access_mode": binding.access_mode,
+            "capabilities": list(binding.capabilities),
+            "active_task_id": active_task_id,
+            "detail": detail or {},
+        },
+    )
+
+
+def _safe_report_native_tui_state(client: Any, **kwargs: Any) -> None:
+    try:
+        _report_native_tui_state(client, **kwargs)
+    except Exception:
+        # This is telemetry, not the durable task result. Keep the worker alive
+        # across rolling upgrades and transient state-report outages.
+        pass
+
+
+def _refresh_native_tui_state(
+    client: Any,
+    *,
+    connector_id: str,
+    binding: Any,
+    native_client: NativeTuiClient,
+    lock_file: Path,
+) -> None:
+    with endpoint_turn_lock(lock_file, blocking=False) as acquired:
+        if not acquired:
+            _safe_report_native_tui_state(
+                client,
+                connector_id=connector_id,
+                binding=binding,
+                state="busy",
+                detail={"reason": "native_endpoint_turn_in_progress"},
+            )
+            return
+        try:
+            detail = native_client.probe(timeout=5)
+        except NativeTuiError as exc:
+            _safe_report_native_tui_state(
+                client,
+                connector_id=connector_id,
+                binding=binding,
+                state="offline",
+                detail={"probe_error": str(exc)[:500]},
+            )
+            return
+        _safe_report_native_tui_state(
+            client,
+            connector_id=connector_id,
+            binding=binding,
+            state="online" if bool(detail.get("online")) else "offline",
+            detail=detail,
+        )
 
 
 def _task_poll_retry_delay(exc: BridgeRemoteError, attempt: int) -> float | None:
@@ -708,6 +786,33 @@ def run_worker(args: argparse.Namespace) -> None:
         roles=roles,
         capabilities=capabilities,
     )
+    native_binding = None
+    native_client = None
+    native_lock_file = None
+    if adapter in NATIVE_TUI_ADAPTERS:
+        if not connector_id:
+            raise TaskWorkerError(
+                "native TUI task worker requires a connector identity"
+            )
+        try:
+            native_binding = load_native_tui_binding(
+                Path(_required_env("AGENT_BRIDGE_TUI_BINDING_FILE"))
+            )
+        except NativeTuiError as exc:
+            raise TaskWorkerError(str(exc)) from exc
+        if native_binding.adapter_kind != adapter:
+            raise TaskWorkerError(
+                "native TUI adapter binding does not match task worker"
+            )
+        native_client = NativeTuiClient(native_binding)
+        native_lock_file = Path(_required_env("AGENT_BRIDGE_TUI_LOCK_FILE"))
+        _refresh_native_tui_state(
+            client,
+            connector_id=connector_id,
+            binding=native_binding,
+            native_client=native_client,
+            lock_file=native_lock_file,
+        )
     codex_host: CodexTaskHost | None = None
     try:
         if adapter == "codex":
@@ -752,6 +857,18 @@ def run_worker(args: argparse.Namespace) -> None:
             poll_failure_count = 0
             task = page.get("task")
             if not isinstance(task, dict):
+                if (
+                    native_client is not None
+                    and native_binding is not None
+                    and connector_id is not None
+                ):
+                    _refresh_native_tui_state(
+                        client,
+                        connector_id=connector_id,
+                        binding=native_binding,
+                        native_client=native_client,
+                        lock_file=native_lock_file,
+                    )
                 if args.once:
                     return
                 continue
@@ -815,13 +932,30 @@ def run_worker(args: argparse.Namespace) -> None:
                     "status": "running",
                     "execution_cwd": str(cwd),
                     "execution_thread_id": (
-                        codex_host.thread_id if codex_host is not None else ""
+                        codex_host.thread_id
+                        if codex_host is not None
+                        else (
+                            native_binding.native_session_id
+                            if native_binding is not None
+                            else ""
+                        )
                     ),
                 }
                 client.post("/agent/tasks/update", progress_payload)
-                lease_keeper = TaskLeaseKeeper(
-                    lambda: client.post("/agent/tasks/update", progress_payload)
-                )
+
+                def renew_task_lease() -> None:
+                    client.post("/agent/tasks/update", progress_payload)
+                    if native_binding is not None and connector_id is not None:
+                        _safe_report_native_tui_state(
+                            client,
+                            connector_id=connector_id,
+                            binding=native_binding,
+                            state="busy",
+                            active_task_id=task_id,
+                            detail={"reason": "structured_task"},
+                        )
+
+                lease_keeper = TaskLeaseKeeper(renew_task_lease)
                 lease_keeper.start()
                 if adapter == "codex":
                     if codex_host is None:
@@ -852,6 +986,59 @@ def run_worker(args: argparse.Namespace) -> None:
                         environment=environment,
                         poll_inputs=poll_task_inputs,
                     )
+                elif adapter in NATIVE_TUI_ADAPTERS:
+                    if (
+                        native_client is None
+                        or native_binding is None
+                        or native_lock_file is None
+                        or connector_id is None
+                    ):
+                        raise TaskWorkerError("native TUI task host is missing")
+                    with endpoint_turn_lock(native_lock_file) as acquired:
+                        if not acquired:
+                            raise TaskWorkerError("native TUI endpoint lock failed")
+                        _safe_report_native_tui_state(
+                            client,
+                            connector_id=connector_id,
+                            binding=native_binding,
+                            state="busy",
+                            active_task_id=task_id,
+                            detail={"reason": "structured_task"},
+                        )
+                        try:
+                            summary, applied_input_ids = native_client.run_turn(
+                                prompt,
+                                poll_inputs=poll_task_inputs,
+                            )
+                        except Exception as exc:
+                            error_text = str(exc)
+                            waiting = any(
+                                marker in error_text.casefold()
+                                for marker in (
+                                    "approval",
+                                    "permission",
+                                    "full-access",
+                                    "权限",
+                                    "审批",
+                                )
+                            )
+                            _safe_report_native_tui_state(
+                                client,
+                                connector_id=connector_id,
+                                binding=native_binding,
+                                state="waiting_approval" if waiting else "error",
+                                active_task_id=task_id,
+                                detail={"error": error_text[:500]},
+                            )
+                            raise
+                        else:
+                            _safe_report_native_tui_state(
+                                client,
+                                connector_id=connector_id,
+                                binding=native_binding,
+                                state="online",
+                            )
+                    thread_id = native_binding.native_session_id
                 else:
                     raise TaskWorkerError("unsupported task adapter")
                 if applied_input_ids:
@@ -919,7 +1106,13 @@ def run_worker(args: argparse.Namespace) -> None:
                             "result_summary": error_text[:2_000],
                             "execution_cwd": str(cwd),
                             "execution_thread_id": (
-                                codex_host.thread_id if codex_host is not None else ""
+                                codex_host.thread_id
+                                if codex_host is not None
+                                else (
+                                    native_binding.native_session_id
+                                    if native_binding is not None
+                                    else ""
+                                )
                             ),
                         },
                     )
