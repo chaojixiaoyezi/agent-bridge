@@ -249,9 +249,14 @@ class WebAuthStore:
         database: str | Path,
         *,
         captcha_generator: Callable[[], str] | None = None,
+        session_ttl_seconds: int = WEB_SESSION_TTL_SECONDS,
     ) -> None:
         self.database = Path(database).expanduser()
         self._captcha_generator = captcha_generator or self._random_captcha
+        self.session_ttl_seconds = max(
+            5 * 60,
+            min(int(session_ttl_seconds), WEB_SESSION_TTL_SECONDS),
+        )
         self._dummy_password_hash = _password_hash("Dummy-login-password1!")
         self._initialize()
 
@@ -746,6 +751,22 @@ class WebAuthStore:
                 connection.execute("SELECT COUNT(*) FROM web_users").fetchone()[0]
             )
 
+    def bootstrap_admin_ready(self) -> bool:
+        """Return true only after the active bootstrap admin changed its password."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT role, active, must_change_password FROM web_users "
+                "WHERE username = ? COLLATE NOCASE",
+                (DEFAULT_ADMIN_USERNAME,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and str(row["role"]) == "admin"
+            and bool(row["active"])
+            and not bool(row["must_change_password"])
+        )
+
     def _consume_captcha(self, captcha_id: str, answer: str) -> None:
         try:
             challenge = opaque_id(captcha_id, field="captcha_id")
@@ -775,8 +796,8 @@ class WebAuthStore:
         ):
             raise WebAuthenticationError("验证码错误或已过期")
 
-    @staticmethod
     def _create_session_locked(
+        self,
         connection: sqlite3.Connection,
         *,
         user_id: str,
@@ -802,8 +823,8 @@ class WebAuthStore:
                 user_id,
                 WebAuthStore._secret_hash(token),
                 now,
-                now + WEB_SESSION_TTL_SECONDS,
-                WEB_SESSION_TTL_SECONDS,
+                now + self.session_ttl_seconds,
+                self.session_ttl_seconds,
                 now,
             ),
         )

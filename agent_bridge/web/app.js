@@ -5,6 +5,7 @@ const state = {
   passwordPolicy: null,
   authMode: "login",
   passwordChangeRequired: false,
+  webRegistrationMode: "open",
   rooms: [],
   selectedRoom: window.localStorage.getItem("agentBridgeSelectedRoom") || null,
   filter: "",
@@ -225,6 +226,8 @@ const elements = {
   authPassword: document.querySelector("#auth-password"),
   authPasswordConfirm: document.querySelector("#auth-password-confirm"),
   registerConfirmWrap: document.querySelector("#register-confirm-wrap"),
+  registerAccessCodeWrap: document.querySelector("#register-access-code-wrap"),
+  registerAccessCode: document.querySelector("#register-access-code"),
   captchaImage: document.querySelector("#captcha-image"),
   captchaAnswer: document.querySelector("#captcha-answer"),
   refreshCaptcha: document.querySelector("#refresh-captcha"),
@@ -516,19 +519,26 @@ function closeLiveConnections() {
 }
 
 function setAuthMode(mode) {
-  state.authMode = mode === "register" ? "register" : "login";
+  state.authMode = mode === "register" && state.webRegistrationMode !== "closed"
+    ? "register"
+    : "login";
   const registering = state.authMode === "register";
+  elements.showRegister.hidden = state.webRegistrationMode === "closed";
   elements.showLogin.classList.toggle("active", !registering);
   elements.showRegister.classList.toggle("active", registering);
   elements.showLogin.setAttribute("aria-selected", String(!registering));
   elements.showRegister.setAttribute("aria-selected", String(registering));
   elements.registerConfirmWrap.hidden = !registering;
   elements.authPasswordConfirm.required = registering;
+  const registrationCodeRequired = registering
+    && state.webRegistrationMode === "access_code";
+  elements.registerAccessCodeWrap.hidden = !registrationCodeRequired;
+  elements.registerAccessCode.required = registrationCodeRequired;
   elements.authPassword.autocomplete = registering ? "new-password" : "current-password";
   elements.authTitle.textContent = registering ? "注册 Web 用户" : "登录 Agent Bridge";
   elements.submitAuth.textContent = registering ? "注册并登录" : "登录";
   elements.authHelp.textContent = registering
-    ? (state.passwordPolicy?.description || "密码需为 10–128 个字符，并至少包含四类字符中的三类。")
+    ? `${state.passwordPolicy?.description || "密码需为 10–128 个字符，并至少包含四类字符中的三类。"}${registrationCodeRequired ? " 该部署还要求管理员提供的注册码。" : ""}`
     : "默认管理员首次登录使用 admin/admin，登录后必须立即设置符合复杂度要求的新密码。";
   elements.authFeedback.textContent = "";
 }
@@ -664,6 +674,12 @@ async function bootstrapAuthentication() {
     await enterApplication();
   } catch (error) {
     if (error.status !== 401) console.error(error);
+    try {
+      const health = await fetchJson("/api/health", { suppressAuthRedirect: true });
+      state.webRegistrationMode = health.web_registration_mode || "open";
+    } catch (healthError) {
+      console.error("public auth policy unavailable", healthError);
+    }
     showAuthScreen(error.status === 401 ? "" : `无法检查登录状态：${error.message}`);
   }
 }
@@ -2947,6 +2963,15 @@ elements.authForm.addEventListener("submit", async (event) => {
   elements.authFeedback.classList.remove("error", "success");
   elements.authFeedback.textContent = registering ? "正在注册…" : "正在登录…";
   try {
+    const authenticationPayload = {
+      username: elements.authUsername.value.trim(),
+      password: elements.authPassword.value,
+      captcha_id: state.captchaId,
+      captcha_answer: elements.captchaAnswer.value.trim(),
+    };
+    if (registering && state.webRegistrationMode === "access_code") {
+      authenticationPayload.registration_code = elements.registerAccessCode.value;
+    }
     const payload = await fetchJson(`/api/auth/${registering ? "register" : "login"}`, {
       method: "POST",
       suppressAuthRedirect: true,
@@ -2954,12 +2979,7 @@ elements.authForm.addEventListener("submit", async (event) => {
         "Content-Type": "application/json",
         "X-Agent-Bridge-Intent": registering ? "register" : "login",
       },
-      body: JSON.stringify({
-        username: elements.authUsername.value.trim(),
-        password: elements.authPassword.value,
-        captcha_id: state.captchaId,
-        captcha_answer: elements.captchaAnswer.value.trim(),
-      }),
+      body: JSON.stringify(authenticationPayload),
     });
     state.currentUser = payload.user;
     state.passwordPolicy = payload.password_policy;

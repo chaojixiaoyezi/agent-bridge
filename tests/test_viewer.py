@@ -10,6 +10,13 @@ from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
 from agent_bridge import viewer as viewer_module
+from agent_bridge.security import (
+    DEFAULT_HSTS_SECONDS,
+    PUBLIC_WEB_SESSION_COOKIE,
+    PUBLIC_WEB_SESSION_TTL_SECONDS,
+    ViewerSecurityConfigurationError,
+    ViewerSecurityPolicy,
+)
 from agent_bridge.viewer import WEB_ROOT, _event_cursor, _sse_event, create_app
 from agent_bridge.viewer_store import ViewerRepository
 
@@ -24,6 +31,25 @@ def make_app(database: Path, **kwargs):
         database,
         captcha_generator=lambda: CAPTCHA_ANSWER,
         **kwargs,
+    )
+
+
+def public_security_policy(
+    *,
+    registration_mode: str = "closed",
+    registration_secret: str | None = None,
+) -> ViewerSecurityPolicy:
+    return ViewerSecurityPolicy(
+        public_mode=True,
+        allowed_hosts=("bridge.example",),
+        allowed_origins=frozenset({"https://bridge.example"}),
+        web_registration_mode=registration_mode,
+        web_registration_secret=registration_secret,
+        secure_cookies=True,
+        web_session_cookie_name=PUBLIC_WEB_SESSION_COOKIE,
+        web_session_ttl_seconds=PUBLIC_WEB_SESSION_TTL_SECONDS,
+        forwarded_allow_ips="127.0.0.1",
+        hsts_seconds=DEFAULT_HSTS_SECONDS,
     )
 
 
@@ -272,6 +298,228 @@ def test_web_login_registration_password_policy_profile_and_roles(
     ).status_code == 403
 
 
+def test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    policy = public_security_policy()
+    agent_registration_secret = "agent-registration-secret-" + "x" * 32
+
+    with pytest.raises(
+        ViewerSecurityConfigurationError,
+        match="default admin password",
+    ):
+        create_app(
+            database,
+            registration_secret=agent_registration_secret,
+            captcha_generator=lambda: CAPTCHA_ANSWER,
+            security_policy=policy,
+        )
+
+    bootstrap = TestClient(make_app(database), base_url="http://bridge.test")
+    login_admin(bootstrap)
+    with pytest.raises(
+        ViewerSecurityConfigurationError,
+        match="Agent registration secret",
+    ):
+        create_app(
+            database,
+            registration_secret="too-short",
+            captcha_generator=lambda: CAPTCHA_ANSWER,
+            security_policy=policy,
+        )
+
+    app = create_app(
+        database,
+        registration_secret=agent_registration_secret,
+        captcha_generator=lambda: CAPTCHA_ANSWER,
+        security_policy=policy,
+    )
+    client = TestClient(app, base_url="https://bridge.example")
+    health = client.get("/api/health")
+    assert health.status_code == 200
+    assert health.json()["public_security_mode"] is True
+    assert health.json()["web_registration_mode"] == "closed"
+    assert health.headers["strict-transport-security"] == (
+        f"max-age={DEFAULT_HSTS_SECONDS}"
+    )
+    assert health.headers["permissions-policy"] == (
+        "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+    )
+    assert health.headers["cross-origin-opener-policy"] == "same-origin"
+    assert health.headers["cross-origin-resource-policy"] == "same-origin"
+    assert health.headers["x-request-id"].startswith("req_")
+
+    login = client.post(
+        "/api/auth/login",
+        headers=intent_headers(client, "login"),
+        json={
+            "username": "admin",
+            "password": ADMIN_PASSWORD,
+            "captcha_id": captcha(client),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert login.status_code == 200
+    cookie = login.headers["set-cookie"]
+    assert cookie.startswith(f"{PUBLIC_WEB_SESSION_COOKIE}=")
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "SameSite=strict" in cookie
+    assert f"Max-Age={PUBLIC_WEB_SESSION_TTL_SECONDS}" in cookie
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT ttl_seconds FROM web_sessions ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0] == PUBLIC_WEB_SESSION_TTL_SECONDS
+
+    assert client.post(
+        "/api/auth/logout",
+        headers={
+            "Origin": "https://evil.example",
+            "Sec-Fetch-Site": "cross-site",
+            "X-Agent-Bridge-Intent": "logout",
+        },
+    ).status_code == 403
+    assert client.post(
+        "/api/auth/logout",
+        headers={
+            "Origin": "https://bridge.example:invalid",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Agent-Bridge-Intent": "logout",
+        },
+    ).status_code == 403
+    assert client.get(
+        "/api/health",
+        headers={"Host": "evil.example"},
+    ).status_code == 400
+    insecure_client = TestClient(app, base_url="http://bridge.example")
+    assert insecure_client.get("/api/health").status_code == 400
+    oversized = client.post(
+        "/agent/register",
+        headers={
+            "Content-Type": "application/json",
+            "X-Agent-Bridge-Registration": agent_registration_secret,
+        },
+        content=b"{" + b"x" * 70_001 + b"}",
+    )
+    assert oversized.status_code == 413
+    assert client.post(
+        "/api/auth/register",
+        headers=intent_headers(client, "register"),
+        json={},
+    ).status_code == 403
+    assert client.post(
+        "/agent/register",
+        json={
+            "product": "codex",
+            "username": "public-probe",
+            "conversation_id": "missing-room",
+        },
+    ).status_code == 401
+
+
+def test_public_security_environment_requires_exact_trust_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    names = (
+        "AGENT_BRIDGE_PUBLIC_MODE",
+        "AGENT_BRIDGE_ALLOWED_HOSTS",
+        "AGENT_BRIDGE_ALLOWED_ORIGINS",
+        "AGENT_BRIDGE_FORWARDED_ALLOW_IPS",
+        "AGENT_BRIDGE_TLS_CERT_FILE",
+        "AGENT_BRIDGE_TLS_KEY_FILE",
+        "AGENT_BRIDGE_WEB_REGISTRATION_MODE",
+        "AGENT_BRIDGE_WEB_REGISTRATION_SECRET",
+        "AGENT_BRIDGE_WEB_REGISTRATION_SECRET_FILE",
+        "AGENT_BRIDGE_WEB_SESSION_TTL_SECONDS",
+    )
+    for name in names:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AGENT_BRIDGE_PUBLIC_MODE", "1")
+    with pytest.raises(
+        ViewerSecurityConfigurationError,
+        match="ALLOWED_HOSTS",
+    ):
+        ViewerSecurityPolicy.from_env()
+
+    monkeypatch.setenv("AGENT_BRIDGE_ALLOWED_HOSTS", "bridge.example")
+    monkeypatch.setenv(
+        "AGENT_BRIDGE_ALLOWED_ORIGINS",
+        "https://bridge.example",
+    )
+    monkeypatch.setenv("AGENT_BRIDGE_FORWARDED_ALLOW_IPS", "127.0.0.1/32")
+    policy = ViewerSecurityPolicy.from_env()
+    assert policy.public_mode is True
+    assert policy.web_registration_mode == "closed"
+    assert policy.secure_cookies is True
+    assert policy.web_session_ttl_seconds == PUBLIC_WEB_SESSION_TTL_SECONDS
+
+    monkeypatch.setenv("AGENT_BRIDGE_FORWARDED_ALLOW_IPS", "*")
+    with pytest.raises(
+        ViewerSecurityConfigurationError,
+        match="cannot trust every source",
+    ):
+        ViewerSecurityPolicy.from_env()
+
+    monkeypatch.setenv("AGENT_BRIDGE_FORWARDED_ALLOW_IPS", "127.0.0.1/32")
+    monkeypatch.setenv("AGENT_BRIDGE_ALLOWED_HOSTS", "*.example")
+    with pytest.raises(
+        ViewerSecurityConfigurationError,
+        match="invalid or unsafe allowed host",
+    ):
+        ViewerSecurityPolicy.from_env()
+
+
+def test_public_access_code_registration_and_auth_rate_limits(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    bootstrap = TestClient(make_app(database), base_url="http://bridge.test")
+    login_admin(bootstrap)
+    database.chmod(0o600)
+    access_code = "web-registration-code-" + "y" * 24
+    app = create_app(
+        database,
+        registration_secret="agent-registration-secret-" + "z" * 32,
+        captcha_generator=lambda: CAPTCHA_ANSWER,
+        security_policy=public_security_policy(
+            registration_mode="access_code",
+            registration_secret=access_code,
+        ),
+    )
+    client = TestClient(app, base_url="https://bridge.example")
+    captcha_id = captcha(client)
+    registration = {
+        "username": "secure-member",
+        "password": USER_PASSWORD,
+        "captcha_id": captcha_id,
+        "captcha_answer": CAPTCHA_ANSWER,
+    }
+    denied = client.post(
+        "/api/auth/register",
+        headers=intent_headers(client, "register"),
+        json={**registration, "registration_code": "wrong-code"},
+    )
+    assert denied.status_code == 403
+    created = client.post(
+        "/api/auth/register",
+        headers=intent_headers(client, "register"),
+        json={**registration, "registration_code": access_code},
+    )
+    assert created.status_code == 201
+    assert access_code not in created.text
+    assert created.json()["user"]["username"] == "secure-member"
+
+    limiter_database = tmp_path / "limiter.db"
+    limiter_client = TestClient(make_app(limiter_database))
+    for _index in range(20):
+        assert limiter_client.get("/api/auth/captcha").status_code == 200
+    limited = limiter_client.get("/api/auth/captcha")
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert limited.json()["retry_after_seconds"] > 0
+
+
 def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None:
     database = tmp_path / "bridge.db"
     seed(database)
@@ -509,14 +757,16 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-3" in index_html
-    assert "app.css?v=20260814-3" in index_html
+    assert "app.js?v=20260814-4" in index_html
+    assert "app.css?v=20260814-4" in index_html
     assert "requestAnimationFrame" in javascript
     assert "const INITIAL_ROOM_MESSAGE_LIMIT = 60" in javascript
     assert "const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100" in javascript
     assert "new AbortController()" in javascript
     assert "/search?${parameters.toString()}" in javascript
     assert 'id="room-message-search-form"' in index_html
+    assert 'id="register-access-code"' in index_html
+    assert "webRegistrationMode" in javascript
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript
     assert "/receipts?limit=" in javascript

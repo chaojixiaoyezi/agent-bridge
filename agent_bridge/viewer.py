@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import secrets
 import shlex
@@ -17,6 +18,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .a2a_gateway import (
     A2A_PROTOCOL_VERSION,
@@ -44,6 +46,14 @@ from .resident_health import (
     room_resident_detail,
     split_supported_identity,
 )
+from .security import (
+    MAX_REQUEST_BODY_BYTES,
+    PublicTransportMiddleware,
+    RequestRateLimitExceeded,
+    SlidingWindowRateLimiter,
+    ViewerSecurityPolicy,
+    request_client_key,
+)
 from .store import (
     AvatarRateLimitError,
     AuthenticationError,
@@ -62,8 +72,6 @@ from .validation import (
 )
 from .viewer_store import ViewerRepository
 from .web_auth import (
-    WEB_SESSION_COOKIE,
-    WEB_SESSION_TTL_SECONDS,
     WebAuthenticationError,
     WebAuthorizationError,
     WebAuthStore,
@@ -78,10 +86,14 @@ ALLOWED_BIND_HOSTS = {"127.0.0.1", "0.0.0.0"}
 
 
 class SecurityHeadersMiddleware:
-    def __init__(self, app):
+    def __init__(self, app, *, public_mode: bool = False, hsts_seconds: int = 0):
         self.app = app
+        self.public_mode = bool(public_mode)
+        self.hsts_seconds = max(0, int(hsts_seconds))
 
     async def __call__(self, scope, receive, send):
+        request_id = f"req_{secrets.token_hex(12)}"
+
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
@@ -99,6 +111,17 @@ class SecurityHeadersMiddleware:
                 headers["Referrer-Policy"] = "no-referrer"
                 headers["X-Content-Type-Options"] = "nosniff"
                 headers["X-Frame-Options"] = "DENY"
+                headers["Permissions-Policy"] = (
+                    "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+                )
+                headers["Cross-Origin-Opener-Policy"] = "same-origin"
+                headers["Cross-Origin-Resource-Policy"] = "same-origin"
+                headers["X-Permitted-Cross-Domain-Policies"] = "none"
+                headers["X-Request-ID"] = request_id
+                if self.public_mode and self.hsts_seconds > 0:
+                    headers["Strict-Transport-Security"] = (
+                        f"max-age={self.hsts_seconds}"
+                    )
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -110,12 +133,28 @@ def create_app(
     registration_secret: str | None = None,
     captcha_generator: Callable[[], str] | None = None,
     enable_resident_repair: bool = False,
+    security_policy: ViewerSecurityPolicy | None = None,
 ) -> Starlette:
+    policy = security_policy or ViewerSecurityPolicy()
+    required_registration_secret = (
+        str(registration_secret or "").strip() or None
+    )
     # Read projections stay query_only. Web and Agent writes both go through the
     # same BridgeStore authority used by MCP and CLI.
     store = BridgeStore(database)
     repository = ViewerRepository(database)
-    web_auth = WebAuthStore(database, captcha_generator=captcha_generator)
+    web_auth = WebAuthStore(
+        database,
+        captcha_generator=captcha_generator,
+        session_ttl_seconds=policy.web_session_ttl_seconds,
+    )
+    policy.validate_runtime(
+        agent_registration_secret=required_registration_secret,
+        bootstrap_admin_ready=web_auth.bootstrap_admin_ready(),
+        database=database,
+    )
+    request_limiter = SlidingWindowRateLimiter()
+    web_session_cookie = policy.web_session_cookie_name
 
     async def index(_: Request) -> Response:
         return FileResponse(WEB_ROOT / "index.html", media_type="text/html")
@@ -137,10 +176,6 @@ def create_app(
         if path is None:
             return Response(status_code=404)
         return FileResponse(path, media_type="image/webp")
-
-    required_registration_secret = (
-        str(registration_secret or "").strip() or None
-    )
 
     async def lifecycle_maintenance() -> None:
         while True:
@@ -237,7 +272,7 @@ def create_app(
         *,
         allow_password_change: bool = False,
     ) -> dict[str, object]:
-        identity = web_auth.authenticate(request.cookies.get(WEB_SESSION_COOKIE))
+        identity = web_auth.authenticate(request.cookies.get(web_session_cookie))
         if identity["must_change_password"] and not allow_password_change:
             raise WebAuthorizationError("请先修改初始密码后再使用聊天室")
         return identity
@@ -249,8 +284,23 @@ def create_app(
         return identity
 
     def require_web_intent(request: Request, *, intent: str) -> None:
-        if not _is_same_origin_intent(request, intent=intent):
+        if not _is_same_origin_intent(request, intent=intent, policy=policy):
             raise WebAuthorizationError("请求来源校验失败，请从当前网页重试")
+
+    def enforce_rate(
+        request: Request,
+        bucket: str,
+        *,
+        subject: object | None = None,
+        limit: int,
+        window_seconds: float,
+    ) -> None:
+        request_limiter.check(
+            bucket,
+            subject if subject is not None else request_client_key(request),
+            limit=limit,
+            window_seconds=window_seconds,
+        )
 
     def login_response(
         request: Request,
@@ -267,18 +317,24 @@ def create_app(
             status_code=status_code,
         )
         response.set_cookie(
-            WEB_SESSION_COOKIE,
+            web_session_cookie,
             session_token,
-            max_age=WEB_SESSION_TTL_SECONDS,
+            max_age=policy.web_session_ttl_seconds,
             path="/",
-            secure=request.url.scheme == "https",
+            secure=policy.secure_cookies or request.url.scheme == "https",
             httponly=True,
             samesite="strict",
         )
         return response
 
-    async def auth_captcha(_: Request) -> Response:
+    async def auth_captcha(request: Request) -> Response:
         try:
+            enforce_rate(
+                request,
+                "auth-captcha-ip",
+                limit=20,
+                window_seconds=60,
+            )
             challenge = await asyncio.to_thread(web_auth.create_captcha)
             return JSONResponse({"captcha": challenge})
         except Exception as exc:
@@ -287,11 +343,36 @@ def create_app(
     async def auth_register(request: Request) -> Response:
         try:
             require_web_intent(request, intent="register")
+            if policy.web_registration_mode == "closed":
+                raise WebAuthorizationError("公开注册已关闭，请联系管理员")
             payload = await _json_body(
                 request,
                 required={"username", "password", "captcha_id", "captcha_answer"},
-                allowed={"username", "password", "captcha_id", "captcha_answer"},
+                allowed={
+                    "username",
+                    "password",
+                    "captcha_id",
+                    "captcha_answer",
+                    "registration_code",
+                },
             )
+            enforce_rate(
+                request,
+                "auth-register-ip",
+                limit=6,
+                window_seconds=60 * 60,
+            )
+            enforce_rate(
+                request,
+                "auth-register-account",
+                subject=str(payload["username"]).strip().casefold(),
+                limit=3,
+                window_seconds=60 * 60,
+            )
+            if not policy.registration_code_matches(
+                payload.get("registration_code")
+            ):
+                raise WebAuthorizationError("注册码无效或公开注册已关闭")
             identity, session_token = await asyncio.to_thread(
                 web_auth.register,
                 username=payload["username"],
@@ -315,6 +396,19 @@ def create_app(
                 request,
                 required={"username", "password", "captcha_id", "captcha_answer"},
                 allowed={"username", "password", "captcha_id", "captcha_answer"},
+            )
+            enforce_rate(
+                request,
+                "auth-login-ip",
+                limit=30,
+                window_seconds=5 * 60,
+            )
+            enforce_rate(
+                request,
+                "auth-login-account",
+                subject=str(payload["username"]).strip().casefold(),
+                limit=12,
+                window_seconds=5 * 60,
             )
             identity, session_token = await asyncio.to_thread(
                 web_auth.login,
@@ -349,15 +443,17 @@ def create_app(
     async def auth_logout(request: Request) -> Response:
         try:
             require_web_intent(request, intent="logout")
-            web_auth.logout(request.cookies.get(WEB_SESSION_COOKIE))
+            web_auth.logout(request.cookies.get(web_session_cookie))
             response = JSONResponse({"logged_out": True})
             response.delete_cookie(
-                WEB_SESSION_COOKIE,
+                web_session_cookie,
                 path="/",
-                secure=request.url.scheme == "https",
+                secure=policy.secure_cookies or request.url.scheme == "https",
                 httponly=True,
                 samesite="strict",
             )
+            if policy.public_mode:
+                response.headers["Clear-Site-Data"] = '"cache", "cookies"'
             return response
         except Exception as exc:
             return _json_error(exc)
@@ -373,6 +469,13 @@ def create_app(
                 request,
                 required={"current_password", "new_password"},
                 allowed={"current_password", "new_password"},
+            )
+            enforce_rate(
+                request,
+                "auth-password-session",
+                subject=identity["session_id"],
+                limit=10,
+                window_seconds=10 * 60,
             )
             updated = await asyncio.to_thread(
                 web_auth.change_password,
@@ -416,9 +519,11 @@ def create_app(
             "server_time": time.time(),
             "open_registration_enabled": required_registration_secret is None,
             "registration_secret_required": required_registration_secret is not None,
+            "web_registration_mode": policy.web_registration_mode,
+            "public_security_mode": policy.public_mode,
             "web_login_required": True,
         }
-        if not request.cookies.get(WEB_SESSION_COOKIE):
+        if not request.cookies.get(web_session_cookie):
             return JSONResponse(public_health)
         try:
             identity = authenticated_web_user(request)
@@ -429,8 +534,16 @@ def create_app(
             result = repository.health()
             result.update(public_health)
             result["current_user"] = _public_web_identity(
-                web_auth.authenticate(request.cookies.get(WEB_SESSION_COOKIE))
+                web_auth.authenticate(request.cookies.get(web_session_cookie))
             )
+            result["security"] = {
+                "public_mode": policy.public_mode,
+                "https_required": policy.public_mode,
+                "trusted_host_count": len(policy.allowed_hosts),
+                "web_registration_mode": policy.web_registration_mode,
+                "request_body_limit_bytes": MAX_REQUEST_BODY_BYTES,
+                "web_session_ttl_seconds": policy.web_session_ttl_seconds,
+            }
             result["message_rate_limits"] = store.message_rate_summary(
                 web_participant_id=str(identity["participant_id"]),
                 web_role=str(identity["role"]),
@@ -452,6 +565,13 @@ def create_app(
     async def a2a_rpc(request: Request) -> Response:
         request_id: object = None
         try:
+            if policy.public_mode:
+                enforce_rate(
+                    request,
+                    "a2a-rpc-ip",
+                    limit=120,
+                    window_seconds=60,
+                )
             if request.headers.get("a2a-version", A2A_PROTOCOL_VERSION) != (
                 A2A_PROTOCOL_VERSION
             ):
@@ -890,6 +1010,16 @@ def create_app(
             return _json_error(exc)
 
     async def register_agent(request: Request) -> Response:
+        if policy.public_mode:
+            try:
+                enforce_rate(
+                    request,
+                    "agent-register-ip",
+                    limit=120,
+                    window_seconds=60,
+                )
+            except Exception as exc:
+                return _json_error(exc)
         try:
             payload = await _json_body(
                 request,
@@ -961,6 +1091,16 @@ def create_app(
         )
 
     async def accept_agent_invitation(request: Request) -> Response:
+        if policy.public_mode:
+            try:
+                enforce_rate(
+                    request,
+                    "agent-invitation-ip",
+                    limit=60,
+                    window_seconds=60,
+                )
+            except Exception as exc:
+                return _json_error(exc)
         invitation_token = request.headers.get(
             "x-agent-bridge-invitation",
             "",
@@ -1242,6 +1382,13 @@ def create_app(
 
     async def agent_events(request: Request) -> Response:
         try:
+            if policy.public_mode:
+                enforce_rate(
+                    request,
+                    "agent-events-ip",
+                    limit=120,
+                    window_seconds=60,
+                )
             auth = _authenticate_request(request, store)
             cursor = _event_cursor(request.headers.get("last-event-id"))
         except Exception as exc:
@@ -1579,6 +1726,13 @@ def create_app(
     async def search_room_messages(request: Request) -> Response:
         try:
             authenticated_web_user(request)
+            if policy.public_mode:
+                enforce_rate(
+                    request,
+                    "room-search-ip",
+                    limit=120,
+                    window_seconds=60,
+                )
             sender = request.query_params.get("sender_participant_id")
             payload = repository.search_messages(
                 request.path_params["conversation_id"],
@@ -2663,7 +2817,14 @@ def create_app(
 
     async def owner_events(request: Request) -> Response:
         try:
-            session_token = request.cookies.get(WEB_SESSION_COOKIE)
+            if policy.public_mode:
+                enforce_rate(
+                    request,
+                    "web-events-ip",
+                    limit=60,
+                    window_seconds=60,
+                )
+            session_token = request.cookies.get(web_session_cookie)
             authenticated_web_user(request)
             cursor = _event_cursor(request.headers.get("last-event-id"))
         except Exception as exc:
@@ -2719,6 +2880,7 @@ def create_app(
     app = Starlette(
         debug=False,
         lifespan=lifespan,
+        max_body_size=MAX_REQUEST_BODY_BYTES,
         routes=[
             Route("/", index, methods=["GET"]),
             Route("/assets/app.css", stylesheet, methods=["GET"]),
@@ -2969,7 +3131,18 @@ def create_app(
             ),
         ],
     )
-    app.add_middleware(SecurityHeadersMiddleware)
+    if policy.public_mode:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=list(policy.allowed_hosts),
+            www_redirect=False,
+        )
+        app.add_middleware(PublicTransportMiddleware, enabled=True)
+    app.add_middleware(
+        SecurityHeadersMiddleware,
+        public_mode=policy.public_mode,
+        hsts_seconds=policy.hsts_seconds,
+    )
     return app
 
 
@@ -3007,13 +3180,21 @@ def _json_call(
         return JSONResponse({"error": str(exc)}, status_code=401)
     except (AuthorizationError, WebAuthorizationError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=403)
-    except (RateLimitError, NicknameRateLimitError, AvatarRateLimitError) as exc:
+    except (
+        RateLimitError,
+        NicknameRateLimitError,
+        AvatarRateLimitError,
+        RequestRateLimitExceeded,
+    ) as exc:
         return JSONResponse(
             {
                 "error": str(exc),
                 "retry_after_seconds": exc.retry_after_seconds,
             },
             status_code=429,
+            headers={
+                "Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))
+            },
         )
     except (ConflictError, WebConflictError) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
@@ -3124,7 +3305,12 @@ def _json_error(exc: Exception) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=403)
     if isinstance(
         exc,
-        (RateLimitError, NicknameRateLimitError, AvatarRateLimitError),
+        (
+            RateLimitError,
+            NicknameRateLimitError,
+            AvatarRateLimitError,
+            RequestRateLimitExceeded,
+        ),
     ):
         return JSONResponse(
             {
@@ -3132,6 +3318,9 @@ def _json_error(exc: Exception) -> JSONResponse:
                 "retry_after_seconds": exc.retry_after_seconds,
             },
             status_code=429,
+            headers={
+                "Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))
+            },
         )
     if isinstance(exc, (ConflictError, WebConflictError)):
         return JSONResponse({"error": str(exc)}, status_code=409)
@@ -3147,12 +3336,20 @@ def _json_error(exc: Exception) -> JSONResponse:
     return JSONResponse({"error": "internal bridge error"}, status_code=500)
 
 
-def _is_same_origin_intent(request: Request, *, intent: str) -> bool:
+def _is_same_origin_intent(
+    request: Request,
+    *,
+    intent: str,
+    policy: ViewerSecurityPolicy | None = None,
+) -> bool:
     host = request.headers.get("host", "")
     if not host:
         return False
     expected_origin = f"{request.url.scheme}://{host}"
-    if request.headers.get("origin") != expected_origin:
+    origin = request.headers.get("origin")
+    if origin != expected_origin:
+        return False
+    if policy is not None and not policy.origin_allowed(origin):
         return False
     fetch_site = request.headers.get("sec-fetch-site")
     if fetch_site and fetch_site != "same-origin":
@@ -3174,6 +3371,7 @@ def _int_query(
 
 def main() -> None:
     config = BridgeConfig.from_env()
+    security_policy = ViewerSecurityPolicy.from_env()
     host = os.environ.get("AGENT_BRIDGE_VIEWER_HOST", "0.0.0.0").strip()
     if host not in ALLOWED_BIND_HOSTS:
         raise RuntimeError("AGENT_BRIDGE_VIEWER_HOST must be 0.0.0.0 or 127.0.0.1")
@@ -3188,12 +3386,25 @@ def main() -> None:
             config.database,
             registration_secret=config.registration_secret,
             enable_resident_repair=True,
+            security_policy=security_policy,
         ),
         host=host,
         port=port,
         access_log=False,
         log_level="info",
         server_header=False,
+        proxy_headers=security_policy.proxy_headers_enabled,
+        forwarded_allow_ips=security_policy.forwarded_allow_ips or "127.0.0.1",
+        ssl_certfile=(
+            str(security_policy.tls_cert_file)
+            if security_policy.tls_cert_file is not None
+            else None
+        ),
+        ssl_keyfile=(
+            str(security_policy.tls_key_file)
+            if security_policy.tls_key_file is not None
+            else None
+        ),
     )
 
 

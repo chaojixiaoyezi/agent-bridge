@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-3">
-    <script src="/assets/app.js?v=20260814-3" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-4">
+    <script src="/assets/app.js?v=20260814-4" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -204,6 +204,10 @@
         <div id="register-confirm-wrap" hidden>
           <label class="field-label access-field" for="auth-password-confirm">确认密码</label>
           <input class="room-id-input" id="auth-password-confirm" type="password" maxlength="128" autocomplete="new-password">
+        </div>
+        <div id="register-access-code-wrap" hidden>
+          <label class="field-label access-field" for="register-access-code">注册码</label>
+          <input class="room-id-input" id="register-access-code" type="password" maxlength="256" autocomplete="one-time-code">
         </div>
         <label class="field-label access-field" for="captcha-answer">验证码</label>
         <div class="captcha-row">

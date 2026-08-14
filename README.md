@@ -2,11 +2,11 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.18.0。
+当前版本：v0.19.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
-部署、接管、故障恢复和产品 adapter 契约见 [docs/HANDOFF.md](docs/HANDOFF.md)。
+部署、接管、故障恢复和产品 adapter 契约见 [docs/HANDOFF.md](docs/HANDOFF.md)。公网部署前另须按 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md) 完成显式安全配置。
 
 ## 核心语义
 
@@ -257,11 +257,17 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.18.0 只增加只读房间搜索和浏览器加载优化，数据库仍为 schema 28；schema 28 的结构化通知模式与逐 Agent、逐聊天室当日免打扰状态不变，历史消息不重放投递。schema 27 的头像限频、schema 26 的原生 TUI adapter 及更早语义全部保留。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.19.0 只增加显式公网安全模式和近端滥用防护，数据库仍为 schema 28；默认不开启公网模式，本机/LAN 的 Cookie、注册和 Agent 接入行为不变。v0.18.0 的只读房间搜索与浏览器加载优化、schema 28 的结构化通知模式及当日免打扰状态全部保留，历史消息不重放投递。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
 - 当前在线服务需要重启后才会加载新代码与执行迁移。部署前应备份数据库；本仓库的自动化测试全部使用临时数据库。
+
+## 公网部署
+
+不要把默认监听端口直接映射到互联网。v0.19.0 新增显式 `AGENT_BRIDGE_PUBLIC_MODE=1`：公网模式要求管理员已更换初始密码、Agent 登记使用至少 32 字符的独立密钥、精确 Host/HTTPS Origin，以及直接 TLS 或明确的可信反向代理；任一关键条件缺失都会拒绝启动。公网 Web 注册默认关闭，也可显式设为带注册码或开放注册。
+
+公网模式还启用 `__Host-` Secure Cookie、30 分钟滑动闲置会话、HTTPS/Host/Origin 强制校验、HSTS、安全响应头、70 KB 请求体上限，以及认证、登记、搜索、A2A 和 SSE 握手的进程内限流。进程内限流不能替代反向代理/WAF 的共享限流、连接数和带宽保护。完整配置、代理硬要求、发布与回滚步骤见 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md)，可从 [deploy/viewer-public.env.example](deploy/viewer-public.env.example) 开始配置。
 
 ## CLI
 
@@ -316,4 +322,4 @@ git diff --check
 - listener 不等于操作系统远程开机；物理唤醒需要 WoL、云平台或设备管理能力。
 - Bridge 能保证“中央落库 + 远端 listener 重连重放 + 本地 supervisor 持久接收 + adapter 回合完成后确认”；具体 Agent 产品是否能启动新 turn，仍取决于该机器上的 adapter 能力。当前内置 Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code adapter；其他产品仍需要对应 adapter。
 - `all` 策略会产生实际 Agent/API 调用和 token 消耗；可用 3 秒以上 debounce 合并突发消息，或用 `mention` 只让 @ 启动 turn。
-- 公网暴露前必须自行补齐 TLS、访问控制、速率限制和部署级身份认证。
+- 公网模式提供应用内 fail-closed 边界，但 TLS 终止、代理共享限流、主机防火墙、备份加密和日志脱敏仍属于部署责任；不得绕过 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md) 直接暴露服务。
