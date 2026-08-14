@@ -73,12 +73,16 @@ const state = {
     counts: { total: 0 },
     has_more: false,
   },
+  connectorHealth: null,
+  connectorHealthLoadedAt: 0,
+  connectorHealthRenderSignature: "",
 };
 
 const ROOM_SNAPSHOT_LIMIT = 4;
 const ROOM_SNAPSHOT_FRESH_MS = 15_000;
 const INITIAL_ROOM_MESSAGE_LIMIT = 60;
 const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100;
+const CONNECTOR_HEALTH_CACHE_MS = 15_000;
 
 const elements = {
   appShell: document.querySelector("#app-shell"),
@@ -245,6 +249,11 @@ const elements = {
   agentInvitationSection: document.querySelector("#agent-invitation-section"),
   agentInvitationList: document.querySelector("#agent-invitation-list"),
   agentInvitationCount: document.querySelector("#agent-invitation-count"),
+  connectorHealthSection: document.querySelector("#connector-health-section"),
+  connectorHealthSummary: document.querySelector("#connector-health-summary"),
+  connectorHealthFeedback: document.querySelector("#connector-health-feedback"),
+  connectorHealthList: document.querySelector("#connector-health-list"),
+  refreshConnectorHealth: document.querySelector("#refresh-connector-health"),
   agentSessionSection: document.querySelector("#agent-session-section"),
   sessionList: document.querySelector("#session-list"),
   activeSessionCount: document.querySelector("#active-session-count"),
@@ -623,6 +632,9 @@ function showAuthScreen(message = "") {
     counts: { total: 0 },
     has_more: false,
   };
+  state.connectorHealth = null;
+  state.connectorHealthLoadedAt = 0;
+  state.connectorHealthRenderSignature = "";
   renderPendingCenter();
   elements.appShell.hidden = true;
   for (const dialog of [
@@ -664,6 +676,7 @@ function applyUserPermissions() {
   elements.openRegistrationCodes.hidden = !admin;
   elements.openAgentAccess.hidden = !admin;
   elements.agentInvitationSection.hidden = !admin;
+  elements.connectorHealthSection.hidden = !admin;
   elements.agentSessionSection.hidden = !admin;
   elements.nicknameSection.hidden = !admin;
   elements.renameRoom.hidden = !(activeRoom?.can_rename_room);
@@ -1612,6 +1625,143 @@ function renderAgentInvitations() {
     }
     elements.agentInvitationList.append(card);
   }
+}
+
+function connectorHealthStateLabel(value) {
+  return {
+    healthy: "正常",
+    degraded: "需关注",
+    offline: "listener 离线",
+    failed: "异常",
+    setup: "接入中",
+    manual: "手动接入",
+  }[value] || value || "未知";
+}
+
+function renderConnectorHealth() {
+  const visible = isAdmin();
+  elements.connectorHealthSection.hidden = !visible;
+  if (!visible) return;
+  const health = state.connectorHealth;
+  const signature = JSON.stringify(health || {});
+  if (signature === state.connectorHealthRenderSignature) return;
+  state.connectorHealthRenderSignature = signature;
+  elements.connectorHealthSummary.replaceChildren();
+  elements.connectorHealthList.replaceChildren();
+  if (!health) {
+    elements.connectorHealthFeedback.textContent = "等待首次诊断…";
+    return;
+  }
+  const summaryItems = [
+    [`${health.online_count || 0}/${health.count || 0}`, "listener 在线", "healthy"],
+    [health.attention_count || 0, "需要关注", (health.attention_count || 0) ? "warning" : "healthy"],
+    [health.backlog?.required_pending_count || 0, "必须回复待处理", (health.backlog?.required_pending_count || 0) ? "warning" : "healthy"],
+    [health.tasks?.active_count || 0, "进行中任务", (health.tasks?.expired_lease_count || 0) ? "failed" : "task"],
+  ];
+  for (const [value, label, tone] of summaryItems) {
+    const card = makeElement("span", `connector-health-summary-card ${tone}`);
+    card.append(makeElement("strong", "", value));
+    card.append(makeElement("small", "", label));
+    elements.connectorHealthSummary.append(card);
+  }
+
+  const attentionRooms = (health.rooms || []).filter(
+    (room) => Number(room.required_pending_count || 0) > 0
+      || Number(room.needs_input_count || 0) > 0
+      || Number(room.expired_lease_count || 0) > 0,
+  );
+  if (attentionRooms.length) {
+    elements.connectorHealthList.append(makeElement("p", "connector-health-subtitle", "聊天室待处理"));
+    for (const room of attentionRooms.slice(0, 8)) {
+      const card = makeElement("article", "connector-health-room-card");
+      card.append(makeElement("strong", "", room.conversation_id));
+      const details = [];
+      if (room.required_pending_count) details.push(`必须回复 ${room.required_pending_count}`);
+      if (room.active_task_count) details.push(`进行中任务 ${room.active_task_count}`);
+      if (room.needs_input_count) details.push(`等待输入 ${room.needs_input_count}`);
+      if (room.expired_lease_count) details.push(`过期租约 ${room.expired_lease_count}`);
+      card.append(makeElement("span", "", details.join(" · ")));
+      elements.connectorHealthList.append(card);
+    }
+  }
+
+  elements.connectorHealthList.append(makeElement("p", "connector-health-subtitle", "连接器明细"));
+  const priorities = { failed: 0, offline: 1, degraded: 2, setup: 3, manual: 4, healthy: 5 };
+  const connectors = [...(health.connectors || [])].sort((left, right) => (
+    (priorities[left.health_state] ?? 9) - (priorities[right.health_state] ?? 9)
+    || Number(right.oldest_required_age_seconds || 0) - Number(left.oldest_required_age_seconds || 0)
+    || String(left.display_name || left.client_type).localeCompare(
+      String(right.display_name || right.client_type),
+      "zh-CN",
+    )
+  ));
+  if (!connectors.length) {
+    elements.connectorHealthList.append(makeElement("p", "muted-copy", "还没有可诊断的连接器。"));
+  }
+  for (const connector of connectors) {
+    const card = makeElement("article", `connector-health-card ${connector.health_state || "unknown"}`);
+    const heading = makeElement("div", "connector-health-card-heading");
+    heading.append(makeElement("strong", "", connector.display_name || connector.client_type));
+    heading.append(makeElement(
+      "span",
+      `connector-health-state ${connector.health_state || "unknown"}`,
+      connectorHealthStateLabel(connector.health_state),
+    ));
+    card.append(heading);
+    card.append(makeElement(
+      "span",
+      "connector-health-route",
+      `${connector.conversation_id} · ${connector.effective_adapter_kind} · ${connector.active_session_count || 0} 个有效会话`,
+    ));
+    const listenerAge = connector.connector_last_seen_age_seconds == null
+      ? "listener 从未探活"
+      : `listener ${formatAge(connector.connector_last_seen_age_seconds)}`;
+    card.append(makeElement(
+      "small",
+      "connector-health-facts",
+      `${listenerAge} · 必须回复 ${connector.required_pending_count || 0} · 普通积压 ${connector.optional_pending_count || 0} · 活跃任务 ${connector.active_task_count || 0}`,
+    ));
+    if (connector.diagnostic_detail) {
+      card.append(makeElement(
+        "small",
+        "connector-health-detail",
+        `最近错误：${connector.diagnostic_detail}`,
+      ));
+    }
+    if ((connector.issues || []).length) {
+      const issues = makeElement("div", "connector-health-issues");
+      for (const issue of connector.issues) {
+        issues.append(makeElement(
+          "span",
+          `connector-health-issue ${issue.severity || "info"}`,
+          issue.label,
+        ));
+      }
+      card.append(issues);
+    }
+    elements.connectorHealthList.append(card);
+  }
+  elements.connectorHealthFeedback.classList.remove("error", "success");
+  elements.connectorHealthFeedback.textContent = health.attention_count
+    ? `诊断完成：${health.attention_count} 个自动值守连接需要关注。`
+    : "诊断完成：中央 Bridge 未发现自动值守异常。";
+}
+
+async function loadConnectorHealth({ force = false } = {}) {
+  if (!isAdmin()) return null;
+  if (
+    !force
+    && state.connectorHealth
+    && Date.now() - state.connectorHealthLoadedAt < CONNECTOR_HEALTH_CACHE_MS
+  ) {
+    return state.connectorHealth;
+  }
+  const payload = await fetchJson("/api/admin/connectors/health");
+  state.connectorHealth = payload;
+  state.connectorHealthLoadedAt = Date.now();
+  state.connectorHealthRenderSignature = "";
+  renderConnectorHealth();
+  return payload;
 }
 
 async function fetchAgentInvitations(roomId = null) {
@@ -2583,6 +2733,9 @@ function mergeRefreshOptions(current, incoming) {
       || incomingMode === "task"
     ),
     refreshReceipts: Boolean(current.refreshReceipts || incoming.refreshReceipts),
+    forceDiagnostics: Boolean(
+      current.forceDiagnostics || incoming.forceDiagnostics,
+    ),
   };
 }
 
@@ -2603,6 +2756,13 @@ async function refresh(options = {}) {
     const invitationRequest = isAdmin() && refreshPresence
       ? fetchAgentInvitations()
       : Promise.resolve(null);
+    const connectorHealthRequest = isAdmin() && refreshPresence && (
+      options.forceDiagnostics === true
+      || !state.connectorHealth
+      || Date.now() - state.connectorHealthLoadedAt >= CONNECTOR_HEALTH_CACHE_MS
+    )
+      ? fetchJson("/api/admin/connectors/health")
+      : Promise.resolve(null);
     const healthRequest = mode === "full" ? fetchJson("/api/health") : Promise.resolve(null);
     const nicknameRequest = mode === "full" ? fetchNicknameRequests() : Promise.resolve(null);
     const pendingCenterRequest = fetchJson("/api/pending-responses?limit=100");
@@ -2612,6 +2772,7 @@ async function refresh(options = {}) {
       sessionPayload,
       nicknamePayload,
       invitationPayload,
+      connectorHealthPayload,
       pendingCenterPayload,
     ] = await Promise.all([
       healthRequest,
@@ -2619,6 +2780,7 @@ async function refresh(options = {}) {
       sessionRequest,
       nicknameRequest,
       invitationRequest,
+      connectorHealthRequest,
       pendingCenterRequest,
     ]);
     if (healthPayload) {
@@ -2632,6 +2794,11 @@ async function refresh(options = {}) {
     }
     if (nicknamePayload) state.nicknameRequests = nicknamePayload.requests;
     if (invitationPayload) state.agentInvitations = invitationPayload.invitations;
+    if (connectorHealthPayload) {
+      state.connectorHealth = connectorHealthPayload;
+      state.connectorHealthLoadedAt = Date.now();
+      state.connectorHealthRenderSignature = "";
+    }
     state.pendingCenter = pendingCenterPayload;
     if (!state.selectedRoom || !state.rooms.some((room) => room.conversation_id === state.selectedRoom)) {
       state.selectedRoom = state.rooms[0]?.conversation_id || null;
@@ -2641,6 +2808,7 @@ async function refresh(options = {}) {
     populateAccessRooms();
     renderSessions();
     renderAgentInvitations();
+    renderConnectorHealth();
     renderNicknameRequests();
     renderPendingCenter();
     applyUserPermissions();
@@ -4292,8 +4460,17 @@ async function openAgentAccessDialog(roomId = null) {
   }
   renderSessions();
   renderAgentInvitations();
+  renderConnectorHealth();
   renderNicknameRequests();
   elements.agentAccessDialog.showModal();
+  if (isAdmin()) {
+    elements.connectorHealthFeedback.classList.remove("error", "success");
+    elements.connectorHealthFeedback.textContent = "正在核对中央运行状态…";
+    loadConnectorHealth().catch((error) => {
+      elements.connectorHealthFeedback.classList.add("error");
+      elements.connectorHealthFeedback.textContent = `诊断失败：${error.message}`;
+    });
+  }
   if (!isAdmin()) {
     try {
       const payload = await fetchAgentInvitations(elements.accessRoom.value);
@@ -4317,6 +4494,20 @@ function closeAgentAccessDialog() {
 
 elements.closeAgentAccess.addEventListener("click", closeAgentAccessDialog);
 elements.clearInactiveSessions.addEventListener("click", clearInactiveSessions);
+elements.refreshConnectorHealth.addEventListener("click", async () => {
+  elements.refreshConnectorHealth.disabled = true;
+  elements.connectorHealthFeedback.classList.remove("error", "success");
+  elements.connectorHealthFeedback.textContent = "正在重新核对中央运行状态…";
+  try {
+    await loadConnectorHealth({ force: true });
+    elements.connectorHealthFeedback.classList.add("success");
+  } catch (error) {
+    elements.connectorHealthFeedback.classList.add("error");
+    elements.connectorHealthFeedback.textContent = `诊断失败：${error.message}`;
+  } finally {
+    elements.refreshConnectorHealth.disabled = false;
+  }
+});
 elements.agentAccessDialog.addEventListener("click", (event) => {
   if (event.target === elements.agentAccessDialog) closeAgentAccessDialog();
 });

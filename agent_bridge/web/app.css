@@ -1270,6 +1270,81 @@ select option {
 .session-main strong { font-size: 10px; }
 .session-main span { margin-top: 3px; color: var(--muted); font-size: 9px; }
 .session-main small { margin-top: 4px; color: #687080; font-size: 8px; }
+.connector-health-section .session-heading > div { min-width: 0; }
+.connector-health-section .session-heading strong,
+.connector-health-section .session-heading span { display: block; }
+.connector-health-section .session-heading span { margin-top: 3px; }
+.connector-health-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 12px;
+}
+.connector-health-summary-card {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+.connector-health-summary-card strong,
+.connector-health-summary-card small { display: block; }
+.connector-health-summary-card strong { color: var(--text); font-size: 15px; }
+.connector-health-summary-card small { margin-top: 3px; color: var(--muted); font-size: 8px; }
+.connector-health-summary-card.warning strong { color: var(--amber); }
+.connector-health-summary-card.failed strong { color: var(--danger); }
+.connector-health-summary-card.task strong { color: var(--purple); }
+.connector-health-list { max-height: 390px; }
+.connector-health-subtitle {
+  margin: 7px 1px 0;
+  color: var(--muted-strong);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.connector-health-room-card,
+.connector-health-card {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-soft);
+}
+.connector-health-room-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.connector-health-room-card strong { color: var(--text); font-size: 10px; }
+.connector-health-room-card span { color: var(--amber); font-size: 8px; text-align: right; }
+.connector-health-card { border-left: 3px solid var(--cyan); }
+.connector-health-card.degraded { border-left-color: var(--amber); }
+.connector-health-card.offline,
+.connector-health-card.failed { border-left-color: var(--danger); }
+.connector-health-card.setup,
+.connector-health-card.manual { border-left-color: var(--muted); }
+.connector-health-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 9px; }
+.connector-health-card-heading strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.connector-health-state {
+  flex: none;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+  font-size: 8px;
+}
+.connector-health-state.degraded { color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); }
+.connector-health-state.offline,
+.connector-health-state.failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.connector-health-state.setup,
+.connector-health-state.manual { color: var(--muted-strong); background: var(--surface-soft); }
+.connector-health-route,
+.connector-health-facts,
+.connector-health-detail { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connector-health-route { margin-top: 5px; color: var(--muted-strong); font-size: 9px; }
+.connector-health-facts { margin-top: 4px; color: var(--muted); font-size: 8px; }
+.connector-health-detail { margin-top: 5px; color: var(--danger); font-size: 8px; }
+.connector-health-issues { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.connector-health-issue { padding: 3px 6px; border-radius: 999px; color: var(--muted-strong); background: var(--surface-strong); font-size: 8px; }
+.connector-health-issue.warning { color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); }
+.connector-health-issue.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
 .revoke-button { flex: none; padding: 6px 9px; border: 1px solid rgba(255,119,141,.18); border-radius: 8px; color: var(--danger); background: rgba(255,119,141,.07); font-size: 9px; cursor: pointer; }
 .revoke-button:disabled { opacity: .5; }
 .room-id-input:focus { border-color: rgba(85,214,199,.4); box-shadow: 0 0 0 3px rgba(85,214,199,.07); }
@@ -1321,6 +1396,9 @@ select option {
   .rate-override-input { width: 100% !important; }
   .lifecycle-form, .member-room-list, .wake-policy-digest { grid-template-columns: 1fr; }
   .pending-center-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .connector-health-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .connector-health-room-card { align-items: flex-start; flex-direction: column; }
+  .connector-health-room-card span { text-align: left; }
   .lifecycle-form .form-actions { margin-top: 10px; }
 }
 

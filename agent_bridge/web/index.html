@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-8">
-    <script src="/assets/app.js?v=20260814-8" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-9">
+    <script src="/assets/app.js?v=20260814-9" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -670,6 +670,19 @@
             <span id="agent-invitation-count">0 个邀请</span>
           </div>
           <div class="session-list" id="agent-invitation-list"></div>
+        </section>
+        <section class="session-section connector-health-section" id="connector-health-section" hidden>
+          <div class="session-heading">
+            <div>
+              <strong>运行健康度</strong>
+              <span>中央投递、会话、listener、TUI 与任务状态</span>
+            </div>
+            <button class="secondary-button compact-button" id="refresh-connector-health" type="button">刷新诊断</button>
+          </div>
+          <p class="field-help">这里只展示中央 Bridge 能验证的事实；远端机器自己的 supervisor 队列和模型进程错误仍需在对应机器查看。</p>
+          <div class="connector-health-summary" id="connector-health-summary"></div>
+          <p class="form-feedback" id="connector-health-feedback" role="status" aria-live="polite"></p>
+          <div class="session-list connector-health-list" id="connector-health-list"></div>
         </section>
         <section class="session-section" id="agent-session-section">
           <div class="session-heading">

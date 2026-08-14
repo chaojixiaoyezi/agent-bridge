@@ -613,6 +613,7 @@ def test_room_owner_delegates_scoped_moderator_controls(
     assert invitation.status_code == 200
     invitation_id = invitation.json()["access"]["invitation"]["invitation_id"]
     assert moderator_client.get("/api/agent-invitations").status_code == 403
+    assert moderator_client.get("/api/admin/connectors/health").status_code == 403
     scoped_invitations = moderator_client.get(
         "/api/agent-invitations",
         params={"conversation_id": "delegated-room"},
@@ -1390,8 +1391,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-8" in index_html
-    assert "app.css?v=20260814-8" in index_html
+    assert "app.js?v=20260814-9" in index_html
+    assert "app.css?v=20260814-9" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -2186,6 +2187,56 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
     assert listed["resident_status"] == "online"
     assert invitation_token not in str(listed)
     assert enrollment_token not in str(listed)
+
+    agent_status = client.post(
+        "/agent/send",
+        headers=agent_headers,
+        json={
+            "conversation_id": "邀请值守群",
+            "body": "Agent 状态消息只会形成 Web 用户未读，不应污染 Agent 运维积压。",
+        },
+    )
+    assert agent_status.status_code == 200
+
+    diagnostics = client.get("/api/admin/connectors/health")
+    assert diagnostics.status_code == 200
+    diagnostic_payload = diagnostics.json()
+    assert diagnostic_payload["count"] == 1
+    assert diagnostic_payload["online_count"] == 1
+    assert diagnostic_payload["attention_count"] == 0
+    assert diagnostic_payload["backlog"]["pending_count"] == 0
+    assert diagnostic_payload["backlog"]["required_pending_count"] == 0
+    assert diagnostic_payload["tasks"]["active_count"] == 0
+    connector_health = diagnostic_payload["connectors"][0]
+    assert connector_health["connector_id"] == connector_id
+    assert connector_health["health_state"] == "healthy"
+    assert connector_health["active_session_count"] >= 1
+    assert connector_health["online"] is True
+    assert connector_health["component_activity"]["mcp"][
+        "active_session_count"
+    ] >= 1
+    assert connector_health["issues"][0]["code"] == "legacy_binding"
+    assert invitation_token not in diagnostics.text
+    assert enrollment_token not in diagnostics.text
+
+    with BridgeStore(database)._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_connectors SET connector_last_seen_at = ? "
+            "WHERE connector_id = ?",
+            (time.time() - 76, connector_id),
+        )
+    offline_diagnostics = client.get("/api/admin/connectors/health").json()
+    assert offline_diagnostics["online_count"] == 0
+    assert offline_diagnostics["attention_count"] == 1
+    assert offline_diagnostics["connectors"][0]["health_state"] == "offline"
+    assert {
+        issue["code"] for issue in offline_diagnostics["connectors"][0]["issues"]
+    } >= {"listener_offline"}
+    BridgeStore(database).touch_agent_connector(
+        participant_id=registration["participant_id"],
+        authorized_session_id=registration["session_id"],
+        connector_id=connector_id,
+    )
 
     renamed = client.patch(
         "/api/rooms/%E9%82%80%E8%AF%B7%E5%80%BC%E5%AE%88%E7%BE%A4",
