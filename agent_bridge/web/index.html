@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-6">
-    <script src="/assets/app.js?v=20260814-6" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-7">
+    <script src="/assets/app.js?v=20260814-7" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -546,7 +546,7 @@
           <button class="dialog-close" id="close-member-management" type="button" aria-label="关闭">×</button>
         </div>
 
-        <section class="rate-section">
+        <section class="rate-section" id="agent-lifecycle-section">
           <div class="rate-section-heading">
             <div>
               <strong>不发言自动过期</strong>
@@ -576,11 +576,11 @@
           </form>
         </section>
 
-        <section class="rate-section">
+        <section class="rate-section" id="room-web-members-section">
           <div class="rate-section-heading">
             <div>
               <strong>Web 用户访问</strong>
-              <p>聊天室默认私有。管理员可让普通用户加入或移出指定聊天室；移出后不能再查看历史、搜索或发送消息，Agent 侧不受影响。</p>
+              <p>聊天室默认私有。全局管理员、创建者和受委派的聊天室管理员可加入或移出普通成员；只有全局管理员或创建者能委派新的聊天室管理员。</p>
             </div>
           </div>
           <label class="field-label" for="web-member-room">聊天室</label>
@@ -593,7 +593,7 @@
           <div class="rate-result-list web-member-results" id="web-member-results"></div>
         </section>
 
-        <section class="rate-section">
+        <section class="rate-section" id="member-migration-section">
           <div class="rate-section-heading">
             <div>
               <strong>跨聊天室迁移</strong>

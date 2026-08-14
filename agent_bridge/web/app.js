@@ -39,6 +39,7 @@ const state = {
   memberRooms: [],
   memberSelections: new Map(),
   roomWebUsers: [],
+  roomWebPermissions: null,
   roomPermissionUsers: [],
   registrationCodes: [],
   generatedRegistrationCode: "",
@@ -195,6 +196,9 @@ const elements = {
   messageRateResults: document.querySelector("#message-rate-results"),
   memberManagementDialog: document.querySelector("#member-management-dialog"),
   closeMemberManagement: document.querySelector("#close-member-management"),
+  agentLifecycleSection: document.querySelector("#agent-lifecycle-section"),
+  roomWebMembersSection: document.querySelector("#room-web-members-section"),
+  memberMigrationSection: document.querySelector("#member-migration-section"),
   agentLifecycleForm: document.querySelector("#agent-lifecycle-form"),
   agentInactivityDays: document.querySelector("#agent-inactivity-days"),
   unactivatedAgentInactivityDays: document.querySelector("#unactivated-agent-inactivity-days"),
@@ -633,9 +637,13 @@ function applyUserPermissions() {
   elements.agentInvitationSection.hidden = !admin;
   elements.agentSessionSection.hidden = !admin;
   elements.nicknameSection.hidden = !admin;
-  elements.renameRoom.hidden = !(admin && activeRoom);
-  elements.inviteAgent.hidden = !(admin && activeRoom && activeRoom.status === "active");
-  elements.manageMembers.hidden = !(admin && activeRoom && activeRoom.status === "active");
+  elements.renameRoom.hidden = !(activeRoom?.can_rename_room);
+  elements.inviteAgent.hidden = !(
+    activeRoom?.can_invite_agents && activeRoom.status === "active"
+  );
+  elements.manageMembers.hidden = !(
+    activeRoom?.can_manage_web_members && activeRoom.status === "active"
+  );
   elements.repairResidents.hidden = !(admin && activeRoom && activeRoom.status === "active");
   elements.manageWakePolicy.hidden = !(
     activeRoom?.can_manage_wake_policy && activeRoom.status === "active"
@@ -1276,7 +1284,10 @@ function createParticipantCard(person) {
     mention.title = `特别通知 ${person.display_name || person.client_type}`;
     mention.addEventListener("click", () => addComposerMention(person));
     head.append(mention);
-    if (isAdmin() && state.selectedRoom) {
+    const activeRoom = state.rooms.find(
+      (room) => room.conversation_id === state.selectedRoom,
+    );
+    if (activeRoom?.can_kick_agents && state.selectedRoom) {
       const kick = makeElement("button", "person-kick-button", "踢");
       kick.type = "button";
       kick.title = `将 ${person.display_name || person.client_type} 踢出当前聊天室`;
@@ -1434,7 +1445,7 @@ function renderParticipants(participants) {
 
 function populateAccessRooms() {
   const activeRooms = state.rooms
-    .filter((item) => item.status === "active")
+    .filter((item) => item.status === "active" && item.can_invite_agents)
     .map((item) => item.conversation_id);
   const signature = JSON.stringify(activeRooms);
   if (signature === state.accessRoomSignature) return;
@@ -1524,21 +1535,30 @@ function invitationStatusLabel(invitation) {
 }
 
 function renderAgentInvitations() {
-  elements.agentInvitationSection.hidden = !isAdmin();
-  if (!isAdmin()) return;
+  const roomId = elements.accessRoom.value || state.selectedRoom || "";
+  const room = state.rooms.find((item) => item.conversation_id === roomId);
+  const canView = isAdmin() || Boolean(room?.can_invite_agents);
+  elements.agentInvitationSection.hidden = !canView;
+  if (!canView) return;
+  const invitations = isAdmin()
+    ? state.agentInvitations
+    : state.agentInvitations.filter(
+      (invitation) => invitation.conversation_id === roomId,
+    );
   const signature = JSON.stringify([
     state.currentUser?.user_id || "",
-    state.agentInvitations.slice(0, 30),
+    roomId,
+    invitations.slice(0, 30),
   ]);
   if (signature === state.invitationRenderSignature) return;
   state.invitationRenderSignature = signature;
   elements.agentInvitationList.replaceChildren();
-  elements.agentInvitationCount.textContent = `${state.agentInvitations.length} 个邀请`;
-  if (!state.agentInvitations.length) {
+  elements.agentInvitationCount.textContent = `${invitations.length} 个邀请`;
+  if (!invitations.length) {
     elements.agentInvitationList.append(makeElement("p", "muted-copy", "还没有生成接入邀请。"));
     return;
   }
-  for (const invitation of state.agentInvitations.slice(0, 30)) {
+  for (const invitation of invitations.slice(0, 30)) {
     const card = makeElement("article", `session-card invitation-${invitation.status}`);
     const main = makeElement("div", "session-main");
     main.append(makeElement(
@@ -1565,9 +1585,11 @@ function renderAgentInvitations() {
   }
 }
 
-async function fetchAgentInvitations() {
-  if (!isAdmin()) return { invitations: [] };
-  return fetchJson("/api/agent-invitations?limit=100");
+async function fetchAgentInvitations(roomId = null) {
+  if (!isAdmin() && !roomId) return { invitations: [] };
+  const query = new URLSearchParams({ limit: "100" });
+  if (roomId) query.set("conversation_id", roomId);
+  return fetchJson(`/api/agent-invitations?${query.toString()}`);
 }
 
 async function revokeAgentInvitation(invitationId, button) {
@@ -1578,6 +1600,12 @@ async function revokeAgentInvitation(invitationId, button) {
       headers: { "X-Agent-Bridge-Intent": "revoke-agent-invitation" },
     });
     await refresh({ fullRoom: true });
+    if (!isAdmin()) {
+      const payload = await fetchAgentInvitations(elements.accessRoom.value);
+      state.agentInvitations = payload.invitations || [];
+      state.invitationRenderSignature = "";
+      renderAgentInvitations();
+    }
   } catch (error) {
     elements.accessFeedback.classList.add("error");
     elements.accessFeedback.textContent = error.message;
@@ -2983,8 +3011,30 @@ function renderMemberRooms() {
 
 async function loadMemberManagementData({ preserveTarget = true } = {}) {
   const previousTarget = preserveTarget
-    ? (elements.memberTargetRoom.value || state.selectedRoom || "")
+    ? (elements.webMemberRoom.value || elements.memberTargetRoom.value || state.selectedRoom || "")
     : (state.selectedRoom || "");
+  const manageableRooms = state.rooms.filter(
+    (room) => room.status === "active" && room.can_manage_web_members,
+  );
+  elements.agentLifecycleSection.hidden = !isAdmin();
+  elements.memberMigrationSection.hidden = !isAdmin();
+  elements.roomWebMembersSection.hidden = manageableRooms.length === 0;
+  elements.webMemberRoom.replaceChildren();
+  for (const room of manageableRooms) {
+    const option = makeElement("option", "", room.conversation_id);
+    option.value = room.conversation_id;
+    elements.webMemberRoom.append(option);
+  }
+  if ([...elements.webMemberRoom.options].some((option) => option.value === previousTarget)) {
+    elements.webMemberRoom.value = previousTarget;
+  }
+  if (!isAdmin()) {
+    state.memberRooms = [];
+    state.memberSelections = new Map();
+    elements.memberRoomList.replaceChildren();
+    await loadRoomWebUsers();
+    return;
+  }
   const [lifecycle, members] = await Promise.all([
     fetchJson("/api/agent-lifecycle"),
     fetchJson("/api/admin/room-members"),
@@ -3000,23 +3050,56 @@ async function loadMemberManagementData({ preserveTarget = true } = {}) {
     lifecycle.unactivated_inactivity_days || members.unactivated_inactivity_days || 3,
   );
   elements.memberTargetRoom.replaceChildren();
-  elements.webMemberRoom.replaceChildren();
   for (const room of state.memberRooms) {
     const option = makeElement("option", "", room.conversation_id);
     option.value = room.conversation_id;
     elements.memberTargetRoom.append(option);
-    const webOption = makeElement("option", "", room.conversation_id);
-    webOption.value = room.conversation_id;
-    elements.webMemberRoom.append(webOption);
   }
   if ([...elements.memberTargetRoom.options].some((option) => option.value === previousTarget)) {
     elements.memberTargetRoom.value = previousTarget;
   }
-  if ([...elements.webMemberRoom.options].some((option) => option.value === previousTarget)) {
-    elements.webMemberRoom.value = previousTarget;
-  }
   renderMemberRooms();
   await loadRoomWebUsers();
+}
+
+async function updateRoomWebUserAccess(user, { active, accessRole = "member" }) {
+  const room = elements.webMemberRoom.value;
+  const roleLabel = accessRole === "moderator" ? "聊天室管理员" : "普通成员";
+  if (!active && !window.confirm(`确认将 ${user.display_name} 移出聊天室“${room}”？`)) return;
+  if (
+    active
+    && accessRole === "moderator"
+    && !window.confirm(`确认将 ${user.display_name} 委派为“${room}”的聊天室管理员？`)
+  ) return;
+  for (const button of elements.webMemberResults.querySelectorAll("button, select")) {
+    button.disabled = true;
+  }
+  elements.webMemberFeedback.classList.remove("error", "success");
+  elements.webMemberFeedback.textContent = active ? `正在设置为${roleLabel}…` : "正在移出…";
+  try {
+    await fetchJson(
+      `/api/rooms/${encodeURIComponent(room)}/web-users/${encodeURIComponent(user.user_id)}`,
+      {
+        method: active ? "PUT" : "DELETE",
+        headers: {
+          ...(active ? { "Content-Type": "application/json" } : {}),
+          "X-Agent-Bridge-Intent": active
+            ? "invite-room-web-user"
+            : "remove-room-web-user",
+        },
+        ...(active ? { body: JSON.stringify({ access_role: accessRole }) } : {}),
+      },
+    );
+    await Promise.all([loadRoomWebUsers(), refresh({})]);
+    elements.webMemberFeedback.classList.add("success");
+    elements.webMemberFeedback.textContent = active
+      ? `${user.display_name} 已设置为 ${roleLabel}。`
+      : `${user.display_name} 已移出 ${room}，Agent 成员和历史消息未改变。`;
+  } catch (error) {
+    elements.webMemberFeedback.classList.add("error");
+    elements.webMemberFeedback.textContent = error.message;
+    renderRoomWebUsers();
+  }
 }
 
 function renderRoomWebUsers() {
@@ -3036,52 +3119,75 @@ function renderRoomWebUsers() {
     ));
     card.append(identity);
 
+    const roleLabel = user.is_room_owner
+      ? "创建者"
+      : user.access_role === "moderator" && user.has_room_access
+      ? "聊天室管理员"
+      : user.has_room_access
+      ? "普通成员"
+      : "未加入";
     const status = makeElement(
       "span",
       `web-member-status ${user.has_room_access ? "active" : "inactive"}`,
-      user.is_room_owner ? "创建者" : user.has_room_access ? "已加入" : "未加入",
+      roleLabel,
     );
     card.append(status);
 
-    if (!user.is_room_owner) {
-      const action = makeElement(
-        "button",
-        user.has_room_access ? "secondary-button compact-button danger-button" : "primary-button compact-button",
-        user.has_room_access ? "移出" : "加入",
-      );
-      action.type = "button";
-      action.addEventListener("click", async () => {
-        const room = elements.webMemberRoom.value;
-        const adding = !user.has_room_access;
-        if (!adding && !window.confirm(`确认将 ${user.display_name} 移出聊天室“${room}”？`)) return;
-        action.disabled = true;
-        elements.webMemberFeedback.classList.remove("error", "success");
-        elements.webMemberFeedback.textContent = adding ? "正在加入…" : "正在移出…";
-        try {
-          await fetchJson(
-            `/api/admin/rooms/${encodeURIComponent(room)}/web-users/${encodeURIComponent(user.user_id)}`,
-            {
-              method: adding ? "PUT" : "DELETE",
-              headers: {
-                "X-Agent-Bridge-Intent": adding
-                  ? "invite-room-web-user"
-                  : "remove-room-web-user",
-              },
-            },
-          );
-          await Promise.all([loadRoomWebUsers(), refresh({})]);
-          elements.webMemberFeedback.classList.add("success");
-          elements.webMemberFeedback.textContent = adding
-            ? `${user.display_name} 已加入 ${room}。`
-            : `${user.display_name} 已移出 ${room}，Agent 成员和历史消息未改变。`;
-        } catch (error) {
-          elements.webMemberFeedback.classList.add("error");
-          elements.webMemberFeedback.textContent = error.message;
-          action.disabled = false;
-        }
-      });
-      card.append(action);
+    if (user.is_room_owner) {
+      elements.webMemberResults.append(card);
+      continue;
     }
+    const managerIsModerator = state.roomWebPermissions?.room_role === "moderator";
+    const protectedModerator = managerIsModerator
+      && user.has_room_access
+      && user.access_role === "moderator";
+    if (protectedModerator) {
+      card.append(makeElement("span", "web-member-protected", "同级管理员"));
+      elements.webMemberResults.append(card);
+      continue;
+    }
+    const actions = makeElement("div", "web-member-actions");
+    if (!user.has_room_access) {
+      const add = makeElement("button", "primary-button compact-button", "加入");
+      add.type = "button";
+      add.addEventListener("click", () => updateRoomWebUserAccess(
+        user,
+        { active: true, accessRole: "member" },
+      ));
+      actions.append(add);
+      if (state.roomWebPermissions?.can_delegate_room_moderators) {
+        const promote = makeElement("button", "secondary-button compact-button", "设为管理员");
+        promote.type = "button";
+        promote.addEventListener("click", () => updateRoomWebUserAccess(
+          user,
+          { active: true, accessRole: "moderator" },
+        ));
+        actions.append(promote);
+      }
+    } else {
+      if (state.roomWebPermissions?.can_delegate_room_moderators) {
+        const role = makeElement("select", "room-id-input compact-role-select");
+        for (const [value, label] of [["member", "普通成员"], ["moderator", "聊天室管理员"]]) {
+          const option = makeElement("option", "", label);
+          option.value = value;
+          role.append(option);
+        }
+        role.value = user.access_role === "moderator" ? "moderator" : "member";
+        role.addEventListener("change", () => updateRoomWebUserAccess(
+          user,
+          { active: true, accessRole: role.value },
+        ));
+        actions.append(role);
+      }
+      const remove = makeElement("button", "secondary-button compact-button danger-button", "移出");
+      remove.type = "button";
+      remove.addEventListener("click", () => updateRoomWebUserAccess(
+        user,
+        { active: false },
+      ));
+      actions.append(remove);
+    }
+    card.append(actions);
     elements.webMemberResults.append(card);
   }
 }
@@ -3090,6 +3196,7 @@ async function loadRoomWebUsers() {
   const room = elements.webMemberRoom.value;
   if (!room) {
     state.roomWebUsers = [];
+    state.roomWebPermissions = null;
     renderRoomWebUsers();
     return;
   }
@@ -3099,13 +3206,15 @@ async function loadRoomWebUsers() {
   elements.webMemberFeedback.textContent = "正在载入用户…";
   try {
     const payload = await fetchJson(
-      `/api/admin/rooms/${encodeURIComponent(room)}/web-users?query=${encodeURIComponent(query)}&limit=100`,
+      `/api/rooms/${encodeURIComponent(room)}/web-users?query=${encodeURIComponent(query)}&limit=100`,
     );
     state.roomWebUsers = payload.users || [];
+    state.roomWebPermissions = payload.permissions || null;
     renderRoomWebUsers();
     elements.webMemberFeedback.textContent = "";
   } catch (error) {
     state.roomWebUsers = [];
+    state.roomWebPermissions = null;
     renderRoomWebUsers();
     elements.webMemberFeedback.classList.add("error");
     elements.webMemberFeedback.textContent = error.message;
@@ -3115,11 +3224,12 @@ async function loadRoomWebUsers() {
 }
 
 async function openMemberManagementDialog() {
-  if (!isAdmin()) return;
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!room?.can_manage_web_members) return;
   state.memberSelections = new Map();
   elements.memberSearch.value = "";
   elements.webMemberSearch.value = "";
-  elements.agentLifecycleFeedback.textContent = "正在载入设置…";
+  elements.agentLifecycleFeedback.textContent = isAdmin() ? "正在载入设置…" : "";
   elements.agentLifecycleFeedback.classList.remove("error", "success");
   elements.memberManagementFeedback.textContent = "";
   elements.memberManagementFeedback.classList.remove("error", "success");
@@ -3138,7 +3248,8 @@ async function openMemberManagementDialog() {
 }
 
 async function kickAgentFromRoom(conversationId, agent, button) {
-  if (!isAdmin()) return;
+  const room = state.rooms.find((item) => item.conversation_id === conversationId);
+  if (!room?.can_kick_agents) return;
   const name = agent.display_name || agent.client_type;
   if (!window.confirm(`确认将 ${name} 踢出聊天室“${conversationId}”？之后必须重新邀请才能返回该聊天室。`)) return;
   button.disabled = true;
@@ -3746,7 +3857,8 @@ function closeRenameDialog() {
 }
 
 elements.renameRoom.addEventListener("click", () => {
-  if (!isAdmin() || !state.selectedRoom) return;
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!room?.can_rename_room || !state.selectedRoom) return;
   elements.renameRoomForm.reset();
   elements.renamedRoomId.value = state.selectedRoom;
   elements.renameRoomFeedback.textContent = "";
@@ -3761,7 +3873,8 @@ elements.renameRoomDialog.addEventListener("click", (event) => {
 });
 elements.renameRoomForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (!elements.renameRoomForm.reportValidity() || !state.selectedRoom || !isAdmin()) return;
+  const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
+  if (!elements.renameRoomForm.reportValidity() || !state.selectedRoom || !room?.can_rename_room) return;
   const previousRoom = state.selectedRoom;
   const renamedRoom = elements.renamedRoomId.value.trim();
   elements.submitRenameRoom.disabled = true;
@@ -3951,8 +4064,9 @@ elements.ownerMessageBody.addEventListener("input", updateMentionMenu);
 elements.ownerMessageBody.addEventListener("click", updateMentionMenu);
 elements.ownerMessageBody.addEventListener("blur", () => window.setTimeout(hideMentionMenu, 120));
 
-function openAgentAccessDialog(roomId = null) {
-  if (!isAdmin()) return;
+async function openAgentAccessDialog(roomId = null) {
+  const room = state.rooms.find((item) => item.conversation_id === roomId);
+  if (!isAdmin() && !room?.can_invite_agents) return;
   elements.accessFeedback.textContent = "";
   elements.accessFeedback.classList.remove("error", "success");
   elements.accessOutput.value = "";
@@ -3966,6 +4080,17 @@ function openAgentAccessDialog(roomId = null) {
   renderAgentInvitations();
   renderNicknameRequests();
   elements.agentAccessDialog.showModal();
+  if (!isAdmin()) {
+    try {
+      const payload = await fetchAgentInvitations(elements.accessRoom.value);
+      state.agentInvitations = payload.invitations || [];
+      state.invitationRenderSignature = "";
+      renderAgentInvitations();
+    } catch (error) {
+      elements.accessFeedback.classList.add("error");
+      elements.accessFeedback.textContent = error.message;
+    }
+  }
   window.setTimeout(() => elements.accessProduct.focus(), 0);
 }
 
@@ -3980,6 +4105,18 @@ elements.closeAgentAccess.addEventListener("click", closeAgentAccessDialog);
 elements.clearInactiveSessions.addEventListener("click", clearInactiveSessions);
 elements.agentAccessDialog.addEventListener("click", (event) => {
   if (event.target === elements.agentAccessDialog) closeAgentAccessDialog();
+});
+elements.accessRoom.addEventListener("change", async () => {
+  if (isAdmin()) return;
+  try {
+    const payload = await fetchAgentInvitations(elements.accessRoom.value);
+    state.agentInvitations = payload.invitations || [];
+    state.invitationRenderSignature = "";
+    renderAgentInvitations();
+  } catch (error) {
+    elements.accessFeedback.classList.add("error");
+    elements.accessFeedback.textContent = error.message;
+  }
 });
 
 elements.agentAccessForm.addEventListener("submit", async (event) => {

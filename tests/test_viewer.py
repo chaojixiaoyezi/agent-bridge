@@ -459,6 +459,173 @@ def test_private_web_rooms_require_explicit_access_and_revocation_isolated(
     assert "这条隐藏消息" not in str(scoped_event)
 
 
+def test_room_owner_delegates_scoped_moderator_controls(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "room-moderators.db"
+    app = make_app(database)
+    admin_client = TestClient(app)
+    login_admin(admin_client)
+    owner_client = TestClient(app)
+    owner = register_web_user(owner_client, username="room-owner-user")
+    moderator_client = TestClient(app)
+    moderator = register_web_user(moderator_client, username="room-moderator")
+    peer_client = TestClient(app)
+    peer = register_web_user(peer_client, username="room-peer-moderator")
+    member_client = TestClient(app)
+    member = register_web_user(member_client, username="room-member")
+    outsider_client = TestClient(app)
+    outsider = register_web_user(outsider_client, username="room-outsider-user")
+
+    permission = admin_client.patch(
+        f"/api/admin/web-users/{owner['user_id']}/room-permission",
+        headers=intent_headers(admin_client, "manage-room-permission"),
+        json={"can_create_rooms": True, "room_limit": 2},
+    )
+    assert permission.status_code == 200
+    created = owner_client.post(
+        "/api/rooms",
+        headers=intent_headers(owner_client, "create-room"),
+        json={"conversation_id": "delegated-room"},
+    )
+    assert created.status_code == 201
+
+    for delegated in (moderator, peer):
+        promoted = owner_client.put(
+            f"/api/rooms/delegated-room/web-users/{delegated['user_id']}",
+            headers=intent_headers(owner_client, "invite-room-web-user"),
+            json={"access_role": "moderator"},
+        )
+        assert promoted.status_code == 200
+        assert promoted.json()["user"]["access_role"] == "moderator"
+
+    moderator_room = moderator_client.get("/api/rooms").json()["rooms"][0]
+    assert moderator_room["room_role"] == "moderator"
+    assert moderator_room["is_room_moderator"] is True
+    assert moderator_room["can_manage_web_members"] is True
+    assert moderator_room["can_invite_agents"] is True
+    assert moderator_room["can_kick_agents"] is True
+    assert moderator_room["can_wake_all"] is True
+    assert moderator_room["can_manage_wake_policy"] is True
+    assert moderator_room["can_delegate_room_moderators"] is False
+    assert moderator_room["can_rename_room"] is False
+    assert moderator_room["can_manage_task_permissions"] is False
+
+    added = moderator_client.put(
+        f"/api/rooms/delegated-room/web-users/{member['user_id']}",
+        headers=intent_headers(moderator_client, "invite-room-web-user"),
+        json={"access_role": "member"},
+    )
+    assert added.status_code == 200
+    assert added.json()["user"]["has_room_access"] is True
+    member_room = member_client.get("/api/rooms").json()["rooms"][0]
+    assert member_room["room_role"] == "member"
+    assert member_room["can_manage_web_members"] is False
+    assert member_room["can_invite_agents"] is False
+    assert member_room["can_wake_all"] is False
+
+    cannot_delegate = moderator_client.put(
+        f"/api/rooms/delegated-room/web-users/{outsider['user_id']}",
+        headers=intent_headers(moderator_client, "invite-room-web-user"),
+        json={"access_role": "moderator"},
+    )
+    assert cannot_delegate.status_code == 403
+    cannot_remove_peer = moderator_client.delete(
+        f"/api/rooms/delegated-room/web-users/{peer['user_id']}",
+        headers=intent_headers(moderator_client, "remove-room-web-user"),
+    )
+    assert cannot_remove_peer.status_code == 403
+    assert outsider_client.get("/api/rooms").json()["rooms"] == []
+
+    wake_policy = moderator_client.patch(
+        "/api/rooms/delegated-room/wake-policy",
+        headers=intent_headers(moderator_client, "manage-wake-policy"),
+        json={
+            "mode": "digest",
+            "digest_min_messages": 12,
+            "digest_after_seconds": 3600,
+        },
+    )
+    assert wake_policy.status_code == 200
+    wake_all = moderator_client.post(
+        "/api/rooms/delegated-room/messages",
+        headers=intent_headers(moderator_client, "send-message"),
+        json={"body": "聊天室管理员通知。", "wake_all_agents": True},
+    )
+    assert wake_all.status_code == 201
+    assert wake_all.json()["message"]["wake_all_agents"] is True
+
+    invitation = moderator_client.post(
+        "/api/agent-access",
+        headers=intent_headers(moderator_client, "generate-agent-access"),
+        json={
+            "conversation_id": "delegated-room",
+            "product": "custom-agent",
+            "mode": "basic",
+            "reusable": False,
+        },
+    )
+    assert invitation.status_code == 200
+    invitation_id = invitation.json()["access"]["invitation"]["invitation_id"]
+    assert moderator_client.get("/api/agent-invitations").status_code == 403
+    scoped_invitations = moderator_client.get(
+        "/api/agent-invitations",
+        params={"conversation_id": "delegated-room"},
+    )
+    assert scoped_invitations.status_code == 200
+    assert [
+        item["invitation_id"]
+        for item in scoped_invitations.json()["invitations"]
+    ] == [invitation_id]
+    revoked = moderator_client.post(
+        f"/api/agent-invitations/{invitation_id}/revoke",
+        headers=intent_headers(moderator_client, "revoke-agent-invitation"),
+    )
+    assert revoked.status_code == 200
+
+    registered = admin_client.post(
+        "/agent/register",
+        json={
+            "conversation_id": "delegated-room",
+            "product": "codex",
+            "username": "moderated-agent",
+            "signature": "等待聊天室管理员治理。",
+        },
+    )
+    assert registered.status_code == 201
+    kicked = moderator_client.post(
+        "/api/rooms/delegated-room/participants/"
+        f"{registered.json()['participant_id']}/kick",
+        headers=intent_headers(moderator_client, "kick-agent"),
+    )
+    assert kicked.status_code == 200
+    assert kicked.json()["agent"]["history_preserved"] is True
+
+    denied_rename = moderator_client.patch(
+        "/api/rooms/delegated-room",
+        headers=intent_headers(moderator_client, "rename-room"),
+        json={"new_conversation_id": "moderator-cannot-rename"},
+    )
+    assert denied_rename.status_code == 403
+    renamed = owner_client.patch(
+        "/api/rooms/delegated-room",
+        headers=intent_headers(owner_client, "rename-room"),
+        json={"new_conversation_id": "delegated-room-renamed"},
+    )
+    assert renamed.status_code == 200
+    renamed_moderator_room = moderator_client.get("/api/rooms").json()["rooms"][0]
+    assert renamed_moderator_room["conversation_id"] == "delegated-room-renamed"
+    assert renamed_moderator_room["room_role"] == "moderator"
+
+    demoted = owner_client.put(
+        f"/api/rooms/delegated-room-renamed/web-users/{peer['user_id']}",
+        headers=intent_headers(owner_client, "invite-room-web-user"),
+        json={"access_role": "member"},
+    )
+    assert demoted.status_code == 200
+    assert demoted.json()["user"]["access_role"] == "member"
+
+
 def test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body(
     tmp_path: Path,
 ) -> None:
@@ -1057,8 +1224,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-6" in index_html
-    assert "app.css?v=20260814-6" in index_html
+    assert "app.js?v=20260814-7" in index_html
+    assert "app.css?v=20260814-7" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript

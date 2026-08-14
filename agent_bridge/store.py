@@ -4568,7 +4568,13 @@ class BridgeStore:
         )
         now = time.time()
         with self._transaction() as conn:
-            self._require_active_admin_locked(conn, administrator)
+            room_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=administrator,
+                conversation_id=conversation,
+            )
+            if not room_permissions["can_kick_agents"]:
+                raise AuthorizationError("你没有踢出本聊天室 Agent 的权限")
             self._expire_inactive_agents_locked(conn, now=now)
             self._require_active_room(conn, conversation)
             profile = self._require_agent_participant_locked(conn, participant)
@@ -5351,7 +5357,13 @@ class BridgeStore:
         invitation_id = f"invite_{uuid.uuid4().hex}"
         invitation_token = f"invite_{secrets.token_urlsafe(32)}"
         with self._transaction() as conn:
-            self._require_active_admin_locked(conn, creator)
+            room_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=creator,
+                conversation_id=conversation,
+            )
+            if not room_permissions["can_invite_agents"]:
+                raise AuthorizationError("你没有邀请 Agent 加入这个聊天室的权限")
             self._require_active_room(conn, conversation)
             self._expire_agent_invitations_locked(conn, now=now)
             conn.execute(
@@ -5408,7 +5420,25 @@ class BridgeStore:
         normalized_limit = max(1, min(int(limit), 500))
         now = time.time()
         with self._transaction() as conn:
-            self._require_active_admin_locked(conn, requester)
+            requester_row = conn.execute(
+                "SELECT role FROM web_users WHERE user_id = ? AND active = 1",
+                (requester,),
+            ).fetchone()
+            if requester_row is None:
+                raise AuthenticationError("active Web user is required")
+            if conversation is None:
+                if str(requester_row["role"]) != "admin":
+                    raise AuthorizationError(
+                        "聊天室管理员只能查看指定聊天室的邀请"
+                    )
+            else:
+                room_permissions = self._room_web_permissions_locked(
+                    conn,
+                    web_user_id=requester,
+                    conversation_id=conversation,
+                )
+                if not room_permissions["can_invite_agents"]:
+                    raise AuthorizationError("你没有查看本聊天室邀请的权限")
             self._expire_agent_invitations_locked(conn, now=now)
             rows = conn.execute(
                 """
@@ -5480,7 +5510,6 @@ class BridgeStore:
         )
         now = time.time()
         with self._transaction() as conn:
-            self._require_active_admin_locked(conn, reviewer)
             self._expire_agent_invitations_locked(conn, now=now)
             row = conn.execute(
                 "SELECT * FROM agent_invitations WHERE invitation_id = ?",
@@ -5488,6 +5517,13 @@ class BridgeStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError(f"unknown agent invitation: {invitation}")
+            room_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=reviewer,
+                conversation_id=str(row["conversation_id"]),
+            )
+            if not room_permissions["can_invite_agents"]:
+                raise AuthorizationError("你没有撤销本聊天室邀请的权限")
             if str(row["status"]) == "revoked":
                 projected = self._agent_invitation_row_locked(
                     conn,
@@ -7249,6 +7285,70 @@ class BridgeStore:
             )
         return access
 
+    def room_web_permissions_bulk(
+        self,
+        *,
+        requesting_web_user_id: str,
+        conversation_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        conversations = list(
+            dict.fromkeys(
+                validate_conversation_id(value) for value in conversation_ids
+            )
+        )
+        if not conversations:
+            return {}
+        with self._connection() as conn:
+            web_user = conn.execute(
+                "SELECT role FROM web_users WHERE user_id = ? AND active = 1",
+                (requester,),
+            ).fetchone()
+            if web_user is None:
+                raise AuthenticationError("active Web user is required")
+            placeholders = ",".join("?" for _ in conversations)
+            rows = conn.execute(
+                f"""
+                SELECT room.conversation_id, room.status,
+                       CASE WHEN owner.web_user_id IS NOT NULL THEN 1 ELSE 0 END
+                           AS is_room_owner,
+                       access.access_role
+                FROM rooms AS room
+                LEFT JOIN room_web_owners AS owner
+                  ON owner.conversation_id = room.conversation_id
+                 AND owner.web_user_id = ?
+                LEFT JOIN room_web_members AS access
+                  ON access.conversation_id = room.conversation_id
+                 AND access.web_user_id = ?
+                 AND access.active = 1
+                WHERE room.conversation_id IN ({placeholders})
+                """,
+                (requester, requester, *conversations),
+            ).fetchall()
+            by_conversation = {
+                str(row["conversation_id"]): row for row in rows
+            }
+            result: dict[str, dict[str, Any]] = {}
+            for conversation in conversations:
+                row = by_conversation.get(conversation)
+                if row is None:
+                    raise NotFoundError(f"unknown conversation: {conversation}")
+                result[conversation] = self._room_web_permission_payload(
+                    conversation_id=conversation,
+                    room_status=str(row["status"]),
+                    is_global_admin=str(web_user["role"]) == "admin",
+                    is_room_owner=bool(row["is_room_owner"]),
+                    access_role=(
+                        str(row["access_role"])
+                        if row["access_role"] is not None
+                        else None
+                    ),
+                )
+            return result
+
     def search_room_web_users(
         self,
         *,
@@ -7275,7 +7375,13 @@ class BridgeStore:
         )
         pattern = f"%{escaped}%"
         with self._connection() as conn:
-            self._require_active_rate_admin_locked(conn, requester)
+            manager_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=requester,
+                conversation_id=conversation,
+            )
+            if not manager_permissions["can_manage_web_members"]:
+                raise AuthorizationError("你没有管理这个聊天室成员的权限")
             if conn.execute(
                 "SELECT 1 FROM rooms WHERE conversation_id = ?",
                 (conversation,),
@@ -7323,6 +7429,7 @@ class BridgeStore:
             "users": users,
             "count": len(users),
             "query": normalized_query,
+            "permissions": manager_permissions,
         }
 
     def manage_room_web_member(
@@ -7332,6 +7439,7 @@ class BridgeStore:
         conversation_id: str,
         target_web_user_id: str,
         active: bool,
+        access_role: str = "member",
     ) -> dict[str, Any]:
         requester = opaque_id(
             requesting_web_user_id,
@@ -7341,9 +7449,18 @@ class BridgeStore:
         conversation = validate_conversation_id(conversation_id)
         if not isinstance(active, bool):
             raise ValidationError("active must be a boolean")
+        normalized_role = str(access_role or "member").strip().lower()
+        if normalized_role not in {"member", "moderator"}:
+            raise ValidationError("access_role must be member or moderator")
         now = time.time()
         with self._transaction() as conn:
-            self._require_active_rate_admin_locked(conn, requester)
+            manager_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=requester,
+                conversation_id=conversation,
+            )
+            if not manager_permissions["can_manage_web_members"]:
+                raise AuthorizationError("你没有管理这个聊天室成员的权限")
             room = conn.execute(
                 "SELECT status FROM rooms WHERE conversation_id = ?",
                 (conversation,),
@@ -7364,6 +7481,27 @@ class BridgeStore:
             ).fetchone()
             if not active and owner is not None:
                 raise ConflictError("不能移除聊天室创建者")
+            current_access = conn.execute(
+                "SELECT access_role, active FROM room_web_members "
+                "WHERE conversation_id = ? AND web_user_id = ?",
+                (conversation, target),
+            ).fetchone()
+            target_is_moderator = bool(
+                current_access is not None
+                and current_access["active"]
+                and str(current_access["access_role"]) == "moderator"
+            )
+            if (
+                manager_permissions["room_role"] == "moderator"
+                and target_is_moderator
+            ):
+                raise AuthorizationError("聊天室管理员不能修改其他管理员")
+            if (
+                active
+                and normalized_role == "moderator"
+                and not manager_permissions["can_delegate_room_moderators"]
+            ):
+                raise AuthorizationError("只有全局管理员或创建者可以委派管理员")
             if active:
                 if str(room["status"]) != "active":
                     raise ConflictError("不能向已废弃的聊天室添加 Web 用户")
@@ -7372,14 +7510,21 @@ class BridgeStore:
                     INSERT INTO room_web_members
                         (conversation_id, web_user_id, access_role, active,
                          invited_by_web_user_id, created_at, updated_at)
-                    VALUES (?, ?, 'member', 1, ?, ?, ?)
+                    VALUES (?, ?, ?, 1, ?, ?, ?)
                     ON CONFLICT(conversation_id, web_user_id) DO UPDATE SET
-                        access_role = 'member',
+                        access_role = excluded.access_role,
                         active = 1,
                         invited_by_web_user_id = excluded.invited_by_web_user_id,
                         updated_at = excluded.updated_at
                     """,
-                    (conversation, target, requester, now, now),
+                    (
+                        conversation,
+                        target,
+                        normalized_role,
+                        requester,
+                        now,
+                        now,
+                    ),
                 )
                 self._ensure_web_membership_locked(
                     conn,
@@ -7569,13 +7714,25 @@ class BridgeStore:
         *,
         conversation_id: str,
         new_conversation_id: str,
+        renamed_by_web_user_id: str,
     ) -> dict[str, Any]:
         """Rename one room while preserving every foreign-key-linked record."""
 
         current = validate_conversation_id(conversation_id)
         renamed = validate_conversation_id(new_conversation_id)
+        actor = opaque_id(
+            renamed_by_web_user_id,
+            field="renamed_by_web_user_id",
+        )
         now = time.time()
         with self._transaction() as conn:
+            room_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=actor,
+                conversation_id=current,
+            )
+            if not room_permissions["can_rename_room"]:
+                raise AuthorizationError("只有全局管理员或聊天室创建者可以重命名")
             room = conn.execute(
                 "SELECT * FROM rooms WHERE conversation_id = ?",
                 (current,),
@@ -8905,15 +9062,15 @@ class BridgeStore:
                             ),
                         )
                     )
-                if normalized_wake_all and str(web_identity["role"]) != "admin":
-                    ownership = conn.execute(
-                        "SELECT 1 FROM room_web_owners "
-                        "WHERE conversation_id = ? AND web_user_id = ?",
-                        (conversation, str(web_identity["user_id"])),
-                    ).fetchone()
-                    if ownership is None:
+                if normalized_wake_all:
+                    room_permissions = self._room_web_permissions_locked(
+                        conn,
+                        web_user_id=str(web_identity["user_id"]),
+                        conversation_id=conversation,
+                    )
+                    if not room_permissions["can_wake_all"]:
                         raise AuthorizationError(
-                            "只有全局管理员或本聊天室创建者可以使用 @全员"
+                            "只有全局管理员、创建者或聊天室管理员可以使用 @全员"
                         )
                 cooldown_seconds = (
                     0.0
@@ -9509,14 +9666,14 @@ class BridgeStore:
                 conversation_id=conversation,
             )
             self._require_active_room(conn, conversation)
-            ownership = conn.execute(
-                "SELECT 1 FROM room_web_owners "
-                "WHERE conversation_id = ? AND web_user_id = ?",
-                (conversation, str(identity["user_id"])),
-            ).fetchone()
-            if str(identity["role"]) != "admin" and ownership is None:
+            room_permissions = self._room_web_permissions_locked(
+                conn,
+                web_user_id=str(identity["user_id"]),
+                conversation_id=conversation,
+            )
+            if not room_permissions["can_manage_wake_policy"]:
                 raise AuthorizationError(
-                    "只有全局管理员或聊天室创建者可以调整唤醒策略"
+                    "只有全局管理员、创建者或聊天室管理员可以调整唤醒策略"
                 )
             conn.execute(
                 """
@@ -12880,6 +13037,84 @@ class BridgeStore:
                 if is_owner
                 else str(member["access_role"])
             ),
+        }
+
+    @staticmethod
+    def _room_web_permissions_locked(
+        conn: sqlite3.Connection,
+        *,
+        web_user_id: str,
+        conversation_id: str,
+    ) -> dict[str, Any]:
+        web_user = conn.execute(
+            "SELECT user_id, role FROM web_users "
+            "WHERE user_id = ? AND active = 1",
+            (web_user_id,),
+        ).fetchone()
+        if web_user is None:
+            raise AuthenticationError("active Web user is required")
+        room = conn.execute(
+            "SELECT status FROM rooms WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if room is None:
+            raise NotFoundError(f"unknown conversation: {conversation_id}")
+        owner = conn.execute(
+            "SELECT 1 FROM room_web_owners "
+            "WHERE conversation_id = ? AND web_user_id = ?",
+            (conversation_id, web_user_id),
+        ).fetchone()
+        access = conn.execute(
+            "SELECT access_role FROM room_web_members "
+            "WHERE conversation_id = ? AND web_user_id = ? AND active = 1",
+            (conversation_id, web_user_id),
+        ).fetchone()
+        return BridgeStore._room_web_permission_payload(
+            conversation_id=conversation_id,
+            room_status=str(room["status"]),
+            is_global_admin=str(web_user["role"]) == "admin",
+            is_room_owner=owner is not None,
+            access_role=(
+                str(access["access_role"]) if access is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _room_web_permission_payload(
+        *,
+        conversation_id: str,
+        room_status: str,
+        is_global_admin: bool,
+        is_room_owner: bool,
+        access_role: str | None,
+    ) -> dict[str, Any]:
+        is_moderator = access_role == "moderator"
+        if not is_global_admin and not is_room_owner and access_role is None:
+            raise AuthorizationError("你无权访问这个聊天室")
+        room_role = (
+            "global_admin"
+            if is_global_admin
+            else "owner"
+            if is_room_owner
+            else "moderator"
+            if is_moderator
+            else "member"
+        )
+        can_manage = is_global_admin or is_room_owner or is_moderator
+        return {
+            "conversation_id": conversation_id,
+            "room_status": room_status,
+            "room_role": room_role,
+            "is_global_admin": is_global_admin,
+            "is_room_owner": is_room_owner,
+            "is_room_moderator": is_moderator,
+            "can_wake_all": can_manage,
+            "can_manage_wake_policy": can_manage,
+            "can_manage_web_members": can_manage,
+            "can_delegate_room_moderators": is_global_admin or is_room_owner,
+            "can_invite_agents": can_manage,
+            "can_kick_agents": can_manage,
+            "can_rename_room": is_global_admin or is_room_owner,
         }
 
     @staticmethod

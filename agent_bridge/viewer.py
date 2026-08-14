@@ -724,7 +724,10 @@ def create_app(
                 visible_conversation_ids=access_scope["conversation_ids"],
             )
             user_id = str(identity["user_id"])
-            admin = bool(identity["is_admin"])
+            room_permissions = store.room_web_permissions_bulk(
+                requesting_web_user_id=user_id,
+                conversation_ids=[str(room["conversation_id"]) for room in projected],
+            )
             task_permissions = store.room_task_permissions_bulk(
                 authorized_session_id=str(identity["session_id"]),
                 participant_id=str(identity["participant_id"]),
@@ -734,8 +737,7 @@ def create_app(
                 conversation_ids=[str(room["conversation_id"]) for room in projected]
             )
             for room in projected:
-                room["is_room_owner"] = room.get("owner_web_user_id") == user_id
-                room["can_wake_all"] = admin or bool(room["is_room_owner"])
+                room.update(room_permissions[str(room["conversation_id"])])
                 permissions = task_permissions[str(room["conversation_id"])]
                 room.update(
                     {
@@ -749,9 +751,6 @@ def create_app(
                     }
                 )
                 room["wake_policy"] = wake_policies[str(room["conversation_id"])]
-                room["can_manage_wake_policy"] = admin or bool(
-                    room["is_room_owner"]
-                )
             return {"rooms": projected}
 
         return _json_call(payload, before=store.archive_stale_rooms)
@@ -868,7 +867,7 @@ def create_app(
 
     async def room_web_users(request: Request) -> Response:
         try:
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
             return JSONResponse(
                 store.search_room_web_users(
                     requesting_web_user_id=str(identity["user_id"]),
@@ -888,7 +887,14 @@ def create_app(
                 else "remove-room-web-user"
             )
             require_web_intent(request, intent=intent)
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
+            payload: dict[str, object] = {}
+            if request.method == "PUT" and await request.body():
+                payload = await _json_body(
+                    request,
+                    required=set(),
+                    allowed={"access_role"},
+                )
             return JSONResponse(
                 {
                     "user": store.manage_room_web_member(
@@ -896,6 +902,7 @@ def create_app(
                         conversation_id=request.path_params["conversation_id"],
                         target_web_user_id=request.path_params["user_id"],
                         active=request.method == "PUT",
+                        access_role=payload.get("access_role", "member"),
                     )
                 }
             )
@@ -905,7 +912,7 @@ def create_app(
     async def rename_room(request: Request) -> Response:
         try:
             require_web_intent(request, intent="rename-room")
-            authenticated_admin(request)
+            identity = authenticated_web_user(request)
             payload = await _json_body(
                 request,
                 required={"new_conversation_id"},
@@ -916,6 +923,7 @@ def create_app(
                     "room": store.rename_room(
                         conversation_id=request.path_params["conversation_id"],
                         new_conversation_id=payload["new_conversation_id"],
+                        renamed_by_web_user_id=str(identity["user_id"]),
                     )
                 }
             )
@@ -979,7 +987,7 @@ def create_app(
     async def kick_room_agent(request: Request) -> Response:
         try:
             require_web_intent(request, intent="kick-agent")
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
             return JSONResponse(
                 {
                     "agent": store.kick_agent_from_room(
@@ -2532,13 +2540,21 @@ def create_app(
     async def agent_access(request: Request) -> Response:
         try:
             require_web_intent(request, intent="generate-agent-access")
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
             payload = await _json_body(
                 request,
                 required={"conversation_id", "product"},
                 allowed={"conversation_id", "product", "mode", "reusable"},
             )
             conversation = validate_conversation_id(payload["conversation_id"])
+            permissions = store.room_web_permissions_bulk(
+                requesting_web_user_id=str(identity["user_id"]),
+                conversation_ids=[conversation],
+            )[conversation]
+            if not permissions["can_invite_agents"]:
+                raise AuthorizationError(
+                    "你没有邀请 Agent 加入这个聊天室的权限"
+                )
             store.archive_stale_rooms()
             room = store.room(conversation)
             if room["status"] != "active":
@@ -2933,7 +2949,7 @@ def create_app(
 
     async def agent_invitations(request: Request) -> Response:
         try:
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
             return JSONResponse(
                 {
                     "invitations": store.list_agent_invitations(
@@ -2949,7 +2965,7 @@ def create_app(
     async def revoke_agent_invitation(request: Request) -> Response:
         try:
             require_web_intent(request, intent="revoke-agent-invitation")
-            identity = authenticated_admin(request)
+            identity = authenticated_web_user(request)
             return JSONResponse(
                 {
                     "invitation": store.revoke_agent_invitation(
@@ -3104,6 +3120,16 @@ def create_app(
             ),
             Route(
                 "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}",
+                update_room_web_user,
+                methods=["PUT", "DELETE"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/web-users",
+                room_web_users,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/rooms/{conversation_id:str}/web-users/{user_id:str}",
                 update_room_web_user,
                 methods=["PUT", "DELETE"],
             ),

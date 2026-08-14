@@ -1160,7 +1160,7 @@ def test_web_room_owner_permission_limit_and_optional_wake_all(
         assert "wake_all" in wake_delivery["reasons"]
         assert "mention" not in wake_delivery["reasons"]
 
-    with pytest.raises(AuthorizationError, match="聊天室创建者"):
+    with pytest.raises(AuthorizationError, match="聊天室管理员"):
         store.send_web_message(
             authorized_session_id=str(outsider["session_id"]),
             participant_id=str(outsider["participant_id"]),

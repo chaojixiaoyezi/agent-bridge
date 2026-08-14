@@ -984,6 +984,9 @@ select option {
 .web-member-card { grid-template-columns: minmax(0, 1fr) auto auto; }
 .web-member-status { color: var(--muted); font-size: 9px; white-space: nowrap; }
 .web-member-status.active { color: var(--cyan); }
+.web-member-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.compact-role-select { width: auto; min-width: 108px; height: 30px; padding: 0 8px; font-size: 9px; }
+.web-member-protected { color: var(--muted); font-size: 8px; white-space: nowrap; }
 .danger-button { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 32%, var(--line)); }
 .rate-section + .rate-section { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
 .rate-section-heading { display: flex; justify-content: space-between; margin-bottom: 12px; }
