@@ -369,16 +369,21 @@ def create_app(
                 limit=3,
                 window_seconds=60 * 60,
             )
-            if not policy.registration_code_matches(
-                payload.get("registration_code")
-            ):
-                raise WebAuthorizationError("注册码无效或公开注册已关闭")
+            supplied_registration_code = payload.get("registration_code")
+            legacy_code_matches = policy.registration_code_matches(
+                supplied_registration_code
+            )
             identity, session_token = await asyncio.to_thread(
                 web_auth.register,
                 username=payload["username"],
                 password=payload["password"],
                 captcha_id=payload["captcha_id"],
                 captcha_answer=payload["captcha_answer"],
+                registration_code=supplied_registration_code,
+                registration_code_required=(
+                    policy.web_registration_mode == "access_code"
+                    and not legacy_code_matches
+                ),
             )
             return login_response(
                 request,
@@ -520,13 +525,27 @@ def create_app(
             "open_registration_enabled": required_registration_secret is None,
             "registration_secret_required": required_registration_secret is not None,
             "web_registration_mode": policy.web_registration_mode,
+            "admin_registration_codes_enabled": True,
             "public_security_mode": policy.public_mode,
             "web_login_required": True,
         }
         if not request.cookies.get(web_session_cookie):
             return JSONResponse(public_health)
         try:
-            identity = authenticated_web_user(request)
+            identity = authenticated_web_user(
+                request,
+                allow_password_change=True,
+            )
+        except WebAuthenticationError:
+            response = JSONResponse(public_health)
+            response.delete_cookie(
+                web_session_cookie,
+                path="/",
+                secure=policy.secure_cookies or request.url.scheme == "https",
+                httponly=True,
+                samesite="strict",
+            )
+            return response
         except Exception as exc:
             return _json_error(exc)
 
@@ -746,6 +765,58 @@ def create_app(
                     query=str(request.query_params.get("query") or ""),
                     limit=_int_query(request, "limit", default=50, maximum=100),
                 )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def web_registration_codes(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            if request.method == "GET":
+                return JSONResponse(
+                    web_auth.list_registration_codes(
+                        requesting_web_user_id=str(identity["user_id"]),
+                        limit=_int_query(request, "limit", default=100, maximum=200),
+                    )
+                )
+            require_web_intent(request, intent="create-registration-code")
+            payload = await _json_body(
+                request,
+                required=set(),
+                allowed={"label", "max_uses", "expires_in_hours"},
+            )
+            expires_in_hours = payload.get("expires_in_hours", 24)
+            if isinstance(expires_in_hours, bool):
+                raise ValidationError("expires_in_hours must be a number")
+            try:
+                expires_in_seconds = float(expires_in_hours) * 60 * 60
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("expires_in_hours must be a number") from exc
+            return JSONResponse(
+                {
+                    "registration_code": web_auth.create_registration_code(
+                        created_by_web_user_id=str(identity["user_id"]),
+                        label=payload.get("label", ""),
+                        max_uses=payload.get("max_uses", 1),
+                        expires_in_seconds=expires_in_seconds,
+                    )
+                },
+                status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def revoke_web_registration_code(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="revoke-registration-code")
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "registration_code": web_auth.revoke_registration_code(
+                        code_id=request.path_params["code_id"],
+                        revoked_by_web_user_id=str(identity["user_id"]),
+                    )
+                }
             )
         except Exception as exc:
             return _json_error(exc)
@@ -2911,6 +2982,16 @@ def create_app(
             Route("/api/auth/logout", auth_logout, methods=["POST"]),
             Route("/api/auth/password", auth_password, methods=["POST"]),
             Route("/api/auth/profile", auth_profile, methods=["PATCH"]),
+            Route(
+                "/api/admin/web-registration-codes",
+                web_registration_codes,
+                methods=["GET", "POST"],
+            ),
+            Route(
+                "/api/admin/web-registration-codes/{code_id:str}/revoke",
+                revoke_web_registration_code,
+                methods=["POST"],
+            ),
             Route("/api/rooms", rooms, methods=["GET"]),
             Route("/api/rooms", create_room, methods=["POST"]),
             Route(

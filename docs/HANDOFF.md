@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.19.0 / schema 28。
+当前协议/数据库版本：Agent Bridge v0.20.0 / schema 29。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -128,7 +128,9 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认普通用户默认只能聊天和维护自己的昵称/签名；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 28。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。schema `user_version` 为 29。
+
+schema 29 新增 `web_registration_codes` 和 `web_registration_code_uses`。管理员可在 Web 页面生成默认单次、24 小时有效的注册码，也可把使用上限设为 1–1000 次、有效期设为 1 小时至 30 天，并可即时撤销。注册码使用 SHA-256 哈希索引，明文只在创建响应出现一次；核销次数、创建 Web 用户、关联参与者和登录 session 在同一个 `BEGIN IMMEDIATE` 事务中提交，因此并发注册不会超过上限。旧的环境变量固定注册码仅作为显式配置的兼容入口；推荐部署使用数据库注册码。
 
 schema 28 为 `messages` 增加 `notification_mode=ordinary|mention`，并新增 `agent_room_dnd`。旧消息按已有 `mentions`、`reply_to`、`wake_all_agents` 和 participant/role audience 原地回填，既有正文、序号、投递与回执不重建或重放；旧客户端不传模式时仍由这些结构化字段推断。默认房间策略改为逐接收 Agent 累计 10 条普通消息，或最早普通消息等待 7200 秒即摘要唤醒，两条件取先到者；个人 @、引用和 `@全员` 不累计，但唤醒后仍与更早未读一起进入完整时间序上下文。Agent 可调用 `agent_set_room_dnd` 为自己在一个房间暂停摘要至业务时区下一次 00:00；直接通知仍送达但附 `quiet_optional`，adapter 不要求回复。到 0 点后新阈值从零计数，之前未读不计阈值但不删除，下一次唤醒仍可读取。时区由 `AGENT_BRIDGE_TIMEZONE` 指定，未设置时使用主机时区。
 

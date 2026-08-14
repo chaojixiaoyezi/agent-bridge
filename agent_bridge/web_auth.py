@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
 import random
 import re
 import secrets
@@ -29,6 +30,10 @@ WEB_SESSION_TTL_SECONDS = 12 * 60 * 60
 WEB_SESSION_TOUCH_INTERVAL_SECONDS = 30
 WEB_SESSION_AUDIT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 CAPTCHA_TTL_SECONDS = 5 * 60
+DEFAULT_REGISTRATION_CODE_TTL_SECONDS = 24 * 60 * 60
+MAX_REGISTRATION_CODE_TTL_SECONDS = 30 * 24 * 60 * 60
+MAX_REGISTRATION_CODE_USES = 1000
+REGISTRATION_CODE_PREFIX = "ABR"
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
 DEFAULT_ADMIN_USERNAME = "admin"
@@ -130,6 +135,40 @@ CREATE TABLE IF NOT EXISTS web_login_captchas (
 
 CREATE INDEX IF NOT EXISTS idx_web_login_captchas_expiry
     ON web_login_captchas(expires_at, consumed_at);
+
+CREATE TABLE IF NOT EXISTS web_registration_codes (
+    code_id TEXT PRIMARY KEY,
+    code_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL DEFAULT '',
+    max_uses INTEGER NOT NULL DEFAULT 1
+        CHECK (max_uses BETWEEN 1 AND 1000),
+    use_count INTEGER NOT NULL DEFAULT 0
+        CHECK (use_count >= 0 AND use_count <= max_uses),
+    created_by_web_user_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    last_used_at REAL,
+    revoked_at REAL,
+    revoked_by_web_user_id TEXT,
+    FOREIGN KEY (created_by_web_user_id) REFERENCES web_users(user_id),
+    FOREIGN KEY (revoked_by_web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_registration_codes_status
+    ON web_registration_codes(revoked_at, expires_at, use_count, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS web_registration_code_uses (
+    use_id TEXT PRIMARY KEY,
+    code_id TEXT NOT NULL,
+    web_user_id TEXT NOT NULL,
+    username_snapshot TEXT NOT NULL,
+    used_at REAL NOT NULL,
+    FOREIGN KEY (code_id) REFERENCES web_registration_codes(code_id),
+    FOREIGN KEY (web_user_id) REFERENCES web_users(user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_registration_code_uses_code
+    ON web_registration_code_uses(code_id, used_at DESC);
 """
 
 
@@ -459,12 +498,21 @@ class WebAuthStore:
         password: str,
         captcha_id: str,
         captcha_answer: str,
+        registration_code: object | None = None,
+        registration_code_required: bool = False,
     ) -> tuple[dict[str, object], str]:
         normalized_username = normalize_username(username)
         normalized_password = validate_password(
             password,
             username=normalized_username,
         )
+        if registration_code_required:
+            with self._connection() as connection:
+                self._require_registration_code_locked(
+                    connection,
+                    registration_code=registration_code,
+                    now=time.time(),
+                )
         self._consume_captcha(captcha_id, captcha_answer)
         now = time.time()
         user_id = f"webuser_{uuid.uuid4().hex}"
@@ -474,6 +522,13 @@ class WebAuthStore:
         password_hash = _password_hash(normalized_password)
         try:
             with self._transaction() as connection:
+                code_row = None
+                if registration_code_required:
+                    code_row = self._require_registration_code_locked(
+                        connection,
+                        registration_code=registration_code,
+                        now=now,
+                    )
                 connection.execute(
                     """
                     INSERT INTO web_users
@@ -504,6 +559,28 @@ class WebAuthStore:
                     signature=signature,
                     now=now,
                 )
+                if code_row is not None:
+                    updated = connection.execute(
+                        "UPDATE web_registration_codes "
+                        "SET use_count = use_count + 1, last_used_at = ? "
+                        "WHERE code_id = ? AND revoked_at IS NULL "
+                        "AND expires_at > ? AND use_count < max_uses",
+                        (now, str(code_row["code_id"]), now),
+                    )
+                    if updated.rowcount != 1:
+                        raise WebAuthorizationError("注册码无效、已过期或已用完")
+                    connection.execute(
+                        "INSERT INTO web_registration_code_uses "
+                        "(use_id, code_id, web_user_id, username_snapshot, used_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            f"registration_use_{uuid.uuid4().hex}",
+                            str(code_row["code_id"]),
+                            user_id,
+                            normalized_username,
+                            now,
+                        ),
+                    )
                 token, session_id = self._create_session_locked(
                     connection,
                     user_id=user_id,
@@ -515,6 +592,146 @@ class WebAuthStore:
         payload = self._user_payload(row)
         payload["session_id"] = session_id
         return payload, token
+
+    def create_registration_code(
+        self,
+        *,
+        created_by_web_user_id: str,
+        label: object = "",
+        max_uses: object = 1,
+        expires_in_seconds: object = DEFAULT_REGISTRATION_CODE_TTL_SECONDS,
+    ) -> dict[str, object]:
+        creator = opaque_id(
+            created_by_web_user_id,
+            field="created_by_web_user_id",
+        )
+        normalized_label = str(label or "").strip()
+        if len(normalized_label) > 80:
+            raise ValidationError("registration code label must be at most 80 characters")
+        if any(ord(character) < 32 or ord(character) == 127 for character in normalized_label):
+            raise ValidationError("registration code label cannot contain control characters")
+        if isinstance(max_uses, bool) or (
+            isinstance(max_uses, float) and not max_uses.is_integer()
+        ):
+            raise ValidationError("max_uses must be an integer")
+        try:
+            normalized_max_uses = int(max_uses)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("max_uses must be an integer") from exc
+        if not 1 <= normalized_max_uses <= MAX_REGISTRATION_CODE_USES:
+            raise ValidationError(
+                f"max_uses must be between 1 and {MAX_REGISTRATION_CODE_USES}"
+            )
+        if isinstance(expires_in_seconds, bool):
+            raise ValidationError("expires_in_seconds must be a number")
+        try:
+            ttl_seconds = float(expires_in_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("expires_in_seconds must be a number") from exc
+        if not math.isfinite(ttl_seconds) or not (
+            60 * 60 <= ttl_seconds <= MAX_REGISTRATION_CODE_TTL_SECONDS
+        ):
+            raise ValidationError("registration code lifetime must be between 1 hour and 30 days")
+
+        now = time.time()
+        code_id = f"registration_code_{uuid.uuid4().hex}"
+        code = f"{REGISTRATION_CODE_PREFIX}-{secrets.token_urlsafe(24)}"
+        with self._transaction() as connection:
+            self._require_admin_locked(connection, creator)
+            connection.execute(
+                """
+                INSERT INTO web_registration_codes
+                    (code_id, code_hash, label, max_uses, use_count,
+                     created_by_web_user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+                """,
+                (
+                    code_id,
+                    self._secret_hash(code),
+                    normalized_label,
+                    normalized_max_uses,
+                    creator,
+                    now,
+                    now + ttl_seconds,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM web_registration_codes WHERE code_id = ?",
+                (code_id,),
+            ).fetchone()
+        payload = self._registration_code_payload(row, now=now)
+        payload["code"] = code
+        return payload
+
+    def list_registration_codes(
+        self,
+        *,
+        requesting_web_user_id: str,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        requester = opaque_id(
+            requesting_web_user_id,
+            field="requesting_web_user_id",
+        )
+        normalized_limit = max(1, min(int(limit), 200))
+        now = time.time()
+        with self._connection() as connection:
+            self._require_admin_locked(connection, requester)
+            rows = connection.execute(
+                "SELECT code.*, creator.username AS created_by_username, "
+                "revoker.username AS revoked_by_username "
+                "FROM web_registration_codes AS code "
+                "JOIN web_users AS creator "
+                "ON creator.user_id = code.created_by_web_user_id "
+                "LEFT JOIN web_users AS revoker "
+                "ON revoker.user_id = code.revoked_by_web_user_id "
+                "ORDER BY code.created_at DESC LIMIT ?",
+                (normalized_limit,),
+            ).fetchall()
+        return {
+            "codes": [self._registration_code_payload(row, now=now) for row in rows],
+            "server_time": now,
+        }
+
+    def revoke_registration_code(
+        self,
+        *,
+        code_id: str,
+        revoked_by_web_user_id: str,
+    ) -> dict[str, object]:
+        normalized_code_id = opaque_id(code_id, field="registration_code_id")
+        revoker = opaque_id(
+            revoked_by_web_user_id,
+            field="revoked_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as connection:
+            self._require_admin_locked(connection, revoker)
+            row = connection.execute(
+                "SELECT * FROM web_registration_codes WHERE code_id = ?",
+                (normalized_code_id,),
+            ).fetchone()
+            if row is None:
+                raise WebConflictError("注册码不存在")
+            if row["revoked_at"] is None:
+                connection.execute(
+                    "UPDATE web_registration_codes "
+                    "SET revoked_at = ?, revoked_by_web_user_id = ? "
+                    "WHERE code_id = ? AND revoked_at IS NULL",
+                    (now, revoker, normalized_code_id),
+                )
+            row = connection.execute(
+                "SELECT code.*, creator.username AS created_by_username, "
+                "revoker.username AS revoked_by_username "
+                "FROM web_registration_codes AS code "
+                "JOIN web_users AS creator "
+                "ON creator.user_id = code.created_by_web_user_id "
+                "LEFT JOIN web_users AS revoker "
+                "ON revoker.user_id = code.revoked_by_web_user_id "
+                "WHERE code.code_id = ?",
+                (normalized_code_id,),
+            ).fetchone()
+        return self._registration_code_payload(row, now=now)
 
     def login(
         self,
@@ -766,6 +983,104 @@ class WebAuthStore:
             and bool(row["active"])
             and not bool(row["must_change_password"])
         )
+
+    @staticmethod
+    def _require_admin_locked(
+        connection: sqlite3.Connection,
+        user_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM web_users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None or not bool(row["active"]):
+            raise WebAuthenticationError("未知或已停用的用户")
+        if str(row["role"]) != "admin":
+            raise WebAuthorizationError("此操作仅限管理员")
+        return row
+
+    @classmethod
+    def _require_registration_code_locked(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        registration_code: object | None,
+        now: float,
+    ) -> sqlite3.Row:
+        supplied = str(registration_code or "").strip()
+        if not supplied or len(supplied) > 256 or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in supplied
+        ):
+            raise WebAuthorizationError("注册码无效、已过期或已用完")
+        row = connection.execute(
+            "SELECT * FROM web_registration_codes WHERE code_hash = ?",
+            (cls._secret_hash(supplied),),
+        ).fetchone()
+        if (
+            row is None
+            or row["revoked_at"] is not None
+            or float(row["expires_at"]) <= now
+            or int(row["use_count"]) >= int(row["max_uses"])
+        ):
+            raise WebAuthorizationError("注册码无效、已过期或已用完")
+        return row
+
+    @staticmethod
+    def _registration_code_payload(
+        row: sqlite3.Row,
+        *,
+        now: float,
+    ) -> dict[str, object]:
+        keys = set(row.keys())
+        if row["revoked_at"] is not None:
+            status = "revoked"
+        elif float(row["expires_at"]) <= now:
+            status = "expired"
+        elif int(row["use_count"]) >= int(row["max_uses"]):
+            status = "exhausted"
+        else:
+            status = "active"
+        return {
+            "code_id": str(row["code_id"]),
+            "label": str(row["label"] or ""),
+            "max_uses": int(row["max_uses"]),
+            "use_count": int(row["use_count"]),
+            "remaining_uses": max(
+                0,
+                int(row["max_uses"]) - int(row["use_count"]),
+            ),
+            "status": status,
+            "created_by_web_user_id": str(row["created_by_web_user_id"]),
+            "created_by_username": (
+                str(row["created_by_username"])
+                if "created_by_username" in keys
+                else None
+            ),
+            "created_at": float(row["created_at"]),
+            "expires_at": float(row["expires_at"]),
+            "last_used_at": (
+                float(row["last_used_at"])
+                if row["last_used_at"] is not None
+                else None
+            ),
+            "revoked_at": (
+                float(row["revoked_at"])
+                if row["revoked_at"] is not None
+                else None
+            ),
+            "revoked_by_web_user_id": (
+                str(row["revoked_by_web_user_id"])
+                if row["revoked_by_web_user_id"] is not None
+                else None
+            ),
+            "revoked_by_username": (
+                str(row["revoked_by_username"])
+                if "revoked_by_username" in keys
+                and row["revoked_by_username"] is not None
+                else None
+            ),
+        }
 
     def _consume_captcha(self, captcha_id: str, answer: str) -> None:
         try:

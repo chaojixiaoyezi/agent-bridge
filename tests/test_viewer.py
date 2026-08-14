@@ -520,6 +520,145 @@ def test_public_access_code_registration_and_auth_rate_limits(
     assert limited.json()["retry_after_seconds"] > 0
 
 
+def test_admin_managed_registration_codes_are_hashed_atomic_and_revocable(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    app = make_app(
+        database,
+        security_policy=ViewerSecurityPolicy(web_registration_mode="access_code"),
+    )
+    stale_browser = TestClient(app)
+    stale_browser.cookies.set("agent_bridge_web_session", "stale-session-token")
+    stale_health = stale_browser.get("/api/health")
+    assert stale_health.status_code == 200
+    assert stale_health.json()["web_registration_mode"] == "access_code"
+
+    admin = TestClient(app)
+    login_admin(admin)
+
+    created = admin.post(
+        "/api/admin/web-registration-codes",
+        headers=intent_headers(admin, "create-registration-code"),
+        json={"label": "测试邀请", "max_uses": 1, "expires_in_hours": 24},
+    )
+    assert created.status_code == 201
+    registration_code = created.json()["registration_code"]
+    plaintext = registration_code.pop("code")
+    assert plaintext.startswith("ABR-")
+    assert registration_code["status"] == "active"
+    assert registration_code["remaining_uses"] == 1
+
+    listed = admin.get("/api/admin/web-registration-codes")
+    assert listed.status_code == 200
+    assert listed.json()["codes"][0]["label"] == "测试邀请"
+    assert plaintext not in listed.text
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT code_hash, use_count FROM web_registration_codes"
+        ).fetchone()
+        assert stored is not None
+        assert stored[0] != plaintext
+        assert len(stored[0]) == 64
+        assert stored[1] == 0
+
+    def register(index: int) -> int:
+        client = TestClient(app)
+        return client.post(
+            "/api/auth/register",
+            headers=intent_headers(client, "register"),
+            json={
+                "username": f"atomic-member-{index}",
+                "password": USER_PASSWORD,
+                "captcha_id": captcha(client),
+                "captcha_answer": CAPTCHA_ANSWER,
+                "registration_code": plaintext,
+            },
+        ).status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = sorted(executor.map(register, range(2)))
+    assert statuses == [201, 403]
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT use_count FROM web_registration_codes"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM web_registration_code_uses"
+        ).fetchone()[0] == 1
+
+    reusable = admin.post(
+        "/api/admin/web-registration-codes",
+        headers=intent_headers(admin, "create-registration-code"),
+        json={"label": "撤销测试", "max_uses": 3, "expires_in_hours": 48},
+    ).json()["registration_code"]
+    revoked = admin.post(
+        f"/api/admin/web-registration-codes/{reusable['code_id']}/revoke",
+        headers=intent_headers(admin, "revoke-registration-code"),
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["registration_code"]["status"] == "revoked"
+
+    denied_client = TestClient(app)
+    denied = denied_client.post(
+        "/api/auth/register",
+        headers=intent_headers(denied_client, "register"),
+        json={
+            "username": "revoked-member",
+            "password": USER_PASSWORD,
+            "captcha_id": captcha(denied_client),
+            "captcha_answer": CAPTCHA_ANSWER,
+            "registration_code": reusable["code"],
+        },
+    )
+    assert denied.status_code == 403
+    assert "无效" in denied.json()["error"]
+
+    expiring = admin.post(
+        "/api/admin/web-registration-codes",
+        headers=intent_headers(admin, "create-registration-code"),
+        json={"label": "过期测试", "max_uses": 1, "expires_in_hours": 1},
+    ).json()["registration_code"]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE web_registration_codes SET expires_at = ? WHERE code_id = ?",
+            (time.time() - 1, expiring["code_id"]),
+        )
+    expired_codes = admin.get("/api/admin/web-registration-codes").json()["codes"]
+    assert next(
+        item for item in expired_codes if item["code_id"] == expiring["code_id"]
+    )["status"] == "expired"
+    expired_client = TestClient(app)
+    expired = expired_client.post(
+        "/api/auth/register",
+        headers=intent_headers(expired_client, "register"),
+        json={
+            "username": "expired-member",
+            "password": USER_PASSWORD,
+            "captcha_id": captcha(expired_client),
+            "captcha_answer": CAPTCHA_ANSWER,
+            "registration_code": expiring["code"],
+        },
+    )
+    assert expired.status_code == 403
+
+
+def test_registration_code_admin_endpoints_reject_ordinary_users(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    app = make_app(database)
+    user = TestClient(app)
+    register_web_user(user)
+    assert user.get("/api/admin/web-registration-codes").status_code == 403
+    denied = user.post(
+        "/api/admin/web-registration-codes",
+        headers=intent_headers(user, "create-registration-code"),
+        json={},
+    )
+    assert denied.status_code == 403
+
+
 def test_dashboard_lists_rooms_messages_and_participants(tmp_path: Path) -> None:
     database = tmp_path / "bridge.db"
     seed(database)
@@ -757,8 +896,10 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-4" in index_html
-    assert "app.css?v=20260814-4" in index_html
+    assert "app.js?v=20260814-5" in index_html
+    assert "app.css?v=20260814-5" in index_html
+    assert 'id="open-registration-codes"' in index_html
+    assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
     assert "const INITIAL_ROOM_MESSAGE_LIMIT = 60" in javascript
     assert "const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100" in javascript

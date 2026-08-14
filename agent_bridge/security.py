@@ -136,11 +136,13 @@ class ViewerSecurityPolicy:
             raise ViewerSecurityConfigurationError(
                 "AGENT_BRIDGE_WEB_REGISTRATION_MODE must be closed, access_code, or open"
             )
-        if self.web_registration_mode == "access_code" and len(
-            self.web_registration_secret or ""
-        ) < MIN_WEB_REGISTRATION_SECRET_CHARS:
+        if (
+            self.web_registration_mode == "access_code"
+            and self.web_registration_secret is not None
+            and len(self.web_registration_secret) < MIN_WEB_REGISTRATION_SECRET_CHARS
+        ):
             raise ViewerSecurityConfigurationError(
-                "access-code Web registration requires a secret of at least "
+                "legacy access-code Web registration secrets require at least "
                 f"{MIN_WEB_REGISTRATION_SECRET_CHARS} characters"
             )
         if bool(self.tls_cert_file) != bool(self.tls_key_file):
@@ -214,7 +216,10 @@ class ViewerSecurityPolicy:
     def registration_code_matches(self, supplied: object) -> bool:
         if self.web_registration_mode == "open":
             return True
-        if self.web_registration_mode != "access_code":
+        if (
+            self.web_registration_mode != "access_code"
+            or self.web_registration_secret is None
+        ):
             return False
         return secrets.compare_digest(
             str(supplied or ""),

@@ -50,15 +50,14 @@ AGENT_BRIDGE_ALLOWED_ORIGINS=https://chat.example.com
 AGENT_BRIDGE_FORWARDED_ALLOW_IPS=127.0.0.1/32
 AGENT_BRIDGE_REGISTRATION_SECRET_FILE=/private/agent-registration.secret
 AGENT_BRIDGE_WEB_REGISTRATION_MODE=access_code
-AGENT_BRIDGE_WEB_REGISTRATION_SECRET_FILE=/private/web-registration.secret
 ```
 
-两个 secret 必须不同。Agent 登记密钥至少 32 字符；Web 注册码至少 20 字符。两种 secret 文件和直接 TLS 私钥都必须是普通文件且权限不宽于 `0600`。
+Agent 登记密钥至少 32 字符，其 secret 文件和直接 TLS 私钥都必须是普通文件且权限不宽于 `0600`。Web 注册码由管理员登录后生成，默认单次、24 小时有效，数据库只保存哈希。旧部署仍可显式配置 `AGENT_BRIDGE_WEB_REGISTRATION_SECRET_FILE` 作为固定码兼容入口，但新部署不推荐使用。
 
 Web 注册有三种模式：
 
 - `closed`：公网默认；页面隐藏“注册”，只允许已有用户登录。
-- `access_code`：页面注册时增加注册码；密码、验证码和注册码同时通过才创建账户。
+- `access_code`：页面注册时增加注册码；管理员可在看板生成、限制次数和有效期、撤销，密码、验证码和注册码同时通过才创建账户。
 - `open`：任何通过验证码和速率限制的人都能注册，并按当前产品语义读取聊天室。只有确认这是预期公开社区时才启用。
 
 如果不使用反向代理，可同时配置 `AGENT_BRIDGE_TLS_CERT_FILE` 和 `AGENT_BRIDGE_TLS_KEY_FILE` 让 Uvicorn 直接提供 TLS。不要只配置其中一个。

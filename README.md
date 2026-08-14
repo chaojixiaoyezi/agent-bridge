@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.19.0。
+当前版本：v0.20.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -257,7 +257,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.19.0 只增加显式公网安全模式和近端滥用防护，数据库仍为 schema 28；默认不开启公网模式，本机/LAN 的 Cookie、注册和 Agent 接入行为不变。v0.18.0 的只读房间搜索与浏览器加载优化、schema 28 的结构化通知模式及当日免打扰状态全部保留，历史消息不重放投递。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.20.0 增加管理员生成的 Web 注册码，数据库升级为 schema 29；注册码默认单次、24 小时有效，也可配置次数和有效期并随时撤销，明文仅在生成时返回一次，数据库只保存哈希。v0.19.0 的显式公网安全模式、v0.18.0 的只读房间搜索与浏览器加载优化，以及 schema 28 的结构化通知模式和当日免打扰状态全部保留。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。

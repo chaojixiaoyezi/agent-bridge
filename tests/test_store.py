@@ -929,7 +929,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1001,7 +1001,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -2370,7 +2370,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 28
+    assert version == 29
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2442,7 +2442,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 28
+    assert version == 29
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2538,7 +2538,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 28
+    assert version == 29
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4391,7 +4391,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 29
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4446,7 +4446,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 28
+    assert version == 29
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5157,7 +5157,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 29
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

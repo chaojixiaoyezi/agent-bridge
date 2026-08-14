@@ -39,6 +39,8 @@ const state = {
   memberRooms: [],
   memberSelections: new Map(),
   roomPermissionUsers: [],
+  registrationCodes: [],
+  generatedRegistrationCode: "",
   theme: "paper",
   roomRenderSignature: "",
   messageRenderSignature: "",
@@ -141,6 +143,19 @@ const elements = {
   submitForwardMessage: document.querySelector("#submit-forward-message"),
   openMessageRates: document.querySelector("#open-message-rates"),
   openRoomPermissions: document.querySelector("#open-room-permissions"),
+  openRegistrationCodes: document.querySelector("#open-registration-codes"),
+  registrationCodeDialog: document.querySelector("#registration-code-dialog"),
+  closeRegistrationCodes: document.querySelector("#close-registration-codes"),
+  registrationCodeForm: document.querySelector("#registration-code-form"),
+  registrationCodeLabel: document.querySelector("#registration-code-label"),
+  registrationCodeMaxUses: document.querySelector("#registration-code-max-uses"),
+  registrationCodeHours: document.querySelector("#registration-code-hours"),
+  registrationCodeFeedback: document.querySelector("#registration-code-feedback"),
+  registrationCodeOutput: document.querySelector("#registration-code-output"),
+  generatedRegistrationCode: document.querySelector("#generated-registration-code"),
+  copyRegistrationCode: document.querySelector("#copy-registration-code"),
+  createRegistrationCode: document.querySelector("#create-registration-code"),
+  registrationCodeList: document.querySelector("#registration-code-list"),
   roomPermissionDialog: document.querySelector("#room-permission-dialog"),
   closeRoomPermissions: document.querySelector("#close-room-permissions"),
   taskPermissionDialog: document.querySelector("#task-permission-dialog"),
@@ -574,6 +589,7 @@ function showAuthScreen(message = "") {
   for (const dialog of [
     elements.passwordDialog,
     elements.accountDialog,
+    elements.registrationCodeDialog,
     elements.createRoomDialog,
     elements.renameRoomDialog,
     elements.forwardMessageDialog,
@@ -605,6 +621,7 @@ function applyUserPermissions() {
   elements.openCreateRoom.hidden = !(admin || state.currentUser?.can_create_rooms);
   elements.openMessageRates.hidden = !admin;
   elements.openRoomPermissions.hidden = !admin;
+  elements.openRegistrationCodes.hidden = !admin;
   elements.openAgentAccess.hidden = !admin;
   elements.agentInvitationSection.hidden = !admin;
   elements.agentSessionSection.hidden = !admin;
@@ -2673,6 +2690,97 @@ async function openRoomPermissionDialog() {
   }
 }
 
+function renderRegistrationCodes() {
+  elements.registrationCodeList.replaceChildren();
+  if (!state.registrationCodes.length) {
+    elements.registrationCodeList.append(
+      makeElement("p", "muted-copy", "还没有生成过注册码。"),
+    );
+    return;
+  }
+  const statusLabels = {
+    active: "可用",
+    exhausted: "已用完",
+    expired: "已过期",
+    revoked: "已撤销",
+  };
+  for (const code of state.registrationCodes) {
+    const card = makeElement("article", "rate-result-card registration-code-card");
+    const heading = makeElement("div", "rate-result-heading");
+    const identity = makeElement("div", "rate-result-identity");
+    identity.append(makeElement("strong", "", code.label || "未备注注册码"));
+    identity.append(makeElement(
+      "span",
+      "",
+      `已使用 ${code.use_count}/${code.max_uses} 次 · ${fullTime(code.created_at)} 创建`,
+    ));
+    identity.append(makeElement("small", "", `有效期至 ${fullTime(code.expires_at)}`));
+    heading.append(identity);
+    heading.append(makeElement(
+      "span",
+      `rate-effective-badge registration-code-status ${code.status}`,
+      statusLabels[code.status] || code.status,
+    ));
+    card.append(heading);
+    if (code.status === "active") {
+      const controls = makeElement("div", "rate-result-controls");
+      const revoke = makeElement("button", "revoke-button", "撤销");
+      revoke.type = "button";
+      revoke.addEventListener("click", async () => {
+        revoke.disabled = true;
+        elements.registrationCodeFeedback.classList.remove("error", "success");
+        elements.registrationCodeFeedback.textContent = "正在撤销注册码…";
+        try {
+          await fetchJson(
+            `/api/admin/web-registration-codes/${encodeURIComponent(code.code_id)}/revoke`,
+            {
+              method: "POST",
+              headers: { "X-Agent-Bridge-Intent": "revoke-registration-code" },
+            },
+          );
+          await loadRegistrationCodes();
+          elements.registrationCodeFeedback.classList.add("success");
+          elements.registrationCodeFeedback.textContent = "注册码已撤销，之后不能再使用。";
+        } catch (error) {
+          elements.registrationCodeFeedback.classList.add("error");
+          elements.registrationCodeFeedback.textContent = error.message;
+          revoke.disabled = false;
+        }
+      });
+      controls.append(revoke);
+      card.append(controls);
+    }
+    elements.registrationCodeList.append(card);
+  }
+}
+
+async function loadRegistrationCodes() {
+  const payload = await fetchJson("/api/admin/web-registration-codes?limit=100");
+  state.registrationCodes = payload.codes || [];
+  renderRegistrationCodes();
+}
+
+async function openRegistrationCodeDialog() {
+  if (!isAdmin()) return;
+  state.generatedRegistrationCode = "";
+  elements.generatedRegistrationCode.textContent = "";
+  elements.registrationCodeOutput.hidden = true;
+  elements.registrationCodeFeedback.classList.remove("error", "success");
+  elements.registrationCodeFeedback.textContent = "正在载入注册码…";
+  elements.registrationCodeList.replaceChildren();
+  if (!elements.registrationCodeDialog.open) {
+    elements.registrationCodeDialog.showModal();
+  }
+  try {
+    await loadRegistrationCodes();
+    elements.registrationCodeFeedback.textContent = "";
+    window.setTimeout(() => elements.registrationCodeLabel.focus(), 0);
+  } catch (error) {
+    elements.registrationCodeFeedback.classList.add("error");
+    elements.registrationCodeFeedback.textContent = error.message;
+  }
+}
+
 function renderTaskPermissionMembers() {
   elements.taskPermissionResults.replaceChildren();
   const members = state.taskPermissions?.members || [];
@@ -3124,6 +3232,71 @@ elements.search.addEventListener("input", (event) => {
 elements.refreshButton.addEventListener("click", () => refresh({ fullRoom: true }));
 elements.openMessageRates.addEventListener("click", openMessageRateDialog);
 elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
+elements.openRegistrationCodes.addEventListener("click", openRegistrationCodeDialog);
+elements.closeRegistrationCodes.addEventListener("click", () => {
+  state.generatedRegistrationCode = "";
+  elements.generatedRegistrationCode.textContent = "";
+  elements.registrationCodeOutput.hidden = true;
+  elements.registrationCodeDialog.close();
+});
+elements.registrationCodeDialog.addEventListener("click", (event) => {
+  if (event.target !== elements.registrationCodeDialog) return;
+  state.generatedRegistrationCode = "";
+  elements.generatedRegistrationCode.textContent = "";
+  elements.registrationCodeOutput.hidden = true;
+  elements.registrationCodeDialog.close();
+});
+elements.registrationCodeDialog.addEventListener("close", () => {
+  state.generatedRegistrationCode = "";
+  elements.generatedRegistrationCode.textContent = "";
+  elements.registrationCodeOutput.hidden = true;
+});
+elements.registrationCodeForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!elements.registrationCodeForm.reportValidity()) return;
+  elements.createRegistrationCode.disabled = true;
+  elements.registrationCodeFeedback.classList.remove("error", "success");
+  elements.registrationCodeFeedback.textContent = "正在生成注册码…";
+  try {
+    const payload = await fetchJson("/api/admin/web-registration-codes", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "create-registration-code",
+      },
+      body: JSON.stringify({
+        label: elements.registrationCodeLabel.value.trim(),
+        max_uses: Number(elements.registrationCodeMaxUses.value),
+        expires_in_hours: Number(elements.registrationCodeHours.value),
+      }),
+    });
+    state.generatedRegistrationCode = payload.registration_code.code;
+    elements.generatedRegistrationCode.textContent = state.generatedRegistrationCode;
+    elements.registrationCodeOutput.hidden = false;
+    elements.registrationCodeFeedback.classList.add("success");
+    elements.registrationCodeFeedback.textContent = "注册码已生成。请立即复制；关闭窗口后不会再次显示明文。";
+    elements.registrationCodeLabel.value = "";
+    await loadRegistrationCodes();
+  } catch (error) {
+    elements.registrationCodeFeedback.classList.add("error");
+    elements.registrationCodeFeedback.textContent = error.message;
+  } finally {
+    elements.createRegistrationCode.disabled = false;
+  }
+});
+elements.copyRegistrationCode.addEventListener("click", async () => {
+  if (!state.generatedRegistrationCode) return;
+  try {
+    await navigator.clipboard.writeText(state.generatedRegistrationCode);
+    elements.registrationCodeFeedback.classList.remove("error");
+    elements.registrationCodeFeedback.classList.add("success");
+    elements.registrationCodeFeedback.textContent = "注册码已复制。";
+  } catch (error) {
+    elements.registrationCodeFeedback.classList.remove("success");
+    elements.registrationCodeFeedback.classList.add("error");
+    elements.registrationCodeFeedback.textContent = "浏览器未允许复制，请手动复制上方注册码。";
+  }
+});
 elements.manageTaskPermissions.addEventListener("click", openTaskPermissionDialog);
 elements.manageWakePolicy.addEventListener("click", openWakePolicyDialog);
 elements.closeWakePolicy.addEventListener("click", () => elements.wakePolicyDialog.close());

@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-4">
-    <script src="/assets/app.js?v=20260814-4" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-5">
+    <script src="/assets/app.js?v=20260814-5" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -36,6 +36,7 @@
           <button class="access-button" id="open-agent-access" type="button">Agent 接入</button>
           <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
           <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
+          <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
           <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
           <span class="status-dot" id="status-dot" aria-hidden="true"></span>
           <span id="connection-label">正在连接</span>
@@ -279,6 +280,50 @@
           <button class="primary-button" id="submit-profile" type="submit">保存资料</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="room-dialog rate-dialog" id="registration-code-dialog" aria-labelledby="registration-code-title">
+      <div class="room-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ADMIN WEB ENROLLMENT</p>
+            <h2 id="registration-code-title">Web 用户注册码</h2>
+          </div>
+          <button class="dialog-close" id="close-registration-codes" type="button" aria-label="关闭">×</button>
+        </div>
+        <form id="registration-code-form">
+          <label class="field-label" for="registration-code-label">用途备注（可选）</label>
+          <input class="room-id-input" id="registration-code-label" type="text" maxlength="80" placeholder="例如：设计组小王" autocomplete="off">
+          <div class="rate-global-grid registration-code-options">
+            <label class="rate-global-card" for="registration-code-max-uses">
+              <span>最多使用</span>
+              <span class="rate-number-wrap"><input id="registration-code-max-uses" type="number" min="1" max="1000" step="1" value="1" required><small>次</small></span>
+            </label>
+            <label class="rate-global-card" for="registration-code-hours">
+              <span>有效时间</span>
+              <span class="rate-number-wrap"><input id="registration-code-hours" type="number" min="1" max="720" step="1" value="24" required><small>小时</small></span>
+            </label>
+          </div>
+          <p class="field-help">默认只能注册一个账户、24 小时失效。明文只在创建后显示一次；服务器只保存哈希，可随时撤销。</p>
+          <p class="form-feedback" id="registration-code-feedback" role="status" aria-live="polite"></p>
+          <div class="registration-code-output" id="registration-code-output" hidden>
+            <code id="generated-registration-code"></code>
+            <button class="secondary-button compact-button" id="copy-registration-code" type="button">复制</button>
+          </div>
+          <div class="form-actions">
+            <button class="primary-button" id="create-registration-code" type="submit">生成注册码</button>
+          </div>
+        </form>
+        <section class="rate-section registration-code-history">
+          <div class="rate-section-heading">
+            <div>
+              <strong>最近生成</strong>
+              <p>历史列表不会再次显示注册码明文。</p>
+            </div>
+          </div>
+          <div class="rate-result-list" id="registration-code-list"></div>
+        </section>
+      </div>
     </dialog>
 
     <dialog class="room-dialog" id="create-room-dialog" aria-labelledby="create-room-title">

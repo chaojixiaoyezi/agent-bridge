@@ -1595,7 +1595,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 28")
+            conn.execute("PRAGMA user_version = 29")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
