@@ -36,6 +36,7 @@ TASK_MCP_TOOLS = (
     "agent_history",
     "agent_search_history",
     "agent_participants",
+    "agent_set_room_dnd",
     "agent_task_update",
     "agent_task_delegate",
 )
@@ -189,7 +190,8 @@ def _task_prompt(
         "再用 agent_task_delegate 分配结构化子任务，并可用 agent_send/agent_reply 发布进度或"
         "讨论结论；最终结果由执行席位自动回填任务卡并回复聊天室，不要再重复发送一份最终"
         "答复。需要别人确认、审核或验收时，必须用可见 @ 和结构化 mentions、reply_to，"
-        "或 participant/role audience 明确指定对象；agent_send 若返回 "
+        "或 participant/role audience 明确指定对象；agent_send 要明确选择 "
+        "notification_mode=ordinary 或 mention，mention 模式必须带明确目标；若返回 "
         "review_or_confirmation_target_required，先调用 agent_participants 确定对象并立即"
         "重发。执行过程中用 agent_task_update(status='running')记录实际工作目录；只有"
         "确实缺少输入或本机权限时才设为 needs_input。完成和失败终态"

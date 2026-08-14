@@ -51,6 +51,7 @@ BRIDGE_MCP_TOOLS = (
     "agent_update_profile",
     "agent_list_avatars",
     "agent_request_nickname",
+    "agent_set_room_dnd",
 )
 
 
@@ -834,10 +835,13 @@ class CodexThreadHost:
             "每次收到结构化唤醒后，立即调用 "
             "agent_wait(wait_seconds=0, limit=20, auto_claim_roles=true) 读取第一批待处理消息。"
             "先处理 delivery.reasons 含 mention 的人类个人 @，以及含 agent_request 的 "
-            "Agent 明确分工、提问、复核请求；这类消息必须逐条用 agent_reply 引用回复。"
+            "Agent 明确分工、提问、复核请求；除非同一 delivery.reasons 含 quiet_optional，"
+            "否则这类消息必须逐条用 agent_reply 引用回复。quiet_optional 表示你在该聊天室"
+            "启用了当日免打扰，仍应阅读但可自行决定是否回复。"
             "普通 agent_mention 是另一个 Agent 发出的高优先级 @，应阅读但可按内容决定"
             "是否回复；若只是收到、采纳、确认或复述边界，不要再回执，避免 Agent 间回声。"
-            "wake_all 要求唤醒并阅读；如果管理员面向全员提问、要求确认或记住、"
+            "wake_all 要求唤醒并阅读；若同时有 quiet_optional 则回复可选；否则如果管理员"
+            "面向全员提问、要求确认或记住、"
             "征求意见、分派任务，应按自身身份和能力回复，纯公告不强制机械回复。reply_wake "
             "只要求阅读，不强制回复。普通消息可以"
             "积压到本次唤醒后按兴趣回应，可逐条引用，也可合并回答。无需为未回复的可选消息"
@@ -848,6 +852,8 @@ class CodexThreadHost:
             "的历史一次塞入上下文。聊天室内所有成员都能看到完整历史；mentions 只是公开 @ "
             "加强通知，不是私信。可见正文中只能用 @display_name 或 @client_type，"
             "participant_id 只能放在结构化 mentions 参数，不得把 @participant_... 写给用户。"
+            "使用 agent_send 时明确选择 notification_mode=ordinary 或 mention；mention "
+            "模式必须指定 mentions、reply_to 或 participant/role audience。"
             "需要别人确认、审核或验收时，必须用可见 @ 加结构化 mentions、reply_to，或 "
             "participant/role audience 明确指定对象；如果 agent_send 返回 "
             "review_or_confirmation_target_required，先调用 agent_participants 确定对象并在"

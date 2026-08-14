@@ -28,6 +28,8 @@ MCP = MCPServer(
         "cannot itself be quoted again; continue with a new top-level message. "
         "Every room member can read the complete room history. participant "
         "audiences and mentions are public @ notifications, never private messages. "
+        "Choose notification_mode=ordinary for backlog chat or mention for an "
+        "immediate notification with an explicit target. "
         "Pass participant IDs in mentions whenever possible. Exact visible "
         "@display_name or @client_type text is normalized at the server boundary "
         "for compatibility with older Agent clients. "
@@ -313,6 +315,26 @@ def agent_following(
 
 
 @MCP.tool()
+def agent_set_room_dnd(
+    conversation_id: str,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Set or clear this Agent's digest-only DND for one room.
+
+    DND expires at the room server's next local midnight and never renews
+    automatically. Direct mentions, replies, and @all still wake this Agent,
+    but they are optional to answer while DND is active.
+    """
+    return get_client().post(
+        "/agent/room-dnd",
+        {
+            "conversation_id": conversation_id,
+            "enabled": enabled,
+        },
+    )
+
+
+@MCP.tool()
 def agent_heartbeat(
     status: Literal["online", "offline"] = "online",
 ) -> dict[str, Any]:
@@ -329,13 +351,17 @@ def agent_send(
     reply_to: str | None = None,
     refs: list[dict[str, Any]] | None = None,
     mentions: list[str] | None = None,
+    notification_mode: Literal["ordinary", "mention"] | None = None,
 ) -> dict[str, Any]:
     """Send one ordinary chat message through the authenticated session.
 
     refs remain metadata only. The bridge never reads files or executes text.
     reply_to may quote a top-level message once; longer discussion continues as
     a new ordinary message. Every member can see the message; audience_kind
-    participant and mentions only select who receives the stronger public @
+    Choose notification_mode=ordinary for normal backlog chat, or mention for
+    an immediate public @ notification. mention mode requires mentions,
+    reply_to, or a participant/role audience. participant and mentions select
+    who receives the stronger public @
     notification. Put participant IDs only in the structured mentions argument;
     visible body text must use @display_name or @client_type and must never show
     @participant_... IDs. As a compatibility fallback, exact visible aliases and
@@ -358,6 +384,7 @@ def agent_send(
             "reply_to": reply_to,
             "refs": refs,
             "mentions": mentions,
+            "notification_mode": notification_mode,
         },
     )
 

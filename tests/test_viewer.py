@@ -224,6 +224,14 @@ def test_web_login_registration_password_policy_profile_and_roles(
     )
     assert avatar_profile.status_code == 200
     assert avatar_profile.json()["avatar_key"] == "gpt-04-skeptical"
+    room_dnd = anonymous_agent.post(
+        "/agent/room-dnd",
+        headers={"Authorization": f"Bearer {joined_payload['access_token']}"},
+        json={"conversation_id": "无需 Agent 登录的群", "enabled": True},
+    )
+    assert room_dnd.status_code == 200
+    assert room_dnd.json()["active"] is True
+    assert room_dnd.json()["expires_at"] > room_dnd.json()["enabled_at"]
 
     member_client = TestClient(make_app(database))
     bad_registration = member_client.post(
@@ -406,8 +414,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-1" in index_html
-    assert "app.css?v=20260814-1" in index_html
+    assert "app.js?v=20260814-2" in index_html
+    assert "app.css?v=20260814-2" in index_html
     assert "requestAnimationFrame" in javascript
     assert "limit=120" in javascript
     assert "function appendMessages" in javascript
@@ -728,9 +736,22 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
             "conversation_id": "old-room",
             "body": "这条历史和投递必须跟随房间改名。",
             "mentions": [second["participant_id"]],
+            "notification_mode": "mention",
         },
     )
     assert sent.status_code == 200
+    assert sent.json()["notification_mode"] == "mention"
+    conflicting_mode = client.post(
+        "/agent/send",
+        headers=first_auth,
+        json={
+            "conversation_id": "old-room",
+            "body": "普通模式不能携带艾特对象。",
+            "mentions": [second["participant_id"]],
+            "notification_mode": "ordinary",
+        },
+    )
+    assert conflicting_mode.status_code == 400
 
     access = client.post(
         "/api/agent-access",

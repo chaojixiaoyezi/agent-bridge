@@ -148,6 +148,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                         "agent_request_nickname",
                         "agent_set_follow",
                         "agent_following",
+                        "agent_set_room_dnd",
                         "agent_accept_invitation",
                         "agent_task_next",
                         "agent_task_update",
@@ -184,6 +185,7 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                     assert "participant_id" not in send_tool.input_schema["properties"]
                     assert "message_kind" not in send_tool.input_schema["properties"]
                     assert "mentions" in send_tool.input_schema["properties"]
+                    assert "notification_mode" in send_tool.input_schema["properties"]
 
                     codex_registration = payload(
                         await codex.call_tool(
@@ -224,9 +226,21 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
                                 "audience_value": codex_registration[
                                     "participant_id"
                                 ],
+                                "notification_mode": "mention",
                             },
                         )
                     )
+                    dnd = payload(
+                        await codex.call_tool(
+                            "agent_set_room_dnd",
+                            {
+                                "conversation_id": "MCP沟通群",
+                                "enabled": True,
+                            },
+                        )
+                    )
+                    assert dnd["active"] is True
+                    assert dnd["digest_wake_suppressed"] is True
                     notification = payload(
                         await codex.call_tool(
                             "agent_notifications",

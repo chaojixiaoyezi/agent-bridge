@@ -2433,9 +2433,9 @@ async function openWakePolicyDialog() {
       `/api/rooms/${encodeURIComponent(room.conversation_id)}/wake-policy`,
     );
     elements.wakePolicyMode.value = policy.mode || "mention";
-    elements.wakeDigestMinMessages.value = String(policy.digest_min_messages || 5);
+    elements.wakeDigestMinMessages.value = String(policy.digest_min_messages || 10);
     elements.wakeDigestAfterMinutes.value = String(
-      Math.max(0.5, Number(policy.digest_after_seconds || 300) / 60),
+      Math.max(0.5, Number(policy.digest_after_seconds || 7200) / 60),
     );
     updateWakePolicyFields();
     elements.wakePolicyFeedback.textContent = "";

@@ -35,6 +35,7 @@ BRIDGE_TOOLS = (
     "agent_update_profile",
     "agent_list_avatars",
     "agent_request_nickname",
+    "agent_set_room_dnd",
 )
 MODEL_BRIDGE_TOOLS = tuple(tool for tool in BRIDGE_TOOLS if tool != "agent_wait")
 MAX_PREFETCH_PAGES = 5
@@ -595,11 +596,15 @@ def run_claude(batch: dict[str, Any]) -> None:
         "必须回复的消息即使本身已是引用回复也照常调用 agent_reply；Bridge 会自动改为"
         "顶层续聊并通知原发送者。"
         "人类个人 @ 与 Agent 发出的明确分工、提问、复核请求必须用 agent_reply 回复；"
-        "后者的 delivery.reasons 为 agent_request。普通 agent_mention 只要求及时阅读，"
-        "不要对纯收到/采纳/确认继续回执。wake_all 会唤醒所有 Agent：管理员向全员提问、"
+        "但 delivery.reasons 含 quiet_optional 时表示本 Agent 已在该聊天室开启当日免打扰，"
+        "消息仍需阅读但回复可选。后者的 delivery.reasons 为 agent_request。普通 "
+        "agent_mention 只要求及时阅读，不要对纯收到/采纳/确认继续回执。wake_all 会唤醒"
+        "所有 Agent；若同时有 quiet_optional 则回复可选，否则管理员向全员提问、"
         "要求确认或记住、征求意见、分派任务时，应按自己的身份和能力回应；纯公告不强制"
         "机械回复。普通消息按兴趣回复。需要别人确认、审核或验收时，必须通过可见 @ 和"
-        "结构化 mentions、reply_to，或 participant/role audience 明确指定对象；如果 "
+        "结构化 mentions、reply_to，或 participant/role audience 明确指定对象。使用 "
+        "agent_send 时明确选择 notification_mode=ordinary 或 mention；mention 模式必须"
+        "带明确目标。如果 "
         "agent_send 返回 review_or_confirmation_target_required，先调用 agent_participants "
         "确定对象并立即重发，不能当作已通知。可见正文只用 @display_name 或 "
         "@client_type；participant_id 只放在结构化 mentions 参数，不得写出 "

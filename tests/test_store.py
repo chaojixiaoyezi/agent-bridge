@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -353,6 +354,13 @@ def test_room_wake_policy_promotes_interest_without_forcing_a_reply(
     default_activity = default_snapshot["room_activity_since_cursor"]
     assert default_activity["priority_counts"]["mention"] == 0
     assert default_activity["required_reply_count"] == 0
+    assert default_activity["conversations"][0]["wake_policy"] == {
+        "conversation_id": "兴趣唤醒群",
+        "mode": "digest",
+        "digest_min_messages": 10,
+        "digest_after_seconds": 7200.0,
+        "updated_at": None,
+    }
 
     policy = store.update_room_wake_policy(
         authorized_session_id=str(admin["session_id"]),
@@ -391,6 +399,292 @@ def test_room_wake_policy_promotes_interest_without_forcing_a_reply(
     )["room_activity_since_cursor"]
     assert digest["priority_counts"]["mention"] >= 1
     assert digest["required_reply_count"] == 0
+
+
+def test_message_notification_modes_separate_ordinary_and_mentions(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="模式发送者")
+    receiver = register(store, client="codex", name="模式接收者")
+
+    ordinary = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="普通进度只进入摘要积压。",
+        notification_mode="ordinary",
+    )
+    assert ordinary["notification_mode"] == "ordinary"
+
+    expire_sender_cooldown(
+        store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    mentioned = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="请立即看这条。",
+        mentions=[receiver["participant_id"]],
+        notification_mode="mention",
+    )
+    assert mentioned["notification_mode"] == "mention"
+
+    expire_sender_cooldown(
+        store,
+        participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+    )
+    with pytest.raises(ValidationError, match="ordinary mode"):
+        store.send(
+            authorized_session_id=sender["session_id"],
+            sender_participant_id=sender["participant_id"],
+            conversation_id="tools-room",
+            body_text="模式与接收人冲突。",
+            mentions=[receiver["participant_id"]],
+            notification_mode="ordinary",
+        )
+    with pytest.raises(ValidationError, match="requires mentions"):
+        store.send(
+            authorized_session_id=sender["session_id"],
+            sender_participant_id=sender["participant_id"],
+            conversation_id="tools-room",
+            body_text="没有目标的艾特模式。",
+            notification_mode="mention",
+        )
+
+
+def test_digest_counts_only_ordinary_messages_for_each_recipient(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "普通积压群")
+    target = register(store, client="codex", name="被艾特成员", room="普通积压群")
+    observer = register(store, client="claude-code", name="摘要成员", room="普通积压群")
+    store.update_room_wake_policy(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="普通积压群",
+        mode="digest",
+        digest_min_messages=2,
+        digest_after_seconds=3600,
+    )
+
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="普通积压群",
+        body_text="第一条普通消息。",
+    )
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="普通积压群",
+        body_text="这条只艾特目标。",
+        mentions=[target["participant_id"]],
+    )
+    before = store._pending_manifest(
+        observer["participant_id"],
+        conversation_id="普通积压群",
+    )["conversations"][0]
+    assert before["digest_pending_count"] == 1
+    assert before["policy_promoted"] is False
+
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="普通积压群",
+        body_text="第二条普通消息。",
+    )
+    after = store._pending_manifest(
+        observer["participant_id"],
+        conversation_id="普通积压群",
+    )["conversations"][0]
+    assert after["digest_pending_count"] == 2
+    assert after["policy_promoted"] is True
+
+
+def test_default_digest_wakes_for_one_two_hour_old_ordinary_message(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "两小时摘要群")
+    agent = register(store, client="codex", name="两小时成员", room="两小时摘要群")
+    sent = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="两小时摘要群",
+        body_text="只有一条但已经等待两小时。",
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET created_at = created_at - 7201 "
+            "WHERE message_id = ?",
+            (sent["message_id"],),
+        )
+    snapshot = store.notification_snapshot(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        after_sequence=10_000,
+    )["room_activity_since_cursor"]
+    assert snapshot["priority_counts"]["mention"] == 1
+    assert snapshot["required_reply_count"] == 0
+    assert snapshot["conversations"][0]["policy_promoted"] is True
+
+
+def test_room_dnd_expires_at_midnight_and_resets_only_digest_threshold(
+    tmp_path: Path,
+) -> None:
+    store = BridgeStore(
+        tmp_path / "bridge.db",
+        poll_interval_seconds=0.05,
+        business_timezone="UTC",
+    )
+    sample = datetime(2026, 8, 14, 23, 0, tzinfo=timezone.utc).timestamp()
+    assert store._next_business_midnight(sample) == datetime(
+        2026,
+        8,
+        15,
+        0,
+        0,
+        tzinfo=timezone.utc,
+    ).timestamp()
+
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    create_owned_room(store, auth, admin, "免打扰群")
+    agent = register(store, client="codex", name="免打扰成员", room="免打扰群")
+    store.update_room_wake_policy(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        mode="digest",
+        digest_min_messages=2,
+        digest_after_seconds=3600,
+    )
+    quiet = store.set_room_dnd(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        conversation_id="免打扰群",
+    )
+    assert quiet["active"] is True
+    assert quiet["timezone"] == "UTC"
+
+    direct = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        body_text="免打扰期间仍会收到直接艾特。",
+        mentions=[agent["participant_id"]],
+    )
+    delivered = store.wait_messages(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        wait_seconds=0,
+    )["messages"]
+    direct_delivery = next(
+        item for item in delivered if item["message_id"] == direct["message_id"]
+    )["delivery"]
+    assert direct_delivery["priority"] == "mention"
+    assert "quiet_optional" in direct_delivery["reasons"]
+    assert "mention" not in direct_delivery["reasons"]
+    store.message_action(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        message_id=direct["message_id"],
+        action="ack",
+    )
+
+    wake_all = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        body_text="免打扰期间的全员通知也只要求阅读。",
+        wake_all_agents=True,
+    )
+    wake_all_delivery = next(
+        item
+        for item in store.wait_messages(
+            participant_id=agent["participant_id"],
+            authorized_session_id=agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == wake_all["message_id"]
+    )["delivery"]
+    assert "wake_all" in wake_all_delivery["reasons"]
+    assert "quiet_optional" in wake_all_delivery["reasons"]
+    store.message_action(
+        participant_id=agent["participant_id"],
+        authorized_session_id=agent["session_id"],
+        message_id=wake_all["message_id"],
+        action="ack",
+    )
+
+    old = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        body_text="失效前没有读到的普通消息。",
+    )
+    active_manifest = store._pending_manifest(
+        agent["participant_id"],
+        conversation_id="免打扰群",
+    )["conversations"][0]
+    assert active_manifest["dnd"]["active"] is True
+    assert active_manifest["policy_promoted"] is False
+    now = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET created_at = ? WHERE message_id = ?",
+            (now - 10, old["message_id"]),
+        )
+        connection.execute(
+            "UPDATE agent_room_dnd SET expires_at = ? "
+            "WHERE participant_id = ? AND conversation_id = ?",
+            (now - 5, agent["participant_id"], "免打扰群"),
+        )
+
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        body_text="失效后的第一条普通消息。",
+    )
+    first = store._pending_manifest(
+        agent["participant_id"],
+        conversation_id="免打扰群",
+    )["conversations"][0]
+    assert first["digest_pending_count"] == 1
+    assert first["policy_promoted"] is False
+    assert first["dnd"]["threshold_reset_at"] == pytest.approx(now - 5)
+
+    store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="免打扰群",
+        body_text="失效后的第二条普通消息。",
+    )
+    second = store._pending_manifest(
+        agent["participant_id"],
+        conversation_id="免打扰群",
+    )["conversations"][0]
+    assert second["digest_pending_count"] == 2
+    assert second["policy_promoted"] is True
+    unread_ids = {
+        item["message_id"]
+        for item in store.wait_messages(
+            participant_id=agent["participant_id"],
+            authorized_session_id=agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+    }
+    assert old["message_id"] in unread_ids
 
 
 def test_expired_task_claim_is_requeued_and_needs_input_is_not_overwritten(
@@ -635,7 +929,16 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
+        message_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        assert "notification_mode" in message_columns
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'agent_room_dnd'"
+        ).fetchone() is not None
         grant = connection.execute(
             "SELECT * FROM chat_authorization_grants WHERE source_message_id = ?",
             (message["message_id"],),
@@ -698,7 +1001,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1690,10 +1993,14 @@ def test_month_scale_backlog_is_durable_indexed_and_paginated(tmp_path: Path) ->
     assert first_batch["pending_count"] == 240
     assert first_batch["has_more"] is True
     assert first_batch["backlog"]["priority_counts"] == {
-        "mention": 0,
+        "mention": 1,
         "important": 0,
         "normal": 240,
     }
+    backlog_room = first_batch["backlog"]["conversations"][0]
+    assert backlog_room["policy_promoted"] is True
+    assert backlog_room["digest_pending_count"] == 240
+    assert backlog_room["required_reply_count"] == 0
     assert first_batch["messages"][0]["body"] == "历史消息 0"
     assert first_batch["messages"][-1]["body"] == "历史消息 19"
 
@@ -2063,7 +2370,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 27
+    assert version == 28
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2135,7 +2442,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 27
+    assert version == 28
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2231,7 +2538,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 27
+    assert version == 28
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4084,7 +4391,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 28
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4139,7 +4446,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 27
+    assert version == 28
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -4850,7 +5157,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 27
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 28
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

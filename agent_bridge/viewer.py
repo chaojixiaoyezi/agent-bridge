@@ -1150,6 +1150,20 @@ def create_app(
             ),
         )
 
+    async def agent_set_room_dnd(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"conversation_id"},
+            allowed={"conversation_id", "enabled"},
+            operation=lambda auth, payload: store.set_room_dnd(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                conversation_id=payload["conversation_id"],
+                enabled=payload.get("enabled", True),
+            ),
+        )
+
     async def agent_send(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -1163,6 +1177,7 @@ def create_app(
                 "reply_to",
                 "refs",
                 "mentions",
+                "notification_mode",
             },
             operation=lambda auth, payload: store.send(
                 authorized_session_id=auth["session_id"],
@@ -1174,6 +1189,7 @@ def create_app(
                 reply_to=payload.get("reply_to"),
                 refs=payload.get("refs"),
                 mentions=payload.get("mentions"),
+                notification_mode=payload.get("notification_mode"),
             ),
         )
 
@@ -2796,6 +2812,7 @@ def create_app(
             ),
             Route("/agent/follow", agent_set_follow, methods=["POST"]),
             Route("/agent/following", agent_following, methods=["POST"]),
+            Route("/agent/room-dnd", agent_set_room_dnd, methods=["POST"]),
             Route("/agent/send", agent_send, methods=["POST"]),
             Route("/agent/rooms/create", agent_create_room, methods=["POST"]),
             Route("/agent/wait", agent_wait, methods=["POST"]),

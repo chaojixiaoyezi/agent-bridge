@@ -11,8 +11,10 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .avatars import (
     AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS,
@@ -110,8 +112,10 @@ CONNECTOR_COMPONENTS = {"listener", "chat", "task", "mcp"}
 SESSION_COMPONENTS = CONNECTOR_COMPONENTS | {"a2a", "unknown"}
 MESSAGE_SENDER_SEATS = {"main", "shadow", "executor", "web", "a2a", "unknown"}
 ROOM_WAKE_MODES = {"mention", "digest", "all"}
-DEFAULT_ROOM_DIGEST_MIN_MESSAGES = 5
-DEFAULT_ROOM_DIGEST_AFTER_SECONDS = 5 * 60
+MESSAGE_NOTIFICATION_MODES = {"ordinary", "mention"}
+DEFAULT_ROOM_WAKE_MODE = "digest"
+DEFAULT_ROOM_DIGEST_MIN_MESSAGES = 10
+DEFAULT_ROOM_DIGEST_AFTER_SECONDS = 2 * 60 * 60
 CHAT_AUTHORIZATION_FROZEN = True
 OWNER_PARTICIPANT_ID = "participant_web_owner"
 OWNER_AUTHORIZATION_ID = "owner_web_ui"
@@ -337,6 +341,8 @@ CREATE TABLE IF NOT EXISTS messages (
     forwarded_from_message_id TEXT,
     sender_seat TEXT NOT NULL DEFAULT 'unknown'
         CHECK (sender_seat IN ('main', 'shadow', 'executor', 'web', 'a2a', 'unknown')),
+    notification_mode TEXT NOT NULL DEFAULT 'ordinary'
+        CHECK (notification_mode IN ('ordinary', 'mention')),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
@@ -478,6 +484,21 @@ CREATE TABLE IF NOT EXISTS room_wake_policies (
 
 CREATE INDEX IF NOT EXISTS idx_room_wake_policies_updated
     ON room_wake_policies(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS agent_room_dnd (
+    participant_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    enabled_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    timezone_name TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (participant_id, conversation_id),
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_room_dnd_expiry
+    ON agent_room_dnd(expires_at, participant_id, conversation_id);
 """
 
 
@@ -1258,10 +1279,49 @@ class BridgeStore:
         database: str | Path,
         *,
         poll_interval_seconds: float = 0.2,
+        business_timezone: str | None = None,
     ) -> None:
         self.database = Path(database).expanduser()
         self.poll_interval_seconds = max(0.05, min(float(poll_interval_seconds), 2.0))
+        (
+            self.business_timezone,
+            self.business_timezone_name,
+        ) = self._resolve_business_timezone(business_timezone)
         self._initialize()
+
+    @staticmethod
+    def _resolve_business_timezone(value: str | None):
+        configured = str(
+            value
+            if value is not None
+            else os.environ.get("AGENT_BRIDGE_TIMEZONE", "")
+        ).strip()
+        if not configured:
+            try:
+                resolved = str(Path("/etc/localtime").resolve())
+            except OSError:
+                resolved = ""
+            marker = "/zoneinfo/"
+            if marker in resolved:
+                configured = resolved.split(marker, 1)[1]
+        if configured:
+            try:
+                return ZoneInfo(configured), configured
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError(
+                    f"unknown AGENT_BRIDGE_TIMEZONE: {configured}"
+                ) from exc
+        local = datetime.now().astimezone().tzinfo or timezone.utc
+        return local, getattr(local, "key", None) or str(local)
+
+    def _next_business_midnight(self, now: float) -> float:
+        current = datetime.fromtimestamp(now, tz=self.business_timezone)
+        next_date = current.date() + timedelta(days=1)
+        return datetime.combine(
+            next_date,
+            datetime_time.min,
+            tzinfo=self.business_timezone,
+        ).timestamp()
 
     def _initialize(self) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1438,26 @@ class BridgeStore:
                 conn.execute(
                     "ALTER TABLE messages ADD COLUMN sender_seat TEXT "
                     "NOT NULL DEFAULT 'unknown'"
+                )
+            notification_mode_added = "notification_mode" not in message_columns
+            if notification_mode_added:
+                conn.execute(
+                    "ALTER TABLE messages ADD COLUMN notification_mode TEXT "
+                    "NOT NULL DEFAULT 'ordinary' "
+                    "CHECK (notification_mode IN ('ordinary', 'mention'))"
+                )
+                conn.execute(
+                    """
+                    UPDATE messages
+                    SET notification_mode = CASE
+                        WHEN mentions_json != '[]'
+                          OR wake_all_agents = 1
+                          OR reply_to IS NOT NULL
+                          OR audience_kind IN ('participant', 'role')
+                        THEN 'mention'
+                        ELSE 'ordinary'
+                    END
+                    """
                 )
             if schema_version < 8 or mentions_column_added:
                 self._backfill_implicit_participant_mentions(conn)
@@ -1515,7 +1595,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 27")
+            conn.execute("PRAGMA user_version = 28")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -2683,6 +2763,14 @@ class BridgeStore:
                 (conversation, sender, created_at),
             ).fetchall()
         }
+        quiet_participants = {
+            str(row["participant_id"])
+            for row in conn.execute(
+                "SELECT participant_id FROM agent_room_dnd "
+                "WHERE conversation_id = ? AND enabled_at <= ? AND expires_at > ?",
+                (conversation, created_at, created_at),
+            ).fetchall()
+        }
         audience_kind = str(message["audience_kind"])
         candidates: list[dict[str, Any]] = []
         for membership in memberships:
@@ -2705,7 +2793,9 @@ class BridgeStore:
                 # Courtesy Agent mentions remain optional, while explicit
                 # assignments/questions get one required response.  Human
                 # personal mentions retain their existing required semantics.
-                if sender_is_human:
+                if participant in quiet_participants:
+                    reasons.extend(("agent_mention", "quiet_optional"))
+                elif sender_is_human:
                     reasons.append("mention")
                 elif agent_request_requires_reply:
                     reasons.append("agent_request")
@@ -2713,8 +2803,12 @@ class BridgeStore:
                     reasons.append("agent_mention")
             if include_optional_wakes and wake_all_agents and is_agent:
                 reasons.append("wake_all")
+                if participant in quiet_participants:
+                    reasons.append("quiet_optional")
             if include_optional_wakes and reply_target == participant and is_agent:
                 reasons.append("reply_wake")
+                if participant in quiet_participants:
+                    reasons.append("quiet_optional")
             if participant in followers:
                 reasons.append("follow")
             if participant in mention_ids:
@@ -8264,6 +8358,85 @@ class BridgeStore:
             "count": len(follows),
         }
 
+    def set_room_dnd(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        conversation_id: str,
+        enabled: bool = True,
+        _now: float | None = None,
+    ) -> dict[str, Any]:
+        """Suppress only digest wakes in one room until the next local midnight."""
+
+        participant = opaque_id(participant_id, field="participant_id")
+        session = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        conversation = validate_conversation_id(conversation_id)
+        if not isinstance(enabled, bool):
+            raise ValidationError("enabled must be a boolean")
+        now = float(time.time() if _now is None else _now)
+        with self._transaction() as conn:
+            self._require_live_room_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                conversation_id=conversation,
+                now=now,
+            )
+            self._require_membership(conn, participant, conversation)
+            if enabled:
+                expires_at = self._next_business_midnight(now)
+                conn.execute(
+                    """
+                    INSERT INTO agent_room_dnd
+                        (participant_id, conversation_id, enabled_at,
+                         expires_at, timezone_name, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(participant_id, conversation_id) DO UPDATE SET
+                        enabled_at = excluded.enabled_at,
+                        expires_at = excluded.expires_at,
+                        timezone_name = excluded.timezone_name,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        participant,
+                        conversation,
+                        now,
+                        expires_at,
+                        self.business_timezone_name,
+                        now,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM agent_room_dnd "
+                    "WHERE participant_id = ? AND conversation_id = ?",
+                    (participant, conversation),
+                )
+            row = conn.execute(
+                "SELECT * FROM agent_room_dnd "
+                "WHERE participant_id = ? AND conversation_id = ?",
+                (participant, conversation),
+            ).fetchone()
+        active = row is not None and float(row["expires_at"]) > now
+        return {
+            "participant_id": participant,
+            "conversation_id": conversation,
+            "active": active,
+            "enabled_at": float(row["enabled_at"]) if active else None,
+            "expires_at": float(row["expires_at"]) if active else None,
+            "timezone": (
+                str(row["timezone_name"])
+                if active
+                else self.business_timezone_name
+            ),
+            "digest_wake_suppressed": active,
+            "direct_notifications_optional": active,
+        }
+
     def send(
         self,
         *,
@@ -8276,6 +8449,7 @@ class BridgeStore:
         reply_to: str | None = None,
         refs: Sequence[dict[str, Any]] | None = None,
         mentions: Sequence[str] | None = None,
+        notification_mode: str | None = None,
         wake_all_agents: bool = False,
         _owner_ui: bool = False,
         _web_user: bool = False,
@@ -8297,6 +8471,18 @@ class BridgeStore:
             raise ValidationError(f"unsupported audience_kind: {normalized_audience}")
         normalized_refs = message_refs(refs)
         normalized_mentions = self._normalize_mentions(mentions)
+        requested_notification_mode = (
+            str(notification_mode).strip().lower()
+            if notification_mode is not None
+            else None
+        )
+        if (
+            requested_notification_mode is not None
+            and requested_notification_mode not in MESSAGE_NOTIFICATION_MODES
+        ):
+            raise ValidationError(
+                "notification_mode must be ordinary or mention"
+            )
         if not isinstance(wake_all_agents, bool):
             raise ValidationError("wake_all_agents must be a boolean")
         normalized_wake_all = bool(wake_all_agents)
@@ -8571,6 +8757,26 @@ class BridgeStore:
                     raise ConflictError(
                         "forward chains are not allowed; forward the original message"
                     )
+            has_notification_target = bool(
+                normalized_mentions
+                or normalized_wake_all
+                or normalized_reply
+                or normalized_audience in {"participant", "role"}
+            )
+            effective_notification_mode = (
+                requested_notification_mode
+                or ("mention" if has_notification_target else "ordinary")
+            )
+            if effective_notification_mode == "mention" and not has_notification_target:
+                raise ValidationError(
+                    "mention mode requires mentions, reply_to, or a participant/role "
+                    "audience"
+                )
+            if effective_notification_mode == "ordinary" and has_notification_target:
+                raise ValidationError(
+                    "ordinary mode cannot include mentions, reply_to, @全员, or a "
+                    "participant/role audience"
+                )
             self._assert_speaking_cooldown(
                 conn,
                 participant_id=sender,
@@ -8586,8 +8792,8 @@ class BridgeStore:
                          audience_kind, audience_value, message_kind, body,
                          refs_json, mentions_json, wake_all_agents, reply_to, status,
                          authorized_session_id, forwarded_from_message_id,
-                         sender_seat, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)
+                         sender_seat, notification_mode, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -8604,6 +8810,7 @@ class BridgeStore:
                         session,
                         normalized_forward,
                         sender_seat,
+                        effective_notification_mode,
                         now,
                         now,
                     ),
@@ -8858,7 +9065,7 @@ class BridgeStore:
     ) -> dict[str, Any]:
         return {
             "conversation_id": conversation_id,
-            "mode": str(row["mode"]) if row is not None else "mention",
+            "mode": str(row["mode"]) if row is not None else DEFAULT_ROOM_WAKE_MODE,
             "digest_min_messages": (
                 int(row["digest_min_messages"])
                 if row is not None
@@ -11484,12 +11691,28 @@ class BridgeStore:
                 )
                 mode = str(policy["mode"])
                 item = by_room.get(room_id)
+                dnd_row = conn.execute(
+                    "SELECT enabled_at, expires_at, timezone_name "
+                    "FROM agent_room_dnd "
+                    "WHERE participant_id = ? AND conversation_id = ?",
+                    (participant_id, room_id),
+                ).fetchone()
+                dnd_active = bool(
+                    dnd_row is not None and float(dnd_row["expires_at"]) > now
+                )
+                threshold_reset_at = (
+                    float(dnd_row["expires_at"])
+                    if dnd_row is not None and not dnd_active
+                    else None
+                )
                 promote = bool(
                     mode == "all"
                     and item is not None
                     and int(item.get("policy_eligible_count") or 0) > 0
                 )
-                if mode == "digest":
+                digest_pending_count = 0
+                digest_oldest_created_at: float | None = None
+                if mode == "digest" and not dnd_active:
                     metrics = conn.execute(
                         """
                         SELECT COUNT(*) AS pending_count,
@@ -11508,43 +11731,50 @@ class BridgeStore:
                           AND message.conversation_id = ?
                           AND delivery.state IN ('pending', 'delivered')
                           AND message.sender_participant_id != ?
+                          AND message.notification_mode = 'ordinary'
+                          AND message.created_at >= ?
                           AND instr(
                               delivery.reasons_json,
                               '"echo_suppressed"'
                           ) = 0
                         """,
-                        (participant_id, room_id, participant_id),
+                        (
+                            participant_id,
+                            room_id,
+                            participant_id,
+                            threshold_reset_at or 0.0,
+                        ),
                     ).fetchone()
-                    pending_count = int(metrics["pending_count"] or 0)
-                    oldest_created_at = (
+                    digest_pending_count = int(metrics["pending_count"] or 0)
+                    digest_oldest_created_at = (
                         float(metrics["oldest_created_at"])
                         if metrics["oldest_created_at"] is not None
                         else None
                     )
-                    promote = pending_count > 0 and (
-                        pending_count >= int(policy["digest_min_messages"])
+                    promote = digest_pending_count > 0 and (
+                        digest_pending_count >= int(policy["digest_min_messages"])
                         or (
-                            oldest_created_at is not None
-                            and oldest_created_at
+                            digest_oldest_created_at is not None
+                            and digest_oldest_created_at
                             <= now - float(policy["digest_after_seconds"])
                         )
                     )
                     if promote and item is None:
                         item = {
                             "conversation_id": room_id,
-                            count_key: pending_count,
+                            count_key: digest_pending_count,
                             "oldest_sequence": int(metrics["oldest_sequence"]),
                             "newest_sequence": int(metrics["newest_sequence"]),
                             "priority_counts": {
                                 "mention": 0,
                                 "important": 0,
-                                "normal": pending_count,
+                                "normal": digest_pending_count,
                             },
                             "required_reply_count": 0,
-                            "policy_eligible_count": pending_count,
+                            "policy_eligible_count": digest_pending_count,
                         }
                         if count_key == "pending_count":
-                            item["oldest_created_at"] = oldest_created_at
+                            item["oldest_created_at"] = digest_oldest_created_at
                             item["newest_created_at"] = float(
                                 metrics["newest_created_at"]
                             )
@@ -11553,6 +11783,22 @@ class BridgeStore:
                 if item is not None:
                     item["wake_policy"] = policy
                     item["policy_promoted"] = promote
+                    item["digest_pending_count"] = digest_pending_count
+                    item["digest_oldest_created_at"] = digest_oldest_created_at
+                    item["dnd"] = {
+                        "active": dnd_active,
+                        "expires_at": (
+                            float(dnd_row["expires_at"])
+                            if dnd_row is not None
+                            else None
+                        ),
+                        "timezone": (
+                            str(dnd_row["timezone_name"])
+                            if dnd_row is not None
+                            else self.business_timezone_name
+                        ),
+                        "threshold_reset_at": threshold_reset_at,
+                    }
                     if promote:
                         # Wake a mention-only worker; required replies remain
                         # unchanged so every Agent may still choose silence.
@@ -12444,6 +12690,17 @@ class BridgeStore:
                 str(row["sender_seat"] or "unknown")
                 if "sender_seat" in set(row.keys())
                 else "unknown"
+            ),
+            "notification_mode": (
+                str(row["notification_mode"] or "ordinary")
+                if "notification_mode" in set(row.keys())
+                else (
+                    "mention"
+                    if row["reply_to"]
+                    or bool(row["wake_all_agents"])
+                    or json.loads(str(row["mentions_json"] or "[]"))
+                    else "ordinary"
+                )
             ),
             "audience_kind": str(row["audience_kind"]),
             "message_kind": str(row["message_kind"] or "message"),
