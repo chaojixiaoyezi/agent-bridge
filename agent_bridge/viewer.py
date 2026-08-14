@@ -1491,8 +1491,25 @@ def create_app(
             payload = await _json_body(
                 request,
                 required=set(),
-                allowed={"wait_seconds", "limit", "auto_claim_roles"},
+                allowed={
+                    "wait_seconds",
+                    "limit",
+                    "auto_claim_roles",
+                    "compact_optional_backlog",
+                    "keep_recent_optional",
+                },
             )
+            compact_requested = payload.get("compact_optional_backlog", False)
+            if not isinstance(compact_requested, bool):
+                raise ValidationError("compact_optional_backlog must be boolean")
+            compaction = None
+            if compact_requested:
+                compaction = await asyncio.to_thread(
+                    store.compact_optional_backlog,
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    keep_recent=payload.get("keep_recent_optional", 20),
+                )
             result = await asyncio.to_thread(
                 store.wait_messages,
                 participant_id=auth["participant_id"],
@@ -1501,9 +1518,24 @@ def create_app(
                 limit=payload.get("limit", 20),
                 auto_claim_roles=payload.get("auto_claim_roles", True),
             )
+            if compaction is not None:
+                result["offline_compaction"] = compaction
             return JSONResponse(result)
         except Exception as exc:
             return _json_error(exc)
+
+    async def agent_compact_backlog(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required=set(),
+            allowed={"keep_recent_optional"},
+            operation=lambda auth, payload: store.compact_optional_backlog(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                keep_recent=payload.get("keep_recent_optional", 20),
+            ),
+        )
 
     async def agent_notifications(request: Request) -> Response:
         return await _agent_json_call(
@@ -3271,6 +3303,11 @@ def create_app(
             Route("/agent/send", agent_send, methods=["POST"]),
             Route("/agent/rooms/create", agent_create_room, methods=["POST"]),
             Route("/agent/wait", agent_wait, methods=["POST"]),
+            Route(
+                "/agent/backlog/compact",
+                agent_compact_backlog,
+                methods=["POST"],
+            ),
             Route("/agent/notifications", agent_notifications, methods=["POST"]),
             Route("/agent/events", agent_events, methods=["GET"]),
             Route("/agent/action", agent_action, methods=["POST"]),

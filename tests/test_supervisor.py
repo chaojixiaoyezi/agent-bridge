@@ -35,12 +35,14 @@ def wake_event(
     event_id: int,
     priority: str = "normal",
     required_reply_count: int = 0,
+    event_name: str = "message_available",
+    pending_count: int = 1,
 ) -> bytes:
     return json.dumps(
         {
             "schema_version": 1,
             "source": "agent-bridge",
-            "event": "message_available",
+            "event": event_name,
             "event_id": event_id,
             "participant_id": "participant_receiver",
             "cursor": event_id,
@@ -49,7 +51,7 @@ def wake_event(
             "has_new": True,
             "has_room_activity": True,
             "backlog": {
-                "pending_count": 1,
+                "pending_count": pending_count,
                 "priority_counts": {
                     "normal": 1 if priority == "normal" else 0,
                     "important": 1 if priority == "important" else 0,
@@ -133,7 +135,46 @@ def test_supervisor_defers_normal_then_coalesces_it_with_a_mention(
         "mention": 1,
     }
     assert batch["required_reply_count"] == 0
+    assert batch["contains_backlog_event"] is False
+    assert batch["backlog_pending_count"] == 0
     assert queue_status(database)["counts"]["handled"] == 2
+
+
+def test_supervisor_marks_initial_backlog_for_bounded_reconnect_context(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wake-queue.db"
+    captured = tmp_path / "batch.json"
+    writer = (
+        str(BRIDGE_ROOT / ".venv" / "bin" / "python"),
+        "-c",
+        (
+            "import pathlib,sys; "
+            "pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())"
+        ),
+        str(captured),
+    )
+    enqueue_event(
+        database,
+        wake_event(
+            event_id=54,
+            priority="mention",
+            event_name="backlog",
+            pending_count=87,
+        ),
+        now=10,
+    )
+    assert process_once(
+        database,
+        adapter_command=writer,
+        wake_policy="mention",
+        debounce=0,
+        adapter_timeout=5,
+        now=20,
+    ) == 1
+    batch = json.loads(captured.read_text(encoding="utf-8"))
+    assert batch["contains_backlog_event"] is True
+    assert batch["backlog_pending_count"] == 87
 
 
 def test_supervisor_uses_largest_mandatory_backlog_snapshot(
@@ -632,6 +673,51 @@ def test_resident_codex_worker_deterministically_acks_only_optional_messages(
     assert captured["client"] is completion_client
     assert captured["message_ids"] == {"msg-optional"}
     assert captured["identity"]["conversation_id"] == "tools-room"
+
+
+def test_resident_codex_worker_compacts_reconnect_backlog_via_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    host = CodexThreadHost(
+        codex_binary="true",
+        cwd=tmp_path,
+        thread_state_file=tmp_path / "thread-id",
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="reads bounded reconnect context",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("history",),
+    )
+    calls: list[tuple[str, dict]] = []
+
+    class CompletionClient:
+        @staticmethod
+        def post(path: str, payload: dict) -> dict:
+            calls.append((path, payload))
+            return {
+                "applied": True,
+                "compacted_optional_count": 80,
+                "history_preserved": True,
+            }
+
+    monkeypatch.setattr(
+        "agent_bridge.codex_worker.resident_http_client",
+        lambda **_identity: CompletionClient(),
+    )
+
+    result = host.compact_offline_backlog()
+
+    assert result["compacted_optional_count"] == 80
+    assert calls == [
+        ("/agent/backlog/compact", {"keep_recent_optional": 20})
+    ]
 
 
 def test_resident_codex_worker_retries_when_deterministic_optional_ack_fails(

@@ -407,17 +407,35 @@ async def agent_wait(
     wait_seconds: float = 30.0,
     limit: int = 20,
     auto_claim_roles: bool = True,
+    compact_optional_backlog: bool = False,
+    keep_recent_optional: int = 20,
 ) -> dict[str, Any]:
-    """Wait for pending chat messages for this authenticated participant."""
+    """Wait for pending chat messages for this authenticated participant.
+
+    Set compact_optional_backlog only for an initial reconnect backlog. It keeps
+    required/actionable deliveries and recent optional messages while preserving
+    older optional bodies in history/search instead of loading all of them.
+    """
     bounded_wait = min(float(wait_seconds), CONFIG.maximum_wait_seconds)
+    payload: dict[str, Any] = {
+        "wait_seconds": bounded_wait,
+        "limit": limit,
+        "auto_claim_roles": auto_claim_roles,
+    }
+    # Keep the normal request wire-compatible with older Viewer releases.
+    # Reconnect compaction is opt-in and is only sent after the listener has
+    # observed an explicit backlog event from a compatible central service.
+    if compact_optional_backlog:
+        payload.update(
+            {
+                "compact_optional_backlog": True,
+                "keep_recent_optional": keep_recent_optional,
+            }
+        )
     return await asyncio.to_thread(
         get_client().post,
         "/agent/wait",
-        {
-            "wait_seconds": bounded_wait,
-            "limit": limit,
-            "auto_claim_roles": auto_claim_roles,
-        },
+        payload,
         timeout=bounded_wait + 10.0,
     )
 

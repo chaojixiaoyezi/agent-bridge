@@ -184,6 +184,51 @@ def seed(database: Path) -> tuple[BridgeStore, dict, dict]:
     return store, sender, receiver
 
 
+def test_agent_wait_exposes_explicit_offline_compaction_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "bridge.db"
+    _store, _sender, receiver = seed(database)
+    calls: list[tuple[str, str, int]] = []
+
+    def compact(
+        _self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        keep_recent: int,
+    ) -> dict:
+        calls.append((participant_id, authorized_session_id, keep_recent))
+        return {
+            "applied": True,
+            "compacted_optional_count": 73,
+            "history_preserved": True,
+        }
+
+    monkeypatch.setattr(BridgeStore, "compact_optional_backlog", compact)
+    client = TestClient(make_app(database))
+    response = client.post(
+        "/agent/wait",
+        json={
+            "wait_seconds": 0,
+            "compact_optional_backlog": True,
+            "keep_recent_optional": 17,
+        },
+        headers={"Authorization": f"Bearer {receiver['access_token']}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["offline_compaction"] == {
+        "applied": True,
+        "compacted_optional_count": 73,
+        "history_preserved": True,
+    }
+    assert calls == [
+        (receiver["participant_id"], receiver["session_id"], 17)
+    ]
+
+
 def test_web_login_registration_password_policy_profile_and_roles(
     tmp_path: Path,
 ) -> None:

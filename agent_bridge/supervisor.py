@@ -433,12 +433,22 @@ def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
     # mandatory backlog.  Coalescing events must therefore keep the largest
     # snapshot, not sum repeated snapshots of the same outstanding mentions.
     required_by_participant: dict[str, int] = {}
+    contains_backlog_event = False
+    backlog_pending_count = 0
     for row in rows:
         try:
             event_payload = json.loads(str(row["payload_json"]))
         except json.JSONDecodeError:
             continue
         if isinstance(event_payload, dict):
+            if str(event_payload.get("event") or "") == "backlog":
+                contains_backlog_event = True
+                backlog = event_payload.get("backlog")
+                if isinstance(backlog, dict):
+                    backlog_pending_count = max(
+                        backlog_pending_count,
+                        int(backlog.get("pending_count") or 0),
+                    )
             participant_id = str(event_payload.get("participant_id") or "")
             required_by_participant[participant_id] = max(
                 required_by_participant.get(participant_id, 0),
@@ -459,6 +469,8 @@ def _batch_envelope(rows: Sequence[sqlite3.Row]) -> bytes:
         "participant_ids": sorted({str(row["participant_id"]) for row in rows}),
         "wake_priority": highest,
         "required_reply_count": required_reply_count,
+        "contains_backlog_event": contains_backlog_event,
+        "backlog_pending_count": backlog_pending_count,
         "priority_counts": {
             "normal": priorities.get("normal", 0),
             "important": priorities.get("important", 0),

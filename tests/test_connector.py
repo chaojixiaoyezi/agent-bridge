@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import plistlib
 import subprocess
@@ -499,6 +500,54 @@ def test_connector_preflight_defaults_to_current_tui_directory(
     assert workspace == tmp_path.resolve()
 
 
+def test_agent_wait_keeps_normal_calls_wire_compatible_and_opts_in_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict, float]] = []
+
+    class CompletionClient:
+        @staticmethod
+        def post(path, payload, *, timeout):
+            calls.append((path, payload, timeout))
+            return {"messages": []}
+
+    monkeypatch.setattr(
+        bridge_server,
+        "CONFIG",
+        SimpleNamespace(maximum_wait_seconds=30),
+    )
+    monkeypatch.setattr(bridge_server, "get_client", CompletionClient)
+
+    asyncio.run(bridge_server.agent_wait(wait_seconds=0, limit=7))
+    asyncio.run(
+        bridge_server.agent_wait(
+            wait_seconds=0,
+            limit=7,
+            compact_optional_backlog=True,
+            keep_recent_optional=12,
+        )
+    )
+
+    assert calls == [
+        (
+            "/agent/wait",
+            {"wait_seconds": 0.0, "limit": 7, "auto_claim_roles": True},
+            10.0,
+        ),
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0.0,
+                "limit": 7,
+                "auto_claim_roles": True,
+                "compact_optional_backlog": True,
+                "keep_recent_optional": 12,
+            },
+            10.0,
+        ),
+    ]
+
+
 def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -772,6 +821,64 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
         match="fallback reply generation failed",
     ):
         claude_adapter.run_claude(batch)
+
+
+def test_claude_adapter_bounds_only_an_explicit_reconnect_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    enrollment_file = tmp_path / "enrollment.token"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+    enrollment_file.write_text("enroll_private\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_BRIDGE_URL", "https://bridge.example.test")
+    monkeypatch.setenv("AGENT_BRIDGE_PRODUCT", "claude-code")
+    monkeypatch.setenv("AGENT_BRIDGE_USERNAME", "值守者")
+    monkeypatch.setenv("AGENT_BRIDGE_SIGNATURE", "只处理通知。")
+    monkeypatch.setenv("AGENT_BRIDGE_CONVERSATION_ID", "测试群")
+    monkeypatch.setenv("AGENT_BRIDGE_MCP_COMMAND", str(mcp_command))
+    monkeypatch.setenv("AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE", str(enrollment_file))
+    monkeypatch.setenv("AGENT_BRIDGE_CLAUDE_CWD", str(tmp_path))
+    monkeypatch.setattr(claude_adapter.shutil, "which", lambda _name: "/opt/claude")
+
+    class CompletionClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        def post(self, path, payload):
+            self.calls.append((path, payload))
+            return {"messages": [], "has_more": False}
+
+    completion_client = CompletionClient()
+    monkeypatch.setattr(
+        claude_adapter,
+        "resident_http_client",
+        lambda **_identity: completion_client,
+    )
+
+    claude_adapter.run_claude(
+        {
+            "schema_version": 1,
+            "source": "agent-bridge-supervisor",
+            "event": "wake_batch",
+            "event_count": 1,
+            "wake_priority": "normal",
+            "contains_backlog_event": True,
+        }
+    )
+
+    assert completion_client.calls == [
+        (
+            "/agent/wait",
+            {
+                "wait_seconds": 0,
+                "limit": 20,
+                "auto_claim_roles": True,
+                "compact_optional_backlog": True,
+                "keep_recent_optional": 20,
+            },
+        )
+    ]
 
 
 def test_claude_adapter_deterministically_acks_optional_inspected_messages(

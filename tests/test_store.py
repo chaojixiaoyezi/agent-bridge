@@ -2131,6 +2131,117 @@ def test_month_scale_backlog_is_durable_indexed_and_paginated(tmp_path: Path) ->
         )
 
 
+def test_offline_compaction_keeps_required_and_recent_optional_history(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="断线发送者")
+    receiver = register(store, client="codex", name="断线接收者")
+    old_start = time.time() - 7 * 24 * 60 * 60
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE memberships SET joined_at = ?, updated_at = ? "
+            "WHERE conversation_id = 'tools-room' AND participant_id = ?",
+            (old_start - 1, old_start - 1, receiver["participant_id"]),
+        )
+        for index in range(45):
+            created_at = old_start + index * (MESSAGE_COOLDOWN_SECONDS + 1)
+            message_id = f"msg_offline_optional_{index:02d}"
+            connection.execute(
+                """
+                INSERT INTO messages
+                    (message_id, conversation_id, sender_participant_id,
+                     audience_kind, audience_value, message_kind, body,
+                     refs_json, mentions_json, status, authorized_session_id,
+                     created_at, updated_at)
+                VALUES (?, 'tools-room', ?, 'room', 'tools-room', 'message', ?,
+                        '[]', '[]', 'open', ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    sender["participant_id"],
+                    f"历史可选 {index:02d} 专用",
+                    sender["session_id"],
+                    created_at,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            store._create_message_deliveries_locked(connection, row)
+
+    required = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="@断线接收者 请明确回复这条断线期间的复核请求。",
+        mentions=[receiver["participant_id"]],
+        notification_mode="mention",
+    )
+    compacted = store.compact_optional_backlog(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        keep_recent=5,
+    )
+    assert compacted["applied"] is True
+    assert compacted["compacted_optional_count"] == 40
+    assert compacted["kept_recent_optional_count"] == 5
+    assert compacted["protected_pending_count"] == 1
+    assert compacted["oldest_compacted_sequence"] is not None
+    assert compacted["newest_compacted_sequence"] is not None
+    assert compacted["history_preserved"] is True
+    assert compacted["sender_counts"][0]["message_count"] == 40
+
+    with store._connection() as connection:
+        compacted_rows = connection.execute(
+            "SELECT state, reasons_json FROM message_deliveries "
+            "WHERE participant_id = ? AND state = 'cancelled'",
+            (receiver["participant_id"],),
+        ).fetchall()
+        required_state = connection.execute(
+            "SELECT state, reasons_json FROM message_deliveries "
+            "WHERE participant_id = ? AND message_id = ?",
+            (receiver["participant_id"], required["message_id"]),
+        ).fetchone()
+    assert len(compacted_rows) == 40
+    assert all("offline_compacted" in row["reasons_json"] for row in compacted_rows)
+    assert required_state["state"] == "pending"
+    assert "agent_request" in required_state["reasons_json"]
+
+    page = store.wait_messages(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        wait_seconds=0,
+        limit=20,
+    )
+    assert page["count"] == 6
+    assert page["pending_count"] == 6
+    assert page["messages"][0]["message_id"] == required["message_id"]
+    assert [item["body"] for item in page["messages"][1:]] == [
+        f"历史可选 {index:02d} 专用" for index in range(40, 45)
+    ]
+
+    history = store.search_history(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        conversation_id="tools-room",
+        query="历史可选 03 专用",
+        limit=10,
+    )
+    assert [item["message_id"] for item in history["results"]] == [
+        "msg_offline_optional_03"
+    ]
+    repeated = store.compact_optional_backlog(
+        participant_id=receiver["participant_id"],
+        authorized_session_id=receiver["session_id"],
+        keep_recent=5,
+    )
+    assert repeated["applied"] is False
+    assert repeated["compacted_optional_count"] == 0
+
+
 def test_room_message_reply_does_not_hide_it_from_other_members(
     tmp_path: Path,
 ) -> None:

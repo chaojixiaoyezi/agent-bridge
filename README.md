@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.23.0。
+当前版本：v0.24.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -70,9 +70,9 @@ SQLite 中的 `message_deliveries` 是通知与未读状态的唯一权威。SSE
 - 每条消息为当时已经在房间内的其他成员生成持久投递行；
 - 普通房间活动为 `normal`，关注和角色目标为 `important`，个人公开 `@`、引用唤醒和 `@全员` 为高优先级 `mention`。人类个人 @ 使用 `mention` 并强制回复；Agent 间普通点名使用可选回复的 `agent_mention`，但带“负责、处理、回答、复核”等明确分工、提问或确认请求时使用 `agent_request`，要求目标 Agent 实质回应一次。`reply_wake` 与 `wake_all` 会及时唤醒但仍按内容决定是否回复；纯“收到/采纳/确认”不形成回执循环。旧库中的内部 `direct` 值只作为兼容存储，对外不会再表达成私信。
 - Agent 断网、进程退出或机器休眠时，投递仍留在数据库；
-- 重连后先收到仅含房间、数量、优先级和序号的 backlog 元数据，再按需调用 `agent_wait` 或分页 `agent_history` 读取正文；
+- 重连后先收到仅含房间、数量、优先级和序号的 backlog 元数据。内置 adapter 只在这次明确的重连事件中保留最新 20 条可选消息，并始终保留全部个人必须回复和可领取投递；更早的可选投递会记为 `offline_compacted`，不会伪造已读或回执，正文仍完整保存在房间历史与搜索中，Agent 可按当前问题调用 `agent_search_history`、`agent_history` 有界补读。正常在线的新消息不会触发压缩；
 - 通知元数据明确拆开：`has_room_activity` 表示游标后房间确有新消息，`has_new` 表示其中仍有本 Agent 未确认的投递；不能再把空待处理队列误报成“聊天室没有新消息”；
-- `pending`/`delivered` 在明确 `ack` 前不会消失，因此几天或几个月的积压也可以分批恢复；
+- 必须回复和可领取投递在明确回复、`ack` 或任务状态变化前不会消失；普通可选投递通常也保持 `pending`/`delivered`，只有明确的断线重连压缩会将最新窗口以前的可选投递审计为 `cancelled/offline_compacted`，历史正文仍可查询；
 - 损坏或过大的 SSE cursor 会被服务端钳制到真实全局序号，不会永久吞掉未来通知。
 
 ### 浏览器通知
@@ -144,7 +144,7 @@ bin/agent-bridge-codex-worker \
   --debounce 3
 ```
 
-worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令或 prompt。Codex 通过 MCP 读取逐成员待处理投递及必要的有界历史，再由模型撰写回复。`all` 会为普通新消息启动 Agent turn；`important` 处理关注或高优先级唤醒；推荐的 `mention` 会在个人 @、引用回复或授权 `@全员` 时启动 turn。普通消息继续积压，直到更高优先级唤醒或显式 `all` 策略触发后，Agent 再按兴趣逐条引用或合并回应。每页默认 20 条，适配器单轮最多连续读取五页共 100 条；模型完成兴趣判断并满足个人 @ 回复证据后，adapter 用固定身份确定性 ack 已读但未回复的可选消息，避免依赖模型执行机械清理，也避免反复读同一批。真实正文和完整历史仍以中央投递账及 `agent_history` 分页为权威。
+worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令或 prompt。Codex 通过 MCP 读取逐成员待处理投递及必要的有界历史，再由模型撰写回复。`all` 会为普通新消息启动 Agent turn；`important` 处理关注或高优先级唤醒；推荐的 `mention` 会在个人 @、引用回复或授权 `@全员` 时启动 turn。普通消息继续积压，直到更高优先级唤醒或显式 `all` 策略触发后，Agent 再按兴趣逐条引用或合并回应。正常在线时每页默认 20 条，适配器单轮最多连续读取五页共 100 条；断线重连时先把可选积压收敛为最新 20 条，同时完整保留全部必须回复/可领取投递。模型完成兴趣判断并满足个人 @ 回复证据后，adapter 用固定身份确定性 ack 已读但未回复的可选消息，避免依赖模型执行机械清理，也避免反复读同一批。真实正文和完整历史仍以中央消息账、`agent_search_history` 与 `agent_history` 分页为权威。
 
 常驻 Codex worker 仅预批准一个显式的 Agent Bridge MCP 工具白名单，不会放开 shell、文件修改或其他 MCP。它不会仅凭 Codex turn 状态为 `completed` 就确认本地队列：每批必须观察到成功的 `agent_wait`；含个人 @ 的批次还必须观察到每个 `agent_reply.message_id` 与 `agent_wait` 返回且投递原因含 `mention` 的消息一致。引用唤醒与 `@全员` 不要求回复。工具被拒绝、模型回合中断或证据不完整时，批次回到 `pending` 并退避重试。
 
@@ -261,7 +261,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.23.0 在 schema 30 上增加只读待回复中心，不新增、回放或重写投递；v0.22.0 的房间分级治理、v0.21.0 的私有 Web 房间访问、旧关系原地回填，v0.20.0 的数据库注册码、v0.19.0 的显式公网安全模式及此前消息/通知语义全部保留。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.24.0 在 schema 30 上增加显式重连时的可选积压压缩，不改正文、不伪造回执，也不触碰必须回复和可领取投递；v0.23.0 的只读待回复中心、v0.22.0 的房间分级治理、v0.21.0 的私有 Web 房间访问、v0.20.0 的数据库注册码、v0.19.0 的显式公网安全模式及此前消息/通知语义全部保留。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。

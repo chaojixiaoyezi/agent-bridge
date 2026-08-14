@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, time as datetime_time, timedelta, timezone
@@ -60,6 +61,8 @@ CONNECTOR_SESSION_MIN_RETAIN = 6
 NICKNAME_REQUEST_COOLDOWN_SECONDS = 24 * 60 * 60
 MAX_MENTIONS_PER_MESSAGE = 64
 MAX_WAIT_MESSAGES_PAGE_SIZE = 20
+DEFAULT_OFFLINE_BACKLOG_KEEP_MESSAGES = 20
+MAX_OFFLINE_BACKLOG_KEEP_MESSAGES = 100
 MAX_HISTORY_SEARCH_TERMS = 8
 MAX_HISTORY_SEARCH_QUERY_LENGTH = 256
 MAX_TASK_TARGETS = 64
@@ -11175,6 +11178,192 @@ class BridgeStore:
                 recipient_participant_id=None,
             )
         return payload or {}
+
+    def compact_optional_backlog(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        keep_recent: int = DEFAULT_OFFLINE_BACKLOG_KEEP_MESSAGES,
+    ) -> dict[str, Any]:
+        """Cancel only old optional deliveries while preserving room history.
+
+        This is used for an explicit reconnect backlog event. Required replies,
+        actionable participant/role deliveries, and the newest optional window
+        remain in the normal delivery queue. Cancelled rows keep their original
+        message in history/search and gain an audit reason instead of pretending
+        the Agent read or acknowledged their bodies.
+        """
+
+        participant = opaque_id(participant_id, field="participant_id")
+        session = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        if isinstance(keep_recent, bool):
+            raise ValidationError("keep_recent must be an integer")
+        try:
+            keep = int(keep_recent)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("keep_recent must be an integer") from exc
+        if not 1 <= keep <= MAX_OFFLINE_BACKLOG_KEEP_MESSAGES:
+            raise ValidationError(
+                "keep_recent must be between 1 and "
+                f"{MAX_OFFLINE_BACKLOG_KEEP_MESSAGES}"
+            )
+
+        now = time.time()
+        compacted_count = 0
+        oldest_sequence: int | None = None
+        newest_sequence: int | None = None
+        sender_counts: Counter[tuple[str, str, str]] = Counter()
+        with self._transaction() as conn:
+            self._archive_stale_rooms_locked(conn, now=now)
+            session_row = self._require_live_session(
+                conn,
+                session_id=session,
+                participant_id=participant,
+                now=now,
+            )
+            conversation = str(session_row["registered_conversation_id"])
+            self._require_membership(conn, participant, conversation)
+
+            candidate_where = """
+                delivery.participant_id = ?
+                AND delivery.state IN ('pending', 'delivered')
+                AND delivery.actionable = 0
+                AND instr(delivery.reasons_json, '"mention"') = 0
+                AND instr(delivery.reasons_json, '"agent_request"') = 0
+                AND message.conversation_id = ?
+            """
+            optional_total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM message_deliveries AS delivery "
+                    "JOIN messages AS message "
+                    "ON message.message_id = delivery.message_id "
+                    f"WHERE {candidate_where}",
+                    (participant, conversation),
+                ).fetchone()[0]
+            )
+            protected_pending = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM message_deliveries AS delivery
+                    JOIN messages AS message
+                      ON message.message_id = delivery.message_id
+                    WHERE delivery.participant_id = ?
+                      AND delivery.state IN ('pending', 'delivered')
+                      AND message.conversation_id = ?
+                      AND (
+                          delivery.actionable = 1
+                          OR instr(delivery.reasons_json, '"mention"') > 0
+                          OR instr(
+                              delivery.reasons_json,
+                              '"agent_request"'
+                          ) > 0
+                      )
+                    """,
+                    (participant, conversation),
+                ).fetchone()[0]
+            )
+
+            while optional_total - compacted_count > keep:
+                rows = conn.execute(
+                    """
+                    SELECT delivery.message_id, delivery.reasons_json,
+                           message.sequence,
+                           sender.participant_id AS sender_participant_id,
+                           sender.client_type AS sender_client_type,
+                           sender.display_name AS sender_display_name
+                    FROM message_deliveries AS delivery
+                    JOIN messages AS message
+                      ON message.message_id = delivery.message_id
+                    JOIN participants AS sender
+                      ON sender.participant_id = message.sender_participant_id
+                    WHERE """
+                    + candidate_where
+                    + " ORDER BY message.sequence DESC LIMIT 500 OFFSET ?",
+                    (participant, conversation, keep),
+                ).fetchall()
+                if not rows:
+                    break
+                updates: list[tuple[str, str, str]] = []
+                for row in rows:
+                    try:
+                        reasons = list(json.loads(str(row["reasons_json"] or "[]")))
+                    except (TypeError, json.JSONDecodeError):
+                        reasons = []
+                    if "offline_compacted" not in reasons:
+                        reasons.append("offline_compacted")
+                    updates.append(
+                        (
+                            compact_json(reasons),
+                            str(row["message_id"]),
+                            participant,
+                        )
+                    )
+                    sequence = int(row["sequence"])
+                    oldest_sequence = (
+                        sequence
+                        if oldest_sequence is None
+                        else min(oldest_sequence, sequence)
+                    )
+                    newest_sequence = (
+                        sequence
+                        if newest_sequence is None
+                        else max(newest_sequence, sequence)
+                    )
+                    sender_counts[
+                        (
+                            str(row["sender_participant_id"]),
+                            str(row["sender_client_type"]),
+                            str(row["sender_display_name"]),
+                        )
+                    ] += 1
+                conn.executemany(
+                    """
+                    UPDATE message_deliveries
+                    SET state = 'cancelled', reasons_json = ?, actionable = 0
+                    WHERE message_id = ? AND participant_id = ?
+                      AND state IN ('pending', 'delivered')
+                    """,
+                    updates,
+                )
+                compacted_count += len(rows)
+
+        sender_summary = [
+            {
+                "participant_id": sender[0],
+                "client_type": sender[1],
+                "display_name": sender[2],
+                "message_count": count,
+            }
+            for sender, count in sorted(
+                sender_counts.items(),
+                key=lambda item: (-item[1], item[0][2], item[0][0]),
+            )[:10]
+        ]
+        return {
+            "applied": compacted_count > 0,
+            "conversation_id": conversation,
+            "compacted_optional_count": compacted_count,
+            "kept_recent_optional_count": min(optional_total, keep),
+            "protected_pending_count": protected_pending,
+            "oldest_compacted_sequence": oldest_sequence,
+            "newest_compacted_sequence": newest_sequence,
+            "sender_counts": sender_summary,
+            "other_sender_message_count": max(
+                0,
+                compacted_count
+                - sum(item["message_count"] for item in sender_summary),
+            ),
+            "history_preserved": True,
+            "history_hint": (
+                "Use agent_history with before_sequence/around_sequence or "
+                "agent_search_history when older context is relevant."
+            ),
+        }
 
     def wait_messages(
         self,

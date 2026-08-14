@@ -763,6 +763,11 @@ class CodexThreadHost:
         )
         if not optional:
             return frozenset()
+        acknowledged = acknowledge_messages(self._bridge_client(), optional)
+        evidence.resolved_message_ids.update(acknowledged)
+        return acknowledged
+
+    def _bridge_client(self):
         if self._completion_client is None:
             self._completion_client = resident_http_client(
                 bridge_url=self.bridge_url,
@@ -773,9 +778,13 @@ class CodexThreadHost:
                 roles=self.roles,
                 capabilities=self.capabilities,
             )
-        acknowledged = acknowledge_messages(self._completion_client, optional)
-        evidence.resolved_message_ids.update(acknowledged)
-        return acknowledged
+        return self._completion_client
+
+    def compact_offline_backlog(self) -> dict[str, Any]:
+        return self._bridge_client().post(
+            "/agent/backlog/compact",
+            {"keep_recent_optional": 20},
+        )
 
     def _read_thread_id(self) -> str | None:
         if not self.thread_state_file.exists():
@@ -878,6 +887,7 @@ class CodexThreadHost:
         counts = batch.get("priority_counts")
         mention_count = int(counts.get("mention") or 0) if isinstance(counts, dict) else 0
         required_reply_count = _required_reply_count(batch)
+        offline_compaction = batch.get("offline_compaction")
         return (
             "Agent Bridge 有新的持久通知，请现在按常驻值守流程读取并处理。"
             "此处只有可信的元数据，不含聊天室正文。"
@@ -885,7 +895,11 @@ class CodexThreadHost:
             f"最高优先级={str(batch.get('wake_priority') or '')}；"
             f"高优先级唤醒事件数={mention_count}；"
             f"唤醒快照待核对的必须回复事件数={required_reply_count}；"
-            f"最新事件序号={batch.get('last_event_id')}。"
+            f"最新事件序号={batch.get('last_event_id')}；"
+            "断线可选消息压缩="
+            f"{json.dumps(offline_compaction or {}, ensure_ascii=False, separators=(',', ':'))}。"
+            "如果压缩记录 applied=true，旧可选消息仍在历史中；仅在当前问题需要时用"
+            "搜索定位并有界读取，不要一次加载全部历史。"
         )
 
 
@@ -1034,6 +1048,8 @@ def run_session(args: argparse.Namespace) -> None:
                     host = _host_from_args(args)
                     host.start()
                 batch = json.loads(_batch_envelope(rows).decode("utf-8"))
+                if bool(batch.get("contains_backlog_event")):
+                    batch["offline_compaction"] = host.compact_offline_backlog()
                 run_id = host.submit(batch)
                 mention_required_by_run[run_id] = (
                     mention_required_by_run.get(run_id, False)
