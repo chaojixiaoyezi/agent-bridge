@@ -1911,6 +1911,12 @@ function renderConnectorHealth() {
       "connector-health-facts",
       `${listenerAge} · 必须回复 ${connector.required_pending_count || 0} · 普通积压 ${connector.optional_pending_count || 0} · 活跃任务 ${connector.active_task_count || 0}`,
     ));
+    const enrollment = connector.enrollment || {};
+    card.append(makeElement(
+      "small",
+      "connector-health-facts",
+      `设备凭证 v${enrollment.credential_version || 1} · 已轮换 ${enrollment.rotation_count || 0} 次${enrollment.rotation_required ? " · 等待本机自动轮换" : ""}`,
+    ));
     if (connector.diagnostic_detail) {
       card.append(makeElement(
         "small",
@@ -1929,6 +1935,24 @@ function renderConnectorHealth() {
       }
       card.append(issues);
     }
+    const deviceActions = makeElement("div", "connector-device-actions");
+    const rotate = makeElement(
+      "button",
+      "secondary-button compact-button",
+      enrollment.rotation_required ? "等待设备轮换" : "轮换凭证",
+    );
+    rotate.type = "button";
+    rotate.disabled = Boolean(enrollment.rotation_required);
+    rotate.addEventListener("click", () => requestConnectorRotation(connector.connector_id, rotate));
+    const revoke = makeElement(
+      "button",
+      "secondary-button compact-button danger-button",
+      "撤销设备",
+    );
+    revoke.type = "button";
+    revoke.addEventListener("click", () => revokeConnectorDevice(connector, revoke));
+    deviceActions.append(rotate, revoke);
+    card.append(deviceActions);
     elements.connectorHealthList.append(card);
   }
   elements.connectorHealthFeedback.classList.remove("error", "success");
@@ -1952,6 +1976,60 @@ async function loadConnectorHealth({ force = false } = {}) {
   state.connectorHealthRenderSignature = "";
   renderConnectorHealth();
   return payload;
+}
+
+async function requestConnectorRotation(connectorId, button) {
+  button.disabled = true;
+  elements.connectorHealthFeedback.classList.remove("error", "success");
+  elements.connectorHealthFeedback.textContent = "已登记轮换要求，等待该设备下次连接时自动完成…";
+  try {
+    await fetchJson(
+      `/api/admin/connectors/${encodeURIComponent(connectorId)}/rotation-request`,
+      {
+        method: "POST",
+        headers: { "X-Agent-Bridge-Intent": "request-connector-rotation" },
+      },
+    );
+    state.connectorHealth = null;
+    state.connectorHealthLoadedAt = 0;
+    state.connectorHealthRenderSignature = "";
+    await loadConnectorHealth({ force: true });
+    elements.connectorHealthFeedback.classList.add("success");
+    elements.connectorHealthFeedback.textContent = "轮换要求已登记；设备会在自然重连时本地生成并切换新凭证。";
+  } catch (error) {
+    elements.connectorHealthFeedback.classList.add("error");
+    elements.connectorHealthFeedback.textContent = `轮换登记失败：${error.message}`;
+    button.disabled = false;
+  }
+}
+
+async function revokeConnectorDevice(connector, button) {
+  const label = connector.display_name || connector.client_type || connector.connector_id;
+  if (!window.confirm(`确定撤销设备“${label}”吗？只会使这一个连接器及其会话失效，不会删除成员、聊天记录或同邀请接入的其他设备。`)) {
+    return;
+  }
+  button.disabled = true;
+  elements.connectorHealthFeedback.classList.remove("error", "success");
+  elements.connectorHealthFeedback.textContent = `正在撤销设备“${label}”…`;
+  try {
+    await fetchJson(
+      `/api/admin/connectors/${encodeURIComponent(connector.connector_id)}/revoke`,
+      {
+        method: "POST",
+        headers: { "X-Agent-Bridge-Intent": "revoke-connector-device" },
+      },
+    );
+    state.connectorHealth = null;
+    state.connectorHealthLoadedAt = 0;
+    state.connectorHealthRenderSignature = "";
+    await loadConnectorHealth({ force: true });
+    elements.connectorHealthFeedback.classList.add("success");
+    elements.connectorHealthFeedback.textContent = `设备“${label}”已撤销；其他设备和聊天室历史未受影响。`;
+  } catch (error) {
+    elements.connectorHealthFeedback.classList.add("error");
+    elements.connectorHealthFeedback.textContent = `撤销设备失败：${error.message}`;
+    button.disabled = false;
+  }
 }
 
 async function fetchAgentInvitations(roomId = null) {

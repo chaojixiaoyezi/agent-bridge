@@ -1192,6 +1192,36 @@ def create_app(
         except Exception as exc:
             return _json_error(exc)
 
+    async def request_connector_enrollment_rotation(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="request-connector-rotation")
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "connector": store.request_agent_connector_enrollment_rotation(
+                        connector_id=request.path_params["connector_id"],
+                        requested_by_web_user_id=str(identity["user_id"]),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def revoke_connector_device(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="revoke-connector-device")
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "connector": store.revoke_agent_connector(
+                        connector_id=request.path_params["connector_id"],
+                        revoked_by_web_user_id=str(identity["user_id"]),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def kick_room_agent(request: Request) -> Response:
         try:
             require_web_intent(request, intent="kick-agent")
@@ -1435,6 +1465,48 @@ def create_app(
             ),
             success_status=201,
         )
+
+    async def rotate_agent_enrollment(request: Request) -> Response:
+        if policy.public_mode:
+            try:
+                enforce_rate(
+                    request,
+                    "agent-enrollment-rotation-ip",
+                    limit=30,
+                    window_seconds=60 * 60,
+                )
+            except Exception as exc:
+                return _json_error(exc)
+        enrollment_token = request.headers.get(
+            "x-agent-bridge-enrollment",
+            "",
+        ).strip()
+        connector_id = request.headers.get(
+            "x-agent-bridge-connector",
+            "",
+        ).strip()
+        if not enrollment_token or not connector_id:
+            return JSONResponse(
+                {"error": "connector enrollment authorization is required"},
+                status_code=401,
+            )
+        try:
+            payload = await _json_body(
+                request,
+                required={"new_enrollment_token"},
+                allowed={"new_enrollment_token"},
+            )
+            return JSONResponse(
+                {
+                    "connector": store.rotate_agent_connector_enrollment(
+                        connector_id=connector_id,
+                        current_enrollment_token=enrollment_token,
+                        new_enrollment_token=payload["new_enrollment_token"],
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
 
     async def accept_agent_invitation(request: Request) -> Response:
         if policy.public_mode:
@@ -3518,6 +3590,16 @@ def create_app(
                 methods=["GET"],
             ),
             Route(
+                "/api/admin/connectors/{connector_id:str}/rotation-request",
+                request_connector_enrollment_rotation,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/connectors/{connector_id:str}/revoke",
+                revoke_connector_device,
+                methods=["POST"],
+            ),
+            Route(
                 "/api/rooms/{conversation_id:str}/participants/"
                 "{participant_id:str}/kick",
                 kick_room_agent,
@@ -3573,6 +3655,11 @@ def create_app(
                 methods=["POST"],
             ),
             Route("/agent/register", register_agent, methods=["POST"]),
+            Route(
+                "/agent/connector/enrollment/rotate",
+                rotate_agent_enrollment,
+                methods=["POST"],
+            ),
             Route(
                 "/agent/invitations/accept",
                 accept_agent_invitation,

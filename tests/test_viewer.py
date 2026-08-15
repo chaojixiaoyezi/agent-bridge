@@ -1682,8 +1682,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-13" in index_html
-    assert "app.css?v=20260814-13" in index_html
+    assert "app.js?v=20260814-14" in index_html
+    assert "app.css?v=20260814-14" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -1701,6 +1701,10 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert 'id="account-email-section"' in index_html
     assert "/api/auth/password-reset/request" in javascript
     assert "/api/auth/email/verify" in javascript
+    assert "function requestConnectorRotation" in javascript
+    assert "function revokeConnectorDevice" in javascript
+    assert "request-connector-rotation" in javascript
+    assert "revoke-connector-device" in javascript
     assert "webRegistrationMode" in javascript
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript
@@ -2583,6 +2587,146 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
     health = client.get("/api/health").json()
     assert health["open_registration_enabled"] is False
     assert health["registration_secret_required"] is True
+
+
+def test_admin_rotates_and_revokes_one_connector_without_exposing_credentials(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    app = make_app(database)
+    client = TestClient(app)
+    login_admin(client)
+    assert client.post(
+        "/api/rooms",
+        headers=intent_headers(client, "create-room"),
+        json={"conversation_id": "设备管理群"},
+    ).status_code == 201
+    access = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={
+            "conversation_id": "设备管理群",
+            "product": "codex",
+            "mode": "resident",
+        },
+    ).json()["access"]
+    invitation_token = access["mcp"]["env"]["AGENT_BRIDGE_INVITATION_TOKEN"]
+    old_enrollment = "enroll_" + "r" * 64
+    new_enrollment = "enroll_" + "s" * 64
+    accepted = client.post(
+        "/agent/invitations/accept",
+        headers={"X-Agent-Bridge-Invitation": invitation_token},
+        json={
+            "product": "codex",
+            "username": "managed-device",
+            "signature": "凭证由本机保管",
+            "enrollment_token": old_enrollment,
+        },
+    ).json()
+    connector_id = accepted["connector_id"]
+
+    ordinary_client = TestClient(make_app(database))
+    register_web_user(ordinary_client, username="ordinary-device-user")
+    assert ordinary_client.post(
+        f"/api/admin/connectors/{connector_id}/rotation-request",
+        headers=intent_headers(ordinary_client, "request-connector-rotation"),
+    ).status_code == 403
+    assert ordinary_client.post(
+        f"/api/admin/connectors/{connector_id}/revoke",
+        headers=intent_headers(ordinary_client, "revoke-connector-device"),
+    ).status_code == 403
+
+    rotation_request = client.post(
+        f"/api/admin/connectors/{connector_id}/rotation-request",
+        headers=intent_headers(client, "request-connector-rotation"),
+    )
+    assert rotation_request.status_code == 200
+    assert rotation_request.json()["connector"]["enrollment"][
+        "rotation_required"
+    ] is True
+    assert old_enrollment not in rotation_request.text
+
+    registration_body = {
+        "product": "codex",
+        "username": accepted["username"],
+        "signature": "设备自动重连",
+        "conversation_id": "设备管理群",
+    }
+    old_headers = {
+        "X-Agent-Bridge-Enrollment": old_enrollment,
+        "X-Agent-Bridge-Connector": connector_id,
+    }
+    pending = client.post(
+        "/agent/register",
+        headers=old_headers,
+        json=registration_body,
+    )
+    assert pending.status_code == 201
+    assert pending.json()["enrollment_rotation_required"] is True
+
+    assert client.post(
+        "/agent/connector/enrollment/rotate",
+        headers=old_headers,
+        json={"new_enrollment_token": "too-short"},
+    ).status_code == 400
+    rotated = client.post(
+        "/agent/connector/enrollment/rotate",
+        headers=old_headers,
+        json={"new_enrollment_token": new_enrollment},
+    )
+    assert rotated.status_code == 200
+    assert rotated.json()["connector"]["enrollment"]["credential_version"] == 2
+    assert old_enrollment not in rotated.text
+    assert new_enrollment not in rotated.text
+    retried = client.post(
+        "/agent/connector/enrollment/rotate",
+        headers=old_headers,
+        json={"new_enrollment_token": new_enrollment},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["connector"]["enrollment"]["rotation_count"] == 1
+
+    grace = client.post(
+        "/agent/register",
+        headers=old_headers,
+        json=registration_body,
+    )
+    assert grace.status_code == 201
+    assert grace.json()["enrollment_credential_state"] == "grace"
+    current = client.post(
+        "/agent/register",
+        headers={
+            "X-Agent-Bridge-Enrollment": new_enrollment,
+            "X-Agent-Bridge-Connector": connector_id,
+        },
+        json=registration_body,
+    )
+    assert current.status_code == 201
+    assert current.json()["enrollment_credential_state"] == "current"
+    assert current.json()["enrollment_rotation_required"] is False
+    health = client.get("/api/admin/connectors/health")
+    assert health.status_code == 200
+    assert health.json()["connectors"][0]["enrollment"][
+        "credential_version"
+    ] == 2
+    assert old_enrollment not in health.text
+    assert new_enrollment not in health.text
+
+    revoked = client.post(
+        f"/api/admin/connectors/{connector_id}/revoke",
+        headers=intent_headers(client, "revoke-connector-device"),
+    )
+    assert revoked.status_code == 200
+    assert revoked.json()["connector"]["resident_status"] == "revoked"
+    assert client.post(
+        "/agent/register",
+        headers={
+            "X-Agent-Bridge-Enrollment": new_enrollment,
+            "X-Agent-Bridge-Connector": connector_id,
+        },
+        json=registration_body,
+    ).status_code == 401
+    assert client.get("/api/admin/connectors/health").json()["count"] == 0
 
 
 def test_reusable_invitation_enrolls_multiple_agents_with_independent_credentials(

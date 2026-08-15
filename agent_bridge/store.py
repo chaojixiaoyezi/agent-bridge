@@ -81,6 +81,7 @@ TASK_STATUSES = {
 DEFAULT_INVITATION_TTL_SECONDS = 30 * 60
 MAX_INVITATION_TTL_SECONDS = 24 * 60 * 60
 CONNECTOR_ONLINE_WINDOW_SECONDS = 75.0
+ENROLLMENT_PREVIOUS_GRACE_SECONDS = 24 * 60 * 60
 DEFAULT_AGENT_INACTIVITY_DAYS = 10
 DEFAULT_UNACTIVATED_AGENT_INACTIVITY_DAYS = 3
 MIN_AGENT_INACTIVITY_DAYS = 1
@@ -990,7 +991,16 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     accepted_participant_id TEXT NOT NULL,
     initial_session_id TEXT NOT NULL,
     enrollment_token_hash TEXT UNIQUE,
+    previous_enrollment_token_hash TEXT,
+    previous_enrollment_valid_until REAL,
     enrollment_last_used_at REAL,
+    enrollment_rotated_at REAL,
+    enrollment_rotation_count INTEGER NOT NULL DEFAULT 0
+        CHECK (enrollment_rotation_count >= 0),
+    enrollment_credential_version INTEGER NOT NULL DEFAULT 1
+        CHECK (enrollment_credential_version >= 1),
+    enrollment_rotation_required_at REAL,
+    enrollment_rotation_requested_by_web_user_id TEXT,
     setup_status TEXT NOT NULL DEFAULT 'awaiting_setup'
         CHECK (setup_status IN (
             'awaiting_setup', 'configured', 'manual', 'failed', 'revoked'
@@ -1014,11 +1024,15 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     tui_detail_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     revoked_at REAL,
+    revoked_by_web_user_id TEXT,
     updated_at REAL NOT NULL,
     FOREIGN KEY (invitation_id) REFERENCES agent_invitations(invitation_id),
     FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id),
     FOREIGN KEY (accepted_participant_id) REFERENCES participants(participant_id),
     FOREIGN KEY (initial_session_id) REFERENCES agent_sessions(session_id),
+    FOREIGN KEY (enrollment_rotation_requested_by_web_user_id)
+        REFERENCES web_users(user_id),
+    FOREIGN KEY (revoked_by_web_user_id) REFERENCES web_users(user_id),
     UNIQUE (invitation_id, accepted_participant_id)
 );
 
@@ -1706,7 +1720,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 33")
+            conn.execute("PRAGMA user_version = 34")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -2141,12 +2155,30 @@ class BridgeStore:
             "bound_client_type": "TEXT",
             "bound_roles_json": "TEXT",
             "bound_capabilities_json": "TEXT",
+            "previous_enrollment_token_hash": "TEXT",
+            "previous_enrollment_valid_until": "REAL",
+            "enrollment_rotated_at": "REAL",
+            "enrollment_rotation_count": (
+                "INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (enrollment_rotation_count >= 0)"
+            ),
+            "enrollment_credential_version": (
+                "INTEGER NOT NULL DEFAULT 1 "
+                "CHECK (enrollment_credential_version >= 1)"
+            ),
+            "enrollment_rotation_required_at": "REAL",
+            "enrollment_rotation_requested_by_web_user_id": "TEXT",
+            "revoked_by_web_user_id": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in columns:
                 conn.execute(
                     f"ALTER TABLE agent_connectors ADD COLUMN {name} {declaration}"
                 )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_connectors_rotation_required "
+            "ON agent_connectors(enrollment_rotation_required_at, revoked_at)"
+        )
         conn.execute(
             """
             UPDATE agent_connectors
@@ -5491,6 +5523,35 @@ class BridgeStore:
             ),
             "connector_last_seen_at": last_seen,
             "resident_status": resident_status,
+            "enrollment": {
+                "credential_version": int(
+                    row["enrollment_credential_version"] or 1
+                ),
+                "rotation_count": int(row["enrollment_rotation_count"] or 0),
+                "last_used_at": (
+                    float(row["enrollment_last_used_at"])
+                    if row["enrollment_last_used_at"] is not None
+                    else None
+                ),
+                "rotated_at": (
+                    float(row["enrollment_rotated_at"])
+                    if row["enrollment_rotated_at"] is not None
+                    else None
+                ),
+                "rotation_required": (
+                    row["enrollment_rotation_required_at"] is not None
+                ),
+                "rotation_required_at": (
+                    float(row["enrollment_rotation_required_at"])
+                    if row["enrollment_rotation_required_at"] is not None
+                    else None
+                ),
+                "previous_valid_until": (
+                    float(row["previous_enrollment_valid_until"])
+                    if row["previous_enrollment_valid_until"] is not None
+                    else None
+                ),
+            },
             "tui": {
                 "endpoint_id": (
                     str(row["tui_endpoint_id"])
@@ -5743,9 +5804,14 @@ class BridgeStore:
             conn.execute(
                 "UPDATE agent_connectors SET setup_status = 'revoked', "
                 "revoked_at = COALESCE(revoked_at, ?), "
+                "revoked_by_web_user_id = "
+                "COALESCE(revoked_by_web_user_id, ?), "
+                "enrollment_token_hash = NULL, "
+                "previous_enrollment_token_hash = NULL, "
+                "previous_enrollment_valid_until = NULL, "
                 "setup_updated_at = ?, updated_at = ? "
                 "WHERE invitation_id = ?",
-                (now, now, now, invitation),
+                (now, reviewer, now, now, invitation),
             )
             conn.execute(
                 "UPDATE agent_sessions SET revoked_at = ?, "
@@ -5760,6 +5826,185 @@ class BridgeStore:
                 now=now,
             )
         return self._agent_invitation_payload(updated, now=now)
+
+    def request_agent_connector_enrollment_rotation(
+        self,
+        *,
+        connector_id: str,
+        requested_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        connector = opaque_id(connector_id, field="connector_id")
+        requester = opaque_id(
+            requested_by_web_user_id,
+            field="requested_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, requester)
+            row = self._agent_connector_row_locked(conn, connector)
+            if row["revoked_at"] is not None or str(row["invitation_status"]) == "revoked":
+                raise ConflictError("Agent connector is revoked")
+            conn.execute(
+                "UPDATE agent_connectors SET "
+                "enrollment_rotation_required_at = "
+                "COALESCE(enrollment_rotation_required_at, ?), "
+                "enrollment_rotation_requested_by_web_user_id = "
+                "CASE WHEN enrollment_rotation_required_at IS NULL THEN ? "
+                "ELSE enrollment_rotation_requested_by_web_user_id END, "
+                "updated_at = ? WHERE connector_id = ?",
+                (now, requester, now, connector),
+            )
+            updated = self._agent_connector_row_locked(conn, connector)
+        return self._agent_connector_payload(updated, now=now)
+
+    def revoke_agent_connector(
+        self,
+        *,
+        connector_id: str,
+        revoked_by_web_user_id: str,
+    ) -> dict[str, Any]:
+        connector = opaque_id(connector_id, field="connector_id")
+        requester = opaque_id(
+            revoked_by_web_user_id,
+            field="revoked_by_web_user_id",
+        )
+        now = time.time()
+        with self._transaction() as conn:
+            self._require_active_admin_locked(conn, requester)
+            row = self._agent_connector_row_locked(conn, connector)
+            if row["revoked_at"] is None:
+                conn.execute(
+                    "UPDATE agent_connectors SET setup_status = 'revoked', "
+                    "revoked_at = ?, revoked_by_web_user_id = ?, "
+                    "enrollment_token_hash = NULL, "
+                    "previous_enrollment_token_hash = NULL, "
+                    "previous_enrollment_valid_until = NULL, "
+                    "enrollment_rotation_required_at = NULL, "
+                    "enrollment_rotation_requested_by_web_user_id = NULL, "
+                    "setup_updated_at = ?, updated_at = ? "
+                    "WHERE connector_id = ? AND revoked_at IS NULL",
+                    (now, requester, now, now, connector),
+                )
+                conn.execute(
+                    "UPDATE agent_sessions SET revoked_at = ?, "
+                    "revoked_reason = 'connector_revoked' "
+                    "WHERE connector_id = ? AND revoked_at IS NULL",
+                    (now, connector),
+                )
+            updated = self._agent_connector_row_locked(conn, connector)
+        return self._agent_connector_payload(updated, now=now)
+
+    def rotate_agent_connector_enrollment(
+        self,
+        *,
+        connector_id: str,
+        current_enrollment_token: str,
+        new_enrollment_token: str,
+    ) -> dict[str, Any]:
+        connector = opaque_id(connector_id, field="connector_id")
+        current_token = opaque_id(
+            current_enrollment_token,
+            field="current_enrollment_token",
+        )
+        next_token = opaque_id(
+            new_enrollment_token,
+            field="new_enrollment_token",
+        )
+        if not next_token.startswith("enroll_") or len(next_token) < 40:
+            raise ValidationError(
+                "new_enrollment_token must be a strong enroll_ token"
+            )
+        current_hash = self._secret_hash(current_token)
+        next_hash = self._secret_hash(next_token)
+        now = time.time()
+        with self._transaction() as conn:
+            row = self._agent_connector_row_locked(conn, connector)
+            if row["revoked_at"] is not None or str(row["invitation_status"]) == "revoked":
+                raise AuthenticationError("invalid or revoked Agent enrollment")
+            stored_current = str(row["enrollment_token_hash"] or "")
+            stored_previous = str(row["previous_enrollment_token_hash"] or "")
+            previous_valid = bool(
+                stored_previous
+                and row["previous_enrollment_valid_until"] is not None
+                and float(row["previous_enrollment_valid_until"]) > now
+            )
+            matches_current = self._constant_time_eq(current_hash, stored_current)
+            matches_previous = bool(
+                previous_valid
+                and self._constant_time_eq(current_hash, stored_previous)
+            )
+            if matches_previous and self._constant_time_eq(next_hash, stored_current):
+                # The server committed the first attempt but its response was
+                # lost. Repeating the exact client-generated successor is safe.
+                updated = row
+            elif matches_current:
+                if self._constant_time_eq(next_hash, stored_current):
+                    raise ValidationError(
+                        "new enrollment credential must differ from the current one"
+                    )
+                if stored_previous and self._constant_time_eq(
+                    next_hash,
+                    stored_previous,
+                ):
+                    raise ValidationError(
+                        "new enrollment credential must not reuse the previous one"
+                    )
+                collision = conn.execute(
+                    "SELECT connector_id FROM agent_connectors "
+                    "WHERE connector_id <> ? AND revoked_at IS NULL AND ("
+                    "enrollment_token_hash = ? OR ("
+                    "previous_enrollment_token_hash = ? "
+                    "AND previous_enrollment_valid_until > ?)) LIMIT 1",
+                    (connector, next_hash, next_hash, now),
+                ).fetchone()
+                if collision is not None:
+                    raise ValidationError(
+                        "new enrollment credential is already assigned"
+                    )
+                conn.execute(
+                    "UPDATE agent_connectors SET "
+                    "previous_enrollment_token_hash = enrollment_token_hash, "
+                    "previous_enrollment_valid_until = ?, "
+                    "enrollment_token_hash = ?, enrollment_rotated_at = ?, "
+                    "enrollment_rotation_count = enrollment_rotation_count + 1, "
+                    "enrollment_credential_version = "
+                    "enrollment_credential_version + 1, "
+                    "enrollment_rotation_required_at = NULL, "
+                    "enrollment_rotation_requested_by_web_user_id = NULL, "
+                    "updated_at = ? WHERE connector_id = ?",
+                    (
+                        now + ENROLLMENT_PREVIOUS_GRACE_SECONDS,
+                        next_hash,
+                        now,
+                        now,
+                        connector,
+                    ),
+                )
+                updated = self._agent_connector_row_locked(conn, connector)
+            else:
+                raise AuthenticationError("invalid or revoked Agent enrollment")
+        payload = self._agent_connector_payload(updated, now=now)
+        payload["rotation_completed"] = True
+        return payload
+
+    @staticmethod
+    def _agent_connector_row_locked(
+        conn: sqlite3.Connection,
+        connector_id: str,
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT connector.*, invitation.product, invitation.requested_mode, "
+            "invitation.adapter_kind, invitation.tui_adapter_kind, "
+            "invitation.status AS invitation_status "
+            "FROM agent_connectors AS connector "
+            "JOIN agent_invitations AS invitation "
+            "ON invitation.invitation_id = connector.invitation_id "
+            "WHERE connector.connector_id = ?",
+            (connector_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"unknown Agent connector: {connector_id}")
+        return row
 
     def accept_agent_invitation(
         self,
@@ -5916,6 +6161,18 @@ class BridgeStore:
                     ).fetchone()
             existing_connector = None
             if normalized_enrollment is not None:
+                enrollment_hash = self._secret_hash(normalized_enrollment)
+                previous_collision = conn.execute(
+                    "SELECT connector_id FROM agent_connectors "
+                    "WHERE previous_enrollment_token_hash = ? "
+                    "AND previous_enrollment_valid_until > ? "
+                    "AND revoked_at IS NULL LIMIT 1",
+                    (enrollment_hash, now),
+                ).fetchone()
+                if previous_collision is not None:
+                    raise ConflictError(
+                        "enrollment token is already bound to a rotating connector"
+                    )
                 existing_connector = conn.execute(
                     """
                     SELECT connector.*, participant.client_type
@@ -5924,7 +6181,7 @@ class BridgeStore:
                       ON participant.participant_id = connector.accepted_participant_id
                     WHERE connector.enrollment_token_hash = ?
                     """,
-                    (self._secret_hash(normalized_enrollment),),
+                    (enrollment_hash,),
                 ).fetchone()
             if duplicate_session is not None and (
                 existing_connector is None
@@ -6205,6 +6462,24 @@ class BridgeStore:
                 "enrollment_token": normalized_enrollment,
                 "setup_status": setup_status,
                 "identity_binding_version": binding_version,
+                "enrollment_credential_version": (
+                    int(existing_connector["enrollment_credential_version"] or 1)
+                    if existing_connector is not None
+                    else 1
+                ),
+                "enrollment_credential_state": "current",
+                "enrollment_rotation_required": bool(
+                    existing_connector is not None
+                    and existing_connector["enrollment_rotation_required_at"]
+                    is not None
+                ),
+                "enrollment_previous_valid_until": (
+                    float(existing_connector["previous_enrollment_valid_until"])
+                    if existing_connector is not None
+                    and existing_connector["previous_enrollment_valid_until"]
+                    is not None
+                    else None
+                ),
                 "tui_endpoint_id": normalized_tui_endpoint,
                 "tui_native_session_id": normalized_tui_session,
                 "tui_access_mode": normalized_tui_access,
@@ -6405,6 +6680,11 @@ class BridgeStore:
                        connector.bound_client_type,
                        connector.bound_roles_json,
                        connector.bound_capabilities_json,
+                       connector.enrollment_token_hash,
+                       connector.previous_enrollment_token_hash,
+                       connector.previous_enrollment_valid_until,
+                       connector.enrollment_credential_version,
+                       connector.enrollment_rotation_required_at,
                        participant.client_type
                 FROM agent_connectors AS connector
                 JOIN agent_invitations AS invitation
@@ -6412,8 +6692,16 @@ class BridgeStore:
                 JOIN participants AS participant
                   ON participant.participant_id = connector.accepted_participant_id
                 WHERE connector.enrollment_token_hash = ?
+                   OR (
+                       connector.previous_enrollment_token_hash = ?
+                       AND connector.previous_enrollment_valid_until > ?
+                   )
                 """,
-                (self._secret_hash(normalized_enrollment),),
+                (
+                    self._secret_hash(normalized_enrollment),
+                    self._secret_hash(normalized_enrollment),
+                    now,
+                ),
             ).fetchone()
             if (
                 invitation is None
@@ -6422,6 +6710,11 @@ class BridgeStore:
             ):
                 raise AuthenticationError("invalid or revoked Agent enrollment")
             bound_connector_id = str(invitation["connector_id"])
+            enrollment_hash = self._secret_hash(normalized_enrollment)
+            using_previous_enrollment = not self._constant_time_eq(
+                enrollment_hash,
+                str(invitation["enrollment_token_hash"] or ""),
+            )
             binding_version = int(invitation["binding_version"] or 1)
             if normalized_connector is not None and not self._constant_time_eq(
                 normalized_connector,
@@ -6501,6 +6794,22 @@ class BridgeStore:
         registered["identity_binding_version"] = binding_version
         registered["ready_components"] = ready_components
         registered["missing_components"] = missing_components
+        registered["enrollment_credential_version"] = int(
+            invitation["enrollment_credential_version"] or 1
+        )
+        registered["enrollment_credential_state"] = (
+            "grace" if using_previous_enrollment else "current"
+        )
+        registered["enrollment_rotation_required"] = bool(
+            using_previous_enrollment
+            or invitation["enrollment_rotation_required_at"] is not None
+        )
+        registered["enrollment_previous_valid_until"] = (
+            float(invitation["previous_enrollment_valid_until"])
+            if using_previous_enrollment
+            and invitation["previous_enrollment_valid_until"] is not None
+            else None
+        )
         return registered
 
     def report_agent_connector_setup(
@@ -7143,6 +7452,12 @@ class BridgeStore:
                 )
             if int(row["expired_task_lease_count"] or 0) > 0:
                 add_issue("task_lease_expired", "warning", "存在已过期任务租约")
+            if row["enrollment_rotation_required_at"] is not None:
+                add_issue(
+                    "credential_rotation_required",
+                    "warning",
+                    "设备凭证等待自动轮换",
+                )
 
             issue_codes = {item["code"] for item in issues}
             if setup_status == "failed" or "native_tui_error" in issue_codes:
@@ -7226,6 +7541,45 @@ class BridgeStore:
                         row["expired_task_lease_count"] or 0
                     ),
                     "binding_version": int(row["binding_version"] or 1),
+                    "enrollment": {
+                        "credential_version": int(
+                            row["enrollment_credential_version"] or 1
+                        ),
+                        "rotation_count": int(
+                            row["enrollment_rotation_count"] or 0
+                        ),
+                        "last_used_at": (
+                            float(row["enrollment_last_used_at"])
+                            if row["enrollment_last_used_at"] is not None
+                            else None
+                        ),
+                        "rotated_at": (
+                            float(row["enrollment_rotated_at"])
+                            if row["enrollment_rotated_at"] is not None
+                            else None
+                        ),
+                        "credential_age_seconds": max(
+                            0.0,
+                            now
+                            - float(
+                                row["enrollment_rotated_at"]
+                                or row["created_at"]
+                            ),
+                        ),
+                        "rotation_required": (
+                            row["enrollment_rotation_required_at"] is not None
+                        ),
+                        "rotation_required_at": (
+                            float(row["enrollment_rotation_required_at"])
+                            if row["enrollment_rotation_required_at"] is not None
+                            else None
+                        ),
+                        "previous_valid_until": (
+                            float(row["previous_enrollment_valid_until"])
+                            if row["previous_enrollment_valid_until"] is not None
+                            else None
+                        ),
+                    },
                     "ready_components": ready,
                     "missing_components": missing_components,
                     "component_registration": readiness.get(connector_id, {}),

@@ -16,6 +16,7 @@ class BridgeConfig:
     registration_secret: str | None
     invitation_token: str | None
     enrollment_token: str | None
+    enrollment_token_file: Path | None
     connector_id: str | None
     auto_register: bool
     auto_register_username: str
@@ -57,6 +58,7 @@ class BridgeConfig:
             registration_secret=read_registration_secret(),
             invitation_token=read_invitation_token(),
             enrollment_token=read_enrollment_token(),
+            enrollment_token_file=read_enrollment_token_file(),
             connector_id=read_connector_id(),
             auto_register=_truthy(os.environ.get("AGENT_BRIDGE_AUTO_REGISTER")),
             auto_register_username=os.environ.get(
@@ -106,6 +108,13 @@ def read_enrollment_token() -> str | None:
         file_name="AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE",
         label="Agent Bridge enrollment token",
     )
+
+
+def read_enrollment_token_file() -> Path | None:
+    """Return the private file that can be atomically rotated, if configured."""
+
+    value = os.environ.get("AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE", "").strip()
+    return Path(value).expanduser() if value else None
 
 
 def read_connector_id() -> str | None:

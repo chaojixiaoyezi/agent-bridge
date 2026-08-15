@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
-from .config import read_connector_id, read_enrollment_token, read_registration_secret
+from .config import (
+    read_connector_id,
+    read_enrollment_token,
+    read_enrollment_token_file,
+    read_registration_secret,
+)
 from .http_client import BridgeHttpClient
 
 
@@ -23,6 +28,8 @@ def resident_http_client(
         registration_secret=read_registration_secret(),
         enrollment_token=read_enrollment_token(),
         connector_id=read_connector_id(),
+        enrollment_token_file=read_enrollment_token_file(),
+        enrollment_token_loader=read_enrollment_token,
         auto_registration={
             "product": product,
             "username": username,

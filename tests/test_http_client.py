@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import threading
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -153,6 +154,124 @@ def test_enrollment_registration_sends_connector_identity_header(
 
     assert captured["X-agent-bridge-enrollment"] == "enroll_private"
     assert captured["X-agent-bridge-connector"] == "connector_private"
+
+
+def test_enrollment_rotation_reuses_private_pending_successor_after_lost_response(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enrollment_file = tmp_path / "enrollment.token"
+    old_enrollment = "enroll_" + "o" * 64
+    enrollment_file.write_text(f"{old_enrollment}\n", encoding="utf-8")
+    enrollment_file.chmod(0o600)
+    client = BridgeHttpClient(
+        "https://bridge.example.test",
+        enrollment_token=old_enrollment,
+        connector_id="connector_rotation",
+        enrollment_token_file=enrollment_file,
+        enrollment_token_loader=lambda: enrollment_file.read_text(
+            encoding="utf-8"
+        ).strip(),
+    )
+    submitted_successors: list[str] = []
+
+    def post(
+        path: str,
+        payload: dict[str, Any],
+        *,
+        authenticated: bool,
+    ) -> dict[str, Any]:
+        assert path == "/agent/connector/enrollment/rotate"
+        assert authenticated is False
+        submitted_successors.append(str(payload["new_enrollment_token"]))
+        if len(submitted_successors) == 1:
+            raise BridgeRemoteError("response lost")
+        return {
+            "connector": {
+                "connector_id": "connector_rotation",
+                "rotation_completed": True,
+                "enrollment": {"credential_version": 2},
+            }
+        }
+
+    monkeypatch.setattr(client, "_post", post)
+    with pytest.raises(BridgeRemoteError, match="response lost"):
+        client.rotate_enrollment()
+    pending_file = tmp_path / ".enrollment.token.pending"
+    assert pending_file.exists()
+    assert enrollment_file.read_text(encoding="utf-8").strip() == old_enrollment
+    assert stat.S_IMODE(pending_file.stat().st_mode) == 0o600
+
+    result = client.rotate_enrollment()
+    assert len(submitted_successors) == 2
+    assert submitted_successors[0] == submitted_successors[1]
+    assert submitted_successors[0].startswith("enroll_")
+    assert enrollment_file.read_text(encoding="utf-8").strip() == (
+        submitted_successors[0]
+    )
+    assert stat.S_IMODE(enrollment_file.stat().st_mode) == 0o600
+    assert not pending_file.exists()
+    assert submitted_successors[0] not in str(result)
+    assert result == {
+        "connector_id": "connector_rotation",
+        "credential_version": 2,
+        "rotation_completed": True,
+    }
+
+
+def test_registration_automatically_rotates_requested_file_credential(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enrollment_file = tmp_path / "enrollment.token"
+    enrollment_file.write_text("enroll_" + "x" * 64 + "\n", encoding="utf-8")
+    enrollment_file.chmod(0o600)
+    client = BridgeHttpClient(
+        "https://bridge.example.test",
+        enrollment_token="enroll_" + "x" * 64,
+        connector_id="connector_auto_rotation",
+        enrollment_token_file=enrollment_file,
+        enrollment_token_loader=lambda: enrollment_file.read_text(
+            encoding="utf-8"
+        ).strip(),
+    )
+    calls: list[str] = []
+
+    def post(
+        path: str,
+        payload: dict[str, Any],
+        *,
+        authenticated: bool,
+    ) -> dict[str, Any]:
+        calls.append(path)
+        if path == "/agent/register":
+            assert authenticated is False
+            return {
+                "access_token": "session_rotating",
+                "participant_id": "participant_rotating",
+                "session_id": "session_rotating_id",
+                "enrollment_rotation_required": True,
+                "enrollment_credential_version": 1,
+            }
+        successor = str(payload["new_enrollment_token"])
+        return {
+            "connector": {
+                "connector_id": "connector_auto_rotation",
+                "rotation_completed": True,
+                "enrollment": {"credential_version": 2},
+                "successor_is_not_returned": successor != "",
+            }
+        }
+
+    monkeypatch.setattr(client, "_post", post)
+    registered = client.register(**FIXED_IDENTITY)
+    assert calls == ["/agent/register", "/agent/connector/enrollment/rotate"]
+    assert registered["enrollment_rotation_required"] is False
+    assert registered["enrollment_rotation_pending"] is False
+    assert registered["enrollment_credential_version"] == 2
+    assert enrollment_file.read_text(encoding="utf-8").strip() != (
+        "enroll_" + "x" * 64
+    )
 
 
 def test_invitation_acceptance_declares_strict_connector_binding(

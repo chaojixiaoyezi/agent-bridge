@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from mcp.server.mcpserver import Context, MCPServer
 
-from .config import BridgeConfig
+from .config import BridgeConfig, read_enrollment_token
 from .connector import (
     ConnectorSetupError,
     configure_resident_connector,
@@ -81,6 +81,8 @@ def get_client() -> BridgeHttpClient:
             connector_id=CONFIG.connector_id,
             invitation_token=CONFIG.invitation_token,
             auto_registration=auto_registration,
+            enrollment_token_file=CONFIG.enrollment_token_file,
+            enrollment_token_loader=read_enrollment_token,
         )
     return _CLIENT
 

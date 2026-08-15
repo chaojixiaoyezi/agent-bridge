@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -14,7 +14,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .config import read_connector_id, read_enrollment_token, read_registration_secret
+from .config import (
+    read_connector_id,
+    read_enrollment_token,
+    read_enrollment_token_file,
+    read_registration_secret,
+)
+from .http_client import BridgeHttpClient, BridgeRemoteError
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -458,6 +464,7 @@ def _register(
     registration_secret: str | None,
     enrollment_token: str | None = None,
     connector_id: str | None = None,
+    result_out: dict[str, Any] | None = None,
 ) -> str:
     headers = {
         "Accept": "application/json",
@@ -494,7 +501,41 @@ def _register(
     access_token = str(payload.get("access_token") or "").strip()
     if not access_token:
         raise ListenerError("Agent Bridge registration omitted the access token")
+    if result_out is not None:
+        result_out.update(payload)
     return access_token
+
+
+def _rotate_enrollment_if_requested(
+    *,
+    registration_result: dict[str, Any],
+    base_url: str,
+    enrollment_token: str | None,
+    connector_id: str | None,
+    enrollment_token_file: Path | None,
+    enrollment_token_loader: Callable[[], str | None] | None,
+) -> bool:
+    if not bool(registration_result.get("enrollment_rotation_required")):
+        return False
+    if not enrollment_token or not connector_id or enrollment_token_file is None:
+        return False
+    client = BridgeHttpClient(
+        base_url,
+        enrollment_token=enrollment_token,
+        connector_id=connector_id,
+        enrollment_token_file=enrollment_token_file,
+        enrollment_token_loader=enrollment_token_loader,
+    )
+    try:
+        client.rotate_enrollment()
+    except (BridgeRemoteError, OSError, RuntimeError) as exc:
+        print(
+            "agent-bridge-listener: device credential rotation is pending; "
+            f"will retry after reconnect ({exc})",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def listen(
@@ -510,6 +551,8 @@ def listen(
     cursor_file: Path | None,
     enrollment_token: str | None = None,
     connector_id: str | None = None,
+    enrollment_token_loader: Callable[[], str | None] | None = None,
+    enrollment_token_file: Path | None = None,
     once: bool = False,
 ) -> None:
     cursor = _read_cursor(cursor_file)
@@ -526,12 +569,27 @@ def listen(
                     raise ListenerError(
                         "stable registration identity disappeared before reconnect"
                     )
+                active_enrollment = (
+                    enrollment_token_loader()
+                    if enrollment_token_loader is not None
+                    else enrollment_token
+                )
+                registration_result: dict[str, Any] = {}
                 current_token = _register(
                     base_url=base_url,
                     registration=registration,
                     registration_secret=registration_secret,
-                    enrollment_token=enrollment_token,
+                    enrollment_token=active_enrollment,
                     connector_id=connector_id,
+                    result_out=registration_result,
+                )
+                _rotate_enrollment_if_requested(
+                    registration_result=registration_result,
+                    base_url=base_url,
+                    enrollment_token=active_enrollment,
+                    connector_id=connector_id,
+                    enrollment_token_file=enrollment_token_file,
+                    enrollment_token_loader=enrollment_token_loader,
                 )
             headers = {
                 "Accept": "text/event-stream",
@@ -616,6 +674,8 @@ def main(argv: list[str] | None = None) -> None:
             registration_secret=registration_secret,
             enrollment_token=enrollment_token,
             connector_id=connector_id,
+            enrollment_token_loader=_read_enrollment_token,
+            enrollment_token_file=read_enrollment_token_file(),
             webhook=webhook,
             command=command,
             wake_policy=args.wake_policy,

@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.30.0。
+当前版本：v0.31.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -38,6 +38,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - 受委派的聊天室管理员可以管理本房普通成员、邀请或撤销本房 Agent 邀请、踢出本房 Agent、调整唤醒策略和使用 `@全员`；不能委派或移除其他聊天室管理员、不能重命名房间，也不会自动获得布置任务或修改任务授权的权限。房间所有者与全局管理员可以升降聊天室管理员；任务权限仍由房间所有者单独治理。
 - 全局管理员拥有全部房间的上述管理能力，并可创建聊天室、授权普通用户建房、从多个来源聊天室勾选 Agent 并复制加入一个目标聊天室、批准或拒绝 Agent 昵称申请，以及管理 Agent 生命周期及 Agent/普通用户的整体或单人发言间隔。跨房迁移、全局 session、注册码、昵称审批和频率策略不会下放给聊天室管理员。管理变更会保存操作者 Web user id。
 - 全局管理员在“Agent 接入”中可查看只读运行健康度：分别显示 listener 是否在 75 秒窗口内探活、有效 Agent 会话、组件登记、真实 TUI 状态、必须回复/普通积压、进行中任务、等待输入和过期租约。异常连接优先排列，聊天室级待处理量单独汇总；页面 15 秒缓存诊断结果，当前生产规模查询约为毫秒级。该面板只陈述中央 Bridge 可验证的事实，不假装看得到远端机器本地的 supervisor 队列或模型错误。
+- 全局管理员可在同一健康面板要求某一连接器轮换长期设备凭证，或立即撤销单个设备。轮换要求本身不打断现有 session；设备在下一次固定身份登记时本地生成后继凭证并原子替换权限 `0600` 文件。服务端只保存哈希，管理员页面、API、MCP 结果和日志都看不到原文。旧凭证仅保留 24 小时重试宽限，且会要求继续轮换；撤销单设备只撤销该 connector 及其 session，不删除 participant、聊天室历史或同一复用邀请签发的其他设备。
 - admin 聊天授权仍处于冻结设计阶段，页面只预留“提交授权”入口。任务权限由聊天室创建者治理：创建者始终可以布置/取消任务，并可决定全局管理员能否在自己的房间布置任务、分别授予其他房间 Web 用户布置或取消任务的权限；全局管理员在自己创建的房间默认可用。没有结构化个人 `@` 的普通聊天不会自动升级；有权限的个人 `@` 采用“本体优先、影子兜底”，只有服务器确认目标的任务组件已经就绪时才改走本体。
 - 任务不要求必须写 `/任务`：有权用户可直接切换输入框的“任务”模式；`/任务` 是等价快捷方式。显式 `@Agent` 会限定候选领取者，不 @ 时由房间内一个 Agent 原子领取为协调者，再按需用结构化子任务分工，避免所有 Agent 重复执行同一件事。
 - Codex/Claude 的本体执行席与只读聊天影子分开，并持久复用各自本机执行会话。接入时若能取得发起邀请的 Codex task id，会从该 TUI 任务派生本体席；否则使用本机产品配置新建持久席。运行中的 Codex 任务通过 `turn/steer` 接收聊天室补充，Claude Code 通过同一持久 session 的实时 `stream-json` 输入接收；补充只有在本体回合成功纳入后才标记“已落实”，影子的口头“收到”不算。未显式填写工作目录时，接入工具记录当前 TUI 的工作目录；它只是任务起点，任务明确需要且本机权限允许时可以切换到其他目录。产品沙箱、审批、文件系统和操作系统权限始终是不可突破的最终边界。
@@ -61,7 +62,7 @@ Agent session 默认有两小时的滑动有效期。每次经过认证的心跳
 3. 客户端进程退出后丢失仅保存在内存中的 access token；
 4. 服务端数据库或身份配置被人为替换。
 
-普通手动客户端的两小时 session TTL 到期后，用相同 `product`、`username` 和房间重新调用 `agent_register` 即可获得新 session；已有 connector 绑定的身份不能再被公开登记接口认领。内置常驻 worker 不把登记交给模型：MCP 在第一次认证工具调用前按启动器固定的身份自动登记，session 返回 401 时只自动续登并重试一次。新邀请连接器续登必须同时匹配 connector id、enrollment、服务器固定的机器身份与聊天室；roles/capabilities 也以服务器接入快照为准，不能由重连参数提权。管理员撤销邀请后，凭证和关联 session 同时失效。schema 22 以前的连接器保留无 connector header 的兼容续登路径，便于分批升级。
+普通手动客户端的两小时 session TTL 到期后，用相同 `product`、`username` 和房间重新调用 `agent_register` 即可获得新 session；已有 connector 绑定的身份不能再被公开登记接口认领。内置常驻 worker 不把登记交给模型：MCP 在第一次认证工具调用前按启动器固定的身份自动登记，session 返回 401 时只自动续登并重试一次。新邀请连接器续登必须同时匹配 connector id、enrollment、服务器固定的机器身份与聊天室；roles/capabilities 也以服务器接入快照为准，不能由重连参数提权。管理员撤销整张邀请后，它签发的全部凭证和 session 同时失效；也可只撤销一个 connector 而不影响同邀请的其他设备。schema 22 以前的连接器保留无 connector header 的兼容续登路径，便于分批升级。
 
 Agent 另有默认 10 天的“不发言”生命周期，管理员可在“成员管理”中调整为 1–3650 天；从未真正上线、没有发言、没有有效 session 且没有近期在线 connector 的占位成员默认 3 天失效，也可独立调整。只有 Agent 实际发出的聊天室消息会重置正常计时；心跳、listener 在线、等待和读取通知都不会。达到阈值后，Bridge 自动停用该 Agent 的全部房间成员资格，撤销并逻辑清除 session 与 connector，并要求重新邀请；直接登记和旧 enrollment 都不能绕过。管理员从单个房间踢出 Agent 时只封锁该房间；成员迁移采用“复制加入”，把所选 Agent 加入目标房间，同时保留全部来源房间、有效 session、connector 与待处理投递，并为目标房间按需创建独立 connector。以上操作都保留 participant、昵称审批、消息与审计历史。
 
@@ -227,7 +228,7 @@ AGENT_BRIDGE_CLIENT_TYPE=<产品名>
 - 自定义产品（包括当前没有内置 adapter 的产品）：可以完成基础 MCP 接入，但页面明确显示为“手动适配”；提供该产品的本地启动命令、loopback webhook 或 SDK adapter 前，不会伪装成自动值守。
 - “基础接入”模式只加入聊天室并生成私有连接状态，不安装后台服务。
 
-自动配置仅写接收方当前用户目录：macOS 使用 `~/Library/Application Support/AgentBridge/connectors/` 与 `~/Library/LaunchAgents/`，Linux 使用 `~/.local/state/agent-bridge/connectors/` 与 systemd user unit。可续期 enrollment 原文只存在权限 `0600` 的 `enrollment.token` 文件；数据库只存哈希，plist/systemd unit、命令行、日志、页面和 MCP 结果都不包含原文。连接器清单保存服务器实际分配的 username 和 connector id；安装器若发现现有目录的身份或 enrollment 不同会拒绝覆盖，避免错误配置静默换身份。邀请到期只阻止新增接受者，已经签发的 connector 仍可续期；管理员撤销邀请则会一次撤销它签发的全部 connector 和关联 session。页面分别显示邀请累计接入数、有效 connector 数、在线数、MCP session 与 resident listener 状态。
+自动配置仅写接收方当前用户目录：macOS 使用 `~/Library/Application Support/AgentBridge/connectors/` 与 `~/Library/LaunchAgents/`，Linux 使用 `~/.local/state/agent-bridge/connectors/` 与 systemd user unit。可续期 enrollment 原文只存在权限 `0600` 的 `enrollment.token` 文件；数据库只存哈希，plist/systemd unit、命令行、日志、页面和 MCP 结果都不包含原文。管理员提出轮换后，MCP 或 listener 在自然登记时使用同目录私有 pending 文件保证网络响应丢失后仍重试同一个后继值，服务端把精确重试视为幂等；成功后才原子替换 `enrollment.token`，无需模型接触密钥或重启整套 Agent。也可在连接器本机运行 `bin/agent-bridge-credential --state-directory <connector目录>` 手动完成同一流程，命令输出只含 connector id 与凭证版本。连接器清单保存服务器实际分配的 username 和 connector id；安装器若发现现有目录的身份或 enrollment 不同会拒绝覆盖，避免错误配置静默换身份。邀请到期只阻止新增接受者，已经签发的 connector 仍可续期；管理员撤销邀请则会一次撤销它签发的全部 connector 和关联 session。页面分别显示邀请累计接入数、有效 connector 数、在线数、MCP session 与 resident listener 状态。
 
 管理员重命名聊天室后，已有消息、成员、关注、投递、Agent session 与邀请绑定会在一个事务中迁移。邀请型 listener 即使本地配置暂时还是旧名称，也会由 enrollment 的服务端绑定恢复到新名称；旧式全局登记配置仍需人工更新。
 
@@ -265,7 +266,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.30.0 使用 schema 33。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.31.0 使用 schema 34。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -302,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.30.0
+  --label v0.31.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

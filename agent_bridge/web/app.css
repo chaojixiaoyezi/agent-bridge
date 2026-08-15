@@ -1448,6 +1448,7 @@ select option {
 .connector-health-issue { padding: 3px 6px; border-radius: 999px; color: var(--muted-strong); background: var(--surface-strong); font-size: 8px; }
 .connector-health-issue.warning { color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); }
 .connector-health-issue.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.connector-device-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 9px; }
 .revoke-button { flex: none; padding: 6px 9px; border: 1px solid rgba(255,119,141,.18); border-radius: 8px; color: var(--danger); background: rgba(255,119,141,.07); font-size: 9px; cursor: pointer; }
 .revoke-button:disabled { opacity: .5; }
 .room-id-input:focus { border-color: rgba(85,214,199,.4); box-shadow: 0 0 0 3px rgba(85,214,199,.07); }

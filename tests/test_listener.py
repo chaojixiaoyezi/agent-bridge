@@ -281,6 +281,48 @@ def test_auto_registration_sends_optional_authority_header_without_persisting_to
     assert request.get_header("X-agent-bridge-registration") is None
 
 
+def test_listener_rotates_requested_credential_without_losing_registered_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enrollment_file = tmp_path / "enrollment.token"
+    enrollment = "enroll_" + "l" * 64
+    enrollment_file.write_text(f"{enrollment}\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, base_url: str, **kwargs) -> None:
+            captured["base_url"] = base_url
+            captured.update(kwargs)
+
+        def rotate_enrollment(self) -> dict[str, object]:
+            captured["rotated"] = True
+            return {
+                "connector_id": "connector_listener_rotation",
+                "credential_version": 2,
+                "rotation_completed": True,
+            }
+
+    monkeypatch.setattr(listener, "BridgeHttpClient", FakeClient)
+
+    def loader() -> str:
+        return enrollment_file.read_text(encoding="utf-8").strip()
+
+    assert listener._rotate_enrollment_if_requested(
+        registration_result={"enrollment_rotation_required": True},
+        base_url="https://bridge.example.test",
+        enrollment_token=enrollment,
+        connector_id="connector_listener_rotation",
+        enrollment_token_file=enrollment_file,
+        enrollment_token_loader=loader,
+    ) is True
+    assert captured["base_url"] == "https://bridge.example.test"
+    assert captured["connector_id"] == "connector_listener_rotation"
+    assert captured["enrollment_token_file"] == enrollment_file
+    assert captured["enrollment_token_loader"] is loader
+    assert captured["rotated"] is True
+
+
 def test_listener_retries_failed_sink_and_advances_cursor_only_after_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

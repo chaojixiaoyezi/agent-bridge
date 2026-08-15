@@ -5,7 +5,8 @@ import os
 import secrets
 import threading
 from http.client import HTTPException
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -59,6 +60,8 @@ class BridgeHttpClient:
         connector_component: str | None = None,
         invitation_token: str | None = None,
         auto_registration: dict[str, Any] | None = None,
+        enrollment_token_file: str | Path | None = None,
+        enrollment_token_loader: Callable[[], str | None] | None = None,
     ) -> None:
         normalized = str(base_url or "").strip().rstrip("/")
         parsed = urlparse(normalized)
@@ -80,6 +83,12 @@ class BridgeHttpClient:
             or None
         )
         self.invitation_token = str(invitation_token or "").strip() or None
+        self.enrollment_token_file = (
+            Path(enrollment_token_file).expanduser()
+            if enrollment_token_file is not None
+            else None
+        )
+        self.enrollment_token_loader = enrollment_token_loader
         self.auto_registration = (
             dict(auto_registration) if auto_registration is not None else None
         )
@@ -128,6 +137,7 @@ class BridgeHttpClient:
         self.access_token = access_token
         self.participant_id = str(payload["participant_id"])
         self.session_id = str(payload["session_id"])
+        self._maybe_rotate_enrollment(payload)
         return payload
 
     def accept_invitation(
@@ -225,7 +235,74 @@ class BridgeHttpClient:
     def _register_from_fixed_identity(self) -> None:
         if self.auto_registration is None:
             return
+        self._reload_enrollment_token()
         self.register(**self.auto_registration)
+
+    def rotate_enrollment(self) -> dict[str, Any]:
+        self._reload_enrollment_token()
+        if not self.enrollment_token or not self.connector_id:
+            raise BridgeRemoteError(
+                "connector enrollment and connector id are required for rotation"
+            )
+        if self.enrollment_token_file is None:
+            raise BridgeRemoteError(
+                "automatic rotation requires AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE"
+            )
+        pending_file = self.enrollment_token_file.with_name(
+            f".{self.enrollment_token_file.name}.pending"
+        )
+        successor = _load_or_create_pending_enrollment(pending_file)
+        response = self._post(
+            "/agent/connector/enrollment/rotate",
+            {"new_enrollment_token": successor},
+            authenticated=False,
+        )
+        connector = response.get("connector")
+        if not isinstance(connector, dict) or not secrets.compare_digest(
+            str(connector.get("connector_id") or ""),
+            self.connector_id,
+        ):
+            raise BridgeRemoteError("bridge returned mismatched connector rotation")
+        _atomic_private_secret_write(self.enrollment_token_file, successor)
+        self.enrollment_token = successor
+        try:
+            pending_file.unlink()
+        except FileNotFoundError:
+            pass
+        enrollment = connector.get("enrollment")
+        if not isinstance(enrollment, dict):
+            enrollment = {}
+        return {
+            "connector_id": self.connector_id,
+            "credential_version": int(enrollment.get("credential_version", 1)),
+            "rotation_completed": bool(connector.get("rotation_completed")),
+        }
+
+    def _reload_enrollment_token(self) -> None:
+        if self.enrollment_token_loader is None:
+            return
+        value = str(self.enrollment_token_loader() or "").strip()
+        if value:
+            self.enrollment_token = value
+
+    def _maybe_rotate_enrollment(self, registration: dict[str, Any]) -> None:
+        if not bool(registration.get("enrollment_rotation_required")):
+            return
+        if self.enrollment_token_file is None:
+            registration["enrollment_rotation_pending"] = True
+            return
+        try:
+            result = self.rotate_enrollment()
+        except (BridgeRemoteError, OSError, RuntimeError):
+            # Keep the active Agent session and a private pending successor.
+            # The next fixed-identity registration retries the same rotation.
+            registration["enrollment_rotation_pending"] = True
+            return
+        registration["enrollment_rotation_required"] = False
+        registration["enrollment_rotation_pending"] = False
+        registration["enrollment_credential_version"] = result[
+            "credential_version"
+        ]
 
     def _post(
         self,
@@ -244,12 +321,15 @@ class BridgeHttpClient:
             if not self.access_token:
                 raise BridgeRemoteError("call agent_register before using chat tools")
             headers["Authorization"] = f"Bearer {self.access_token}"
-        elif path == "/agent/register":
+        elif path in {
+            "/agent/register",
+            "/agent/connector/enrollment/rotate",
+        }:
             if self.enrollment_token:
                 headers["X-Agent-Bridge-Enrollment"] = self.enrollment_token
                 if self.connector_id:
                     headers["X-Agent-Bridge-Connector"] = self.connector_id
-                    if self.connector_component:
+                    if self.connector_component and path == "/agent/register":
                         headers["X-Agent-Bridge-Component"] = self.connector_component
                         headers["X-Agent-Bridge-Protocol"] = "2"
             elif self.registration_secret:
@@ -286,3 +366,53 @@ class BridgeHttpClient:
         if not isinstance(result, dict):
             raise BridgeRemoteError("Agent Bridge returned a non-object response")
         return result
+
+
+def _load_or_create_pending_enrollment(path: Path) -> str:
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    except OSError as exc:
+        raise BridgeRemoteError("cannot read pending enrollment rotation") from exc
+    if existing:
+        return existing
+    candidate = f"enroll_{secrets.token_urlsafe(32)}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        return _load_or_create_pending_enrollment(path)
+    try:
+        os.write(descriptor, f"{candidate}\n".encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return candidate
+
+
+def _atomic_private_secret_write(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    try:
+        os.write(descriptor, f"{value}\n".encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass

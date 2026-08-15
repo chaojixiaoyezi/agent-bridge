@@ -284,7 +284,7 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
@@ -323,7 +323,7 @@ def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
             "email_verified_at, pending_email, email_updated_at "
             "FROM web_users WHERE username = 'admin'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'web_email_tokens'"
@@ -1211,7 +1211,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1283,7 +1283,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1512,7 +1512,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -2849,7 +2849,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 33
+    assert version == 34
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2921,7 +2921,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 33
+    assert version == 34
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -3017,7 +3017,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 33
+    assert version == 34
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4165,6 +4165,196 @@ def test_reusable_invitation_accepts_distinct_agents_concurrently(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_connector_enrollment_rotation_and_device_revoke_are_isolated(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("设备凭证治理群")
+    invitation = store.create_agent_invitation(
+        conversation_id="设备凭证治理群",
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+        reusable=True,
+    )
+    invitation_token = str(invitation["invitation_token"])
+    first_token = "enroll_" + "a" * 64
+    second_token = "enroll_" + "b" * 64
+    successor = "enroll_" + "c" * 64
+    first = store.accept_agent_invitation(
+        invitation_token=invitation_token,
+        product="claude-code",
+        username="device-one",
+        signature="第一台设备",
+        enrollment_token=first_token,
+    )
+    second = store.accept_agent_invitation(
+        invitation_token=invitation_token,
+        product="claude-code",
+        username="device-two",
+        signature="第二台设备",
+        enrollment_token=second_token,
+    )
+
+    requested = store.request_agent_connector_enrollment_rotation(
+        connector_id=first["connector_id"],
+        requested_by_web_user_id=admin_id,
+    )
+    assert requested["enrollment"]["rotation_required"] is True
+    assert first_token not in str(requested)
+    before_rotation = store.register_agent_session_from_enrollment(
+        enrollment_token=first_token,
+        connector_id=first["connector_id"],
+        product="claude-code",
+        username=first["username"],
+        signature="轮换前重连",
+    )
+    assert before_rotation["enrollment_rotation_required"] is True
+    assert before_rotation["enrollment_credential_state"] == "current"
+
+    rotated = store.rotate_agent_connector_enrollment(
+        connector_id=first["connector_id"],
+        current_enrollment_token=first_token,
+        new_enrollment_token=successor,
+    )
+    assert rotated["rotation_completed"] is True
+    assert rotated["enrollment"]["credential_version"] == 2
+    assert rotated["enrollment"]["rotation_count"] == 1
+    assert rotated["enrollment"]["rotation_required"] is False
+    assert first_token not in str(rotated)
+    assert successor not in str(rotated)
+
+    # If the first HTTP response is lost, replaying the exact client-generated
+    # successor is idempotent and does not advance the credential version again.
+    retried = store.rotate_agent_connector_enrollment(
+        connector_id=first["connector_id"],
+        current_enrollment_token=first_token,
+        new_enrollment_token=successor,
+    )
+    assert retried["enrollment"]["credential_version"] == 2
+    assert retried["enrollment"]["rotation_count"] == 1
+
+    grace_registration = store.register_agent_session_from_enrollment(
+        enrollment_token=first_token,
+        connector_id=first["connector_id"],
+        product="claude-code",
+        username=first["username"],
+        signature="宽限期旧凭证重连",
+    )
+    assert grace_registration["enrollment_credential_state"] == "grace"
+    assert grace_registration["enrollment_rotation_required"] is True
+    current_registration = store.register_agent_session_from_enrollment(
+        enrollment_token=successor,
+        connector_id=first["connector_id"],
+        product="claude-code",
+        username=first["username"],
+        signature="新凭证重连",
+    )
+    assert current_registration["enrollment_credential_state"] == "current"
+    assert current_registration["enrollment_rotation_required"] is False
+    with pytest.raises(AuthenticationError, match="connector does not match"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=successor,
+            connector_id=second["connector_id"],
+            product="claude-code",
+            username=first["username"],
+            signature="错误设备绑定",
+        )
+
+    with store._connection() as connection:
+        credential_row = connection.execute(
+            "SELECT enrollment_token_hash, previous_enrollment_token_hash, "
+            "enrollment_rotation_count, enrollment_credential_version "
+            "FROM agent_connectors WHERE connector_id = ?",
+            (first["connector_id"],),
+        ).fetchone()
+    assert credential_row["enrollment_token_hash"] == BridgeStore._secret_hash(
+        successor
+    )
+    assert credential_row["previous_enrollment_token_hash"] == (
+        BridgeStore._secret_hash(first_token)
+    )
+    assert first_token not in tuple(credential_row)
+    assert successor not in tuple(credential_row)
+
+    revoked = store.revoke_agent_connector(
+        connector_id=first["connector_id"],
+        revoked_by_web_user_id=admin_id,
+    )
+    assert revoked["resident_status"] == "revoked"
+    with pytest.raises(AuthenticationError, match="invalid or revoked"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=successor,
+            connector_id=first["connector_id"],
+            product="claude-code",
+            username=first["username"],
+            signature="撤销后重连",
+        )
+    second_reconnected = store.register_agent_session_from_enrollment(
+        enrollment_token=second_token,
+        connector_id=second["connector_id"],
+        product="claude-code",
+        username=second["username"],
+        signature="第二台设备不受影响",
+    )
+    assert second_reconnected["participant_id"] == second["participant_id"]
+    listed = store.list_agent_invitations(
+        requesting_web_user_id=admin_id,
+    )[0]
+    assert listed["connector_count"] == 2
+    assert listed["active_connector_count"] == 1
+
+
+def test_expired_previous_enrollment_no_longer_registers(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("凭证宽限期群")
+    invitation = store.create_agent_invitation(
+        conversation_id="凭证宽限期群",
+        product="codex",
+        requested_mode="resident",
+        adapter_kind="codex",
+        created_by_web_user_id=admin_id,
+    )
+    old_token = "enroll_" + "d" * 64
+    new_token = "enroll_" + "e" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="codex",
+        username="expiring-device",
+        signature="测试旧凭证失效",
+        enrollment_token=old_token,
+    )
+    store.rotate_agent_connector_enrollment(
+        connector_id=accepted["connector_id"],
+        current_enrollment_token=old_token,
+        new_enrollment_token=new_token,
+    )
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE agent_connectors SET previous_enrollment_valid_until = ? "
+            "WHERE connector_id = ?",
+            (time.time() - 1, accepted["connector_id"]),
+        )
+    with pytest.raises(AuthenticationError, match="invalid or revoked"):
+        store.register_agent_session_from_enrollment(
+            enrollment_token=old_token,
+            connector_id=accepted["connector_id"],
+            product="codex",
+            username=accepted["username"],
+            signature="过期旧凭证",
+        )
+    assert store.register_agent_session_from_enrollment(
+        enrollment_token=new_token,
+        connector_id=accepted["connector_id"],
+        product="codex",
+        username=accepted["username"],
+        signature="有效新凭证",
+    )["participant_id"] == accepted["participant_id"]
+
+
 def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
     tmp_path: Path,
 ) -> None:
@@ -4870,7 +5060,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 34
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4925,7 +5115,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 33
+    assert version == 34
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5636,7 +5826,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),
