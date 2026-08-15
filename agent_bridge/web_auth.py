@@ -1560,7 +1560,11 @@ class WebAuthStore:
                 now - EMAIL_TOKEN_AUDIT_RETENTION_SECONDS,
             ),
         )
-        token_value = secrets.token_urlsafe(32)
+        # token_urlsafe may legally begin with '-' or '_', while opaque_id
+        # deliberately requires an alphanumeric first character. Prefix every
+        # newly issued email token so every value we deliver is also accepted
+        # by the verification/reset boundary.
+        token_value = f"email_{secrets.token_urlsafe(32)}"
         expires_at = now + float(ttl_seconds)
         connection.execute(
             "INSERT INTO web_email_tokens "

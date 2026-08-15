@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
 from agent_bridge import viewer as viewer_module
+from agent_bridge import web_auth as web_auth_module
 from agent_bridge.security import (
     DEFAULT_HSTS_SECONDS,
     PUBLIC_WEB_SESSION_COOKIE,
@@ -383,6 +384,7 @@ def test_web_login_registration_password_policy_profile_and_roles(
 
 def test_email_verification_and_password_reset_are_optional_single_use_and_private(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database = tmp_path / "email-auth.db"
     disabled = TestClient(make_app(database))
@@ -424,6 +426,7 @@ def test_email_verification_and_password_reset_are_optional_single_use_and_priva
     assert len(mailer.verifications) == 1
     verification_recipient, verification_token = mailer.verifications[0]
     assert verification_recipient == "recovery.user@example.com"
+    assert verification_token.startswith("email_")
 
     with sqlite3.connect(database) as connection:
         stored = connection.execute(
@@ -477,18 +480,25 @@ def test_email_verification_and_password_reset_are_optional_single_use_and_priva
         headers=intent_headers(client, "verify-email"),
         json={"token": replacement_token},
     ).status_code == 400
-    renewed_email = client.post(
-        "/api/auth/email/request",
-        headers=intent_headers(client, "request-email-verification"),
-        json={"email": "second@example.com", "current_password": USER_PASSWORD},
-    )
-    assert renewed_email.status_code == 200
-    _, replacement_token = mailer.verifications[-1]
-    assert client.post(
-        "/api/auth/email/verify",
-        headers=intent_headers(client, "verify-email"),
-        json={"token": replacement_token},
-    ).status_code == 200
+    with monkeypatch.context() as token_patch:
+        token_patch.setattr(
+            web_auth_module.secrets,
+            "token_urlsafe",
+            lambda _size: "-forced-leading-symbol-for-ci",
+        )
+        renewed_email = client.post(
+            "/api/auth/email/request",
+            headers=intent_headers(client, "request-email-verification"),
+            json={"email": "second@example.com", "current_password": USER_PASSWORD},
+        )
+        assert renewed_email.status_code == 200
+        _, replacement_token = mailer.verifications[-1]
+        assert replacement_token == "email_-forced-leading-symbol-for-ci"
+        assert client.post(
+            "/api/auth/email/verify",
+            headers=intent_headers(client, "verify-email"),
+            json={"token": replacement_token},
+        ).status_code == 200
 
     second_session = TestClient(make_app(database, email_delivery=mailer))
     assert second_session.post(
