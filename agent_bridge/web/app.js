@@ -2193,9 +2193,28 @@ function renderMonitoring() {
   elements.monitoringSummary.replaceChildren();
   elements.monitoringTrends.replaceChildren();
   elements.monitoringAlertList.replaceChildren();
+  const coordination = payload?.runtime_coordination;
+  if (coordination) {
+    const runtimeItems = [
+      [coordination.active_instance_count || 0, "本机服务实例", coordination.active_instance_count > 0],
+      [coordination.current_role === "leader" ? "主维护" : "只提供请求", "当前实例职责", coordination.leader_healthy],
+      [coordination.shared_request_rate_limits ? "已共享" : "未共享", "请求限流", coordination.shared_request_rate_limits],
+      [coordination.deployment_scope === "single_node" ? "SQLite 单机" : coordination.deployment_scope, "存储边界", true],
+    ];
+    for (const [value, label, healthy] of runtimeItems) {
+      const card = makeElement("span", `connector-health-summary-card ${healthy ? "healthy" : "warning"}`);
+      card.append(
+        makeElement("strong", "", String(value)),
+        makeElement("small", "", label),
+      );
+      elements.monitoringSummary.append(card);
+    }
+  }
   if (!payload?.latest) {
     elements.monitoringAlertBadge.hidden = true;
-    elements.monitoringFeedback.textContent = "等待首次分钟采样…";
+    elements.monitoringFeedback.textContent = coordination?.leader_healthy
+      ? "维护主实例在线，等待首次分钟采样…"
+      : "暂未发现维护主实例，后台任务会在租约接管后恢复。";
     return;
   }
   const latest = payload.latest;
@@ -2233,7 +2252,10 @@ function renderMonitoring() {
   );
 
   elements.monitoringFeedback.classList.remove("error", "success");
-  elements.monitoringFeedback.textContent = `${payload.sample_count || 0} 个分钟样本 · ${openAlerts.length} 个未解决告警 · 保留 ${payload.retention_days || 30} 天`;
+  const runtimeLabel = coordination
+    ? ` · ${coordination.active_instance_count || 0} 个本机实例 · ${coordination.current_role === "leader" ? "当前主维护" : "当前只提供请求"}`
+    : "";
+  elements.monitoringFeedback.textContent = `${payload.sample_count || 0} 个分钟样本 · ${openAlerts.length} 个未解决告警 · 保留 ${payload.retention_days || 30} 天${runtimeLabel}`;
   const shownAlerts = [
     ...openAlerts,
     ...(payload.alerts || []).filter((alert) => alert.status === "resolved").slice(0, 6),

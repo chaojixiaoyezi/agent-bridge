@@ -6,10 +6,12 @@ import math
 import os
 import secrets
 import shlex
+import socket
 import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from urllib.parse import quote
 
@@ -66,6 +68,7 @@ from .store import (
     NicknameRateLimitError,
     NotFoundError,
     RateLimitError,
+    RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
 )
 from .validation import (
     ValidationError,
@@ -86,6 +89,13 @@ from .web_auth import (
 WEB_ROOT = Path(__file__).with_name("web")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_BIND_HOSTS = {"127.0.0.1", "0.0.0.0"}
+
+
+def _runtime_software_version() -> str:
+    try:
+        return package_version("agent-bridge")
+    except PackageNotFoundError:
+        return "source"
 
 
 ADMIN_AUDIT_ACTIONS: dict[tuple[str, str], tuple[str, str]] = {
@@ -422,8 +432,46 @@ def create_app(
         bootstrap_admin_ready=web_auth.bootstrap_admin_ready(),
         database=database,
     )
-    request_limiter = SlidingWindowRateLimiter()
+    request_limiter = SlidingWindowRateLimiter(database)
     web_session_cookie = policy.web_session_cookie_name
+    runtime_instance_id = f"viewer-{secrets.token_hex(12)}"
+    runtime_node_name = socket.gethostname() or "localhost"
+    runtime_version = _runtime_software_version()
+    runtime_leader = asyncio.Event()
+
+    async def refresh_runtime_leadership(application: Starlette) -> bool:
+        state = await asyncio.to_thread(
+            store.coordinate_runtime_instance,
+            instance_id=runtime_instance_id,
+            node_name=runtime_node_name,
+            process_id=os.getpid(),
+            software_version=runtime_version,
+        )
+        is_leader = bool(state["leader"])
+        if is_leader:
+            runtime_leader.set()
+        else:
+            runtime_leader.clear()
+        application.state.runtime_leader = is_leader
+        application.state.runtime_fencing_token = int(state["fencing_token"])
+        return is_leader
+
+    async def runtime_leadership_confirmed(application: Starlette) -> bool:
+        try:
+            return await refresh_runtime_leadership(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A process that cannot renew the shared lease must stop all
+            # singleton work until the database proves leadership again.
+            runtime_leader.clear()
+            application.state.runtime_leader = False
+            return False
+
+    async def runtime_coordination(application: Starlette) -> None:
+        while True:
+            await asyncio.sleep(RUNTIME_HEARTBEAT_INTERVAL_SECONDS)
+            await runtime_leadership_confirmed(application)
 
     def require_email_delivery() -> EmailDelivery:
         if resolved_email_delivery is None:
@@ -483,20 +531,24 @@ def create_app(
             return Response(status_code=404)
         return FileResponse(path, media_type="image/webp")
 
-    async def lifecycle_maintenance() -> None:
+    async def lifecycle_maintenance(application: Starlette) -> None:
         while True:
+            if await runtime_leadership_confirmed(application):
+                try:
+                    await asyncio.to_thread(store.clear_inactive_sessions)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A transient SQLite lock must never stop the chat server
+                    # or permanently disable the next lifecycle sweep.
+                    pass
             await asyncio.sleep(60)
-            try:
-                await asyncio.to_thread(store.clear_inactive_sessions)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # A transient SQLite lock must never stop the chat server or
-                # permanently disable the next lifecycle sweep.
-                continue
 
-    async def resident_maintenance() -> None:
+    async def resident_maintenance(application: Starlette) -> None:
         while True:
+            if not await runtime_leadership_confirmed(application):
+                await asyncio.sleep(RUNTIME_HEARTBEAT_INTERVAL_SECONDS)
+                continue
             try:
                 snapshot = await asyncio.to_thread(
                     local_resident_snapshot,
@@ -547,45 +599,56 @@ def create_app(
                 pass
             await asyncio.sleep(30)
 
-    async def operational_monitoring() -> None:
+    async def operational_monitoring(application: Starlette) -> None:
         while True:
             started_at = time.monotonic()
-            try:
-                await asyncio.to_thread(store.record_operational_sample)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                # Monitoring is deliberately sidecar-only: a sampling failure
-                # must never interrupt chat, delivery, or task execution.
-                pass
+            if await runtime_leadership_confirmed(application):
+                try:
+                    await asyncio.to_thread(store.record_operational_sample)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Monitoring is deliberately sidecar-only: a sampling
+                    # failure must never interrupt chat, delivery, or tasks.
+                    pass
             elapsed = time.monotonic() - started_at
             await asyncio.sleep(max(5.0, 60.0 - elapsed))
 
     @asynccontextmanager
-    async def lifespan(_: Starlette):
+    async def lifespan(application: Starlette):
+        await refresh_runtime_leadership(application)
+        coordinator = asyncio.create_task(
+            runtime_coordination(application),
+            name="agent-bridge-runtime-coordination",
+        )
         maintenance = asyncio.create_task(
-            lifecycle_maintenance(),
+            lifecycle_maintenance(application),
             name="agent-bridge-lifecycle-maintenance",
         )
         resident_repair = (
             asyncio.create_task(
-                resident_maintenance(),
+                resident_maintenance(application),
                 name="agent-bridge-resident-maintenance",
             )
             if enable_resident_repair
             else None
         )
         monitoring = asyncio.create_task(
-            operational_monitoring(),
+            operational_monitoring(application),
             name="agent-bridge-operational-monitoring",
         )
         try:
             yield
         finally:
+            runtime_leader.clear()
+            application.state.runtime_leader = False
+            coordinator.cancel()
             maintenance.cancel()
             monitoring.cancel()
             if resident_repair is not None:
                 resident_repair.cancel()
+            with suppress(asyncio.CancelledError):
+                await coordinator
             with suppress(asyncio.CancelledError):
                 await maintenance
             with suppress(asyncio.CancelledError):
@@ -593,6 +656,15 @@ def create_app(
             if resident_repair is not None:
                 with suppress(asyncio.CancelledError):
                     await resident_repair
+            try:
+                await asyncio.to_thread(
+                    store.stop_runtime_instance,
+                    instance_id=runtime_instance_id,
+                )
+            except Exception:
+                # The lease expires automatically after a crash or an
+                # unavailable shutdown database; graceful release is best effort.
+                pass
 
     def authenticated_web_user(
         request: Request,
@@ -1075,6 +1147,11 @@ def create_app(
                     "request_body_limit_bytes": MAX_REQUEST_BODY_BYTES,
                     "web_session_ttl_seconds": policy.web_session_ttl_seconds,
                 }
+                result["runtime_coordination"] = (
+                    store.runtime_coordination_status(
+                        current_instance_id=runtime_instance_id,
+                    )
+                )
             result["message_rate_limits"] = store.message_rate_summary(
                 web_participant_id=str(identity["participant_id"]),
                 web_role=str(identity["role"]),
@@ -1484,13 +1561,21 @@ def create_app(
                 requesting_web_user_id=str(identity["user_id"]),
                 hours=hours,
             )
-            if payload["latest"] is None:
+            runtime_status = await asyncio.to_thread(
+                store.runtime_coordination_status,
+                current_instance_id=runtime_instance_id,
+            )
+            if payload["latest"] is None and (
+                runtime_leader.is_set()
+                or int(runtime_status["active_instance_count"]) == 0
+            ):
                 await asyncio.to_thread(store.record_operational_sample)
                 payload = await asyncio.to_thread(
                     store.operational_monitoring_dashboard,
                     requesting_web_user_id=str(identity["user_id"]),
                     hours=hours,
                 )
+            payload["runtime_coordination"] = runtime_status
             return JSONResponse(payload)
         except Exception as exc:
             return _json_error(exc)
@@ -3898,7 +3983,6 @@ def create_app(
             access_scope = initial_scope
             previous_revision: list[object] | None = None
             last_output = time.monotonic()
-            last_maintenance = 0.0
             last_authentication = time.monotonic()
             while not await request.is_disconnected():
                 monotonic_now = time.monotonic()
@@ -3927,9 +4011,6 @@ def create_app(
                         event_id=cursor,
                     )
                     return
-                if monotonic_now - last_maintenance >= 60:
-                    await asyncio.to_thread(store.clear_inactive_sessions)
-                    last_maintenance = monotonic_now
                 snapshot = await asyncio.to_thread(
                     repository.event_snapshot,
                     after_sequence=cursor,
@@ -4343,6 +4424,9 @@ def create_app(
             ),
         ],
     )
+    app.state.runtime_instance_id = runtime_instance_id
+    app.state.runtime_leader = False
+    app.state.runtime_fencing_token = 0
     if policy.public_mode:
         app.add_middleware(
             TrustedHostMiddleware,

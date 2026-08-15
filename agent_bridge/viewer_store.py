@@ -70,6 +70,9 @@ class ViewerRepository:
                     "history_retention_policy",
                     "history_redaction_previews",
                     "history_message_redactions",
+                    "bridge_runtime_instances",
+                    "bridge_runtime_leases",
+                    "shared_request_rate_windows",
                 )
             }
             room_states = {

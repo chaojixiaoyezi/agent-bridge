@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import secrets
+import sqlite3
 import stat
-import threading
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -228,12 +228,24 @@ class ViewerSecurityPolicy:
 
 
 class SlidingWindowRateLimiter:
-    def __init__(self, *, max_buckets: int = 4096) -> None:
+    """Exact SQLite-backed limiter shared by every local viewer process.
+
+    Subjects are irreversibly hashed before persistence.  A short immediate
+    transaction serializes the read/check/write step, so adding another viewer
+    process cannot multiply the effective authentication or search allowance.
+    """
+
+    def __init__(
+        self,
+        database: str | Path,
+        *,
+        max_buckets: int = 100_000,
+        retention_seconds: float = 24 * 60 * 60,
+    ) -> None:
+        self.database = Path(database).expanduser()
         self._max_buckets = max(128, int(max_buckets))
-        self._events: dict[tuple[str, str], deque[float]] = {}
-        self._last_seen: dict[tuple[str, str], float] = {}
+        self._retention_seconds = max(60 * 60, float(retention_seconds))
         self._checks = 0
-        self._lock = threading.Lock()
 
     def check(
         self,
@@ -243,39 +255,83 @@ class SlidingWindowRateLimiter:
         limit: int,
         window_seconds: float,
     ) -> None:
-        now = time.monotonic()
+        now = time.time()
         window = max(1.0, float(window_seconds))
         normalized_limit = max(1, int(limit))
-        key = (str(bucket), _rate_subject(subject))
-        with self._lock:
-            events = self._events.setdefault(key, deque())
-            cutoff = now - window
-            while events and events[0] <= cutoff:
-                events.popleft()
+        normalized_bucket = str(bucket)
+        subject_hash = _rate_subject(subject)
+        connection = sqlite3.connect(
+            str(self.database),
+            timeout=2.0,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 2000")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT events_json FROM shared_request_rate_windows "
+                "WHERE bucket = ? AND subject_hash = ?",
+                (normalized_bucket, subject_hash),
+            ).fetchone()
+            try:
+                stored_events = json.loads(str(row["events_json"])) if row else []
+                events = [
+                    float(event)
+                    for event in stored_events
+                    if float(event) > now - window
+                ]
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise sqlite3.DatabaseError(
+                    "invalid shared request-rate window"
+                ) from exc
             if len(events) >= normalized_limit:
+                connection.rollback()
                 raise RequestRateLimitExceeded(events[0] + window - now)
             events.append(now)
-            self._last_seen[key] = now
+            connection.execute(
+                """
+                INSERT INTO shared_request_rate_windows (
+                    bucket, subject_hash, events_json, last_seen_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(bucket, subject_hash) DO UPDATE SET
+                    events_json = excluded.events_json,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    normalized_bucket,
+                    subject_hash,
+                    json.dumps(events, separators=(",", ":")),
+                    now,
+                ),
+            )
             self._checks += 1
-            if self._checks % 128 == 0 or len(self._events) > self._max_buckets:
-                self._prune(now)
-
-    def _prune(self, now: float) -> None:
-        stale_before = now - 60 * 60
-        stale = [
-            key for key, last_seen in self._last_seen.items()
-            if last_seen <= stale_before
-        ]
-        for key in stale:
-            self._events.pop(key, None)
-            self._last_seen.pop(key, None)
-        overflow = len(self._events) - self._max_buckets
-        if overflow <= 0:
-            return
-        oldest = sorted(self._last_seen, key=self._last_seen.get)[:overflow]
-        for key in oldest:
-            self._events.pop(key, None)
-            self._last_seen.pop(key, None)
+            if self._checks % 128 == 0:
+                connection.execute(
+                    "DELETE FROM shared_request_rate_windows "
+                    "WHERE last_seen_at <= ?",
+                    (now - self._retention_seconds,),
+                )
+                row_count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM shared_request_rate_windows"
+                    ).fetchone()[0]
+                )
+                overflow = row_count - self._max_buckets
+                if overflow > 0:
+                    connection.execute(
+                        "DELETE FROM shared_request_rate_windows WHERE rowid IN ("
+                        "SELECT rowid FROM shared_request_rate_windows "
+                        "ORDER BY last_seen_at ASC LIMIT ?)",
+                        (overflow,),
+                    )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 class PublicTransportMiddleware:
@@ -304,7 +360,7 @@ def request_client_key(request) -> str:
 
 
 def _rate_subject(value: object) -> str:
-    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:24]
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
 
 def _truthy(value: str | None) -> bool:

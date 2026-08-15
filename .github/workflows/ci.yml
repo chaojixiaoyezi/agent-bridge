@@ -160,6 +160,7 @@ jobs:
             tests/test_store.py::test_delivery_migration_keeps_group_history_without_false_old_backlog \
             tests/test_store.py::test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode \
             tests/test_store.py::test_operational_monitoring_persists_trends_alerts_and_recovery \
+            tests/test_store.py::test_runtime_coordination_has_one_leader_and_fenced_failover \
             tests/test_store.py::test_admin_audit_ledger_is_append_only_filterable_and_admin_only \
             tests/test_store.py::test_history_governance_is_manual_abandoned_only_and_append_only
 
@@ -169,6 +170,8 @@ jobs:
             tests/test_viewer.py::test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body \
             tests/test_viewer.py::test_public_security_environment_requires_exact_trust_boundaries \
             tests/test_viewer.py::test_public_access_code_registration_and_auth_rate_limits \
+            tests/test_viewer.py::test_request_rate_limits_are_shared_without_persisting_raw_subjects \
+            tests/test_viewer.py::test_two_viewers_share_one_runtime_leader_and_report_admin_status \
             tests/test_viewer.py::test_private_web_rooms_require_explicit_access_and_revocation_isolated \
             tests/test_viewer.py::test_admin_rotates_and_revokes_one_connector_without_exposing_credentials \
             tests/test_store.py::test_connector_enrollment_rotation_and_device_revoke_are_isolated \

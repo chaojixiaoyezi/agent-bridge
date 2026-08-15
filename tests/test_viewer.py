@@ -16,6 +16,8 @@ from agent_bridge.security import (
     DEFAULT_HSTS_SECONDS,
     PUBLIC_WEB_SESSION_COOKIE,
     PUBLIC_WEB_SESSION_TTL_SECONDS,
+    RequestRateLimitExceeded,
+    SlidingWindowRateLimiter,
     ViewerSecurityConfigurationError,
     ViewerSecurityPolicy,
 )
@@ -1410,6 +1412,85 @@ def test_public_access_code_registration_and_auth_rate_limits(
     assert limited.json()["retry_after_seconds"] > 0
 
 
+def test_request_rate_limits_are_shared_without_persisting_raw_subjects(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "shared-limiter.db"
+    BridgeStore(database)
+    first = SlidingWindowRateLimiter(database)
+    second = SlidingWindowRateLimiter(database)
+    subject = "sensitive-account@example.test"
+
+    first.check("login-account", subject, limit=2, window_seconds=60)
+    second.check("login-account", subject, limit=2, window_seconds=60)
+    with pytest.raises(RequestRateLimitExceeded) as rejected:
+        first.check("login-account", subject, limit=2, window_seconds=60)
+    assert rejected.value.retry_after_seconds > 0
+
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT subject_hash, events_json "
+            "FROM shared_request_rate_windows WHERE bucket = 'login-account'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] != subject
+    assert subject not in row[1]
+    assert len(row[0]) == 64
+
+    race_limiters = [
+        SlidingWindowRateLimiter(database),
+        SlidingWindowRateLimiter(database),
+    ]
+
+    def race_attempt(limiter: SlidingWindowRateLimiter) -> bool:
+        try:
+            limiter.check("concurrent-login", subject, limit=1, window_seconds=60)
+            return True
+        except RequestRateLimitExceeded:
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(race_attempt, race_limiters))
+    assert sorted(outcomes) == [False, True]
+
+
+def test_two_viewers_share_one_runtime_leader_and_report_admin_status(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "multi-viewer.db"
+    first_app = make_app(database)
+    second_app = make_app(database)
+    with TestClient(first_app) as first_client:
+        login_admin(first_client)
+        with TestClient(second_app) as second_client:
+            assert "runtime_coordination" not in second_client.get(
+                "/api/health"
+            ).json()
+            second_client.cookies.update(first_client.cookies)
+            first_health = first_client.get("/api/health").json()
+            second_health = second_client.get("/api/health").json()
+            first_runtime = first_health["runtime_coordination"]
+            second_runtime = second_health["runtime_coordination"]
+            assert first_runtime["active_instance_count"] == 2
+            assert second_runtime["active_instance_count"] == 2
+            assert first_runtime["leader_healthy"] is True
+            assert second_runtime["leader_healthy"] is True
+            assert {first_runtime["current_role"], second_runtime["current_role"]} == {
+                "leader",
+                "follower",
+            }
+            assert first_runtime["lease"]["holder_instance_id"] == (
+                second_runtime["lease"]["holder_instance_id"]
+            )
+            monitoring = second_client.get("/api/admin/monitoring").json()
+            assert monitoring["runtime_coordination"]["active_instance_count"] == 2
+            assert monitoring["runtime_coordination"]["storage_backend"] == "sqlite"
+
+        remaining = first_client.get("/api/health").json()["runtime_coordination"]
+        assert remaining["active_instance_count"] == 1
+        assert remaining["leader_healthy"] is True
+
+
 def test_admin_managed_registration_codes_are_hashed_atomic_and_revocable(
     tmp_path: Path,
 ) -> None:
@@ -1873,8 +1954,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260815-04" in index_html
-    assert "app.css?v=20260815-04" in index_html
+    assert "app.js?v=20260815-05" in index_html
+    assert "app.css?v=20260815-05" in index_html
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html

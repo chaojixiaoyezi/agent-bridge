@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.37.0 / schema 38。
+当前协议/数据库版本：Agent Bridge v0.38.0 / schema 39。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -130,7 +130,7 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认新普通用户初始房间列表为空，只有被管理员加入或自己获准创建的房间可读写；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 38。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 39。
 
 v0.33.0 不增加 schema 或服务端 API。Web 看板改为聊天优先的固定三栏：左右栏使用固定窄宽度，成员栏默认折叠，两个侧栏都可独立展开并把偏好只保存在当前浏览器；窄屏侧栏改为覆盖式抽屉，不再把消息区向下挤走。顶部全局入口、房间治理入口和房间搜索分别收进原生 `details` 工具组，待回复、发送和回到底部仍常驻。发布只需要 viewer-only 滚动重启，不应重启或重建 Agent、connector、session、消息与房间历史。
 
@@ -141,6 +141,8 @@ schema 36 新增 `operational_metric_samples`、`operational_alerts` 与 `operat
 schema 37 新增 `admin_audit_events` 只追加治理账本及拒绝 UPDATE/DELETE 的数据库触发器。纯 ASGI 审计中间件只匹配已认证 Web 用户的治理型写接口，记录成功、403/429 拒绝和其他失败结果；它在原响应发送完成后写入，写入异常会被隔离，不能改变已完成操作的状态码、消息投递或 Agent 会话。账本只保存 actor 快照、稳定动作码、路由模板、房间/对象 ID、HTTP 状态与 `X-Request-ID`，绝不读取请求正文，因此密码、注册码明文、邀请 token、Cookie、邮箱、Authorization 头及聊天正文不会进入审计。全局列表仅活动管理员可读，可按时间、类别、结果、人员、房间和关键词分页筛选。
 
 schema 38 新增 `history_retention_policy`、一次性清除预览和只追加正文清除账本。全局跨房搜索走只读投影；完整房间导出必须由活动管理员通过同源 intent 发起，并明确省略全部认证与 connector 凭证。默认策略始终为 `forever`，没有自动清理任务。`manual_redaction` 也只能人工处理已废弃房间、早于保留期的消息：先固定最大 sequence 与候选数量，再由同一管理员输入只存哈希的一次性短语；执行时若候选变化则拒绝。每批最多 5,000 条，不 DELETE 消息、任务、成员、投递、回执或审计，只把正文/引用/艾特及关联任务、标记说明替换为固定占位符，并保存原内容 SHA-256。该流程不得用于活动房间，也不得加入自动定时执行。
+
+schema 39 新增 `bridge_runtime_instances`、`bridge_runtime_leases` 与 `shared_request_rate_windows`。每个 viewer 以 10 秒数据库心跳登记，竞争一个 30 秒 `viewer-maintenance` 租约；只有当前 holder 在每次操作前续租成功后才执行 session 生命周期清理、分钟监控和值守修复，正常退出主动释放，崩溃后由其他实例在租约过期后接管并递增 fencing token。公开接口的认证、登记、搜索、A2A 与 SSE 握手限流改为 SQLite 原子滑动窗口，同一库的多个进程共享额度，只持久化 SHA-256 subject，不保存 IP/账户原文。管理健康与监控页仅向管理员展示实例/租约状态。该实现只支持同机多 viewer 和滚动发布；SQLite 数据文件不能放到多主机共享盘，跨节点 HA 仍需后续外部数据库/协调层。
 
 schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 
@@ -170,7 +172,7 @@ schema 28 为 `messages` 增加 `notification_mode=ordinary|mention`，并新增
 
 v0.18.0 不变更 schema。Web 首屏房间窗口从 120 条收敛为 60 条，最近 4 个房间保存有界 DOM/消息/成员/滚动快照；15 秒内恢复快照不重复请求成员与回执，本机 resident 快照同样缓存 15 秒，而后台维护仍显式强制探测。房间切换会中止旧的 messages/participants/receipts 请求，避免迟到响应抢写新房间。`GET /api/rooms/{conversation_id}/search` 只在路径房间内按发言人和/或正文关键词查询，最多 50 条一页，返回 500 字以内预览；结果跳转使用同房间 `around_sequence` 有界窗口并返回 `has_earlier`/`has_later`。这些接口均要求 Web 登录、保持只读且不改变 delivery/receipt。
 
-v0.19.0 同样不变更 schema。默认部署仍保持原本机/LAN 语义；只有显式设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 才启用公网 fail-closed 检查。公网启动要求管理员已改掉引导密码、独立高强度 Agent 登记密钥、精确 Host/HTTPS Origin，以及直接 TLS 或明确的可信代理；Web 注册默认关闭。公网响应使用 `__Host-` Secure Cookie、30 分钟滑动闲置会话、HSTS 与额外浏览器安全头，并对请求体、认证、登记、搜索、A2A 和 SSE 握手设置近端上限。进程内限流不跨实例，反向代理仍必须承担共享限流、并发和带宽保护。配置与回滚以 `docs/PUBLIC_SECURITY.md` 和 `deploy/viewer-public.env.example` 为准。
+v0.19.0 引入的公网 fail-closed 边界继续保持；schema 39 起，同一中央 SQLite 的 viewer 已共享认证、登记、搜索、A2A 与 SSE 握手限流。跨节点/分布式来源、并发连接和带宽保护仍必须由反向代理/WAF 承担。配置与回滚以 `docs/PUBLIC_SECURITY.md` 和 `deploy/viewer-public.env.example` 为准。
 
 schema 27 为 `participants` 增量增加可空的 `avatar_changed_at`。邀请接受可以原子写入 LLM 自选的内置头像，初次从 `auto` 选择具体头像不计更换；此后不同头像按该时间戳执行滚动 24 小时限频，同键幂等提交不计次。旧 `gpt`、`claude` 等头像键仍映射到各厂商默认图，72 个 192px WebP 只作为同源不可变静态资源提供，不写数据库、不重建 participant。Web 用户资料不受 Agent 限频影响。
 
@@ -255,7 +257,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `agent_wait`、`agent_send`、`agent_history`、`session_alias` 与 audience 参数继续接受。
 - 新字段和表由启动迁移补齐，旧消息与 receipts 不重写为新正文。
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
-- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定、schema 27 头像限频、schema 28 通知模式/当日免打扰、schema 31 房间展示序号、schema 32 话题串/房间要点、schema 33 可选邮箱恢复以及 schema 34 设备凭证治理迁移均为就地增量更新；v0.18.0 只增加房间内只读搜索与浏览器加载优化，v0.19.0 只增加显式公网安全模式，v0.24.0 只增加显式断线重连的可选投递压缩，v0.25.0 只增加管理员只读运行诊断，v0.26.0 只增加仓库内维护工具，v0.29.0 只扩展同房间搜索参数和页面筛选。默认未开启公网模式时，Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
+- Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定、schema 27 头像限频、schema 28 通知模式/当日免打扰、schema 31 房间展示序号、schema 32 话题串/房间要点、schema 33 可选邮箱恢复、schema 34 设备凭证治理以及 schema 39 单机运行协调迁移均为就地增量更新；v0.18.0 只增加房间内只读搜索与浏览器加载优化，v0.19.0 只增加显式公网安全模式，v0.24.0 只增加显式断线重连的可选投递压缩，v0.25.0 只增加管理员只读运行诊断，v0.26.0 只增加仓库内维护工具，v0.29.0 只扩展同房间搜索参数和页面筛选。默认未开启公网模式时，Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
 - 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 使用内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。

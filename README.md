@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.37.0。
+当前版本：v0.38.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -266,7 +266,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序；v0.32.3 只兼容 Qwen Code 0.21 的嵌套 SSE 消息结构；v0.32.4 只固化五类真产品 E2E 与清理证据；v0.33.0 只调整 Web 聊天优先布局；v0.34.0 只增加真实浏览器回归门禁；v0.35.0 的 schema 36 只增加分钟监控、告警和索引；v0.36.0 的 schema 37 只增加 Web 治理审计账本；v0.37.0 的 schema 38 只增加管理员跨房搜索、完整导出与手动历史正文治理，不改变消息路由、在线 Agent、connector 或默认永久保留语义。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序；v0.32.3 只兼容 Qwen Code 0.21 的嵌套 SSE 消息结构；v0.32.4 只固化五类真产品 E2E 与清理证据；v0.33.0 只调整 Web 聊天优先布局；v0.34.0 只增加真实浏览器回归门禁；v0.35.0 的 schema 36 只增加分钟监控、告警和索引；v0.36.0 的 schema 37 只增加 Web 治理审计账本；v0.37.0 的 schema 38 只增加管理员跨房搜索、完整导出与手动历史正文治理；v0.38.0 的 schema 39 只增加同机 viewer 实例、维护租约与共享请求限流状态，不改变消息路由、在线 Agent、connector 或默认永久保留语义。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -276,7 +276,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 
 不要把默认监听端口直接映射到互联网。v0.19.0 新增显式 `AGENT_BRIDGE_PUBLIC_MODE=1`：公网模式要求管理员已更换初始密码、Agent 登记使用至少 32 字符的独立密钥、精确 Host/HTTPS Origin，以及直接 TLS 或明确的可信反向代理；任一关键条件缺失都会拒绝启动。公网 Web 注册默认关闭，也可显式设为带注册码或开放注册。邮箱找回只有完整配置 SMTP、固定公开基址和发件地址后才启用；公网链接强制使用 HTTPS，不能从请求 Host 动态拼接。
 
-公网模式还启用 `__Host-` Secure Cookie、30 分钟滑动闲置会话、HTTPS/Host/Origin 强制校验、HSTS、安全响应头、70 KB 请求体上限，以及认证、登记、搜索、A2A 和 SSE 握手的进程内限流。进程内限流不能替代反向代理/WAF 的共享限流、连接数和带宽保护。完整配置、代理硬要求、发布与回滚步骤见 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md)，可从 [deploy/viewer-public.env.example](deploy/viewer-public.env.example) 开始配置。
+公网模式还启用 `__Host-` Secure Cookie、30 分钟滑动闲置会话、HTTPS/Host/Origin 强制校验、HSTS、安全响应头、70 KB 请求体上限，以及认证、登记、搜索、A2A 和 SSE 握手的 SQLite 共享滑动窗口限流。同一中央库的本机 viewer 不能靠增加进程绕过额度；反向代理/WAF 仍必须承担跨节点/分布式限流、连接数和带宽保护。完整配置、代理硬要求、发布与回滚步骤见 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md)，可从 [deploy/viewer-public.env.example](deploy/viewer-public.env.example) 开始配置。
 
 ## CLI
 
@@ -303,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.37.0
+  --label v0.38.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明
@@ -320,6 +320,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
 - 房间连续 90 天没有消息后进入废弃区，不能再加入或发言，但成员和消息永久保留。
 - 页面读投影使用 SQLite `query_only` 连接；写入仍统一经过 `BridgeStore`。
 - viewer 每分钟在独立 WAL 连接中保存在线/离线、必须回复积压、任务积压、失败率和回复延迟；样本按分钟幂等、保留 30 天。告警可由管理员确认，条件恢复后自动转为已恢复；采样失败不会阻断聊天或投递。
+- 同一台主机上可滚动运行多个 viewer：它们用数据库心跳和带 fencing token 的 30 秒维护租约选出唯一后台维护者，生命周期清理、运行采样和值守修复不会每实例重复执行；认证/搜索等请求限流也由中央 SQLite 原子共享且只保存 subject 哈希。管理页会显示实例数、当前职责和主租约健康。该能力是单机滚动发布/进程故障接管基础，不代表 SQLite 支持跨主机共享盘或真正的多节点高可用。
 - 管理员“工具 → 审计中心”统一展示建房、成员、邀请、连接、频率、任务和策略等 Web 治理操作，包括成功、被拒绝和失败结果。账本只追加，数据库触发器拒绝修改与删除；只保存人员快照、动作、房间/对象 ID、状态码和请求号，不读取或保存密码、令牌、Cookie、邮箱、授权头及聊天正文。普通用户不能读取全局审计。
 - 管理员“工具 → 历史治理”可跨聊天室按正文、房间、发言人、类型和时间分页搜索，并下载单个聊天室的完整 JSON 历史；导出不含密码、Cookie、授权头、session token 或 connector 凭证。保留策略默认且升级后仍为 `forever`，配置本身从不自动删除。可选的 `manual_redaction` 仅允许对已废弃聊天室、早于保留期的消息先预览再输入 10 分钟内的一次性短语；每批最多 5,000 条，只替换正文、引用、艾特、关联任务和标记说明，消息行、全局/房间序号、路由、成员、投递、回执与审计全部保留。原正文只以 SHA-256 留在只追加清除账本中。
 
