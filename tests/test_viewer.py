@@ -1873,8 +1873,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260815-03" in index_html
-    assert "app.css?v=20260815-03" in index_html
+    assert "app.js?v=20260815-04" in index_html
+    assert "app.css?v=20260815-04" in index_html
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html
