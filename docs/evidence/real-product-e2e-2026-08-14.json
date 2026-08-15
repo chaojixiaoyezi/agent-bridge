@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-14T20:55:46-07:00",
+  "agent_bridge": {
+    "version": "0.32.4",
+    "schema": 35
+  },
+  "environment": {
+    "os": "openEuler 24.03 x86_64",
+    "python": "3.11.6",
+    "node": "24.19.0",
+    "bun": "1.3.14",
+    "network": "product transports bound to loopback only"
+  },
+  "products": [
+    {
+      "product": "opencode",
+      "version": "1.15.13",
+      "transport": "official-loopback-http",
+      "sessions": 2,
+      "probe": "passed",
+      "turn_correlation": "passed",
+      "isolation": "passed",
+      "bridge_change": null
+    },
+    {
+      "product": "pi",
+      "version": "0.78.0",
+      "transport": "official-extension-file-relay",
+      "sessions": 2,
+      "turns": 4,
+      "probe": "passed",
+      "fresh_session_first_turn": "passed",
+      "session_switching": "passed",
+      "isolation": "passed",
+      "bridge_change": "4249f1b776695f6a8a85ff6c7951356800979c20"
+    },
+    {
+      "product": "hermes",
+      "version": "0.19.1",
+      "transport": "official-loopback-websocket",
+      "sessions": 2,
+      "turns": 3,
+      "probe": "passed",
+      "turn_correlation": "passed",
+      "isolation": "passed",
+      "bridge_change": null
+    },
+    {
+      "product": "qwen-code",
+      "version": "0.21.12",
+      "transport": "official-loopback-daemon",
+      "sessions": 2,
+      "turns": 4,
+      "probe": "passed",
+      "bridge_reconnect": "passed",
+      "context_continuity": "passed",
+      "transcript_isolation": "passed",
+      "nested_sse": "passed",
+      "provider_auth_compatibility": "qwen-native-custom-x-api-key",
+      "bridge_change": "14371d49e4638b2010e9f07bc52e41e82629f45c"
+    },
+    {
+      "product": "deepseek-harness",
+      "version": "0.1.0-rc.6",
+      "reference_source_version": "0.1.0-rc.5",
+      "transport": "official-loopback-web-rpc",
+      "sessions": 2,
+      "turns": 4,
+      "probe": "passed",
+      "bridge_reconnect": "passed",
+      "context_continuity": "passed",
+      "history_isolation": "passed",
+      "permission_source": "live-dsh-runtime",
+      "model_route": "pi-ai-anthropic",
+      "bridge_change": null
+    }
+  ],
+  "production_isolation": {
+    "central_database_opened": false,
+    "test_agents_registered": 0,
+    "production_room_messages_written": 0
+  },
+  "cleanup": {
+    "temporary_product_root_removed": true,
+    "temporary_credentials_removed": true,
+    "ports_19100_through_19103_closed": true,
+    "temporary_processes_remaining": 0,
+    "shell_profile_temporary_references": 0,
+    "system_rpms_installed": 0
+  }
+}

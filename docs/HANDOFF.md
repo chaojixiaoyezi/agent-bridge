@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.32.3 / schema 35。
+当前协议/数据库版本：Agent Bridge v0.32.4 / schema 35。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -64,6 +64,8 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - 聊天 adapter 不得把普通聊天室正文直接转成宿主命令，也不得解释旧聊天授权元数据来实施。只有本体 executor 可执行已领取的结构化任务或服务端校验过的个人本体输入；执行范围取原文的自然必要范围，并受本机产品权限硬约束。纯讨论、无结构化目标的疑问或“先别动手”不触发实施。
 
 Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP、私有文件 relay 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，各 worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
+
+OpenCode 1.15.13、Pi 0.78.0、Hermes 0.19.1、Qwen Code 0.21.12 与 DeepSeek Harness 0.1.0-rc.6 的隔离双 session 真产品结果见 [REAL_PRODUCT_E2E.md](REAL_PRODUCT_E2E.md)。该证据区分了“Bridge 客户端重连但产品 runtime 常开”与“产品/机器重启”，也记录了 DeepSeek 参考源码 rc.5 和实测 npm rc.6 的版本边界。
 
 管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。七类内置产品可自动值守，自定义产品及 `basic` 模式只生成私有状态。原生 TUI 邀请只需显式提交稳定 endpoint、该房间独占的 native session 与 loopback/file transport；权限不属于绑定数据，Bridge 不保存、缓存或解释权限标签。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
 
