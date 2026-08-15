@@ -94,6 +94,13 @@ const state = {
     has_more: false,
     next_before_sequence: null,
   },
+  historyGovernance: {
+    searchResults: [],
+    searchHasMore: false,
+    searchNextBefore: null,
+    retention: null,
+    redactionPreview: null,
+  },
   roomsPanelCollapsed: false,
   peoplePanelCollapsed: true,
 };
@@ -193,6 +200,7 @@ const elements = {
   openRoomPermissions: document.querySelector("#open-room-permissions"),
   openRegistrationCodes: document.querySelector("#open-registration-codes"),
   openAdminAudit: document.querySelector("#open-admin-audit"),
+  openHistoryGovernance: document.querySelector("#open-history-governance"),
   adminAuditDialog: document.querySelector("#admin-audit-dialog"),
   closeAdminAudit: document.querySelector("#close-admin-audit"),
   adminAuditFilterForm: document.querySelector("#admin-audit-filter-form"),
@@ -207,6 +215,36 @@ const elements = {
   adminAuditFeedback: document.querySelector("#admin-audit-feedback"),
   adminAuditList: document.querySelector("#admin-audit-list"),
   loadMoreAdminAudit: document.querySelector("#load-more-admin-audit"),
+  historyGovernanceDialog: document.querySelector("#history-governance-dialog"),
+  closeHistoryGovernance: document.querySelector("#close-history-governance"),
+  historySearchForm: document.querySelector("#history-search-form"),
+  historySearchQuery: document.querySelector("#history-search-query"),
+  historySearchRoom: document.querySelector("#history-search-room"),
+  historySearchSender: document.querySelector("#history-search-sender"),
+  historySearchKind: document.querySelector("#history-search-kind"),
+  historySearchFrom: document.querySelector("#history-search-from"),
+  historySearchTo: document.querySelector("#history-search-to"),
+  historySearchFeedback: document.querySelector("#history-search-feedback"),
+  historySearchResults: document.querySelector("#history-search-results"),
+  historySearchMore: document.querySelector("#history-search-more"),
+  historyExportRoom: document.querySelector("#history-export-room"),
+  exportRoomHistory: document.querySelector("#export-room-history"),
+  historyExportFeedback: document.querySelector("#history-export-feedback"),
+  historyRetentionForm: document.querySelector("#history-retention-form"),
+  historyRetentionMode: document.querySelector("#history-retention-mode"),
+  historyRetentionDays: document.querySelector("#history-retention-days"),
+  saveHistoryRetention: document.querySelector("#save-history-retention"),
+  historyRetentionFeedback: document.querySelector("#history-retention-feedback"),
+  historyRedactionPreviewForm: document.querySelector("#history-redaction-preview-form"),
+  historyRedactionRoom: document.querySelector("#history-redaction-room"),
+  historyRedactionReason: document.querySelector("#history-redaction-reason"),
+  previewHistoryRedaction: document.querySelector("#preview-history-redaction"),
+  historyRedactionFeedback: document.querySelector("#history-redaction-feedback"),
+  historyRedactionConfirm: document.querySelector("#history-redaction-confirm"),
+  historyRedactionSummary: document.querySelector("#history-redaction-summary"),
+  historyRedactionPhrase: document.querySelector("#history-redaction-phrase"),
+  historyRedactionConfirmation: document.querySelector("#history-redaction-confirmation"),
+  executeHistoryRedaction: document.querySelector("#execute-history-redaction"),
   openPendingCenter: document.querySelector("#open-pending-center"),
   pendingCenterBadge: document.querySelector("#pending-center-badge"),
   pendingCenterDialog: document.querySelector("#pending-center-dialog"),
@@ -838,6 +876,13 @@ function showAuthScreen(message = "") {
     has_more: false,
     next_before_sequence: null,
   };
+  state.historyGovernance = {
+    searchResults: [],
+    searchHasMore: false,
+    searchNextBefore: null,
+    retention: null,
+    redactionPreview: null,
+  };
   renderPendingCenter();
   elements.appShell.hidden = true;
   for (const dialog of [
@@ -856,6 +901,7 @@ function showAuthScreen(message = "") {
     elements.agentAccessDialog,
     elements.pendingCenterDialog,
     elements.adminAuditDialog,
+    elements.historyGovernanceDialog,
     elements.roomHighlightsDialog,
     elements.messageThreadDialog,
   ]) {
@@ -883,6 +929,7 @@ function applyUserPermissions() {
   elements.openRoomPermissions.hidden = !admin;
   elements.openRegistrationCodes.hidden = !admin;
   elements.openAdminAudit.hidden = !admin;
+  elements.openHistoryGovernance.hidden = !admin;
   elements.openAgentAccess.hidden = !admin;
   elements.agentInvitationSection.hidden = !admin;
   elements.connectorHealthSection.hidden = !admin;
@@ -4069,6 +4116,7 @@ const ADMIN_AUDIT_CATEGORY_LABELS = {
   authorization: "授权",
   connector: "连接与值守",
   identity: "身份与昵称",
+  history: "历史治理",
   knowledge: "知识与转发",
   lifecycle: "生命周期",
   membership: "成员",
@@ -4116,6 +4164,10 @@ const ADMIN_AUDIT_ACTION_LABELS = {
   "message.forward": "跨聊天室转发消息",
   "room_residents.repair": "修复聊天室值守",
   "nickname_request.review": "审批 Agent 昵称",
+  "history.export": "导出聊天室历史",
+  "history.retention_policy.update": "调整历史保留策略",
+  "history.redaction.preview": "预览旧正文清除范围",
+  "history.redaction.execute": "清除旧消息正文",
 };
 
 function populateAdminAuditFacets(payload) {
@@ -4241,6 +4293,348 @@ async function openAdminAuditDialog() {
   elements.globalToolsMenu.open = false;
   if (!elements.adminAuditDialog.open) elements.adminAuditDialog.showModal();
   await loadAdminAudit();
+}
+
+function populateHistoryRoomOptions() {
+  const previousSearch = elements.historySearchRoom.value;
+  const previousExport = elements.historyExportRoom.value || state.selectedRoom || "";
+  const previousRedaction = elements.historyRedactionRoom.value;
+  const rooms = [...state.rooms].sort((left, right) => (
+    left.conversation_id.localeCompare(right.conversation_id, "zh-CN")
+  ));
+  elements.historySearchRoom.replaceChildren(new Option("全部聊天室", ""));
+  elements.historyExportRoom.replaceChildren();
+  elements.historyRedactionRoom.replaceChildren(new Option("全部已废弃聊天室", ""));
+  for (const room of rooms) {
+    const status = room.status === "abandoned" ? "已废弃" : "使用中";
+    const label = `${room.conversation_id} · ${status}`;
+    elements.historySearchRoom.append(new Option(label, room.conversation_id));
+    elements.historyExportRoom.append(new Option(label, room.conversation_id));
+    if (room.status === "abandoned") {
+      elements.historyRedactionRoom.append(new Option(label, room.conversation_id));
+    }
+  }
+  if ([...elements.historySearchRoom.options].some((option) => option.value === previousSearch)) {
+    elements.historySearchRoom.value = previousSearch;
+  }
+  if ([...elements.historyExportRoom.options].some((option) => option.value === previousExport)) {
+    elements.historyExportRoom.value = previousExport;
+  }
+  if ([...elements.historyRedactionRoom.options].some((option) => option.value === previousRedaction)) {
+    elements.historyRedactionRoom.value = previousRedaction;
+  }
+  elements.exportRoomHistory.disabled = rooms.length === 0;
+}
+
+function optionalHistoryTimestamp(input) {
+  if (!input.value) return null;
+  const milliseconds = new Date(input.value).getTime();
+  if (!Number.isFinite(milliseconds)) throw new Error("搜索时间格式无效");
+  return milliseconds / 1000;
+}
+
+function renderHistorySearchResults() {
+  const history = state.historyGovernance;
+  elements.historySearchResults.replaceChildren();
+  if (!history.searchResults.length) {
+    elements.historySearchResults.append(
+      makeElement("p", "muted-copy", "当前条件没有匹配消息。"),
+    );
+  }
+  const kindLabels = { message: "消息", task: "任务", forward: "转发" };
+  for (const result of history.searchResults) {
+    const card = makeElement(
+      "button",
+      `history-result-card ${result.content_redacted ? "redacted" : ""}`,
+    );
+    card.type = "button";
+    const heading = makeElement("span", "history-result-heading");
+    heading.append(
+      makeElement(
+        "strong",
+        "",
+        `${result.conversation_id} · #${roomSequence(result)} · ${result.sender_display_name}`,
+      ),
+      makeElement(
+        "span",
+        "",
+        `${kindLabels[result.message_kind] || result.message_kind} · ${fullTime(result.created_at)}`,
+      ),
+    );
+    const body = makeElement("span", "history-result-body", result.body_preview || "（空正文）");
+    const markers = (result.marker_kinds || []).join("、");
+    const meta = makeElement("span", "history-result-meta");
+    meta.append(
+      makeElement(
+        "span",
+        "",
+        result.content_redacted ? "正文已清除，消息记录保留" : (markers ? `标记：${markers}` : result.sender_client_type),
+      ),
+      makeElement("span", "", result.room_status === "abandoned" ? "已废弃聊天室" : "使用中"),
+    );
+    card.append(heading, body, meta);
+    card.addEventListener("click", async () => {
+      elements.historyGovernanceDialog.close();
+      await locatePendingCenterItem({
+        conversation_id: result.conversation_id,
+        sequence: result.sequence,
+        message_id: result.message_id,
+      });
+    });
+    elements.historySearchResults.append(card);
+  }
+  elements.historySearchMore.hidden = !history.searchHasMore;
+}
+
+async function loadHistorySearch({ append = false } = {}) {
+  if (!isAdmin()) return;
+  let createdAfter;
+  let createdBefore;
+  try {
+    createdAfter = optionalHistoryTimestamp(elements.historySearchFrom);
+    createdBefore = optionalHistoryTimestamp(elements.historySearchTo);
+    if (createdAfter && createdBefore && createdAfter >= createdBefore) {
+      throw new Error("开始时间必须早于结束时间");
+    }
+  } catch (error) {
+    elements.historySearchFeedback.classList.add("error");
+    elements.historySearchFeedback.textContent = error.message;
+    return;
+  }
+  const parameters = new URLSearchParams({
+    limit: "50",
+    q: elements.historySearchQuery.value.trim(),
+    conversation_id: elements.historySearchRoom.value,
+    sender: elements.historySearchSender.value.trim(),
+    message_kind: elements.historySearchKind.value,
+  });
+  if (createdAfter !== null) parameters.set("created_after", String(createdAfter));
+  if (createdBefore !== null) parameters.set("created_before", String(createdBefore));
+  if (append && state.historyGovernance.searchNextBefore) {
+    parameters.set("before_sequence", String(state.historyGovernance.searchNextBefore));
+  }
+  elements.historySearchMore.disabled = true;
+  elements.historySearchFeedback.classList.remove("error", "success");
+  elements.historySearchFeedback.textContent = append ? "正在加载更早结果…" : "正在跨聊天室检索…";
+  try {
+    const payload = await fetchJson(`/api/admin/history/search?${parameters.toString()}`);
+    const nextResults = payload.results || [];
+    state.historyGovernance.searchResults = append
+      ? [...state.historyGovernance.searchResults, ...nextResults]
+      : nextResults;
+    state.historyGovernance.searchHasMore = Boolean(payload.has_more);
+    state.historyGovernance.searchNextBefore = payload.next_before_sequence;
+    renderHistorySearchResults();
+    elements.historySearchFeedback.textContent = `已显示 ${state.historyGovernance.searchResults.length} 条跨聊天室结果`;
+  } catch (error) {
+    elements.historySearchFeedback.classList.add("error");
+    elements.historySearchFeedback.textContent = error.message;
+  } finally {
+    elements.historySearchMore.disabled = false;
+  }
+}
+
+async function loadHistoryRetention() {
+  const payload = await fetchJson("/api/admin/history/retention");
+  state.historyGovernance.retention = payload;
+  elements.historyRetentionMode.value = payload.policy.mode;
+  elements.historyRetentionDays.value = String(payload.policy.retention_days);
+  const modeCopy = payload.policy.mode === "forever"
+    ? "当前永久保留；没有任何自动清除。"
+    : `当前允许手动清除 ${payload.policy.retention_days} 天前、已废弃聊天室的正文；共有 ${payload.eligible_message_count} 条当前符合条件。`;
+  elements.historyRetentionFeedback.classList.remove("error", "success");
+  elements.historyRetentionFeedback.textContent = modeCopy;
+  return payload;
+}
+
+function resetHistoryRedactionPreview() {
+  state.historyGovernance.redactionPreview = null;
+  elements.historyRedactionConfirm.hidden = true;
+  elements.historyRedactionSummary.textContent = "";
+  elements.historyRedactionPhrase.textContent = "";
+  elements.historyRedactionConfirmation.value = "";
+}
+
+async function openHistoryGovernanceDialog() {
+  if (!isAdmin()) return;
+  elements.globalToolsMenu.open = false;
+  populateHistoryRoomOptions();
+  resetHistoryRedactionPreview();
+  elements.historySearchFeedback.textContent = "";
+  elements.historyExportFeedback.textContent = "";
+  elements.historyRedactionFeedback.textContent = "";
+  if (!elements.historyGovernanceDialog.open) {
+    elements.historyGovernanceDialog.showModal();
+  }
+  const results = await Promise.allSettled([
+    loadHistoryRetention(),
+    loadHistorySearch(),
+  ]);
+  if (results[0].status === "rejected") {
+    elements.historyRetentionFeedback.classList.add("error");
+    elements.historyRetentionFeedback.textContent = results[0].reason.message;
+  }
+  window.setTimeout(() => elements.historySearchQuery.focus(), 0);
+}
+
+async function downloadRoomHistory() {
+  const roomId = elements.historyExportRoom.value;
+  if (!roomId) return;
+  elements.exportRoomHistory.disabled = true;
+  elements.historyExportFeedback.classList.remove("error", "success");
+  elements.historyExportFeedback.textContent = "正在生成完整历史文件…";
+  try {
+    const response = await fetch(
+      `/api/admin/rooms/${encodeURIComponent(roomId)}/history-export`,
+      {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "X-Agent-Bridge-Intent": "export-room-history",
+        },
+      },
+    );
+    if (!response.ok) {
+      let errorPayload = {};
+      try { errorPayload = await response.json(); } catch (_error) { /* no-op */ }
+      if (response.status === 401) window.setTimeout(() => handleAuthenticationLost(), 0);
+      throw new Error(errorPayload.error || `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encodedFilename = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    let filename = `${roomId}-history.json`;
+    if (encodedFilename) {
+      try { filename = decodeURIComponent(encodedFilename); } catch (_error) { /* no-op */ }
+    }
+    const blob = await response.blob();
+    const downloadUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = filename;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(downloadUrl);
+    elements.historyExportFeedback.classList.add("success");
+    elements.historyExportFeedback.textContent = `${roomId} 的完整历史已下载。`;
+  } catch (error) {
+    elements.historyExportFeedback.classList.add("error");
+    elements.historyExportFeedback.textContent = error.message;
+  } finally {
+    elements.exportRoomHistory.disabled = false;
+  }
+}
+
+async function saveHistoryRetentionPolicy(event) {
+  event.preventDefault();
+  if (!elements.historyRetentionForm.reportValidity()) return;
+  resetHistoryRedactionPreview();
+  elements.saveHistoryRetention.disabled = true;
+  elements.historyRetentionFeedback.classList.remove("error", "success");
+  elements.historyRetentionFeedback.textContent = "正在保存；本操作不会清除任何消息…";
+  try {
+    await fetchJson("/api/admin/history/retention", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "update-history-retention",
+      },
+      body: JSON.stringify({
+        mode: elements.historyRetentionMode.value,
+        retention_days: Number(elements.historyRetentionDays.value),
+      }),
+    });
+    await loadHistoryRetention();
+    elements.historyRetentionFeedback.classList.add("success");
+    elements.historyRetentionFeedback.textContent += " 策略已保存，未自动改动历史。";
+  } catch (error) {
+    elements.historyRetentionFeedback.classList.add("error");
+    elements.historyRetentionFeedback.textContent = error.message;
+  } finally {
+    elements.saveHistoryRetention.disabled = false;
+  }
+}
+
+async function previewHistoryRedaction(event) {
+  event.preventDefault();
+  if (!elements.historyRedactionPreviewForm.reportValidity()) return;
+  resetHistoryRedactionPreview();
+  elements.previewHistoryRedaction.disabled = true;
+  elements.historyRedactionFeedback.classList.remove("error", "success");
+  elements.historyRedactionFeedback.textContent = "正在计算快照；不会修改数据…";
+  try {
+    const payload = await fetchJson("/api/admin/history/redaction-preview", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "preview-history-redaction",
+      },
+      body: JSON.stringify({
+        conversation_id: elements.historyRedactionRoom.value,
+        reason: elements.historyRedactionReason.value.trim(),
+      }),
+    });
+    const preview = payload.preview;
+    state.historyGovernance.redactionPreview = preview;
+    const roomCopy = (preview.room_counts || [])
+      .map((item) => `${item.conversation_id} ${item.message_count} 条`)
+      .join("、");
+    const remainder = preview.more_eligible_messages_may_remain
+      ? `；本批之后仍有 ${preview.total_eligible_message_count - preview.eligible_message_count} 条可另行预览`
+      : "";
+    elements.historyRedactionSummary.textContent = `本次只会清除 ${preview.eligible_message_count} 条旧正文（${roomCopy}）${remainder}；消息行、序号、路由、回执和审计不删除。`;
+    elements.historyRedactionPhrase.textContent = preview.confirmation_phrase;
+    elements.historyRedactionConfirm.hidden = false;
+    elements.historyRedactionFeedback.classList.add("success");
+    elements.historyRedactionFeedback.textContent = "预览已生成，数据尚未改变；确认短语 10 分钟内有效。";
+    window.setTimeout(() => elements.historyRedactionConfirmation.focus(), 0);
+  } catch (error) {
+    elements.historyRedactionFeedback.classList.add("error");
+    elements.historyRedactionFeedback.textContent = error.message;
+  } finally {
+    elements.previewHistoryRedaction.disabled = false;
+  }
+}
+
+async function executeHistoryRedaction() {
+  const preview = state.historyGovernance.redactionPreview;
+  if (!preview) return;
+  const phrase = elements.historyRedactionConfirmation.value.trim();
+  if (phrase !== preview.confirmation_phrase) {
+    elements.historyRedactionFeedback.classList.add("error");
+    elements.historyRedactionFeedback.textContent = "确认短语不完全一致，未执行。";
+    return;
+  }
+  if (!window.confirm(`确认清除 ${preview.eligible_message_count} 条旧消息正文？消息记录本身仍会保留。`)) return;
+  elements.executeHistoryRedaction.disabled = true;
+  elements.historyRedactionFeedback.classList.remove("error", "success");
+  elements.historyRedactionFeedback.textContent = "正在清除旧正文…";
+  try {
+    const payload = await fetchJson("/api/admin/history/redaction-execute", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "execute-history-redaction",
+      },
+      body: JSON.stringify({
+        preview_id: preview.preview_id,
+        confirmation_phrase: phrase,
+      }),
+    });
+    resetHistoryRedactionPreview();
+    state.roomSnapshots.clear();
+    await Promise.all([loadHistoryRetention(), loadHistorySearch()]);
+    elements.historyRedactionFeedback.classList.add("success");
+    elements.historyRedactionFeedback.textContent = `已清除 ${payload.result.redacted_message_count} 条旧正文；没有删除消息行、序号、回执或审计。`;
+    if (state.selectedRoom) refreshActiveRoom(true, true).catch(console.error);
+  } catch (error) {
+    elements.historyRedactionFeedback.classList.add("error");
+    elements.historyRedactionFeedback.textContent = error.message;
+  } finally {
+    elements.executeHistoryRedaction.disabled = false;
+  }
 }
 
 function renderTaskPermissionMembers() {
@@ -5026,6 +5420,7 @@ elements.openMessageRates.addEventListener("click", openMessageRateDialog);
 elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
 elements.openRegistrationCodes.addEventListener("click", openRegistrationCodeDialog);
 elements.openAdminAudit.addEventListener("click", openAdminAuditDialog);
+elements.openHistoryGovernance.addEventListener("click", openHistoryGovernanceDialog);
 elements.closeAdminAudit.addEventListener("click", () => elements.adminAuditDialog.close());
 elements.adminAuditDialog.addEventListener("click", (event) => {
   if (event.target === elements.adminAuditDialog) elements.adminAuditDialog.close();
@@ -5036,6 +5431,27 @@ elements.adminAuditFilterForm.addEventListener("submit", async (event) => {
 });
 elements.refreshAdminAudit.addEventListener("click", () => loadAdminAudit());
 elements.loadMoreAdminAudit.addEventListener("click", () => loadAdminAudit({ append: true }));
+elements.closeHistoryGovernance.addEventListener("click", () => elements.historyGovernanceDialog.close());
+elements.historyGovernanceDialog.addEventListener("click", (event) => {
+  if (event.target === elements.historyGovernanceDialog) elements.historyGovernanceDialog.close();
+});
+elements.historySearchForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadHistorySearch();
+});
+elements.historySearchMore.addEventListener("click", () => loadHistorySearch({ append: true }));
+elements.exportRoomHistory.addEventListener("click", downloadRoomHistory);
+elements.historyRetentionForm.addEventListener("submit", saveHistoryRetentionPolicy);
+elements.historyRedactionPreviewForm.addEventListener("submit", previewHistoryRedaction);
+elements.executeHistoryRedaction.addEventListener("click", executeHistoryRedaction);
+for (const control of [
+  elements.historyRedactionRoom,
+  elements.historyRedactionReason,
+  elements.historyRetentionMode,
+  elements.historyRetentionDays,
+]) {
+  control.addEventListener("input", resetHistoryRedactionPreview);
+}
 elements.closeRegistrationCodes.addEventListener("click", () => {
   state.generatedRegistrationCode = "";
   elements.generatedRegistrationCode.textContent = "";

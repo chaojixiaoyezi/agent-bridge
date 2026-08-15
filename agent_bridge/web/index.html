@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260815-03">
-    <script src="/assets/app.js?v=20260815-03" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260815-04">
+    <script src="/assets/app.js?v=20260815-04" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -61,6 +61,7 @@
                 <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
                 <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
                 <button class="access-button" id="open-admin-audit" type="button" hidden>审计中心</button>
+                <button class="access-button" id="open-history-governance" type="button" hidden>历史治理</button>
               </div>
               <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
             </div>
@@ -950,6 +951,99 @@
         <p class="form-feedback" id="admin-audit-feedback" role="status" aria-live="polite"></p>
         <div class="audit-event-list" id="admin-audit-list"></div>
         <button class="secondary-button audit-load-more" id="load-more-admin-audit" type="button" hidden>加载更早记录</button>
+      </div>
+    </dialog>
+
+    <dialog class="room-dialog history-dialog" id="history-governance-dialog" aria-labelledby="history-governance-title">
+      <div class="dialog-shell history-dialog-shell">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">SEARCH · EXPORT · RETENTION</p>
+            <h2 id="history-governance-title">聊天室历史治理</h2>
+            <p>跨聊天室检索与完整导出不会改变原消息。默认永久保留；内容清除只允许已废弃聊天室，并需要预览和一次性短语确认。</p>
+          </div>
+          <button class="dialog-close" id="close-history-governance" type="button" aria-label="关闭">×</button>
+        </div>
+
+        <section class="history-section">
+          <div class="history-section-heading">
+            <div>
+              <h3>跨聊天室搜索</h3>
+              <p>按关键词、聊天室、发言人和时间检索；结果可直接定位到原消息。</p>
+            </div>
+          </div>
+          <form class="history-search-form" id="history-search-form">
+            <input id="history-search-query" type="search" maxlength="200" placeholder="消息关键词（可留空查看最近消息）" autocomplete="off">
+            <select id="history-search-room" aria-label="搜索聊天室"><option value="">全部聊天室</option></select>
+            <input id="history-search-sender" type="search" maxlength="200" placeholder="发言人名称或产品" autocomplete="off">
+            <select id="history-search-kind" aria-label="消息类型">
+              <option value="">全部类型</option>
+              <option value="message">普通消息</option>
+              <option value="task">任务</option>
+              <option value="forward">转发</option>
+            </select>
+            <label class="history-date-field"><span>开始</span><input id="history-search-from" type="datetime-local"></label>
+            <label class="history-date-field"><span>结束</span><input id="history-search-to" type="datetime-local"></label>
+            <button class="primary-button compact-button" type="submit">搜索</button>
+          </form>
+          <p class="form-feedback" id="history-search-feedback" role="status" aria-live="polite"></p>
+          <div class="history-result-list" id="history-search-results"></div>
+          <button class="secondary-button history-load-more" id="history-search-more" type="button" hidden>加载更早结果</button>
+        </section>
+
+        <div class="history-governance-grid">
+          <section class="history-section">
+            <div class="history-section-heading">
+              <div>
+                <h3>完整导出</h3>
+                <p>导出一个聊天室的消息、成员、任务和标记；凭证、密码与会话令牌不会进入文件。</p>
+              </div>
+            </div>
+            <div class="history-inline-controls">
+              <select id="history-export-room" aria-label="导出聊天室"></select>
+              <button class="secondary-button compact-button" id="export-room-history" type="button">下载 JSON</button>
+            </div>
+            <p class="form-feedback" id="history-export-feedback" role="status" aria-live="polite"></p>
+          </section>
+
+          <section class="history-section">
+            <div class="history-section-heading">
+              <div>
+                <h3>保留策略</h3>
+                <p>更改策略不会自动删除内容；手动清除模式也只能作用于已废弃聊天室。</p>
+              </div>
+            </div>
+            <form class="history-retention-form" id="history-retention-form">
+              <label><span>模式</span><select id="history-retention-mode"><option value="forever">永久保留（推荐）</option><option value="manual_redaction">允许管理员手动清除旧正文</option></select></label>
+              <label><span>保留天数</span><input id="history-retention-days" type="number" min="90" max="36500" step="1" value="365" required></label>
+              <button class="primary-button compact-button" id="save-history-retention" type="submit">保存策略</button>
+            </form>
+            <p class="form-feedback" id="history-retention-feedback" role="status" aria-live="polite"></p>
+          </section>
+        </div>
+
+        <section class="history-section history-danger-section">
+          <div class="history-section-heading">
+            <div>
+              <h3>手动清除旧正文</h3>
+              <p>不删除消息行、序号、路由、回执和审计记录，只替换符合策略的正文、引用、艾特和关联任务内容。每批最多处理 5,000 条。</p>
+            </div>
+          </div>
+          <form class="history-redaction-form" id="history-redaction-preview-form">
+            <select id="history-redaction-room" aria-label="清除范围"><option value="">全部已废弃聊天室</option></select>
+            <input id="history-redaction-reason" type="text" maxlength="128" placeholder="填写清除原因" required>
+            <button class="secondary-button compact-button" id="preview-history-redaction" type="submit">只预览，不改数据</button>
+          </form>
+          <p class="form-feedback" id="history-redaction-feedback" role="status" aria-live="polite"></p>
+          <div class="history-redaction-confirm" id="history-redaction-confirm" hidden>
+            <p id="history-redaction-summary"></p>
+            <p>请手动输入一次性确认短语：<code id="history-redaction-phrase"></code></p>
+            <div class="history-inline-controls">
+              <input id="history-redaction-confirmation" type="text" autocomplete="off" spellcheck="false" placeholder="输入上面的完整短语">
+              <button class="secondary-button danger-button compact-button" id="execute-history-redaction" type="button">确认清除正文</button>
+            </div>
+          </div>
+        </section>
       </div>
     </dialog>
 

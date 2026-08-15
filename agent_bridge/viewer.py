@@ -11,6 +11,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
 from starlette.applications import Starlette
@@ -131,6 +132,22 @@ ADMIN_AUDIT_ACTIONS: dict[tuple[str, str], tuple[str, str]] = {
         "monitoring",
         "monitoring_alert.acknowledge",
     ),
+    ("PATCH", "/api/admin/history/retention"): (
+        "history",
+        "history.retention_policy.update",
+    ),
+    ("POST", "/api/admin/history/redaction-preview"): (
+        "history",
+        "history.redaction.preview",
+    ),
+    ("POST", "/api/admin/history/redaction-execute"): (
+        "history",
+        "history.redaction.execute",
+    ),
+    (
+        "POST",
+        "/api/admin/rooms/{conversation_id:str}/history-export",
+    ): ("history", "history.export"),
     ("POST", "/api/admin/connectors/{connector_id:str}/rotation-request"): (
         "connector",
         "connector.rotation_request",
@@ -1500,6 +1517,148 @@ def create_app(
                     ),
                     hours=request.query_params.get("hours", "168"),
                 )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def admin_history_search(request: Request) -> Response:
+        try:
+            authenticated_admin(request)
+            if policy.public_mode:
+                enforce_rate(
+                    request,
+                    "admin-history-search-session",
+                    subject=request.state.web_identity["session_id"],
+                    limit=120,
+                    window_seconds=60,
+                )
+            return JSONResponse(
+                await asyncio.to_thread(
+                    repository.search_messages_globally,
+                    query=request.query_params.get("q", ""),
+                    conversation_id=request.query_params.get("conversation_id"),
+                    sender_query=request.query_params.get("sender", ""),
+                    message_kind=request.query_params.get("message_kind"),
+                    notification_mode=request.query_params.get("notification_mode"),
+                    created_after=_optional_float_query(request, "created_after"),
+                    created_before=_optional_float_query(request, "created_before"),
+                    before_sequence=_optional_positive_int_query(
+                        request,
+                        "before_sequence",
+                    ),
+                    limit=_int_query(request, "limit", default=50, maximum=100),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def history_retention_configuration(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                await asyncio.to_thread(
+                    store.history_retention_configuration,
+                    requesting_web_user_id=str(identity["user_id"]),
+                )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def update_history_retention_configuration(
+        request: Request,
+    ) -> Response:
+        try:
+            require_web_intent(request, intent="update-history-retention")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required={"mode", "retention_days"},
+                allowed={"mode", "retention_days"},
+            )
+            return JSONResponse(
+                {
+                    "policy": await asyncio.to_thread(
+                        store.update_history_retention_policy,
+                        updated_by_web_user_id=str(identity["user_id"]),
+                        mode=payload["mode"],
+                        retention_days=payload["retention_days"],
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def preview_history_redaction(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="preview-history-redaction")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required={"reason"},
+                allowed={"reason", "conversation_id"},
+            )
+            return JSONResponse(
+                {
+                    "preview": await asyncio.to_thread(
+                        store.preview_history_redaction,
+                        created_by_web_user_id=str(identity["user_id"]),
+                        reason=payload["reason"],
+                        conversation_id=payload.get("conversation_id"),
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def execute_history_redaction(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="execute-history-redaction")
+            identity = authenticated_admin(request)
+            payload = await _json_body(
+                request,
+                required={"preview_id", "confirmation_phrase"},
+                allowed={"preview_id", "confirmation_phrase"},
+            )
+            return JSONResponse(
+                {
+                    "result": await asyncio.to_thread(
+                        store.execute_history_redaction,
+                        executed_by_web_user_id=str(identity["user_id"]),
+                        preview_id=payload["preview_id"],
+                        confirmation_phrase=payload["confirmation_phrase"],
+                    )
+                }
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def export_room_history(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="export-room-history")
+            identity = authenticated_admin(request)
+            conversation = request.path_params["conversation_id"]
+            payload = await asyncio.to_thread(
+                store.export_room_history,
+                requesting_web_user_id=str(identity["user_id"]),
+                conversation_id=conversation,
+            )
+            body = json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            encoded_name = quote(
+                f"{conversation}-history-{int(payload['exported_at'])}.json"
+            )
+            return Response(
+                body,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        "attachment; filename=agent-bridge-room-history.json; "
+                        f"filename*=UTF-8''{encoded_name}"
+                    )
+                },
             )
         except Exception as exc:
             return _json_error(exc)
@@ -3928,6 +4087,36 @@ def create_app(
                 "/api/admin/audit",
                 admin_audit_events,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/admin/history/search",
+                admin_history_search,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/history/retention",
+                history_retention_configuration,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/history/retention",
+                update_history_retention_configuration,
+                methods=["PATCH"],
+            ),
+            Route(
+                "/api/admin/history/redaction-preview",
+                preview_history_redaction,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/history/redaction-execute",
+                execute_history_redaction,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/admin/rooms/{conversation_id:str}/history-export",
+                export_room_history,
+                methods=["POST"],
             ),
             Route(
                 "/api/admin/monitoring/alerts/{alert_id:str}/acknowledge",

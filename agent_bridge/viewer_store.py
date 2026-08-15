@@ -67,6 +67,9 @@ class ViewerRepository:
                     "operational_metric_samples",
                     "operational_alerts",
                     "admin_audit_events",
+                    "history_retention_policy",
+                    "history_redaction_previews",
+                    "history_message_redactions",
                 )
             }
             room_states = {
@@ -994,6 +997,173 @@ class ViewerRepository:
                 "thread_scope": normalized_thread_scope,
                 "marker_kind": normalized_marker_kind,
                 "room_sequence": normalized_room_sequence,
+                "created_after": normalized_created_after,
+                "created_before": normalized_created_before,
+            },
+            "results": results,
+            "count": len(results),
+            "has_more": has_more,
+            "next_before_sequence": (
+                int(page[-1]["sequence"]) if has_more and page else None
+            ),
+        }
+
+
+    def search_messages_globally(
+        self,
+        *,
+        query: str = "",
+        conversation_id: str | None = None,
+        sender_query: str = "",
+        message_kind: str | None = None,
+        notification_mode: str | None = None,
+        created_after: float | None = None,
+        created_before: float | None = None,
+        before_sequence: int | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Search every room for an already-authorized global administrator."""
+
+        normalized_query = str(query or "").strip()
+        normalized_conversation = str(conversation_id or "").strip() or None
+        if normalized_conversation is not None:
+            normalized_conversation = validate_conversation_id(normalized_conversation)
+        normalized_sender = str(sender_query or "").strip()
+        normalized_message_kind = str(message_kind or "").strip().casefold() or None
+        normalized_notification_mode = (
+            str(notification_mode or "").strip().casefold() or None
+        )
+        normalized_created_after = (
+            float(created_after) if created_after is not None else None
+        )
+        normalized_created_before = (
+            float(created_before) if created_before is not None else None
+        )
+        if len(normalized_query) > 200:
+            raise ValueError("query must be at most 200 characters")
+        if len(normalized_sender) > 200:
+            raise ValueError("sender_query must be at most 200 characters")
+        if normalized_message_kind not in {None, "message", "task", "forward"}:
+            raise ValueError("message_kind must be message, task, or forward")
+        if normalized_notification_mode not in {None, "ordinary", "mention"}:
+            raise ValueError("notification_mode must be ordinary or mention")
+        maximum_timestamp = 253_402_300_799.0
+        for label, timestamp in (
+            ("created_after", normalized_created_after),
+            ("created_before", normalized_created_before),
+        ):
+            if timestamp is not None and not 0 <= timestamp <= maximum_timestamp:
+                raise ValueError(f"{label} is outside the supported range")
+        if (
+            normalized_created_after is not None
+            and normalized_created_before is not None
+            and normalized_created_after >= normalized_created_before
+        ):
+            raise ValueError("created_after must be earlier than created_before")
+        normalized_limit = max(1, min(int(limit), 100))
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if normalized_query:
+            clauses.append(
+                "(instr(lower(message.body), lower(?)) > 0 "
+                "OR instr(lower(message.conversation_id), lower(?)) > 0)"
+            )
+            parameters.extend((normalized_query, normalized_query))
+        if normalized_conversation is not None:
+            clauses.append("message.conversation_id = ?")
+            parameters.append(normalized_conversation)
+        if normalized_sender:
+            clauses.append(
+                "(instr(lower(sender.display_name), lower(?)) > 0 "
+                "OR instr(lower(sender.client_type), lower(?)) > 0 "
+                "OR sender.participant_id = ?)"
+            )
+            parameters.extend((normalized_sender, normalized_sender, normalized_sender))
+        if normalized_message_kind is not None:
+            clauses.append("message.message_kind = ?")
+            parameters.append(normalized_message_kind)
+        if normalized_notification_mode is not None:
+            clauses.append("message.notification_mode = ?")
+            parameters.append(normalized_notification_mode)
+        if normalized_created_after is not None:
+            clauses.append("message.created_at >= ?")
+            parameters.append(normalized_created_after)
+        if normalized_created_before is not None:
+            clauses.append("message.created_at < ?")
+            parameters.append(normalized_created_before)
+        if before_sequence is not None:
+            clauses.append("message.sequence < ?")
+            parameters.append(max(0, int(before_sequence)))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(normalized_limit + 1)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT message.sequence, message.room_sequence,
+                       message.message_id, message.conversation_id,
+                       message.sender_participant_id, message.message_kind,
+                       message.notification_mode, message.reply_to,
+                       message.body, message.created_at,
+                       sender.client_type AS sender_client_type,
+                       sender.display_name AS sender_display_name,
+                       sender.avatar_key AS sender_avatar_key,
+                       room.status AS room_status,
+                       redaction.redacted_at,
+                       (SELECT GROUP_CONCAT(marker.marker_kind)
+                        FROM room_message_markers AS marker
+                        WHERE marker.conversation_id = message.conversation_id
+                          AND marker.message_id = message.message_id)
+                           AS marker_kinds
+                FROM messages AS message
+                JOIN participants AS sender
+                  ON sender.participant_id = message.sender_participant_id
+                JOIN rooms AS room
+                  ON room.conversation_id = message.conversation_id
+                LEFT JOIN history_message_redactions AS redaction
+                  ON redaction.message_id = message.message_id
+                {where_sql}
+                ORDER BY message.sequence DESC
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > normalized_limit
+        page = rows[:normalized_limit]
+        results = []
+        for row in page:
+            body = str(row["body"])
+            results.append(
+                {
+                    "sequence": int(row["sequence"]),
+                    "room_sequence": int(row["room_sequence"] or row["sequence"]),
+                    "message_id": str(row["message_id"]),
+                    "conversation_id": str(row["conversation_id"]),
+                    "room_status": str(row["room_status"]),
+                    "sender_participant_id": str(row["sender_participant_id"]),
+                    "sender_client_type": str(row["sender_client_type"]),
+                    "sender_display_name": str(row["sender_display_name"]),
+                    "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
+                    "message_kind": str(row["message_kind"] or "message"),
+                    "notification_mode": str(row["notification_mode"] or "ordinary"),
+                    "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
+                    "marker_kinds": sorted(
+                        value
+                        for value in str(row["marker_kinds"] or "").split(",")
+                        if value
+                    ),
+                    "body_preview": body[:500],
+                    "body_truncated": len(body) > 500,
+                    "content_redacted": row["redacted_at"] is not None,
+                    "created_at": float(row["created_at"]),
+                }
+            )
+        return {
+            "query": normalized_query,
+            "conversation_id": normalized_conversation,
+            "sender_query": normalized_sender,
+            "filters": {
+                "message_kind": normalized_message_kind,
+                "notification_mode": normalized_notification_mode,
                 "created_after": normalized_created_after,
                 "created_before": normalized_created_before,
             },

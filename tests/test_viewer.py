@@ -445,6 +445,123 @@ def test_admin_audit_api_records_success_and_denial_without_sensitive_bodies(
     assert payload["summary"]["denied_count"] >= 1
 
 
+def test_admin_history_search_export_and_manual_redaction_are_guarded(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "history-governance.db"
+    store, _sender, _receiver = seed(database)
+    anonymous = TestClient(make_app(database))
+    assert anonymous.get("/api/admin/history/search?q=事务").status_code == 401
+    assert anonymous.get("/api/admin/history/retention").status_code == 401
+
+    member_client = TestClient(make_app(database))
+    register_web_user(member_client, username="history-api-member")
+    assert member_client.get("/api/admin/history/search?q=事务").status_code == 403
+    assert (
+        member_client.post(
+            "/api/admin/rooms/room-one/history-export",
+            headers=intent_headers(member_client, "export-room-history"),
+        ).status_code
+        == 403
+    )
+
+    admin_client = TestClient(make_app(database))
+    login_admin(admin_client)
+    second_message = admin_client.post(
+        "/api/rooms/room-two/messages",
+        headers=intent_headers(admin_client, "send-message"),
+        json={"body": "第二个聊天室的跨房间检索内容"},
+    )
+    assert second_message.status_code == 201
+
+    searched = admin_client.get(
+        "/api/admin/history/search?q=事务&sender=小鲸鱼娘&limit=1"
+    )
+    assert searched.status_code == 200
+    assert searched.json()["results"][0]["conversation_id"] == "room-one"
+    assert "事务边界" in searched.json()["results"][0]["body_preview"]
+    paged = admin_client.get("/api/admin/history/search?limit=1").json()
+    assert paged["has_more"] is True
+    older = admin_client.get(
+        "/api/admin/history/search",
+        params={"limit": 1, "before_sequence": paged["next_before_sequence"]},
+    ).json()
+    assert older["results"][0]["sequence"] < paged["results"][0]["sequence"]
+
+    assert (
+        admin_client.post("/api/admin/rooms/room-one/history-export").status_code == 403
+    )
+    exported = admin_client.post(
+        "/api/admin/rooms/room-one/history-export",
+        headers=intent_headers(admin_client, "export-room-history"),
+    )
+    assert exported.status_code == 200
+    assert exported.headers["content-disposition"].startswith("attachment;")
+    assert exported.json()["conversation"]["conversation_id"] == "room-one"
+    assert "请看一下事务边界" in exported.text
+    assert "session_token" not in exported.text
+
+    retention = admin_client.get("/api/admin/history/retention")
+    assert retention.status_code == 200
+    assert retention.json()["policy"]["mode"] == "forever"
+    updated = admin_client.patch(
+        "/api/admin/history/retention",
+        headers=intent_headers(admin_client, "update-history-retention"),
+        json={"mode": "manual_redaction", "retention_days": 90},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["policy"]["automatic_enforcement"] is False
+
+    old_at = time.time() - 200 * 86400
+    archive_at = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET created_at = ?, updated_at = ? "
+            "WHERE conversation_id = 'room-one'",
+            (old_at, old_at),
+        )
+        connection.execute(
+            "UPDATE rooms SET last_activity_at = ? WHERE conversation_id = 'room-one'",
+            (archive_at - ROOM_ABANDON_AFTER_SECONDS - 1,),
+        )
+    assert store.archive_stale_rooms(now=archive_at)["count"] == 1
+    preview_response = admin_client.post(
+        "/api/admin/history/redaction-preview",
+        headers=intent_headers(admin_client, "preview-history-redaction"),
+        json={
+            "conversation_id": "room-one",
+            "reason": "测试 Web 双重确认",
+        },
+    )
+    assert preview_response.status_code == 200
+    preview = preview_response.json()["preview"]
+    assert preview["changes_data"] is False
+    executed = admin_client.post(
+        "/api/admin/history/redaction-execute",
+        headers=intent_headers(admin_client, "execute-history-redaction"),
+        json={
+            "preview_id": preview["preview_id"],
+            "confirmation_phrase": preview["confirmation_phrase"],
+        },
+    )
+    assert executed.status_code == 200
+    assert executed.json()["result"]["rows_deleted"] is False
+    assert (
+        "历史内容已按保留策略清除"
+        in admin_client.get("/api/admin/history/search?conversation_id=room-one").text
+    )
+    audit_actions = {
+        event["action"]
+        for event in admin_client.get("/api/admin/audit?hours=0").json()["events"]
+    }
+    assert {
+        "history.export",
+        "history.retention_policy.update",
+        "history.redaction.preview",
+        "history.redaction.execute",
+    } <= audit_actions
+
+
 def test_email_verification_and_password_reset_are_optional_single_use_and_private(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

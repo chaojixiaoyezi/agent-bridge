@@ -256,6 +256,20 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             ).to_have_count(4)
             page.locator("#close-admin-audit").click()
 
+            page.locator("#global-tools-menu").evaluate(
+                "element => { element.open = true; }"
+            )
+            page.locator("#open-history-governance").click()
+            page.locator("#history-governance-dialog").wait_for(state="visible")
+            playwright_api.expect(
+                page.locator("#history-retention-mode")
+            ).to_have_value("forever")
+            playwright_api.expect(
+                page.locator("#history-search-results .history-result-card")
+            ).to_have_count(50)
+            assert "跨聊天室" in page.locator("#history-search-feedback").inner_text()
+            page.locator("#close-history-governance").click()
+
             page.set_viewport_size({"width": 390, "height": 844})
             page.wait_for_timeout(100)
             assert page.locator("#owner-message-form").is_visible()

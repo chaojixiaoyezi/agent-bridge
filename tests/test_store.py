@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ from agent_bridge.store import (
     AuthorizationError,
     BridgeStore,
     ConflictError,
+    HISTORY_REDACTED_MESSAGE_BODY,
+    HISTORY_REDACTED_TASK_BODY,
     NicknameRateLimitError,
     NotFoundError,
     RateLimitError,
@@ -294,7 +297,7 @@ def test_operational_monitoring_persists_trends_alerts_and_recovery(
     assert unavailable["status"] == "resolved"
     assert unavailable["resolved_at"] is not None
     with store._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
         assert connection.execute(
             "SELECT COUNT(*) FROM operational_metric_samples"
         ).fetchone()[0] == 1
@@ -405,6 +408,196 @@ def test_admin_audit_ledger_is_append_only_filterable_and_admin_only(
             )
 
 
+def test_history_governance_is_manual_abandoned_only_and_append_only(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    member = register_web_identity(auth, username="history-member")
+    create_owned_room(store, auth, admin, "待清理历史群")
+    create_owned_room(store, auth, admin, "仍活跃历史群")
+    worker = register(
+        store,
+        client="codex",
+        name="历史任务执行者",
+        room="待清理历史群",
+    )
+    task_message = store.send_web_task(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="待清理历史群",
+        body_text="绝密旧任务正文",
+        target_participant_ids=[worker["participant_id"]],
+    )
+    task_id = str(task_message["task"]["task_id"])
+    store.set_room_message_marker(
+        conversation_id="待清理历史群",
+        message_id=str(task_message["message_id"]),
+        marker_kind="decision",
+        note="绝密旧决策说明",
+        requesting_web_user_id=str(admin["user_id"]),
+    )
+    active_message = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="仍活跃历史群",
+        body_text="活跃房间旧内容不可清理",
+    )
+    old_at = time.time() - 200 * 86400
+    archive_at = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET body = ?, refs_json = ?, mentions_json = ?, "
+            "created_at = ?, updated_at = ? WHERE message_id = ?",
+            (
+                "绝密旧任务正文",
+                '[{"uri":"secret://old"}]',
+                f'["{worker["participant_id"]}"]',
+                old_at,
+                old_at,
+                task_message["message_id"],
+            ),
+        )
+        connection.execute(
+            "UPDATE messages SET created_at = ?, updated_at = ? WHERE message_id = ?",
+            (old_at, old_at, active_message["message_id"]),
+        )
+        connection.execute(
+            "UPDATE room_tasks SET result_summary = ?, execution_cwd = ?, "
+            "execution_thread_id = ?, created_at = ?, updated_at = ? "
+            "WHERE task_id = ?",
+            ("绝密结果", "/private/project", "native-secret", old_at, old_at, task_id),
+        )
+        connection.execute(
+            "UPDATE rooms SET last_activity_at = ? WHERE conversation_id = ?",
+            (
+                archive_at - ROOM_ABANDON_AFTER_SECONDS - 1,
+                "待清理历史群",
+            ),
+        )
+    assert store.archive_stale_rooms(now=archive_at)["archived_conversation_ids"] == [
+        "待清理历史群"
+    ]
+
+    default_configuration = store.history_retention_configuration(
+        requesting_web_user_id=str(admin["user_id"]),
+    )
+    assert default_configuration["policy"]["mode"] == "forever"
+    assert default_configuration["eligible_message_count"] == 0
+    with pytest.raises(AuthenticationError):
+        store.export_room_history(
+            requesting_web_user_id=str(member["user_id"]),
+            conversation_id="待清理历史群",
+        )
+    exported = store.export_room_history(
+        requesting_web_user_id=str(admin["user_id"]),
+        conversation_id="待清理历史群",
+    )
+    assert exported["messages"][0]["body"] == "绝密旧任务正文"
+    assert exported["tasks"][0]["body"] == "绝密旧任务正文"
+    assert "authorized_session_id" not in str(exported)
+
+    store.update_history_retention_policy(
+        updated_by_web_user_id=str(admin["user_id"]),
+        mode="manual_redaction",
+        retention_days=90,
+    )
+    configuration = store.history_retention_configuration(
+        requesting_web_user_id=str(admin["user_id"]),
+    )
+    assert configuration["eligible_message_count"] == 1
+    assert configuration["redaction_semantics"]["deletes_rows"] is False
+    preview = store.preview_history_redaction(
+        created_by_web_user_id=str(admin["user_id"]),
+        conversation_id="待清理历史群",
+        reason="按测试保留策略清理旧正文",
+    )
+    assert preview["eligible_message_count"] == 1
+    assert preview["changes_data"] is False
+    with store._connection() as connection:
+        stored_preview = connection.execute(
+            "SELECT confirmation_hash FROM history_redaction_previews "
+            "WHERE preview_id = ?",
+            (preview["preview_id"],),
+        ).fetchone()
+        assert (
+            stored_preview["confirmation_hash"]
+            == hashlib.sha256(
+                preview["confirmation_phrase"].encode("utf-8")
+            ).hexdigest()
+        )
+        preview_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(history_redaction_previews)"
+            ).fetchall()
+        }
+        assert "confirmation_phrase" not in preview_columns
+        assert (
+            connection.execute(
+                "SELECT body FROM messages WHERE message_id = ?",
+                (task_message["message_id"],),
+            ).fetchone()["body"]
+            == "绝密旧任务正文"
+        )
+    with pytest.raises(ValidationError, match="confirmation"):
+        store.execute_history_redaction(
+            executed_by_web_user_id=str(admin["user_id"]),
+            preview_id=str(preview["preview_id"]),
+            confirmation_phrase="错误确认短语",
+        )
+
+    result = store.execute_history_redaction(
+        executed_by_web_user_id=str(admin["user_id"]),
+        preview_id=str(preview["preview_id"]),
+        confirmation_phrase=preview["confirmation_phrase"],
+    )
+    assert result["redacted_message_count"] == 1
+    assert result["rows_deleted"] is False
+    with store._connection() as connection:
+        redacted = connection.execute(
+            "SELECT body, refs_json, mentions_json FROM messages WHERE message_id = ?",
+            (task_message["message_id"],),
+        ).fetchone()
+        task = connection.execute(
+            "SELECT body, result_summary, execution_cwd, execution_thread_id "
+            "FROM room_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        active_body = connection.execute(
+            "SELECT body FROM messages WHERE message_id = ?",
+            (active_message["message_id"],),
+        ).fetchone()["body"]
+        ledger = connection.execute(
+            "SELECT * FROM history_message_redactions WHERE message_id = ?",
+            (task_message["message_id"],),
+        ).fetchone()
+    assert tuple(redacted) == (HISTORY_REDACTED_MESSAGE_BODY, "[]", "[]")
+    assert task["body"] == HISTORY_REDACTED_TASK_BODY
+    assert task["result_summary"] == HISTORY_REDACTED_TASK_BODY
+    assert task["execution_cwd"] is None
+    assert task["execution_thread_id"] is None
+    assert active_body == "活跃房间旧内容不可清理"
+    assert (
+        ledger["original_body_sha256"]
+        == hashlib.sha256("绝密旧任务正文".encode("utf-8")).hexdigest()
+    )
+    with store._transaction() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            connection.execute(
+                "UPDATE history_message_redactions SET reason = 'changed' "
+                "WHERE message_id = ?",
+                (task_message["message_id"],),
+            )
+    with store._transaction() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="APPEND_ONLY"):
+            connection.execute(
+                "DELETE FROM history_message_redactions WHERE message_id = ?",
+                (task_message["message_id"],),
+            )
+
+
 def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> None:
     database = tmp_path / "bridge.db"
     store = BridgeStore(database)
@@ -463,7 +656,7 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
@@ -502,7 +695,7 @@ def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
             "email_verified_at, pending_email, email_updated_at "
             "FROM web_users WHERE username = 'admin'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'web_email_tokens'"
@@ -1390,7 +1583,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1462,7 +1655,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1691,7 +1884,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -3028,7 +3221,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 37
+    assert version == 38
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -3100,7 +3293,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 37
+    assert version == 38
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -3196,7 +3389,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 37
+    assert version == 38
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4784,7 +4977,7 @@ def test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode(
         values = connection.execute(
             "SELECT DISTINCT tui_access_mode FROM agent_connectors"
         ).fetchall()
-    assert version == 37
+    assert version == 38
     assert [str(row[0]) for row in values] == ["unknown"]
 
 
@@ -5284,7 +5477,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 38
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -5339,7 +5532,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 37
+    assert version == 38
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -6050,7 +6243,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 38
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),
