@@ -82,7 +82,6 @@ def _report_native_tui_state(
             "tui_endpoint_id": binding.endpoint_id,
             "tui_native_session_id": binding.native_session_id,
             "state": state,
-            "access_mode": binding.access_mode,
             "capabilities": list(binding.capabilities),
             "active_task_id": active_task_id,
             "detail": detail or {},

@@ -337,10 +337,12 @@ def configure_resident_connector(
     native_binding_requested = bool(
         str(tui_endpoint_id or "").strip()
         or str(tui_native_session_id or "").strip()
-        or str(tui_access_mode or "unknown").strip().lower() != "unknown"
         or tui_transport
         or tui_capabilities
     )
+    # Retained only so old direct callers do not break. The local binding and
+    # central Bridge intentionally do not cache a permission mode.
+    del tui_access_mode
     native_binding: NativeTuiBinding | None = None
     if native_adapter is not None and (mode == "resident" or native_binding_requested):
         try:
@@ -348,7 +350,6 @@ def configure_resident_connector(
                 adapter_kind=native_adapter,
                 endpoint_id=str(tui_endpoint_id or ""),
                 native_session_id=str(tui_native_session_id or ""),
-                access_mode=tui_access_mode,
                 capabilities=tui_capabilities,
                 transport=tui_transport,
             )
@@ -566,7 +567,6 @@ def configure_resident_connector(
             "AGENT_BRIDGE_TUI_ADAPTER": native_binding.adapter_kind,
             "AGENT_BRIDGE_TUI_ENDPOINT_ID": native_binding.endpoint_id,
             "AGENT_BRIDGE_TUI_NATIVE_SESSION_ID": native_binding.native_session_id,
-            "AGENT_BRIDGE_TUI_ACCESS_MODE": native_binding.access_mode,
         }
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-supervisor"),

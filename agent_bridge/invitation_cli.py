@@ -76,7 +76,6 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
                 adapter_kind=getattr(args, "tui_adapter", ""),
                 endpoint_id=getattr(args, "tui_endpoint_id", ""),
                 native_session_id=getattr(args, "tui_session_id", ""),
-                access_mode=getattr(args, "tui_access_mode", "full"),
                 capabilities=getattr(args, "tui_capability", []),
                 transport=tui_transport,
             )
@@ -102,7 +101,6 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             {
                 "tui_endpoint_id": tui_binding.endpoint_id,
                 "tui_native_session_id": tui_binding.native_session_id,
-                "tui_access_mode": tui_binding.access_mode,
                 "tui_confirmed": bool(getattr(args, "confirm_tui_binding", False)),
             }
         )
@@ -128,7 +126,6 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             tui_native_session_id=(
                 tui_binding.native_session_id if tui_binding else None
             ),
-            tui_access_mode=(tui_binding.access_mode if tui_binding else "unknown"),
             tui_capabilities=(list(tui_binding.capabilities) if tui_binding else None),
             tui_transport=(tui_binding.transport if tui_binding else None),
             roles=list(accepted.get("roles") or []),
@@ -195,7 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tui-adapter", default="")
     parser.add_argument("--tui-endpoint-id", default="")
     parser.add_argument("--tui-session-id", default="")
-    parser.add_argument("--tui-access-mode", default="full")
+    parser.add_argument(
+        "--tui-access-mode",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--tui-capability", action="append", default=[])
     parser.add_argument("--tui-transport-json", default="")
     parser.add_argument("--confirm-tui-binding", action="store_true")

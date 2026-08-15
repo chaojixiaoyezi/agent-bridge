@@ -1732,7 +1732,6 @@ class ViewerRepository:
                     connector.tui_endpoint_id,
                     connector.tui_native_session_id,
                     connector.tui_state,
-                    connector.tui_access_mode,
                     connector.tui_last_seen_at,
                     connector.tui_active_task_id,
                     CASE
@@ -1945,7 +1944,6 @@ class ViewerRepository:
                         )
                         else str(row["tui_state"] or "unbound")
                     ),
-                    "access_mode": str(row["tui_access_mode"] or "unknown"),
                     "last_seen_at": (
                         float(row["tui_last_seen_at"])
                         if row["tui_last_seen_at"] is not None

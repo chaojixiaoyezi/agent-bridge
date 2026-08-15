@@ -245,7 +245,6 @@ def test_native_tui_task_worker_executes_in_bound_session(
         adapter_kind="opencode",
         endpoint_id="tui-opencode-task",
         native_session_id="native-session-task",
-        access_mode="full",
         transport={
             "kind": "opencode-http",
             "base_url": "http://127.0.0.1:9201",
@@ -333,4 +332,9 @@ def test_native_tui_task_worker_executes_in_bound_session(
     assert any(
         path == "/agent/send" and payload["body"] == "真实 TUI 已完成。"
         for path, payload in sent
+    )
+    assert all(
+        "access_mode" not in payload
+        for path, payload in sent
+        if path == "/agent/connector/tui-state"
     )

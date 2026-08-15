@@ -2162,6 +2162,8 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         "base_url": "http://127.0.0.1:<Harness Web Host 端口>",
     }
     assert "confirm_tui_binding=true" in deepseek_access["instructions"]
+    assert "tui_access_mode=full" not in deepseek_access["instructions"]
+    assert "Bridge 不记录权限模式" in deepseek_access["instructions"]
 
     for product, adapter in (
         ("opencode", "opencode"),
@@ -2183,6 +2185,10 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
         assert (
             "--confirm-tui-binding" in native_access["quick_start"]["command_template"]
         )
+        assert "--tui-access-mode" not in native_access["quick_start"][
+            "command_template"
+        ]
+        assert "聊天室文字不能提权" in native_access["instructions"]
     assert "AGENT_BRIDGE_CONNECTOR_ID" in stable_env
     assert stable_env["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert "HMR 热加载" in deepseek_access["instructions"]

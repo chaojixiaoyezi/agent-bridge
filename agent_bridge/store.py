@@ -104,7 +104,6 @@ TUI_STATES = {
     "offline",
     "error",
 }
-TUI_ACCESS_MODES = {"unknown", "standard", "full"}
 INVITATION_STATUSES = {"active", "exhausted", "revoked", "expired"}
 CONNECTOR_SETUP_STATUSES = {
     "awaiting_setup",
@@ -1017,7 +1016,6 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     tui_endpoint_id TEXT,
     tui_native_session_id TEXT,
     tui_state TEXT NOT NULL DEFAULT 'unbound',
-    tui_access_mode TEXT NOT NULL DEFAULT 'unknown',
     tui_capabilities_json TEXT NOT NULL DEFAULT '[]',
     tui_last_seen_at REAL,
     tui_active_task_id TEXT,
@@ -1720,7 +1718,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 34")
+            conn.execute("PRAGMA user_version = 35")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -2288,11 +2286,11 @@ class BridgeStore:
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(agent_connectors)").fetchall()
         }
+        legacy_access_mode = "tui_access_mode" in connector_columns
         additions = {
             "tui_endpoint_id": "TEXT",
             "tui_native_session_id": "TEXT",
             "tui_state": "TEXT NOT NULL DEFAULT 'unbound'",
-            "tui_access_mode": "TEXT NOT NULL DEFAULT 'unknown'",
             "tui_capabilities_json": "TEXT NOT NULL DEFAULT '[]'",
             "tui_last_seen_at": "REAL",
             "tui_active_task_id": "TEXT",
@@ -2303,6 +2301,16 @@ class BridgeStore:
                 conn.execute(
                     f"ALTER TABLE agent_connectors ADD COLUMN {name} {declaration}"
                 )
+        if legacy_access_mode:
+            # v35 deliberately stops persisting a guessed TUI permission mode.
+            # Keep the legacy column in upgraded SQLite databases so the
+            # migration remains additive, but erase its stale value. The
+            # bound local runtime is the only permission authority for every
+            # turn and may change independently at any time.
+            conn.execute(
+                "UPDATE agent_connectors SET tui_access_mode = 'unknown' "
+                "WHERE tui_access_mode IS NULL OR tui_access_mode <> 'unknown'"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_connectors_tui_endpoint "
             "ON agent_connectors(tui_endpoint_id, revoked_at, tui_last_seen_at DESC)"
@@ -5156,10 +5164,10 @@ class BridgeStore:
                      setup_status, setup_updated_at, binding_version,
                      requested_username, bound_client_type,
                      bound_roles_json, bound_capabilities_json,
-                     tui_endpoint_id, tui_state, tui_access_mode,
+                     tui_endpoint_id, tui_state,
                      created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, 'awaiting_setup', ?, 2,
-                        ?, ?, ?, ?, ?, 'awaiting_confirmation', ?, ?, ?)
+                        ?, ?, ?, ?, ?, 'awaiting_confirmation', ?, ?)
                 """,
                 (
                     connector_id,
@@ -5175,7 +5183,6 @@ class BridgeStore:
                     compact_json(roles),
                     compact_json(capabilities),
                     template["tui_endpoint_id"],
-                    str(template["tui_access_mode"] or "unknown"),
                     now,
                     now,
                 ),
@@ -5564,7 +5571,6 @@ class BridgeStore:
                     else None
                 ),
                 "state": str(row["tui_state"] or "unbound"),
-                "access_mode": str(row["tui_access_mode"] or "unknown"),
                 "capabilities": json.loads(str(row["tui_capabilities_json"] or "[]")),
                 "last_seen_at": (
                     float(row["tui_last_seen_at"])
@@ -6023,6 +6029,9 @@ class BridgeStore:
         tui_access_mode: str = "unknown",
         tui_confirmed: bool = False,
     ) -> dict[str, Any]:
+        # Compatibility-only input from pre-v35 connectors. Bridge must never
+        # store or interpret the local TUI's mutable permission mode.
+        del tui_access_mode
         normalized_invitation_token = opaque_id(
             invitation_token,
             field="invitation_token",
@@ -6040,9 +6049,6 @@ class BridgeStore:
             if str(tui_native_session_id or "").strip()
             else None
         )
-        normalized_tui_access = str(tui_access_mode or "unknown").strip().lower()
-        if normalized_tui_access not in TUI_ACCESS_MODES:
-            raise ValidationError("unsupported TUI access mode")
         if not isinstance(tui_confirmed, bool):
             raise ValidationError("tui_confirmed must be a boolean")
         if isinstance(connector_binding_version, bool):
@@ -6100,7 +6106,6 @@ class BridgeStore:
                 tui_confirmed
                 or normalized_tui_endpoint is not None
                 or normalized_tui_session is not None
-                or normalized_tui_access != "unknown"
             )
             if not native_tui_invitation and tui_binding_supplied:
                 raise ConflictError(
@@ -6116,15 +6121,6 @@ class BridgeStore:
                     "native-TUI bindings require explicit TUI "
                     "confirmation, endpoint identity, and native session identity"
                 )
-            if (
-                native_tui_invitation
-                and native_tui_binding_expected
-                and normalized_tui_access != "full"
-            ):
-                raise ConflictError(
-                    "this native-TUI connector currently requires the local TUI "
-                    "to already be in full-access mode"
-                )
             endpoint_owner = None
             duplicate_session = None
             if normalized_tui_endpoint is not None:
@@ -6132,7 +6128,6 @@ class BridgeStore:
                     """
                     SELECT connector.accepted_participant_id,
                            connector.bound_client_type,
-                           connector.tui_access_mode,
                            invitation.product
                     FROM agent_connectors AS connector
                     JOIN agent_invitations AS invitation
@@ -6390,10 +6385,10 @@ class BridgeStore:
                          requested_username, bound_client_type,
                          bound_roles_json, bound_capabilities_json,
                          tui_endpoint_id, tui_native_session_id,
-                         tui_state, tui_access_mode, tui_last_seen_at,
+                         tui_state, tui_last_seen_at,
                          created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?)
+                            ?, ?, ?, ?)
                     """,
                     (
                         connector_id,
@@ -6421,7 +6416,6 @@ class BridgeStore:
                                 else "unbound"
                             )
                         ),
-                        normalized_tui_access,
                         None,
                         now,
                         now,
@@ -6482,7 +6476,6 @@ class BridgeStore:
                 ),
                 "tui_endpoint_id": normalized_tui_endpoint,
                 "tui_native_session_id": normalized_tui_session,
-                "tui_access_mode": normalized_tui_access,
             }
         )
         return registered
@@ -6941,7 +6934,7 @@ class BridgeStore:
         tui_endpoint_id: str,
         tui_native_session_id: str,
         state: str,
-        access_mode: str,
+        access_mode: object = None,
         capabilities: Sequence[str] | None = None,
         active_task_id: str | None = None,
         detail: object = None,
@@ -6962,9 +6955,9 @@ class BridgeStore:
         normalized_state = str(state or "").strip().lower()
         if normalized_state not in TUI_STATES - {"unbound", "awaiting_confirmation"}:
             raise ValidationError("unsupported native TUI state")
-        normalized_access = str(access_mode or "").strip().lower()
-        if normalized_access not in TUI_ACCESS_MODES:
-            raise ValidationError("unsupported TUI access mode")
+        # Accepted only so already-running pre-v35 workers continue reporting
+        # during a rolling upgrade. The value is intentionally discarded.
+        del access_mode
         normalized_capabilities = string_tokens(
             capabilities,
             field="tui_capabilities",
@@ -7004,15 +6997,13 @@ class BridgeStore:
             conn.execute(
                 """
                 UPDATE agent_connectors
-                SET tui_state = ?, tui_access_mode = ?,
-                    tui_capabilities_json = ?, tui_last_seen_at = ?,
+                SET tui_state = ?, tui_capabilities_json = ?, tui_last_seen_at = ?,
                     tui_active_task_id = ?, tui_detail_json = ?,
                     connector_last_seen_at = ?, updated_at = ?
                 WHERE connector_id = ?
                 """,
                 (
                     normalized_state,
-                    normalized_access,
                     compact_json(normalized_capabilities),
                     now,
                     task_id,
@@ -7597,7 +7588,6 @@ class BridgeStore:
                         ),
                         "state": native_state,
                         "effective_state": effective_native_state,
-                        "access_mode": str(row["tui_access_mode"] or "unknown"),
                         "last_seen_at": native_last_seen,
                         "last_seen_age_seconds": (
                             max(0.0, now - native_last_seen)

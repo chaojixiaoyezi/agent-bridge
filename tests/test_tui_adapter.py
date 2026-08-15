@@ -13,6 +13,7 @@ from agent_bridge.tui_adapter import (
     NativeTuiClient,
     NativeTuiError,
     endpoint_turn_lock,
+    load_native_tui_binding,
     validate_native_tui_binding,
 )
 
@@ -28,7 +29,6 @@ def binding(
         adapter_kind=adapter,
         endpoint_id=f"endpoint-{adapter}",
         native_session_id=session,
-        access_mode="full",
         capabilities=["steer", "multi-room"],
         transport=transport,
     )
@@ -62,7 +62,7 @@ def binding(
         ),
     ],
 )
-def test_native_tui_http_bindings_are_loopback_and_full_access_only(
+def test_native_tui_http_bindings_are_loopback_and_do_not_store_permissions(
     tmp_path: Path,
     adapter: str,
     transport: dict,
@@ -70,16 +70,46 @@ def test_native_tui_http_bindings_are_loopback_and_full_access_only(
 ) -> None:
     configured = binding(tmp_path, adapter, transport)
     assert configured.transport["kind"] == expected_kind
-    assert configured.access_mode == "full"
+    assert configured.payload()["schema_version"] == 2
+    assert "access_mode" not in configured.payload()
 
-    with pytest.raises(NativeTuiError, match="full-access"):
-        validate_native_tui_binding(
-            adapter_kind=adapter,
-            endpoint_id="endpoint-standard",
-            native_session_id="session-standard",
-            access_mode="standard",
-            transport=transport,
-        )
+    compatibility = validate_native_tui_binding(
+        adapter_kind=adapter,
+        endpoint_id="endpoint-standard",
+        native_session_id="session-standard",
+        access_mode="read-only-today",
+        transport=transport,
+    )
+    assert "access_mode" not in compatibility.payload()
+
+
+def test_native_tui_v1_binding_loads_without_republishing_stale_access_mode(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "tui-binding.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "adapter_kind": "opencode",
+                "endpoint_id": "legacy-endpoint",
+                "native_session_id": "legacy-session",
+                "access_mode": "full",
+                "capabilities": ["steer"],
+                "transport": {
+                    "kind": "opencode-http",
+                    "base_url": "http://127.0.0.1:9201",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_native_tui_binding(path)
+
+    assert loaded.endpoint_id == "legacy-endpoint"
+    assert loaded.payload()["schema_version"] == 2
+    assert "access_mode" not in loaded.payload()
 
 
 def test_native_tui_rejects_remote_prompt_endpoints() -> None:

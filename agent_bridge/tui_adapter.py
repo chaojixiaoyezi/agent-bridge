@@ -64,17 +64,15 @@ class NativeTuiBinding:
     adapter_kind: str
     endpoint_id: str
     native_session_id: str
-    access_mode: str
     capabilities: tuple[str, ...]
     transport: dict[str, Any]
 
     def payload(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "adapter_kind": self.adapter_kind,
             "endpoint_id": self.endpoint_id,
             "native_session_id": self.native_session_id,
-            "access_mode": self.access_mode,
             "capabilities": list(self.capabilities),
             "transport": self.transport,
         }
@@ -125,8 +123,8 @@ def validate_native_tui_binding(
     adapter_kind: str,
     endpoint_id: str,
     native_session_id: str,
-    access_mode: str,
-    transport: dict[str, Any] | None,
+    access_mode: object = None,
+    transport: dict[str, Any] | None = None,
     capabilities: list[str] | tuple[str, ...] | None = None,
 ) -> NativeTuiBinding:
     adapter = str(adapter_kind or "").strip().lower()
@@ -137,11 +135,10 @@ def validate_native_tui_binding(
         native_session_id,
         field="tui_native_session_id",
     )
-    access = str(access_mode or "").strip().lower()
-    if access != "full":
-        raise NativeTuiError(
-            "native resident execution requires the TUI to already be in full-access mode"
-        )
+    # Kept as an ignored compatibility argument for v1 callers. Permissions
+    # belong to the live TUI runtime and can change between turns; persisting a
+    # claimed mode here would be stale and could never grant real authority.
+    del access_mode
     raw_transport = dict(transport or {})
     kind = str(raw_transport.get("kind") or adapter).strip().lower()
     normalized: dict[str, Any]
@@ -261,7 +258,6 @@ def validate_native_tui_binding(
         adapter_kind=adapter,
         endpoint_id=endpoint,
         native_session_id=native_session,
-        access_mode=access,
         capabilities=capability_values,
         transport=normalized,
     )
@@ -272,13 +268,13 @@ def load_native_tui_binding(path: Path) -> NativeTuiBinding:
         raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise NativeTuiError("native TUI binding file is unreadable") from exc
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+    if not isinstance(raw, dict) or raw.get("schema_version") not in {1, 2}:
         raise NativeTuiError("native TUI binding schema is unsupported")
     return validate_native_tui_binding(
         adapter_kind=str(raw.get("adapter_kind") or ""),
         endpoint_id=str(raw.get("endpoint_id") or ""),
         native_session_id=str(raw.get("native_session_id") or ""),
-        access_mode=str(raw.get("access_mode") or ""),
+        access_mode=raw.get("access_mode"),
         capabilities=raw.get("capabilities")
         if isinstance(raw.get("capabilities"), list)
         else [],
@@ -1411,7 +1407,8 @@ class NativeTuiClient:
                 own_started or event_prompt_id == prompt_id
             ):
                 raise NativeTuiError(
-                    "Qwen Code requested approval; the bound TUI is no longer in full-access mode"
+                    "Qwen Code requested local approval; complete it in the bound "
+                    "TUI or adjust that TUI's local permissions"
                 )
             if event_type == "turn_error" and event_prompt_id == prompt_id:
                 raise NativeTuiError(

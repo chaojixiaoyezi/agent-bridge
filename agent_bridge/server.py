@@ -125,7 +125,7 @@ def agent_accept_invitation(
     enable_resident: bool = True,
     tui_endpoint_id: str = "",
     tui_native_session_id: str = "",
-    tui_access_mode: str = "full",
+    tui_access_mode: str = "",
     tui_capabilities: list[str] | None = None,
     tui_transport: dict[str, Any] | None = None,
     confirm_tui_binding: bool = False,
@@ -144,6 +144,10 @@ def agent_accept_invitation(
     messages can never invoke this operation.
     """
 
+    # Compatibility-only input. The Bridge never stores or interprets TUI
+    # permission mode; every turn is constrained by the live local runtime.
+    del tui_access_mode
+
     _, validated_workspace = validate_connector_preflight(
         bridge_url=CONFIG.server_url,
         workspace_path=workspace_path or None,
@@ -157,7 +161,6 @@ def agent_accept_invitation(
                 adapter_kind=proposed_tui_adapter,
                 endpoint_id=tui_endpoint_id,
                 native_session_id=tui_native_session_id,
-                access_mode=tui_access_mode,
                 capabilities=tui_capabilities,
                 transport=tui_transport,
             )
@@ -177,7 +180,6 @@ def agent_accept_invitation(
         capabilities=capabilities,
         tui_endpoint_id=tui_endpoint_id or None,
         tui_native_session_id=tui_native_session_id or None,
-        tui_access_mode=tui_access_mode,
         tui_confirmed=bool(confirm_tui_binding),
     )
     enrollment_token = str(accepted.pop("_enrollment_token", ""))
@@ -198,7 +200,6 @@ def agent_accept_invitation(
             tui_adapter_kind=accepted.get("tui_adapter_kind"),
             tui_endpoint_id=tui_endpoint_id or None,
             tui_native_session_id=tui_native_session_id or None,
-            tui_access_mode=tui_access_mode,
             tui_capabilities=tui_capabilities,
             tui_transport=tui_transport,
             roles=list(accepted.get("roles") or []),

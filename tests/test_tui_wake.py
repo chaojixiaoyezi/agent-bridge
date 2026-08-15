@@ -37,7 +37,7 @@ class FakeBridgeClient:
     def __init__(self, messages: list[dict[str, Any]]) -> None:
         self.pending = {str(item["message_id"]): item for item in messages}
         self.replies: list[dict[str, Any]] = []
-        self.states: list[str] = []
+        self.states: list[dict[str, Any]] = []
         self.wait_payloads: list[dict[str, Any]] = []
 
     def post(
@@ -61,7 +61,7 @@ class FakeBridgeClient:
             self.pending.pop(str(payload["message_id"]), None)
             return {"ok": True}
         if path == "/agent/connector/tui-state":
-            self.states.append(str(payload["state"]))
+            self.states.append(dict(payload))
             return {"connector": payload}
         raise AssertionError(path)
 
@@ -75,7 +75,6 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
         adapter_kind="opencode",
         endpoint_id="endpoint-opencode",
         native_session_id="session-room-one",
-        access_mode="full",
         transport={
             "kind": "opencode-http",
             "base_url": "http://127.0.0.1:9201",
@@ -114,7 +113,8 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
     assert bridge.pending == {}
     assert '"message_id":"msg-2"' not in prompts[0]
     assert '"message_id":"msg-3"' in prompts[0]
-    assert bridge.states == ["busy", "online"]
+    assert [item["state"] for item in bridge.states] == ["busy", "online"]
+    assert all("access_mode" not in item for item in bridge.states)
 
 
 def test_native_wake_bounds_only_an_explicit_reconnect_backlog(
@@ -126,7 +126,6 @@ def test_native_wake_bounds_only_an_explicit_reconnect_backlog(
         adapter_kind="opencode",
         endpoint_id="endpoint-opencode",
         native_session_id="session-room-one",
-        access_mode="full",
         transport={
             "kind": "opencode-http",
             "base_url": "http://127.0.0.1:9201",
@@ -180,7 +179,6 @@ def test_native_wake_preserves_required_message_when_tui_is_silent(
         adapter_kind="opencode",
         endpoint_id="endpoint-opencode",
         native_session_id="session-room-one",
-        access_mode="full",
         transport={
             "kind": "opencode-http",
             "base_url": "http://127.0.0.1:9201",
@@ -211,4 +209,5 @@ def test_native_wake_preserves_required_message_when_tui_is_silent(
 
     assert set(bridge.pending) == {"msg-1"}
     assert bridge.replies == []
-    assert bridge.states == ["busy", "error"]
+    assert [item["state"] for item in bridge.states] == ["busy", "error"]
+    assert all("access_mode" not in item for item in bridge.states)

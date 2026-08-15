@@ -284,7 +284,7 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
@@ -323,7 +323,7 @@ def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
             "email_verified_at, pending_email, email_updated_at "
             "FROM web_users WHERE username = 'admin'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'web_email_tokens'"
@@ -1211,7 +1211,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1283,7 +1283,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1512,7 +1512,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -2849,7 +2849,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 34
+    assert version == 35
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2921,7 +2921,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 34
+    assert version == 35
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -3017,7 +3017,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 34
+    assert version == 35
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4383,7 +4383,6 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
         signature="真实 TUI 本体。",
         tui_endpoint_id="tui-opencode-stable-one",
         tui_native_session_id="session-native-room-a",
-        tui_access_mode="full",
         tui_confirmed=True,
         enrollment_token=first_enrollment,
     )
@@ -4394,7 +4393,7 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
         signature="真实 TUI 本体。",
         tui_endpoint_id="tui-opencode-stable-one",
         tui_native_session_id="session-native-room-a",
-        tui_access_mode="full",
+        tui_access_mode="read-only-today-is-ignored",
         tui_confirmed=True,
         enrollment_token=first_enrollment,
     )
@@ -4407,7 +4406,6 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
             signature="不能创建重复绑定。",
             tui_endpoint_id="tui-opencode-stable-one",
             tui_native_session_id="session-native-room-a",
-            tui_access_mode="full",
             tui_confirmed=True,
             enrollment_token="enroll_" + "b" * 64,
         )
@@ -4419,14 +4417,21 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
         signature="同一个真实 TUI 本体。",
         tui_endpoint_id="tui-opencode-stable-one",
         tui_native_session_id="session-native-room-b",
-        tui_access_mode="full",
         tui_confirmed=True,
     )
 
     assert second["participant_id"] == first["participant_id"]
     assert second["username"] == first["username"]
     assert second["connector_id"] != first["connector_id"]
+    assert "tui_access_mode" not in first
+    assert "tui_access_mode" not in second
     with store._connection() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(agent_connectors)"
+            ).fetchall()
+        }
         bindings = connection.execute(
             "SELECT conversation_id, tui_native_session_id, tui_state, "
             "tui_last_seen_at "
@@ -4434,6 +4439,7 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
             "ORDER BY conversation_id",
             ("tui-opencode-stable-one",),
         ).fetchall()
+    assert "tui_access_mode" not in columns
     assert [tuple(row) for row in bindings] == [
         ("native-room-a", "session-native-room-a", "offline", None),
         ("native-room-b", "session-native-room-b", "offline", None),
@@ -4446,13 +4452,14 @@ def test_native_tui_endpoint_reuses_identity_across_rooms_and_isolates_sessions(
         tui_endpoint_id="tui-opencode-stable-one",
         tui_native_session_id="session-native-room-a",
         state="busy",
-        access_mode="full",
+        access_mode="full-yesterday-read-only-today",
         capabilities=["steer", "multi-room"],
         active_task_id="task-native-one",
     )
     assert state["tui"]["state"] == "busy"
     assert state["tui"]["room_binding_count"] == 2
     assert state["tui"]["active_task_id"] == "task-native-one"
+    assert "access_mode" not in state["tui"]
 
 
 def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
@@ -4484,7 +4491,6 @@ def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
         signature="已经确认。",
         tui_endpoint_id="tui-hermes-stable",
         tui_native_session_id="hermes-session-one",
-        tui_access_mode="full",
         tui_confirmed=True,
     )
     second_invitation = store.create_agent_invitation(
@@ -4503,7 +4509,6 @@ def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
             signature="错误复用 session。",
             tui_endpoint_id="tui-hermes-stable",
             tui_native_session_id="hermes-session-one",
-            tui_access_mode="full",
             tui_confirmed=True,
         )
     with pytest.raises(AuthenticationError, match="binding does not match"):
@@ -4514,7 +4519,6 @@ def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
             tui_endpoint_id="tui-hermes-stable",
             tui_native_session_id="another-session",
             state="online",
-            access_mode="full",
         )
 
     ordinary = store.create_agent_invitation(
@@ -4532,7 +4536,6 @@ def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
             signature="不能伪装原生绑定。",
             tui_endpoint_id="fake-native-endpoint",
             tui_native_session_id="fake-native-session",
-            tui_access_mode="full",
             tui_confirmed=True,
         )
 
@@ -4562,6 +4565,48 @@ def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
             tui_endpoint_id="partial-endpoint",
             enrollment_token="enroll_" + "p" * 64,
         )
+
+
+def test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-tui-permission.db"
+    store = BridgeStore(database)
+    admin_id = admin_web_user_id(store)
+    store.create_user_room("legacy-tui-permission-room")
+    invitation = store.create_agent_invitation(
+        conversation_id="legacy-tui-permission-room",
+        product="codex",
+        requested_mode="basic",
+        adapter_kind="codex",
+        created_by_web_user_id=admin_id,
+    )
+    store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="codex",
+        username="legacy-permission-agent",
+        signature="旧数据库权限字段迁移。",
+    )
+    with store._connection() as connection:
+        connection.execute(
+            "ALTER TABLE agent_connectors ADD COLUMN "
+            "tui_access_mode TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET tui_access_mode = 'full'"
+        )
+        connection.execute("PRAGMA user_version = 34")
+        connection.commit()
+
+    migrated = BridgeStore(database)
+
+    with migrated._connection() as connection:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        values = connection.execute(
+            "SELECT DISTINCT tui_access_mode FROM agent_connectors"
+        ).fetchall()
+    assert version == 35
+    assert [str(row[0]) for row in values] == ["unknown"]
 
 
 def test_reusable_invitation_isolates_same_requested_username_and_reconnects(
@@ -5060,7 +5105,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 35
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -5115,7 +5160,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 34
+    assert version == 35
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5826,7 +5871,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 34
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 35
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

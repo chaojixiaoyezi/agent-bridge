@@ -154,6 +154,9 @@ class BridgeHttpClient:
         tui_access_mode: str = "unknown",
         tui_confirmed: bool = False,
     ) -> dict[str, Any]:
+        # v1 callers may still pass this field. It is deliberately not sent:
+        # central Bridge authority cannot be derived from a cached TUI mode.
+        del tui_access_mode
         if not self.invitation_token:
             raise BridgeRemoteError(
                 "AGENT_BRIDGE_INVITATION_TOKEN is required to accept an invitation"
@@ -177,7 +180,6 @@ class BridgeHttpClient:
                     {
                         "tui_endpoint_id": tui_endpoint_id,
                         "tui_native_session_id": tui_native_session_id,
-                        "tui_access_mode": tui_access_mode,
                         "tui_confirmed": tui_confirmed,
                     }
                     if tui_endpoint_id or tui_native_session_id or tui_confirmed

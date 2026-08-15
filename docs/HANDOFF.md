@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.31.0 / schema 34。
+当前协议/数据库版本：Agent Bridge v0.32.0 / schema 35。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -14,7 +14,7 @@
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
 8. Web 房间默认私有：全局管理员看全部房间，普通 Web 用户只看自己创建或被明确加入的房间。所有读取、搜索、回执、成员、策略、任务和发送入口都必须在服务端复核 `room_web_members`/`room_web_owners`，不能依赖侧栏隐藏；移出 Web 用户不得改动 Agent 成员、Agent session 或历史消息。普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2）。创建者是房间所有者，可重命名、管理本房 Web 成员和 Agent、调整唤醒、邀请 Agent、使用 `@全员` 并委派聊天室管理员；受委派管理员可做日常成员/Agent/唤醒治理，但不能管理同级、重命名或自动获得任务权限。跨房迁移、全局 Agent session、注册码、昵称审批和频率策略仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
-9. 房间创建者始终拥有任务治理权，可允许全局管理员在该房间布置任务，并分别授予房间 Web 用户布置/取消权。任务接入工作目录只是起点，本机产品沙箱、审批和操作系统权限才是最终边界；聊天室权限永远不能提升本机权限。
+9. 房间创建者始终拥有任务治理权，可允许全局管理员在该房间布置任务，并分别授予房间 Web 用户布置/取消权。任务接入工作目录只是起点，本机产品沙箱、审批和操作系统权限才是最终边界；聊天室权限永远不能提升本机权限。Bridge 不保存或推断 `full-access`/`read-only`，每次回合都交给当前绑定 TUI 按它当时的真实权限裁决；本机需要审批时只能回到本机 TUI 处理，聊天室不提供远程审批。
 10. 同一公开 Agent 身份的消息必须携带权威席位来源：`main` 是邀请所在 TUI/MCP 本体，`executor` 是持久本体执行席，`shadow` 只作无本机实施权的讨论兜底。个人本体请求一旦成功路由，不得再让影子抢答；影子也不得声称任务已落实、进度、cwd、权限或测试结论。
 
 新客户端应显式传 `mentions=[participant_id]`。为兼容会在正文写 `@名字` 却遗漏结构化参数的旧 Agent，中央发送边界会把正文开头、句中或句尾唯一匹配当前房间成员的 `@display_name` 或 `@client_type` 规范化为 mention；歧义名称和较长名字的前缀保持普通正文，不猜测目标。
@@ -65,7 +65,7 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 
 Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP、私有文件 relay 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，各 worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
 
-管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。七类内置产品可自动值守，自定义产品及 `basic` 模式只生成私有状态。原生 TUI 邀请还必须显式提交 Full Access、稳定 endpoint、该房间独占的 native session 与 loopback/file transport；Bridge 只确认这些现有边界，不能替产品提权。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
+管理员 Web 页面签发的接入邀请是结构化的一次性权限，不是聊天室消息。Agent 明确调用 `agent_accept_invitation` 后，服务端把邀请换成限定产品、稳定身份和聊天室的 enrollment；本机 installer 才会写当前用户级服务。七类内置产品可自动值守，自定义产品及 `basic` 模式只生成私有状态。原生 TUI 邀请只需显式提交稳定 endpoint、该房间独占的 native session 与 loopback/file transport；权限不属于绑定数据，Bridge 不保存、缓存或解释权限标签。邀请撤销会同时拒绝 enrollment 并撤销所有关联 session。接受请求由客户端预生成高强度 enrollment，因此响应丢失时，同一身份和凭证可以安全幂等重试，但不能换身份复用。
 
 跨机器时，每台机器各自运行 listener、队列和 adapter，并只需向中央 Bridge 发起出站 TLS/VPN 连接。中央服务不需要反向连接远端机器。远端暂时离线时，中央投递账保留消息；远端 listener 已收到但 Agent 暂不可用时，本机队列保留事件。
 
@@ -212,7 +212,7 @@ launchctl print gui/$(id -u)/com.example.agent-bridge-supervisor
 6. 聊天室出现引用该 @ 的真实回复；
 7. 重启 listener/worker 后没有丢消息，队列没有永久 `inflight`。
 8. 新邀请只在接受后创建 connector，页面能区分 session 有效、resident 在线、resident 离线和手动适配；撤销后旧 enrollment 返回 401。
-9. 原生 TUI 邀请在未确认、非 Full Access、endpoint 跨产品复用或房间复用同一 native session 时失败；合法多房间绑定复用 participant 且 session 各自隔离。
+9. 原生 TUI 邀请在未确认、endpoint 跨产品复用或房间复用同一 native session 时失败；合法多房间绑定复用 participant 且 session 各自隔离。绑定文件、服务环境、中央 API 和新数据库都不保存权限模式；旧客户端仍可携带旧字段但其值被忽略。
 10. 关闭一个真实 TUI endpoint 后 75 秒内页面显示离线，中央 listener 和未确认投递仍保留；恢复同一 endpoint/session 后无需访问中央数据库即可继续消费。
 
 ## 7. 快速诊断

@@ -281,7 +281,7 @@ def test_opencode_native_tui_connector_installs_shared_endpoint_workers(
         tui_adapter_kind="opencode",
         tui_endpoint_id="tui-opencode-stable",
         tui_native_session_id="opencode-room-session",
-        tui_access_mode="full",
+        tui_access_mode="read-only-at-install-time",
         tui_capabilities=["steer", "multi-room"],
         tui_transport={
             "kind": "opencode-http",
@@ -303,6 +303,8 @@ def test_opencode_native_tui_connector_installs_shared_endpoint_workers(
     )
     assert binding["endpoint_id"] == "tui-opencode-stable"
     assert binding["native_session_id"] == "opencode-room-session"
+    assert binding["schema_version"] == 2
+    assert "access_mode" not in binding
     launch_agents = tmp_path / "Library" / "LaunchAgents"
     worker = plistlib.loads(
         (launch_agents / f"{result.worker_service}.plist").read_bytes()
@@ -313,6 +315,8 @@ def test_opencode_native_tui_connector_installs_shared_endpoint_workers(
     assert task["EnvironmentVariables"]["AGENT_BRIDGE_TUI_ENDPOINT_ID"] == (
         "tui-opencode-stable"
     )
+    assert "AGENT_BRIDGE_TUI_ACCESS_MODE" not in task["EnvironmentVariables"]
+    assert "AGENT_BRIDGE_TUI_ACCESS_MODE" not in worker["EnvironmentVariables"]
     assert (
         task["EnvironmentVariables"]["AGENT_BRIDGE_TUI_LOCK_FILE"]
         == (worker["EnvironmentVariables"]["AGENT_BRIDGE_TUI_LOCK_FILE"])
@@ -368,7 +372,7 @@ def test_pi_native_tui_connector_installs_private_extension(
         tui_adapter_kind="pi",
         tui_endpoint_id="tui-pi-stable",
         tui_native_session_id="pi-room-session",
-        tui_access_mode="full",
+        tui_access_mode="legacy-ignored-value",
         tui_transport={
             "kind": "pi-extension",
             "command_file": str(relay_directory / "commands.jsonl"),
@@ -393,6 +397,8 @@ def test_pi_native_tui_connector_installs_private_extension(
     binding = json.loads(
         (Path(result.state_directory) / "tui-binding.json").read_text(encoding="utf-8")
     )
+    assert binding["schema_version"] == 2
+    assert "access_mode" not in binding
     assert binding["transport"]["session_file"] == str(session_file)
 
 

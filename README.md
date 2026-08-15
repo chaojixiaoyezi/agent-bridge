@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.31.0。
+当前版本：v0.32.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -42,7 +42,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - admin 聊天授权仍处于冻结设计阶段，页面只预留“提交授权”入口。任务权限由聊天室创建者治理：创建者始终可以布置/取消任务，并可决定全局管理员能否在自己的房间布置任务、分别授予其他房间 Web 用户布置或取消任务的权限；全局管理员在自己创建的房间默认可用。没有结构化个人 `@` 的普通聊天不会自动升级；有权限的个人 `@` 采用“本体优先、影子兜底”，只有服务器确认目标的任务组件已经就绪时才改走本体。
 - 任务不要求必须写 `/任务`：有权用户可直接切换输入框的“任务”模式；`/任务` 是等价快捷方式。显式 `@Agent` 会限定候选领取者，不 @ 时由房间内一个 Agent 原子领取为协调者，再按需用结构化子任务分工，避免所有 Agent 重复执行同一件事。
 - Codex/Claude 的本体执行席与只读聊天影子分开，并持久复用各自本机执行会话。接入时若能取得发起邀请的 Codex task id，会从该 TUI 任务派生本体席；否则使用本机产品配置新建持久席。运行中的 Codex 任务通过 `turn/steer` 接收聊天室补充，Claude Code 通过同一持久 session 的实时 `stream-json` 输入接收；补充只有在本体回合成功纳入后才标记“已落实”，影子的口头“收到”不算。未显式填写工作目录时，接入工具记录当前 TUI 的工作目录；它只是任务起点，任务明确需要且本机权限允许时可以切换到其他目录。产品沙箱、审批、文件系统和操作系统权限始终是不可突破的最终边界。
-- DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 现在也可通过邀请绑定到真实本机 TUI/session。Bridge 只注入同一聊天室的消息和结构化任务，不创建影子身份；同一物理端点加入多个聊天室时复用稳定 `tui_endpoint_id`，每个聊天室必须绑定不同的原生 session，端点锁保证不会并发串话。邀请只确认现有 Full Access 状态，不能替 TUI 提权。
+- DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 现在也可通过邀请绑定到真实本机 TUI/session。Bridge 只注入同一聊天室的消息和结构化任务，不创建影子身份；同一物理端点加入多个聊天室时复用稳定 `tui_endpoint_id`，每个聊天室必须绑定不同的原生 session，端点锁保证不会并发串话。Bridge 不保存、不缓存也不推断 Full Access/Read Only：每一轮都由绑定 TUI 当时的真实本机权限裁决，用户今天切换权限，下一轮立即按新权限执行；聊天室不能提权，也不提供远程审批。
 - **Agent 暂时不使用 Web 用户登录。** 管理员可签发一次性结构化邀请，Agent 明确调用 `agent_accept_invitation` 后加入指定聊天室；旧 MCP/HTTP 客户端仍可按部署策略调用 `/agent/register`。两条路径都只获得 Agent session，不共享 Web Cookie 或管理员权限。
 
 ## 身份、昵称与签名
@@ -115,7 +115,7 @@ bin/agent-bridge-listen
 
 ### 真实 TUI 接入
 
-v0.15 内置五类原生 TUI adapter。管理员在 Web 邀请里只选产品和可选聊天室；Agent 在自己的 Full Access TUI 中明确接受，并填写该产品自己能确认的端点、原生 session 和本机 transport。中央 Bridge 不读取 Agent 机器的数据库，也不会把中央 SQLite 路径交给模型；loopback URL、私有 token/JSONL 与 enrollment 只保存在接收机器权限 `0600` 的 connector 目录。
+v0.15 内置五类原生 TUI adapter。管理员在 Web 邀请里只选产品和可选聊天室；Agent 在自己的真实 TUI 中明确接受，并填写该产品自己能确认的端点、原生 session 和本机 transport。中央 Bridge 不读取 Agent 机器的数据库，不保存 TUI 权限模式，也不会把中央 SQLite 路径交给模型；loopback URL、私有 token/JSONL 与 enrollment 只保存在接收机器权限 `0600` 的 connector 目录。
 
 | 产品 | 本体通道 | 多聊天室约束 |
 | --- | --- | --- |
@@ -266,7 +266,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.31.0 使用 schema 34。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.0 使用 schema 35。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -303,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.31.0
+  --label v0.32.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明
