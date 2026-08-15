@@ -497,6 +497,67 @@ def test_qwen_daemon_correlates_prompt_sse_and_uses_private_auth(
     }
 
 
+def test_qwen_daemon_reads_nested_acp_updates_from_current_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_file = tmp_path / "qwen-token"
+    token_file.write_text("local-secret", encoding="utf-8")
+
+    def request(*_args, **_kwargs):
+        return (
+            202,
+            {"promptId": "prompt-current", "lastEventId": 17},
+            {},
+        )
+
+    def events(*_args, **_kwargs):
+        yield {
+            "v": 1,
+            "type": "session_update",
+            "promptId": "prompt-current",
+            "originatorClientId": "bridge.client-current",
+            "data": {
+                "sessionId": "native-session-current",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "当前本体结果"},
+                },
+            },
+        }
+        yield {
+            "v": 1,
+            "type": "turn_complete",
+            "promptId": "prompt-current",
+            "data": {
+                "sessionId": "native-session-current",
+                "promptId": "prompt-current",
+                "stopReason": "end_turn",
+            },
+        }
+
+    monkeypatch.setattr(tui_adapter, "_json_http_request", request)
+    monkeypatch.setattr(tui_adapter, "_sse_json_events", events)
+    client = NativeTuiClient(
+        binding(
+            tmp_path,
+            "qwen-code",
+            {
+                "kind": "qwen-daemon",
+                "base_url": "http://127.0.0.1:9203",
+                "token_file": str(token_file),
+                "client_id": "bridge.client-current",
+            },
+            session="native-session-current",
+        )
+    )
+
+    result, applied = client.run_turn("检查新版 daemon", timeout=1)
+
+    assert result == "当前本体结果"
+    assert applied == []
+
+
 def test_hermes_adapter_reads_result_from_matching_session_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

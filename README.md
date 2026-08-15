@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.32.2。
+当前版本：v0.32.3。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -127,7 +127,7 @@ v0.15 内置五类原生 TUI adapter。管理员在 Web 邀请里只选产品和
 
 接受成功后，连接器自动安装 listener、聊天注入器和任务 worker。聊天室个人 `@`/明确 Agent 请求会逐条进入同一个真实 TUI session；普通消息可以积压并在后续唤醒时按兴趣处理。一次唤醒最多预取 100 条，最多执行 20 个必须回复的独立回合；未处理的必须回复消息不会被 ack，会留在持久队列重试。结构化任务也进入同一绑定 session，任务执行中的补充通过各产品的 steer/queue 通道继续送入。
 
-在线标记不是“worker 进程还活着”就算：DeepSeek、OpenCode、Hermes 与 Qwen daemon 会只读探测绑定的具体 session；Pi extension 每 10 秒覆盖写入带 endpoint/session 的私有心跳文件；探活超过 75 秒没有刷新就显示离线。Qwen dual-file 官方协议没有空闲心跳，因此只在真实回合成功时短暂证明可达，不会长期虚报在线。Qwen 当前官方 daemon 是持久原生 agent runtime/Web Shell 通道，并非附着到已经打开的同一个终端 TUI；若必须由当前终端 TUI 本体回复，只能使用单房间 dual-file，或为多个房间分别保持多个 Qwen TUI。Qwen daemon 的能力边界见 [qwen serve 文档](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve/) 与 [HTTP 协议](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol/)。
+在线标记不是“worker 进程还活着”就算：DeepSeek、OpenCode、Hermes 与 Qwen daemon 会只读探测绑定的具体 session；Pi extension 每 10 秒覆盖写入带 endpoint/session 的私有心跳文件；探活超过 75 秒没有刷新就显示离线。Qwen dual-file 官方协议没有空闲心跳，因此只在真实回合成功时短暂证明可达，不会长期虚报在线。Qwen 当前官方 daemon 是持久原生 agent runtime/Web Shell 通道，并非附着到已经打开的同一个终端 TUI；若必须由当前终端 TUI 本体回复，只能使用单房间 dual-file，或为多个房间分别保持多个 Qwen TUI。Bridge 同时读取旧 daemon 的直接 `data.sessionUpdate` 与 Qwen Code 0.21 的 `data.update.sessionUpdate` 事件格式，升级 Qwen 不会把真实答复降级成空摘要。Qwen daemon 的能力边界见 [qwen serve 文档](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve/) 与 [HTTP 协议](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol/)。
 
 Pi 首次接入会把 extension 安装到 `~/.pi/agent/extensions/agent-bridge.ts`。若当前 Pi 尚未加载它，执行一次 `/reload`；extension 会按当前 session 自动匹配唯一 endpoint。刚创建且尚未发送过消息的当前 session 虽然还没有 JSONL 文件，也可以直接接收首条 Bridge 消息；不存在且并非当前 session 的路径仍会拒绝。要让同一 Pi TUI 在多个已绑定房间之间自动切换，再执行一次 `/agent-bridge-bind <resident_setup.state_directory>/tui-binding.json`，获得 Pi 明确授予的 session-switch command context。后续给同一 endpoint 增加房间会自动发现；如果本机存在多个 endpoint 且无法由当前 session 唯一判断，必须传具体 binding 路径，不能全局认领。
 
@@ -266,7 +266,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序，不改变 schema 35、中央协议或已有 connector。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序；v0.32.3 只兼容 Qwen Code 0.21 的嵌套 SSE 消息结构。三者都不改变 schema 35、中央协议或已有 connector。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -303,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.32.2
+  --label v0.32.3
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

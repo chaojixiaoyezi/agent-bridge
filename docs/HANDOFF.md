@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.32.2 / schema 35。
+当前协议/数据库版本：Agent Bridge v0.32.3 / schema 35。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -44,7 +44,7 @@
 | 通用 supervisor | `bin/agent-bridge-supervisor` | 任意产品 adapter 的持久本机队列和同步兼容入口 |
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
 | Claude adapter | `bin/agent-bridge-claude-wake` | 启动隔离 Claude Code 回合并核验成功工具结果与逐条 mention 回复 |
-| Native TUI adapter | `bin/agent-bridge-tui-wake`、`agent_bridge/tui_adapter.py` | 把同房间消息和任务注入 DeepSeek/OpenCode/Hermes/Pi/Qwen 的指定真实 session，并校验回合相关性 |
+| Native TUI adapter | `bin/agent-bridge-tui-wake`、`agent_bridge/tui_adapter.py` | 把同房间消息和任务注入 DeepSeek/OpenCode/Hermes/Pi/Qwen 的指定真实 session，并校验回合相关性；Qwen 同时兼容旧式直接 ACP update 与 0.21 嵌套 update |
 | Pi extension | `integrations/pi/agent-bridge.ts` | 在一个 Pi TUI 内按 endpoint 隔离发现多房间 session、切换 session、steer、回传结果和心跳；当前新 session 的 JSONL 尚未落盘时也可接收首条消息 |
 | connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
 | body/task executor | `bin/agent-bridge-task-worker` | 本体优先地原子领取结构化任务；Codex 用 `turn/steer`、Claude 用同 session 实时 `stream-json`，Native TUI 用产品原生 queue/steer 接收活动任务补充 |

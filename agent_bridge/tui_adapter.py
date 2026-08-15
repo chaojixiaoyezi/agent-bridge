@@ -544,8 +544,33 @@ def _qwen_event_prompt_id(event: dict[str, Any]) -> str:
         return direct
     metadata = data.get("_meta")
     if isinstance(metadata, dict):
-        return str(metadata.get("promptId") or metadata.get("prompt_id") or "").strip()
+        prompt_id = str(
+            metadata.get("promptId") or metadata.get("prompt_id") or ""
+        ).strip()
+        if prompt_id:
+            return prompt_id
+    update = data.get("update")
+    if isinstance(update, dict):
+        metadata = update.get("_meta")
+        if isinstance(metadata, dict):
+            return str(
+                metadata.get("promptId") or metadata.get("prompt_id") or ""
+            ).strip()
     return ""
+
+
+def _qwen_session_update(event: dict[str, Any]) -> dict[str, Any]:
+    """Return the ACP update across Qwen daemon envelope generations."""
+
+    data = event.get("data")
+    if not isinstance(data, dict):
+        return {}
+    # Qwen Code 0.21 nests the ACP payload below data.update so data can also
+    # carry sessionId. Older daemon builds exposed the update directly as
+    # data. Accept both because installed native runtimes upgrade separately
+    # from Agent Bridge.
+    update = data.get("update")
+    return update if isinstance(update, dict) else data
 
 
 def _wait_jsonl_result(
@@ -1384,8 +1409,9 @@ class NativeTuiClient:
             data = event.get("data")
             payload = data if isinstance(data, dict) else {}
             if event_type == "session_update":
-                update = str(payload.get("sessionUpdate") or "")
-                content = payload.get("content")
+                session_update = _qwen_session_update(event)
+                update = str(session_update.get("sessionUpdate") or "")
+                content = session_update.get("content")
                 chunk = _text_parts(content).strip()
                 if update == "user_message_chunk" and chunk:
                     if event_prompt_id == prompt_id:
