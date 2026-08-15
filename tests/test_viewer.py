@@ -1692,8 +1692,15 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-14" in index_html
-    assert "app.css?v=20260814-14" in index_html
+    assert "app.js?v=20260815-01" in index_html
+    assert "app.css?v=20260815-01" in index_html
+    assert 'id="global-tools-menu"' in index_html
+    assert 'id="room-tools-menu"' in index_html
+    assert 'id="room-search-menu"' in index_html
+    assert 'id="toggle-rooms-panel"' in index_html
+    assert 'id="toggle-people-panel"' in index_html
+    assert "function applyWorkspaceLayout" in javascript
+    assert '"agentBridgeRoomsPanel"' in javascript
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript

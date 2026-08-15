@@ -83,6 +83,8 @@ const state = {
   connectorHealth: null,
   connectorHealthLoadedAt: 0,
   connectorHealthRenderSignature: "",
+  roomsPanelCollapsed: false,
+  peoplePanelCollapsed: true,
 };
 
 const ROOM_SNAPSHOT_LIMIT = 4;
@@ -93,6 +95,12 @@ const CONNECTOR_HEALTH_CACHE_MS = 15_000;
 
 const elements = {
   appShell: document.querySelector("#app-shell"),
+  workspace: document.querySelector("#workspace"),
+  toggleRoomsPanel: document.querySelector("#toggle-rooms-panel"),
+  togglePeoplePanel: document.querySelector("#toggle-people-panel"),
+  globalToolsMenu: document.querySelector("#global-tools-menu"),
+  roomToolsMenu: document.querySelector("#room-tools-menu"),
+  roomSearchMenu: document.querySelector("#room-search-menu"),
   roomList: document.querySelector("#room-list"),
   roomCount: document.querySelector("#room-count"),
   search: document.querySelector("#room-search"),
@@ -546,6 +554,60 @@ function applyTheme(theme) {
 
 applyTheme(state.theme);
 
+function readLayoutPreference(key, fallback) {
+  try {
+    const stored = window.localStorage.getItem(key);
+    return stored === null ? fallback : stored === "collapsed";
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function applyWorkspaceLayout({ persist = false } = {}) {
+  elements.workspace.classList.toggle("rooms-collapsed", state.roomsPanelCollapsed);
+  elements.workspace.classList.toggle("people-collapsed", state.peoplePanelCollapsed);
+  elements.toggleRoomsPanel.setAttribute(
+    "aria-expanded",
+    String(!state.roomsPanelCollapsed),
+  );
+  elements.togglePeoplePanel.setAttribute(
+    "aria-expanded",
+    String(!state.peoplePanelCollapsed),
+  );
+  elements.toggleRoomsPanel.title = state.roomsPanelCollapsed
+    ? "展开聊天室列表"
+    : "收起聊天室列表";
+  elements.togglePeoplePanel.title = state.peoplePanelCollapsed
+    ? "展开成员面板"
+    : "收起成员面板";
+  elements.toggleRoomsPanel.querySelector(".panel-toggle-icon").textContent = state.roomsPanelCollapsed
+    ? "›"
+    : "‹";
+  elements.togglePeoplePanel.querySelector(".panel-toggle-icon").textContent = state.peoplePanelCollapsed
+    ? "‹"
+    : "›";
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(
+      "agentBridgeRoomsPanel",
+      state.roomsPanelCollapsed ? "collapsed" : "expanded",
+    );
+    window.localStorage.setItem(
+      "agentBridgePeoplePanel",
+      state.peoplePanelCollapsed ? "collapsed" : "expanded",
+    );
+  } catch (error) {
+    // Private browsing or a hardened WebView may disable persistent storage.
+  }
+}
+
+state.roomsPanelCollapsed = readLayoutPreference(
+  "agentBridgeRoomsPanel",
+  window.matchMedia("(max-width: 760px)").matches,
+);
+state.peoplePanelCollapsed = readLayoutPreference("agentBridgePeoplePanel", true);
+applyWorkspaceLayout();
+
 function shortTime(timestamp) {
   if (!timestamp) return "—";
   const date = new Date(timestamp * 1000);
@@ -794,6 +856,19 @@ function applyUserPermissions() {
     activeRoom?.can_manage_task_permissions && activeRoom.status === "active"
   );
   elements.openRoomHighlights.hidden = !activeRoom;
+  const visibleRoomTools = [
+    elements.inviteAgent,
+    elements.manageMembers,
+    elements.repairResidents,
+    elements.manageWakePolicy,
+    elements.manageTaskPermissions,
+    elements.openRoomHighlights,
+    elements.renameRoom,
+  ].some((button) => !button.hidden);
+  elements.roomToolsMenu.hidden = !visibleRoomTools;
+  elements.roomSearchMenu.hidden = !activeRoom;
+  if (!visibleRoomTools) elements.roomToolsMenu.open = false;
+  if (!activeRoom) elements.roomSearchMenu.open = false;
   elements.wakeAllAgents.hidden = !(activeRoom?.can_wake_all && activeRoom.status === "active");
   elements.openAccount.textContent = `${state.currentUser.display_name}${admin ? " · 管理员" : ""}`;
   const agentGlobal = state.messageRateLimits?.agent_global_cooldown_seconds ?? 15;
@@ -2417,6 +2492,8 @@ async function selectRoom(roomId) {
   state.taskPermissions = null;
   clearComposerContext();
   clearRoomMessageSearch();
+  elements.roomSearchMenu.open = false;
+  elements.roomToolsMenu.open = false;
   hideMentionMenu();
   updateNewMessageIndicator();
   window.localStorage.setItem("agentBridgeSelectedRoom", roomId);
@@ -5423,5 +5500,43 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pagehide", () => state.ownerEvents?.close());
 
 elements.themeSelect.addEventListener("change", () => applyTheme(elements.themeSelect.value));
+elements.toggleRoomsPanel.addEventListener("click", () => {
+  state.roomsPanelCollapsed = !state.roomsPanelCollapsed;
+  applyWorkspaceLayout({ persist: true });
+});
+elements.togglePeoplePanel.addEventListener("click", () => {
+  state.peoplePanelCollapsed = !state.peoplePanelCollapsed;
+  applyWorkspaceLayout({ persist: true });
+});
+
+const expandableToolMenus = [
+  elements.globalToolsMenu,
+  elements.roomSearchMenu,
+  elements.roomToolsMenu,
+];
+for (const menu of expandableToolMenus) {
+  menu.addEventListener("toggle", () => {
+    if (!menu.open) return;
+    for (const otherMenu of expandableToolMenus) {
+      if (otherMenu !== menu) otherMenu.open = false;
+    }
+  });
+}
+for (const menu of [elements.globalToolsMenu, elements.roomToolsMenu]) {
+  for (const button of menu.querySelectorAll("button")) {
+    button.addEventListener("click", () => {
+      menu.open = false;
+    });
+  }
+}
+document.addEventListener("click", (event) => {
+  for (const menu of expandableToolMenus) {
+    if (menu.open && !menu.contains(event.target)) menu.open = false;
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  for (const menu of expandableToolMenus) menu.open = false;
+});
 updateNotificationButton();
 bootstrapAuthentication();
