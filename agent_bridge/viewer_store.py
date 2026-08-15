@@ -66,6 +66,7 @@ class ViewerRepository:
                     "room_message_markers",
                     "operational_metric_samples",
                     "operational_alerts",
+                    "admin_audit_events",
                 )
             }
             room_states = {

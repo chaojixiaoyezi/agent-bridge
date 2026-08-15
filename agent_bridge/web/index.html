@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260815-02">
-    <script src="/assets/app.js?v=20260815-02" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260815-03">
+    <script src="/assets/app.js?v=20260815-03" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -60,6 +60,7 @@
                 <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
                 <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
                 <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
+                <button class="access-button" id="open-admin-audit" type="button" hidden>审计中心</button>
               </div>
               <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
             </div>
@@ -908,6 +909,47 @@
         <div class="pending-center-summary" id="pending-center-summary"></div>
         <p class="form-feedback" id="pending-center-feedback" role="status" aria-live="polite"></p>
         <div class="pending-center-list" id="pending-center-list"></div>
+      </div>
+    </dialog>
+
+    <dialog class="room-dialog audit-dialog" id="admin-audit-dialog" aria-labelledby="admin-audit-title">
+      <div class="dialog-shell audit-dialog-shell">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">APPEND-ONLY GOVERNANCE LOG</p>
+            <h2 id="admin-audit-title">管理员审计中心</h2>
+            <p>统一查看建房、成员、邀请、连接、频率、任务和策略等治理操作；不记录密码、令牌、Cookie、邮箱或聊天正文。</p>
+          </div>
+          <button class="dialog-close" id="close-admin-audit" type="button" aria-label="关闭">×</button>
+        </div>
+        <form class="audit-filter-form" id="admin-audit-filter-form">
+          <input id="admin-audit-query" type="search" maxlength="200" placeholder="搜索人员、动作、房间、对象或请求号" autocomplete="off">
+          <select id="admin-audit-category" aria-label="审计类别">
+            <option value="">全部类别</option>
+          </select>
+          <select id="admin-audit-outcome" aria-label="审计结果">
+            <option value="">全部结果</option>
+            <option value="success">成功</option>
+            <option value="denied">被拒绝</option>
+            <option value="failed">失败</option>
+          </select>
+          <select id="admin-audit-actor" aria-label="操作人员">
+            <option value="">全部人员</option>
+          </select>
+          <select id="admin-audit-hours" aria-label="审计时间范围">
+            <option value="24">最近 24 小时</option>
+            <option value="168" selected>最近 7 天</option>
+            <option value="720">最近 30 天</option>
+            <option value="0">全部时间</option>
+          </select>
+          <input id="admin-audit-room" type="search" maxlength="128" placeholder="精确聊天室名（可选）" autocomplete="off">
+          <button class="primary-button compact-button" type="submit">筛选</button>
+          <button class="secondary-button compact-button" id="refresh-admin-audit" type="button">刷新</button>
+        </form>
+        <div class="connector-health-summary audit-summary" id="admin-audit-summary"></div>
+        <p class="form-feedback" id="admin-audit-feedback" role="status" aria-live="polite"></p>
+        <div class="audit-event-list" id="admin-audit-list"></div>
+        <button class="secondary-button audit-load-more" id="load-more-admin-audit" type="button" hidden>加载更早记录</button>
       </div>
     </dialog>
 

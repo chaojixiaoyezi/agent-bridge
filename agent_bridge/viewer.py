@@ -16,10 +16,10 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import MutableHeaders
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.routing import Route, compile_path
 
 from .a2a_gateway import (
     A2A_PROTOCOL_VERSION,
@@ -87,6 +87,159 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_BIND_HOSTS = {"127.0.0.1", "0.0.0.0"}
 
 
+ADMIN_AUDIT_ACTIONS: dict[tuple[str, str], tuple[str, str]] = {
+    ("POST", "/api/a2a/grants"): ("access", "a2a_grant.create"),
+    ("POST", "/api/a2a/grants/{grant_id:str}/revoke"): (
+        "access",
+        "a2a_grant.revoke",
+    ),
+    ("POST", "/api/admin/web-registration-codes"): (
+        "access",
+        "registration_code.create",
+    ),
+    ("POST", "/api/admin/web-registration-codes/{code_id:str}/revoke"): (
+        "access",
+        "registration_code.revoke",
+    ),
+    ("POST", "/api/rooms"): ("room", "room.create"),
+    ("PATCH", "/api/admin/web-users/{user_id:str}/room-permission"): (
+        "permission",
+        "room_creation_permission.update",
+    ),
+    ("PUT", "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
+        "membership",
+        "web_room_member.upsert",
+    ),
+    ("DELETE", "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
+        "membership",
+        "web_room_member.remove",
+    ),
+    ("PUT", "/api/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
+        "membership",
+        "web_room_member.upsert",
+    ),
+    ("DELETE", "/api/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
+        "membership",
+        "web_room_member.remove",
+    ),
+    ("PATCH", "/api/rooms/{conversation_id:str}"): ("room", "room.rename"),
+    ("PATCH", "/api/agent-lifecycle"): (
+        "lifecycle",
+        "agent_lifecycle.update",
+    ),
+    ("POST", "/api/admin/monitoring/alerts/{alert_id:str}/acknowledge"): (
+        "monitoring",
+        "monitoring_alert.acknowledge",
+    ),
+    ("POST", "/api/admin/connectors/{connector_id:str}/rotation-request"): (
+        "connector",
+        "connector.rotation_request",
+    ),
+    ("POST", "/api/admin/connectors/{connector_id:str}/revoke"): (
+        "connector",
+        "connector.revoke",
+    ),
+    (
+        "POST",
+        "/api/rooms/{conversation_id:str}/participants/{participant_id:str}/kick",
+    ): ("membership", "agent_room_member.kick"),
+    ("POST", "/api/room-memberships/migrate"): (
+        "membership",
+        "agent_room_member.copy",
+    ),
+    ("PATCH", "/api/message-rates/global/{actor_kind:str}"): (
+        "rate_limit",
+        "message_rate.global_update",
+    ),
+    ("PUT", "/api/message-rates/participants/{participant_id:str}"): (
+        "rate_limit",
+        "message_rate.override_set",
+    ),
+    ("DELETE", "/api/message-rates/participants/{participant_id:str}"): (
+        "rate_limit",
+        "message_rate.override_clear",
+    ),
+    ("POST", "/api/agent-access"): ("access", "agent_invitation.create"),
+    ("POST", "/api/agent-invitations/{invitation_id:str}/revoke"): (
+        "access",
+        "agent_invitation.revoke",
+    ),
+    ("POST", "/api/sessions/cleanup"): ("session", "session.cleanup"),
+    ("POST", "/api/sessions/{session_id:str}/revoke"): (
+        "session",
+        "session.revoke",
+    ),
+    (
+        "PUT",
+        "/api/rooms/{conversation_id:str}/messages/{message_id:str}/markers/{marker_kind:str}",
+    ): ("knowledge", "message_marker.set"),
+    (
+        "DELETE",
+        "/api/rooms/{conversation_id:str}/messages/{message_id:str}/markers/{marker_kind:str}",
+    ): ("knowledge", "message_marker.remove"),
+    ("POST", "/api/rooms/{conversation_id:str}/tasks"): ("task", "task.create"),
+    ("POST", "/api/messages/{message_id:str}/convert-to-task"): (
+        "task",
+        "task.convert_from_message",
+    ),
+    ("PATCH", "/api/rooms/{conversation_id:str}/wake-policy"): (
+        "policy",
+        "wake_policy.update",
+    ),
+    ("PATCH", "/api/rooms/{conversation_id:str}/task-policy"): (
+        "permission",
+        "task_policy.update",
+    ),
+    ("PUT", "/api/rooms/{conversation_id:str}/task-grants/{user_id:str}"): (
+        "permission",
+        "task_grant.update",
+    ),
+    ("POST", "/api/tasks/{task_id:str}/cancel"): ("task", "task.cancel"),
+    ("POST", "/api/messages/{message_id:str}/authorization/revoke"): (
+        "authorization",
+        "chat_authorization.revoke",
+    ),
+    ("POST", "/api/messages/{message_id:str}/forward"): (
+        "knowledge",
+        "message.forward",
+    ),
+    ("POST", "/api/rooms/{conversation_id:str}/residents/repair"): (
+        "connector",
+        "room_residents.repair",
+    ),
+    ("POST", "/api/nickname-requests/{request_id:str}/review"): (
+        "identity",
+        "nickname_request.review",
+    ),
+}
+
+ADMIN_AUDIT_TARGET_PARAMETERS = (
+    ("grant_id", "a2a_grant"),
+    ("code_id", "registration_code"),
+    ("user_id", "web_user"),
+    ("alert_id", "monitoring_alert"),
+    ("connector_id", "connector"),
+    ("participant_id", "participant"),
+    ("actor_kind", "rate_scope"),
+    ("invitation_id", "agent_invitation"),
+    ("session_id", "session"),
+    ("task_id", "task"),
+    ("message_id", "message"),
+    ("request_id", "nickname_request"),
+)
+
+ADMIN_AUDIT_ROUTE_MATCHERS = tuple(
+    (
+        method,
+        route_path,
+        specification,
+        compile_path(route_path)[0],
+        compile_path(route_path)[2],
+    )
+    for (method, route_path), specification in ADMIN_AUDIT_ACTIONS.items()
+)
+
+
 class SecurityHeadersMiddleware:
     def __init__(self, app, *, public_mode: bool = False, hsts_seconds: int = 0):
         self.app = app
@@ -95,6 +248,7 @@ class SecurityHeadersMiddleware:
 
     async def __call__(self, scope, receive, send):
         request_id = f"req_{secrets.token_hex(12)}"
+        scope["agent_bridge.request_id"] = request_id
 
         async def send_with_headers(message):
             if message["type"] == "http.response.start":
@@ -127,6 +281,96 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
+
+
+class AdminAuditMiddleware:
+    def __init__(self, app, *, store: BridgeStore):
+        self.app = app
+        self.store = store
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_method = str(scope.get("method") or "").upper()
+        request_path = str(scope.get("path") or "")
+        matched_route = None
+        matched_parameters: dict[str, str] = {}
+        for (
+            method,
+            route_path,
+            specification,
+            path_regex,
+            convertors,
+        ) in ADMIN_AUDIT_ROUTE_MATCHERS:
+            if request_method != method:
+                continue
+            match = path_regex.match(request_path)
+            if match is None:
+                continue
+            matched_route = (route_path, specification)
+            matched_parameters = {
+                key: str(convertors[key].convert(value))
+                for key, value in match.groupdict().items()
+            }
+            break
+        status_code = 500
+
+        async def send_with_status(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        await self.app(scope, receive, send_with_status)
+        identity = (scope.get("state") or {}).get("web_identity")
+        if matched_route is None or not isinstance(identity, dict):
+            return
+        route_path, specification = matched_route
+        category, action = specification
+        outcome = (
+            "success"
+            if 200 <= status_code < 400
+            else "denied"
+            if status_code in {401, 403, 429}
+            else "failed"
+        )
+        path_parameters = matched_parameters
+        target_kind = None
+        target_id = None
+        for parameter, kind in ADMIN_AUDIT_TARGET_PARAMETERS:
+            value = path_parameters.get(parameter)
+            if value:
+                target_kind = kind
+                target_id = value
+                break
+        try:
+            await asyncio.to_thread(
+                self.store.record_admin_audit_event,
+                actor_web_user_id=str(identity["user_id"]),
+                actor_username=str(identity["username"]),
+                actor_display_name=str(identity["display_name"]),
+                actor_role=str(identity["role"]),
+                category=category,
+                action=action,
+                outcome=outcome,
+                status_code=status_code,
+                http_method=request_method,
+                route=route_path,
+                request_id=str(
+                    scope.get("agent_bridge.request_id")
+                    or f"req_{secrets.token_hex(12)}"
+                ),
+                conversation_id=path_parameters.get("conversation_id"),
+                target_kind=target_kind,
+                target_id=target_id,
+                detail={"path_parameters": path_parameters},
+            )
+        except Exception:
+            # Auditing is append-only but deliberately sidecar-only: a damaged
+            # audit table must never turn a completed governance action into a
+            # failed chat/API response or interrupt existing Agent sessions.
+            pass
 
 
 def create_app(
@@ -339,6 +583,7 @@ def create_app(
         allow_password_change: bool = False,
     ) -> dict[str, object]:
         identity = web_auth.authenticate(request.cookies.get(web_session_cookie))
+        request.state.web_identity = identity
         if identity["must_change_password"] and not allow_password_change:
             raise WebAuthorizationError("请先修改初始密码后再使用聊天室")
         return identity
@@ -1230,6 +1475,32 @@ def create_app(
                     hours=hours,
                 )
             return JSONResponse(payload)
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def admin_audit_events(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                await asyncio.to_thread(
+                    store.admin_audit_events,
+                    requesting_web_user_id=str(identity["user_id"]),
+                    limit=request.query_params.get("limit", "100"),
+                    before_sequence=request.query_params.get("before_sequence"),
+                    query=request.query_params.get("query", ""),
+                    category=request.query_params.get("category", ""),
+                    outcome=request.query_params.get("outcome", ""),
+                    actor_web_user_id=request.query_params.get(
+                        "actor_web_user_id",
+                        "",
+                    ),
+                    conversation_id=request.query_params.get(
+                        "conversation_id",
+                        "",
+                    ),
+                    hours=request.query_params.get("hours", "168"),
+                )
+            )
         except Exception as exc:
             return _json_error(exc)
 
@@ -3654,6 +3925,11 @@ def create_app(
                 methods=["GET"],
             ),
             Route(
+                "/api/admin/audit",
+                admin_audit_events,
+                methods=["GET"],
+            ),
+            Route(
                 "/api/admin/monitoring/alerts/{alert_id:str}/acknowledge",
                 acknowledge_operational_alert,
                 methods=["POST"],
@@ -3885,6 +4161,7 @@ def create_app(
             www_redirect=False,
         )
         app.add_middleware(PublicTransportMiddleware, enabled=True)
+    app.add_middleware(AdminAuditMiddleware, store=store)
     app.add_middleware(
         SecurityHeadersMiddleware,
         public_mode=policy.public_mode,

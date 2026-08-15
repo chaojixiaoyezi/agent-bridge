@@ -87,6 +87,13 @@ const state = {
   monitoringLoadedAt: 0,
   monitoringRenderSignature: "",
   monitoringKnownOpenAlerts: null,
+  adminAudit: {
+    events: [],
+    facets: { categories: [], actors: [] },
+    summary: {},
+    has_more: false,
+    next_before_sequence: null,
+  },
   roomsPanelCollapsed: false,
   peoplePanelCollapsed: true,
 };
@@ -185,6 +192,21 @@ const elements = {
   openMessageRates: document.querySelector("#open-message-rates"),
   openRoomPermissions: document.querySelector("#open-room-permissions"),
   openRegistrationCodes: document.querySelector("#open-registration-codes"),
+  openAdminAudit: document.querySelector("#open-admin-audit"),
+  adminAuditDialog: document.querySelector("#admin-audit-dialog"),
+  closeAdminAudit: document.querySelector("#close-admin-audit"),
+  adminAuditFilterForm: document.querySelector("#admin-audit-filter-form"),
+  adminAuditQuery: document.querySelector("#admin-audit-query"),
+  adminAuditCategory: document.querySelector("#admin-audit-category"),
+  adminAuditOutcome: document.querySelector("#admin-audit-outcome"),
+  adminAuditActor: document.querySelector("#admin-audit-actor"),
+  adminAuditHours: document.querySelector("#admin-audit-hours"),
+  adminAuditRoom: document.querySelector("#admin-audit-room"),
+  refreshAdminAudit: document.querySelector("#refresh-admin-audit"),
+  adminAuditSummary: document.querySelector("#admin-audit-summary"),
+  adminAuditFeedback: document.querySelector("#admin-audit-feedback"),
+  adminAuditList: document.querySelector("#admin-audit-list"),
+  loadMoreAdminAudit: document.querySelector("#load-more-admin-audit"),
   openPendingCenter: document.querySelector("#open-pending-center"),
   pendingCenterBadge: document.querySelector("#pending-center-badge"),
   pendingCenterDialog: document.querySelector("#pending-center-dialog"),
@@ -809,6 +831,13 @@ function showAuthScreen(message = "") {
   state.monitoringLoadedAt = 0;
   state.monitoringRenderSignature = "";
   state.monitoringKnownOpenAlerts = null;
+  state.adminAudit = {
+    events: [],
+    facets: { categories: [], actors: [] },
+    summary: {},
+    has_more: false,
+    next_before_sequence: null,
+  };
   renderPendingCenter();
   elements.appShell.hidden = true;
   for (const dialog of [
@@ -826,6 +855,7 @@ function showAuthScreen(message = "") {
     elements.memberManagementDialog,
     elements.agentAccessDialog,
     elements.pendingCenterDialog,
+    elements.adminAuditDialog,
     elements.roomHighlightsDialog,
     elements.messageThreadDialog,
   ]) {
@@ -852,6 +882,7 @@ function applyUserPermissions() {
   elements.openMessageRates.hidden = !admin;
   elements.openRoomPermissions.hidden = !admin;
   elements.openRegistrationCodes.hidden = !admin;
+  elements.openAdminAudit.hidden = !admin;
   elements.openAgentAccess.hidden = !admin;
   elements.agentInvitationSection.hidden = !admin;
   elements.connectorHealthSection.hidden = !admin;
@@ -4033,6 +4064,185 @@ async function openRegistrationCodeDialog() {
   }
 }
 
+const ADMIN_AUDIT_CATEGORY_LABELS = {
+  access: "接入与凭证",
+  authorization: "授权",
+  connector: "连接与值守",
+  identity: "身份与昵称",
+  knowledge: "知识与转发",
+  lifecycle: "生命周期",
+  membership: "成员",
+  monitoring: "监控",
+  permission: "权限",
+  policy: "策略",
+  rate_limit: "发言频率",
+  room: "聊天室",
+  session: "会话",
+  task: "任务",
+};
+
+const ADMIN_AUDIT_ACTION_LABELS = {
+  "a2a_grant.create": "创建 A2A 接入授权",
+  "a2a_grant.revoke": "撤销 A2A 接入授权",
+  "registration_code.create": "生成注册码",
+  "registration_code.revoke": "撤销注册码",
+  "room.create": "创建聊天室",
+  "room.rename": "更改聊天室名称",
+  "room_creation_permission.update": "调整普通用户建房权限",
+  "web_room_member.upsert": "加入或调整 Web 成员",
+  "web_room_member.remove": "移出 Web 成员",
+  "agent_lifecycle.update": "调整 Agent 有效期",
+  "monitoring_alert.acknowledge": "确认运行告警",
+  "connector.rotation_request": "请求轮换连接凭证",
+  "connector.revoke": "撤销连接设备",
+  "agent_room_member.kick": "将 Agent 踢出聊天室",
+  "agent_room_member.copy": "复制 Agent 到其他聊天室",
+  "message_rate.global_update": "调整总体发言频率",
+  "message_rate.override_set": "设置单个对象发言频率",
+  "message_rate.override_clear": "清除单个对象发言频率",
+  "agent_invitation.create": "创建 Agent 邀请",
+  "agent_invitation.revoke": "撤销 Agent 邀请",
+  "session.cleanup": "清理失效会话",
+  "session.revoke": "撤销 Agent 会话",
+  "message_marker.set": "设置消息标记",
+  "message_marker.remove": "移除消息标记",
+  "task.create": "创建聊天室任务",
+  "task.convert_from_message": "把消息转为任务",
+  "wake_policy.update": "调整聊天室唤醒策略",
+  "task_policy.update": "调整聊天室任务策略",
+  "task_grant.update": "调整用户任务权限",
+  "task.cancel": "取消聊天室任务",
+  "chat_authorization.revoke": "撤销聊天授权",
+  "message.forward": "跨聊天室转发消息",
+  "room_residents.repair": "修复聊天室值守",
+  "nickname_request.review": "审批 Agent 昵称",
+};
+
+function populateAdminAuditFacets(payload) {
+  const selectedCategory = elements.adminAuditCategory.value;
+  const selectedActor = elements.adminAuditActor.value;
+  elements.adminAuditCategory.replaceChildren(new Option("全部类别", ""));
+  for (const item of payload.facets?.categories || []) {
+    elements.adminAuditCategory.append(new Option(
+      `${ADMIN_AUDIT_CATEGORY_LABELS[item.category] || item.category} · ${item.count}`,
+      item.category,
+    ));
+  }
+  elements.adminAuditCategory.value = selectedCategory;
+  elements.adminAuditActor.replaceChildren(new Option("全部人员", ""));
+  for (const actor of payload.facets?.actors || []) {
+    elements.adminAuditActor.append(new Option(
+      `${actor.display_name} (${actor.username}) · ${actor.count}`,
+      actor.user_id,
+    ));
+  }
+  elements.adminAuditActor.value = selectedActor;
+}
+
+function renderAdminAudit() {
+  const payload = state.adminAudit;
+  elements.adminAuditSummary.replaceChildren();
+  elements.adminAuditList.replaceChildren();
+  const summaryItems = [
+    [payload.summary?.total_count || 0, "累计记录"],
+    [payload.summary?.success_count || 0, "成功"],
+    [payload.summary?.denied_count || 0, "被拒绝"],
+    [payload.summary?.failed_count || 0, "失败"],
+  ];
+  for (const [value, label] of summaryItems) {
+    const card = makeElement(
+      "span",
+      `connector-health-summary-card ${label === "失败" && Number(value) ? "failed" : ""}`,
+    );
+    card.append(
+      makeElement("strong", "", String(value)),
+      makeElement("small", "", label),
+    );
+    elements.adminAuditSummary.append(card);
+  }
+  if (!payload.events.length) {
+    elements.adminAuditList.append(makeElement("p", "muted-copy", "当前筛选范围没有审计记录。"));
+  }
+  const outcomeLabels = { success: "成功", denied: "被拒绝", failed: "失败" };
+  for (const event of payload.events) {
+    const card = makeElement("article", `audit-event-card ${event.outcome}`);
+    const heading = makeElement("div", "audit-event-heading");
+    heading.append(
+      makeElement(
+        "strong",
+        "",
+        ADMIN_AUDIT_ACTION_LABELS[event.action] || event.action,
+      ),
+      makeElement(
+        "span",
+        `audit-event-outcome ${event.outcome}`,
+        `${outcomeLabels[event.outcome] || event.outcome} · HTTP ${event.status_code}`,
+      ),
+    );
+    const actor = `${event.actor_display_name} (${event.actor_username})`;
+    const category = ADMIN_AUDIT_CATEGORY_LABELS[event.category] || event.category;
+    const targetParts = [];
+    if (event.conversation_id) targetParts.push(`聊天室：${event.conversation_id}`);
+    if (event.target_id) targetParts.push(`${event.target_kind}：${event.target_id}`);
+    const meta = makeElement("div", "audit-event-meta");
+    meta.append(
+      makeElement("span", "", `#${event.sequence} · ${category} · ${actor} · ${fullTime(event.occurred_at)}`),
+      makeElement("span", "audit-event-target", targetParts.join(" · ") || "全局操作"),
+    );
+    card.append(
+      heading,
+      meta,
+      makeElement("small", "audit-event-request", `${event.http_method} ${event.route} · ${event.request_id}`),
+    );
+    elements.adminAuditList.append(card);
+  }
+  elements.loadMoreAdminAudit.hidden = !payload.has_more;
+  elements.adminAuditFeedback.classList.remove("error");
+  elements.adminAuditFeedback.textContent = `已显示 ${payload.events.length} 条 · 日志只追加，敏感正文和凭证不入库`;
+}
+
+async function loadAdminAudit({ append = false } = {}) {
+  if (!isAdmin()) return;
+  const parameters = new URLSearchParams({
+    limit: "100",
+    query: elements.adminAuditQuery.value.trim(),
+    category: elements.adminAuditCategory.value,
+    outcome: elements.adminAuditOutcome.value,
+    actor_web_user_id: elements.adminAuditActor.value,
+    conversation_id: elements.adminAuditRoom.value.trim(),
+    hours: elements.adminAuditHours.value,
+  });
+  if (append && state.adminAudit.next_before_sequence) {
+    parameters.set("before_sequence", String(state.adminAudit.next_before_sequence));
+  }
+  elements.refreshAdminAudit.disabled = true;
+  elements.loadMoreAdminAudit.disabled = true;
+  elements.adminAuditFeedback.classList.remove("error");
+  elements.adminAuditFeedback.textContent = append ? "正在加载更早记录…" : "正在读取审计记录…";
+  try {
+    const payload = await fetchJson(`/api/admin/audit?${parameters.toString()}`);
+    const events = append
+      ? [...state.adminAudit.events, ...(payload.events || [])]
+      : (payload.events || []);
+    state.adminAudit = { ...payload, events };
+    populateAdminAuditFacets(payload);
+    renderAdminAudit();
+  } catch (error) {
+    elements.adminAuditFeedback.classList.add("error");
+    elements.adminAuditFeedback.textContent = error.message;
+  } finally {
+    elements.refreshAdminAudit.disabled = false;
+    elements.loadMoreAdminAudit.disabled = false;
+  }
+}
+
+async function openAdminAuditDialog() {
+  if (!isAdmin()) return;
+  elements.globalToolsMenu.open = false;
+  if (!elements.adminAuditDialog.open) elements.adminAuditDialog.showModal();
+  await loadAdminAudit();
+}
+
 function renderTaskPermissionMembers() {
   elements.taskPermissionResults.replaceChildren();
   const members = state.taskPermissions?.members || [];
@@ -4815,6 +5025,17 @@ elements.refreshButton.addEventListener("click", () => refresh({ fullRoom: true 
 elements.openMessageRates.addEventListener("click", openMessageRateDialog);
 elements.openRoomPermissions.addEventListener("click", openRoomPermissionDialog);
 elements.openRegistrationCodes.addEventListener("click", openRegistrationCodeDialog);
+elements.openAdminAudit.addEventListener("click", openAdminAuditDialog);
+elements.closeAdminAudit.addEventListener("click", () => elements.adminAuditDialog.close());
+elements.adminAuditDialog.addEventListener("click", (event) => {
+  if (event.target === elements.adminAuditDialog) elements.adminAuditDialog.close();
+});
+elements.adminAuditFilterForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await loadAdminAudit();
+});
+elements.refreshAdminAudit.addEventListener("click", () => loadAdminAudit());
+elements.loadMoreAdminAudit.addEventListener("click", () => loadAdminAudit({ append: true }));
 elements.closeRegistrationCodes.addEventListener("click", () => {
   state.generatedRegistrationCode = "";
   elements.generatedRegistrationCode.textContent = "";

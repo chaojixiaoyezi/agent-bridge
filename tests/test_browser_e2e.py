@@ -248,6 +248,14 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             ).to_have_count(4)
             page.locator("#close-agent-access").click()
 
+            page.locator("#global-tools-menu").evaluate("element => { element.open = true; }")
+            page.locator("#open-admin-audit").click()
+            page.locator("#admin-audit-dialog").wait_for(state="visible")
+            playwright_api.expect(
+                page.locator("#admin-audit-summary .connector-health-summary-card")
+            ).to_have_count(4)
+            page.locator("#close-admin-audit").click()
+
             page.set_viewport_size({"width": 390, "height": 844})
             page.wait_for_timeout(100)
             assert page.locator("#owner-message-form").is_visible()

@@ -401,6 +401,50 @@ def test_admin_operational_monitoring_api_is_authenticated_and_read_only(
     assert payload["thresholds"]["reply_latency_p95_seconds"] == 600
 
 
+def test_admin_audit_api_records_success_and_denial_without_sensitive_bodies(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    admin_client = TestClient(make_app(database))
+    assert admin_client.get("/api/admin/audit").status_code == 401
+    login_admin(admin_client)
+
+    created = admin_client.post(
+        "/api/rooms",
+        headers=intent_headers(admin_client, "create-room"),
+        json={"conversation_id": "审计中心测试群"},
+    )
+    assert created.status_code == 201
+    created_request_id = created.headers["X-Request-ID"]
+
+    member_client = TestClient(make_app(database))
+    member = register_web_user(member_client, username="audit-denied-user")
+    denied = member_client.post(
+        "/api/rooms",
+        headers=intent_headers(member_client, "create-room"),
+        json={"conversation_id": "不应被创建的审计群"},
+    )
+    assert denied.status_code == 403
+    assert member_client.get("/api/admin/audit").status_code == 403
+
+    response = admin_client.get("/api/admin/audit?hours=0&limit=100")
+    assert response.status_code == 200
+    payload = response.json()
+    room_events = [
+        event for event in payload["events"] if event["action"] == "room.create"
+    ]
+    assert [event["outcome"] for event in room_events] == ["denied", "success"]
+    assert room_events[0]["actor_web_user_id"] == member["user_id"]
+    assert room_events[1]["request_id"] == created_request_id
+    serialized = response.text
+    assert ADMIN_PASSWORD not in serialized
+    assert USER_PASSWORD not in serialized
+    assert "cookie" not in serialized.casefold()
+    assert payload["summary"]["append_only"] is True
+    assert payload["summary"]["success_count"] >= 1
+    assert payload["summary"]["denied_count"] >= 1
+
+
 def test_email_verification_and_password_reset_are_optional_single_use_and_private(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1712,8 +1756,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260815-02" in index_html
-    assert "app.css?v=20260815-02" in index_html
+    assert "app.js?v=20260815-03" in index_html
+    assert "app.css?v=20260815-03" in index_html
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html
