@@ -196,10 +196,19 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert page.locator(".load-earlier-button").is_visible()
 
             timeline_locator = page.locator("#timeline")
+            page.wait_for_function(
+                "element => element.scrollHeight - element.scrollTop "
+                "- element.clientHeight < 80",
+                arg=timeline_locator.element_handle(),
+            )
             timeline_locator.evaluate("element => { element.scrollTop = 0; }")
             scroll_before = timeline_locator.evaluate("element => element.scrollTop")
-            page.locator("#refresh-button").click()
-            page.wait_for_timeout(250)
+            with page.expect_response("**/api/rooms?limit=200"):
+                page.locator("#refresh-button").click()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                "() => requestAnimationFrame(resolve)))"
+            )
             scroll_after = timeline_locator.evaluate("element => element.scrollTop")
             assert abs(scroll_after - scroll_before) < 4
 
