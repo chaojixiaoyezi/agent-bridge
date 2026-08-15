@@ -1225,7 +1225,7 @@ def test_room_message_search_is_scoped_composable_paginated_and_jumpable(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "bridge.db"
-    _store, _sender, _receiver = seed(database)
+    store, _sender, _receiver = seed(database)
     client = TestClient(make_app(database))
     admin = login_admin(client)
     headers = intent_headers(client, "send-message")
@@ -1294,6 +1294,90 @@ def test_room_message_search_is_scoped_composable_paginated_and_jumpable(
     assert sender_only["count"] == 6
 
     target = room_one_messages[2]
+    marked = client.put(
+        f"/api/rooms/room-one/messages/{target['message_id']}/markers/decision",
+        headers=intent_headers(client, "manage-room-highlight"),
+        json={"note": "高级搜索测试决策"},
+    )
+    assert marked.status_code == 200
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET created_at = ? WHERE message_id = ?",
+            (1_700_000_000.0, target["message_id"]),
+        )
+    advanced = client.get(
+        "/api/rooms/room-one/search",
+        params={
+            "q": "alpha",
+            "sender_participant_id": admin["participant_id"],
+            "message_kind": "message",
+            "notification_mode": "ordinary",
+            "thread_scope": "roots",
+            "marker_kind": "decision",
+            "room_sequence": target["room_sequence"],
+            "created_after": 1_699_999_999,
+            "created_before": 1_700_000_001,
+        },
+    )
+    assert advanced.status_code == 200
+    advanced_payload = advanced.json()
+    assert [item["message_id"] for item in advanced_payload["results"]] == [
+        target["message_id"]
+    ]
+    assert advanced_payload["results"][0]["marker_kinds"] == ["decision"]
+    assert advanced_payload["filters"] == {
+        "message_kind": "message",
+        "notification_mode": "ordinary",
+        "thread_scope": "roots",
+        "marker_kind": "decision",
+        "room_sequence": target["room_sequence"],
+        "created_after": 1_699_999_999.0,
+        "created_before": 1_700_000_001.0,
+    }
+
+    reply = client.post(
+        "/api/rooms/room-one/messages",
+        headers=headers,
+        json={
+            "body": "thread filter result",
+            "reply_to": target["message_id"],
+        },
+    )
+    assert reply.status_code == 201
+    reply_search = client.get(
+        "/api/rooms/room-one/search",
+        params={"q": "thread filter", "thread_scope": "replies"},
+    )
+    assert reply_search.status_code == 200
+    assert [item["message_id"] for item in reply_search.json()["results"]] == [
+        reply.json()["message"]["message_id"]
+    ]
+    assert reply_search.json()["results"][0]["reply_to"] == target["message_id"]
+
+    mentions_only = client.get(
+        "/api/rooms/room-one/search",
+        params={"notification_mode": "mention"},
+    )
+    assert mentions_only.status_code == 200
+    assert mentions_only.json()["count"] >= 1
+    assert all(
+        item["notification_mode"] == "mention"
+        for item in mentions_only.json()["results"]
+    )
+    for invalid_parameters in (
+        {"message_kind": "unknown"},
+        {"notification_mode": "urgent"},
+        {"thread_scope": "nested"},
+        {"marker_kind": "secret"},
+        {"room_sequence": 0},
+        {"created_after": 2, "created_before": 1},
+        {"created_after": "NaN"},
+    ):
+        assert client.get(
+            "/api/rooms/room-one/search",
+            params=invalid_parameters,
+        ).status_code == 400
+
     around = client.get(
         "/api/rooms/room-one/messages",
         params={"around_sequence": target["sequence"], "limit": 3},
@@ -1395,8 +1479,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-11" in index_html
-    assert "app.css?v=20260814-11" in index_html
+    assert "app.js?v=20260814-12" in index_html
+    assert "app.css?v=20260814-12" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -1405,6 +1489,9 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert "new AbortController()" in javascript
     assert "/search?${parameters.toString()}" in javascript
     assert 'id="room-message-search-form"' in index_html
+    assert 'id="room-message-search-advanced"' in index_html
+    assert 'id="room-message-search-marker"' in index_html
+    assert 'id="room-message-search-sequence"' in index_html
     assert 'id="register-access-code"' in index_html
     assert "webRegistrationMode" in javascript
     assert "function appendMessages" in javascript

@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-11">
-    <script src="/assets/app.js?v=20260814-11" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-12">
+    <script src="/assets/app.js?v=20260814-12" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -106,6 +106,56 @@
               >
               <button class="secondary-button compact-button" id="search-room-messages" type="submit">搜索</button>
               <button class="secondary-button compact-button" id="clear-room-message-search" type="button" hidden>清除</button>
+              <details class="room-message-search-advanced" id="room-message-search-advanced">
+                <summary>高级筛选</summary>
+                <div class="room-message-search-filter-grid">
+                  <label>
+                    <span>消息类型</span>
+                    <select id="room-message-search-kind">
+                      <option value="">全部类型</option>
+                      <option value="message">聊天消息</option>
+                      <option value="task">结构化任务</option>
+                      <option value="forward">跨群转发</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>通知方式</span>
+                    <select id="room-message-search-notification">
+                      <option value="">全部方式</option>
+                      <option value="ordinary">普通</option>
+                      <option value="mention">艾特</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>话题位置</span>
+                    <select id="room-message-search-thread">
+                      <option value="">全部消息</option>
+                      <option value="roots">根消息</option>
+                      <option value="replies">引用回复</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>房间要点</span>
+                    <select id="room-message-search-marker">
+                      <option value="">全部消息</option>
+                      <option value="pin">已置顶</option>
+                      <option value="decision">决策记录</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>房间消息号</span>
+                    <input id="room-message-search-sequence" type="number" min="1" step="1" inputmode="numeric" placeholder="例如 1944">
+                  </label>
+                  <label>
+                    <span>起始日期</span>
+                    <input id="room-message-search-from" type="date">
+                  </label>
+                  <label>
+                    <span>截止日期</span>
+                    <input id="room-message-search-to" type="date">
+                  </label>
+                </div>
+              </details>
             </form>
             <span class="room-message-search-feedback" id="room-message-search-feedback" role="status" aria-live="polite"></span>
             <div class="room-message-search-results" id="room-message-search-results" hidden></div>

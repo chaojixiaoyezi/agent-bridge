@@ -2007,6 +2007,18 @@ def create_app(
                     if sender
                     else None
                 ),
+                message_kind=request.query_params.get("message_kind"),
+                notification_mode=request.query_params.get(
+                    "notification_mode"
+                ),
+                thread_scope=request.query_params.get("thread_scope"),
+                marker_kind=request.query_params.get("marker_kind"),
+                room_sequence=_optional_positive_int_query(
+                    request,
+                    "room_sequence",
+                ),
+                created_after=_optional_float_query(request, "created_after"),
+                created_before=_optional_float_query(request, "created_before"),
                 before_sequence=(
                     int(request.query_params["before_sequence"])
                     if "before_sequence" in request.query_params
@@ -3718,6 +3730,26 @@ def _int_query(
     raw = request.query_params.get(key)
     value = int(raw) if raw is not None else default
     return max(1, min(value, maximum))
+
+
+def _optional_positive_int_query(request: Request, key: str) -> int | None:
+    raw = request.query_params.get(key)
+    if raw is None or not raw.strip():
+        return None
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _optional_float_query(request: Request, key: str) -> float | None:
+    raw = request.query_params.get(key)
+    if raw is None or not raw.strip():
+        return None
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    return value
 
 
 def main() -> None:

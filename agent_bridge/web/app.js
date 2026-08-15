@@ -61,6 +61,7 @@ const state = {
   roomSearchResults: [],
   roomSearchHasMore: false,
   roomSearchNextBefore: null,
+  roomSearchFingerprint: "",
   roomSearchTargetMessageId: null,
   roomHighlights: { items: [], pins: [], decisions: [], count: 0 },
   highlightsLoadedRoom: null,
@@ -107,6 +108,14 @@ const elements = {
   roomMessageSearchForm: document.querySelector("#room-message-search-form"),
   roomMessageSearchParticipant: document.querySelector("#room-message-search-participant"),
   roomMessageSearchQuery: document.querySelector("#room-message-search-query"),
+  roomMessageSearchAdvanced: document.querySelector("#room-message-search-advanced"),
+  roomMessageSearchKind: document.querySelector("#room-message-search-kind"),
+  roomMessageSearchNotification: document.querySelector("#room-message-search-notification"),
+  roomMessageSearchThread: document.querySelector("#room-message-search-thread"),
+  roomMessageSearchMarker: document.querySelector("#room-message-search-marker"),
+  roomMessageSearchSequence: document.querySelector("#room-message-search-sequence"),
+  roomMessageSearchFrom: document.querySelector("#room-message-search-from"),
+  roomMessageSearchTo: document.querySelector("#room-message-search-to"),
   searchRoomMessages: document.querySelector("#search-room-messages"),
   clearRoomMessageSearch: document.querySelector("#clear-room-message-search"),
   roomMessageSearchFeedback: document.querySelector("#room-message-search-feedback"),
@@ -2125,6 +2134,18 @@ function renderActiveRoomHeader(roomId = state.selectedRoom) {
   elements.roomMessageSearchParticipant.disabled = !searchable;
   elements.roomMessageSearchQuery.disabled = !searchable;
   elements.searchRoomMessages.disabled = !searchable;
+  for (const control of [
+    elements.roomMessageSearchKind,
+    elements.roomMessageSearchNotification,
+    elements.roomMessageSearchThread,
+    elements.roomMessageSearchMarker,
+    elements.roomMessageSearchSequence,
+    elements.roomMessageSearchFrom,
+    elements.roomMessageSearchTo,
+  ]) {
+    control.disabled = !searchable;
+  }
+  elements.roomMessageSearchAdvanced.classList.toggle("disabled", !searchable);
   elements.roomTitle.textContent = roomId || "未选择聊天室";
   const abandoned = activeRoom?.status === "abandoned";
   elements.roomRoute.textContent = abandoned ? "ABANDONED · HISTORY ONLY" : "ROOM · EVENT LIVE VIEW";
@@ -2269,10 +2290,19 @@ function clearRoomMessageSearch({ clearInputs = true } = {}) {
   state.roomSearchResults = [];
   state.roomSearchHasMore = false;
   state.roomSearchNextBefore = null;
+  state.roomSearchFingerprint = "";
   state.roomSearchTargetMessageId = null;
   if (clearInputs) {
     elements.roomMessageSearchQuery.value = "";
     elements.roomMessageSearchParticipant.value = "";
+    elements.roomMessageSearchKind.value = "";
+    elements.roomMessageSearchNotification.value = "";
+    elements.roomMessageSearchThread.value = "";
+    elements.roomMessageSearchMarker.value = "";
+    elements.roomMessageSearchSequence.value = "";
+    elements.roomMessageSearchFrom.value = "";
+    elements.roomMessageSearchTo.value = "";
+    elements.roomMessageSearchAdvanced.open = false;
   }
   elements.roomMessageSearchResults.replaceChildren();
   elements.roomMessageSearchResults.hidden = true;
@@ -2309,6 +2339,18 @@ function renderRoomMessageSearchResults() {
       `#${roomSequence(result)} · ${fullTime(result.created_at)}`,
     ));
     button.append(heading);
+    const facets = [];
+    if (result.message_kind === "task") facets.push("任务");
+    if (result.message_kind === "forward") facets.push("转发");
+    facets.push(result.notification_mode === "mention" ? "艾特" : "普通");
+    if (result.reply_to) facets.push("引用回复");
+    if (result.marker_kinds?.includes("decision")) facets.push("决策");
+    if (result.marker_kinds?.includes("pin")) facets.push("置顶");
+    button.append(makeElement(
+      "span",
+      "room-message-search-result-facets",
+      facets.join(" · "),
+    ));
     button.append(makeElement(
       "span",
       "room-message-search-result-body",
@@ -2326,16 +2368,50 @@ function renderRoomMessageSearchResults() {
   }
 }
 
+function roomSearchDateBoundary(value, { nextDay = false } = {}) {
+  if (!value) return null;
+  const boundary = new Date(`${value}T00:00:00`);
+  if (nextDay) boundary.setDate(boundary.getDate() + 1);
+  return Math.floor(boundary.getTime() / 1000);
+}
+
+function currentRoomSearchCriteria() {
+  const sequenceText = elements.roomMessageSearchSequence.value.trim();
+  return {
+    q: elements.roomMessageSearchQuery.value.trim(),
+    sender_participant_id: elements.roomMessageSearchParticipant.value,
+    message_kind: elements.roomMessageSearchKind.value,
+    notification_mode: elements.roomMessageSearchNotification.value,
+    thread_scope: elements.roomMessageSearchThread.value,
+    marker_kind: elements.roomMessageSearchMarker.value,
+    room_sequence: sequenceText ? Number.parseInt(sequenceText, 10) : null,
+    created_after: roomSearchDateBoundary(elements.roomMessageSearchFrom.value),
+    created_before: roomSearchDateBoundary(
+      elements.roomMessageSearchTo.value,
+      { nextDay: true },
+    ),
+  };
+}
+
 async function searchRoomMessagesPage({ append = false } = {}) {
   const roomId = state.selectedRoom;
-  const query = elements.roomMessageSearchQuery.value.trim();
-  const participantId = elements.roomMessageSearchParticipant.value;
+  const criteria = currentRoomSearchCriteria();
   if (!roomId) return;
-  if (!query && !participantId) {
-    elements.roomMessageSearchFeedback.textContent = "请输入关键词或选择发言人。";
+  if (!Object.values(criteria).some((value) => value !== null && value !== "")) {
+    elements.roomMessageSearchFeedback.textContent = "请输入关键词或至少选择一个筛选条件。";
     elements.roomMessageSearchQuery.focus();
     return;
   }
+  if (
+    criteria.created_after !== null
+    && criteria.created_before !== null
+    && criteria.created_after >= criteria.created_before
+  ) {
+    elements.roomMessageSearchFeedback.textContent = "起始日期必须早于截止日期。";
+    return;
+  }
+  const fingerprint = JSON.stringify(criteria);
+  if (append && fingerprint !== state.roomSearchFingerprint) append = false;
   if (append && !state.roomSearchNextBefore) return;
   state.roomSearchRequestController?.abort();
   const controller = new AbortController();
@@ -2343,8 +2419,9 @@ async function searchRoomMessagesPage({ append = false } = {}) {
   elements.searchRoomMessages.disabled = true;
   elements.roomMessageSearchFeedback.textContent = append ? "正在加载更多…" : "正在搜索…";
   const parameters = new URLSearchParams({ limit: "25" });
-  if (query) parameters.set("q", query);
-  if (participantId) parameters.set("sender_participant_id", participantId);
+  for (const [key, value] of Object.entries(criteria)) {
+    if (value !== null && value !== "") parameters.set(key, String(value));
+  }
   if (append) parameters.set("before_sequence", String(state.roomSearchNextBefore));
   try {
     const payload = await fetchJson(
@@ -2359,6 +2436,7 @@ async function searchRoomMessagesPage({ append = false } = {}) {
       );
     } else {
       state.roomSearchResults = payload.results;
+      state.roomSearchFingerprint = fingerprint;
     }
     state.roomSearchHasMore = Boolean(payload.has_more);
     state.roomSearchNextBefore = payload.next_before_sequence;

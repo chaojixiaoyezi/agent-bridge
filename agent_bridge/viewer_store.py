@@ -813,20 +813,77 @@ class ViewerRepository:
         *,
         query: str = "",
         sender_participant_id: str | None = None,
+        message_kind: str | None = None,
+        notification_mode: str | None = None,
+        thread_scope: str | None = None,
+        marker_kind: str | None = None,
+        room_sequence: int | None = None,
+        created_after: float | None = None,
+        created_before: float | None = None,
         before_sequence: int | None = None,
         limit: int = 30,
     ) -> dict[str, Any]:
-        """Search one room only and return a compact newest-first page."""
+        """Search one room with composable, server-validated filters."""
 
         conversation = validate_conversation_id(conversation_id)
         normalized_query = str(query or "").strip()
         normalized_sender = str(sender_participant_id or "").strip() or None
-        if not normalized_query and normalized_sender is None:
-            raise ValueError("query or sender_participant_id is required")
+        normalized_message_kind = str(message_kind or "").strip().casefold() or None
+        normalized_notification_mode = (
+            str(notification_mode or "").strip().casefold() or None
+        )
+        normalized_thread_scope = str(thread_scope or "").strip().casefold() or None
+        normalized_marker_kind = str(marker_kind or "").strip().casefold() or None
+        normalized_room_sequence = (
+            int(room_sequence) if room_sequence is not None else None
+        )
+        normalized_created_after = (
+            float(created_after) if created_after is not None else None
+        )
+        normalized_created_before = (
+            float(created_before) if created_before is not None else None
+        )
+        if not any(
+            (
+                normalized_query,
+                normalized_sender,
+                normalized_message_kind,
+                normalized_notification_mode,
+                normalized_thread_scope,
+                normalized_marker_kind,
+                normalized_room_sequence,
+                normalized_created_after is not None,
+                normalized_created_before is not None,
+            )
+        ):
+            raise ValueError("at least one room search filter is required")
         if len(normalized_query) > 200:
             raise ValueError("query must be at most 200 characters")
         if normalized_sender is not None and len(normalized_sender) > 200:
             raise ValueError("sender_participant_id is invalid")
+        if normalized_message_kind not in {None, "message", "task", "forward"}:
+            raise ValueError("message_kind must be message, task, or forward")
+        if normalized_notification_mode not in {None, "ordinary", "mention"}:
+            raise ValueError("notification_mode must be ordinary or mention")
+        if normalized_thread_scope not in {None, "roots", "replies"}:
+            raise ValueError("thread_scope must be roots or replies")
+        if normalized_marker_kind not in {None, "pin", "decision"}:
+            raise ValueError("marker_kind must be pin or decision")
+        if normalized_room_sequence is not None and normalized_room_sequence < 1:
+            raise ValueError("room_sequence must be a positive integer")
+        maximum_timestamp = 253_402_300_799.0
+        for label, timestamp in (
+            ("created_after", normalized_created_after),
+            ("created_before", normalized_created_before),
+        ):
+            if timestamp is not None and not 0 <= timestamp <= maximum_timestamp:
+                raise ValueError(f"{label} is outside the supported range")
+        if (
+            normalized_created_after is not None
+            and normalized_created_before is not None
+            and normalized_created_after >= normalized_created_before
+        ):
+            raise ValueError("created_after must be earlier than created_before")
         normalized_limit = max(1, min(int(limit), 50))
         clauses = ["message.conversation_id = ?"]
         parameters: list[Any] = [conversation]
@@ -836,6 +893,33 @@ class ViewerRepository:
         if normalized_sender is not None:
             clauses.append("message.sender_participant_id = ?")
             parameters.append(normalized_sender)
+        if normalized_message_kind is not None:
+            clauses.append("message.message_kind = ?")
+            parameters.append(normalized_message_kind)
+        if normalized_notification_mode is not None:
+            clauses.append("message.notification_mode = ?")
+            parameters.append(normalized_notification_mode)
+        if normalized_thread_scope == "roots":
+            clauses.append("message.reply_to IS NULL")
+        elif normalized_thread_scope == "replies":
+            clauses.append("message.reply_to IS NOT NULL")
+        if normalized_marker_kind is not None:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM room_message_markers AS marker_filter "
+                "WHERE marker_filter.conversation_id = message.conversation_id "
+                "AND marker_filter.message_id = message.message_id "
+                "AND marker_filter.marker_kind = ?)"
+            )
+            parameters.append(normalized_marker_kind)
+        if normalized_room_sequence is not None:
+            clauses.append("message.room_sequence = ?")
+            parameters.append(normalized_room_sequence)
+        if normalized_created_after is not None:
+            clauses.append("message.created_at >= ?")
+            parameters.append(normalized_created_after)
+        if normalized_created_before is not None:
+            clauses.append("message.created_at < ?")
+            parameters.append(normalized_created_before)
         if before_sequence is not None:
             clauses.append("message.sequence < ?")
             parameters.append(max(0, int(before_sequence)))
@@ -846,10 +930,17 @@ class ViewerRepository:
                 SELECT message.sequence, message.room_sequence,
                        message.message_id,
                        message.sender_participant_id, message.message_kind,
+                       message.notification_mode, message.reply_to,
                        message.body, message.created_at,
                        sender.client_type AS sender_client_type,
                        sender.display_name AS sender_display_name,
-                       sender.avatar_key AS sender_avatar_key
+                       sender.avatar_key AS sender_avatar_key,
+                       (
+                           SELECT GROUP_CONCAT(marker.marker_kind)
+                           FROM room_message_markers AS marker
+                           WHERE marker.conversation_id = message.conversation_id
+                             AND marker.message_id = message.message_id
+                       ) AS marker_kinds
                 FROM messages AS message
                 JOIN participants AS sender
                   ON sender.participant_id = message.sender_participant_id
@@ -876,6 +967,15 @@ class ViewerRepository:
                     "sender_display_name": str(row["sender_display_name"]),
                     "sender_avatar_key": str(row["sender_avatar_key"] or "auto"),
                     "message_kind": str(row["message_kind"] or "message"),
+                    "notification_mode": str(
+                        row["notification_mode"] or "ordinary"
+                    ),
+                    "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
+                    "marker_kinds": sorted(
+                        value
+                        for value in str(row["marker_kinds"] or "").split(",")
+                        if value
+                    ),
                     "body_preview": body[:500],
                     "body_truncated": len(body) > 500,
                     "created_at": float(row["created_at"]),
@@ -885,6 +985,15 @@ class ViewerRepository:
             "conversation_id": conversation,
             "query": normalized_query,
             "sender_participant_id": normalized_sender,
+            "filters": {
+                "message_kind": normalized_message_kind,
+                "notification_mode": normalized_notification_mode,
+                "thread_scope": normalized_thread_scope,
+                "marker_kind": normalized_marker_kind,
+                "room_sequence": normalized_room_sequence,
+                "created_after": normalized_created_after,
+                "created_before": normalized_created_before,
+            },
             "results": results,
             "count": len(results),
             "has_more": has_more,

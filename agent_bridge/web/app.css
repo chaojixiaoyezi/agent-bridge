@@ -464,6 +464,25 @@ select option {
 .room-message-search select:focus,
 .room-message-search input:focus { border-color: rgba(85,214,199,.38); box-shadow: 0 0 0 3px rgba(85,214,199,.06); }
 .room-message-search .compact-button { min-width: 54px; height: 30px; padding: 0 9px; }
+.room-message-search-advanced { grid-column: 1 / -1; }
+.room-message-search-advanced summary {
+  width: max-content;
+  color: var(--muted);
+  font-size: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.room-message-search-advanced[open] summary { margin-bottom: 7px; color: var(--cyan); }
+.room-message-search-advanced.disabled { opacity: .5; pointer-events: none; }
+.room-message-search-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 7px;
+}
+.room-message-search-filter-grid label { min-width: 0; display: grid; gap: 4px; }
+.room-message-search-filter-grid label > span { color: var(--muted); font-size: 8px; }
+.room-message-search-filter-grid select,
+.room-message-search-filter-grid input { width: 100%; }
 .room-message-search-feedback {
   position: absolute;
   right: 18px;
@@ -504,6 +523,7 @@ select option {
 .room-message-search-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .room-message-search-result-heading strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .room-message-search-result-heading small { flex: none; color: var(--muted); font-size: 8px; }
+.room-message-search-result-facets { display: block; margin-top: 4px; color: var(--purple); font-size: 8px; }
 .room-message-search-result-body { display: -webkit-box; margin-top: 5px; overflow: hidden; color: var(--muted-strong); font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .room-message-search-empty { margin: 8px; color: var(--muted); font-size: 9px; text-align: center; }
 .load-search-results { display: block; margin: 8px auto 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted-strong); background: var(--surface-soft); cursor: pointer; }
