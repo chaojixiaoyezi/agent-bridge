@@ -348,7 +348,14 @@ class BridgeHttpClient:
             with urlopen(request, timeout=max(1.0, float(timeout))) as response:
                 raw = _response_bytes(response)
         except HTTPError as exc:
-            raw = _response_bytes(exc)
+            try:
+                raw = _response_bytes(exc)
+            except (OSError, HTTPException):
+                # Some servers close an empty redirect/error response before
+                # urllib finishes reading its synthetic HTTPError body. Keep
+                # the authoritative HTTP status instead of misreporting that
+                # secondary socket reset as a transport outage.
+                raw = b""
             try:
                 error_payload = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):

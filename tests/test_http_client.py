@@ -6,6 +6,7 @@ import threading
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request
 
 import pytest
@@ -363,3 +364,35 @@ def test_bridge_client_does_not_forward_session_tokens_through_redirects() -> No
         target.shutdown()
         redirect.server_close()
         target.server_close()
+
+
+def test_http_status_survives_a_reset_while_reading_an_empty_error_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResetBody:
+        @staticmethod
+        def read(_limit: int) -> bytes:
+            raise ConnectionResetError("peer closed empty error body")
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    def reject(_request: Request, *, timeout: float):
+        del timeout
+        raise HTTPError(
+            "http://127.0.0.1/agent/wait",
+            302,
+            "Found",
+            {},
+            ResetBody(),
+        )
+
+    monkeypatch.setattr("agent_bridge.http_client.urlopen", reject)
+    client = BridgeHttpClient("http://127.0.0.1")
+    client.access_token = "session-private"
+
+    with pytest.raises(BridgeRemoteError, match="HTTP 302") as captured:
+        client.post("/agent/wait", {"wait_seconds": 0})
+
+    assert captured.value.status_code == 302

@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.32.0 / schema 35。
+当前协议/数据库版本：Agent Bridge v0.32.1 / schema 35。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -249,6 +249,12 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。
 
 ## 9. 发布前维护者检查表
+
+远端 CI 保留原有 `Python 3.12 tests and static checks` 状态，并额外要求
+`macOS runtime and launchd compatibility` 与
+`Migration, security, and release contracts` 通过。前者在 macOS 跑全量测试、
+shell 入口和 launchd plist；后者把数据库迁移、快照恢复、公网 fail-closed、
+私有房间和单设备凭证边界拆成独立门禁。三项都成功才视为可部署。
 
 - [ ] 变更只在 Agent Bridge 仓库，没有夹带接入项目文件。
 - [ ] 数据迁移、旧接口和守护进程模板同步更新。

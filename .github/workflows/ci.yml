@@ -56,3 +56,87 @@ jobs:
 
       - name: Check patch whitespace
         run: git diff --check
+
+  macos-runtime:
+    name: macOS runtime and launchd compatibility
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Verify lockfile and install dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --dev
+
+      - name: Run the full runtime suite on macOS
+        run: uv run pytest
+
+      - name: Check Python and shell entrypoints
+        run: |
+          uv run ruff check .
+          uv run python -m compileall -q agent_bridge tests
+          for entrypoint in bin/*; do
+            sh -n "$entrypoint"
+          done
+
+      - name: Validate launchd templates
+        run: |
+          for plist in deploy/macos/*.plist; do
+            plutil -lint "$plist"
+          done
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+  release-contracts:
+    name: Migration, security, and release contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+
+      - name: Prove migration and non-destructive release gates
+        run: |
+          uv run pytest \
+            tests/test_maintenance.py \
+            tests/test_store.py::test_schema_30_messages_backfill_room_display_sequences \
+            tests/test_store.py::test_schema_32_adds_optional_email_recovery_without_rebuilding_users \
+            tests/test_store.py::test_schema_thirty_backfills_only_explicit_web_room_access \
+            tests/test_store.py::test_delivery_migration_keeps_group_history_without_false_old_backlog \
+            tests/test_store.py::test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode
+
+      - name: Prove public and credential security boundaries
+        run: |
+          uv run pytest \
+            tests/test_viewer.py::test_public_mode_fails_closed_and_enforces_transport_host_cookie_and_body \
+            tests/test_viewer.py::test_public_security_environment_requires_exact_trust_boundaries \
+            tests/test_viewer.py::test_public_access_code_registration_and_auth_rate_limits \
+            tests/test_viewer.py::test_private_web_rooms_require_explicit_access_and_revocation_isolated \
+            tests/test_viewer.py::test_admin_rotates_and_revokes_one_connector_without_exposing_credentials \
+            tests/test_store.py::test_connector_enrollment_rotation_and_device_revoke_are_isolated \
+            tests/test_credential_cli.py \
+            tests/test_email_delivery.py
