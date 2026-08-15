@@ -964,6 +964,15 @@ select option {
 .profile-avatar-section .field-help { margin: 8px 0 0; }
 .account-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
 .account-actions .primary-button { margin-left: auto; }
+.account-email-section {
+  margin: 14px 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-soft);
+}
+.account-email-section .rate-section-heading { margin-bottom: 10px; }
+.account-email-section .form-actions { margin-bottom: 2px; }
 .danger-button { color: var(--danger); border-color: rgba(255,119,141,.2); }
 .dialog-heading { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 23px; }
 .dialog-close {

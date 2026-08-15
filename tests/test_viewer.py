@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import sqlite3
 import time
 from pathlib import Path
@@ -24,6 +25,22 @@ from agent_bridge.viewer_store import ViewerRepository
 CAPTCHA_ANSWER = "ABCDE"
 ADMIN_PASSWORD = "AdminSecure1!"
 USER_PASSWORD = "MemberSecure1!"
+
+
+class FakeEmailDelivery:
+    def __init__(self) -> None:
+        self.verifications: list[tuple[str, str]] = []
+        self.password_resets: list[tuple[str, str]] = []
+        self.password_changes: list[str] = []
+
+    def send_verification(self, recipient: str, token: str) -> None:
+        self.verifications.append((recipient, token))
+
+    def send_password_reset(self, recipient: str, token: str) -> None:
+        self.password_resets.append((recipient, token))
+
+    def send_password_changed(self, recipient: str) -> None:
+        self.password_changes.append(recipient)
 
 
 def make_app(database: Path, **kwargs):
@@ -362,6 +379,192 @@ def test_web_login_registration_password_policy_profile_and_roles(
         headers=intent_headers(member_client, "rename-room"),
         json={"new_conversation_id": "普通用户不能改"},
     ).status_code == 403
+
+
+def test_email_verification_and_password_reset_are_optional_single_use_and_private(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "email-auth.db"
+    disabled = TestClient(make_app(database))
+    disabled_health = disabled.get("/api/health").json()
+    assert disabled_health["email_delivery_enabled"] is False
+    disabled_registration = disabled.post(
+        "/api/auth/register",
+        headers=intent_headers(disabled, "register"),
+        json={
+            "username": "noemail",
+            "password": USER_PASSWORD,
+            "email": "noemail@example.com",
+            "captcha_id": captcha(disabled),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert disabled_registration.status_code == 403
+
+    mailer = FakeEmailDelivery()
+    client = TestClient(make_app(database, email_delivery=mailer))
+    assert client.get("/api/health").json()["email_delivery_enabled"] is True
+    registered = client.post(
+        "/api/auth/register",
+        headers=intent_headers(client, "register"),
+        json={
+            "username": "recoverable",
+            "password": USER_PASSWORD,
+            "email": "Recovery.User@example.com",
+            "captcha_id": captcha(client),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert registered.status_code == 201
+    user = registered.json()["user"]
+    assert user["email_verified"] is False
+    assert user["email_verification_pending"] is True
+    assert user["pending_email_masked"] == "r******r@example.com"
+    assert "recovery.user@example.com" not in str(registered.json())
+    assert len(mailer.verifications) == 1
+    verification_recipient, verification_token = mailer.verifications[0]
+    assert verification_recipient == "recovery.user@example.com"
+
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT token_hash FROM web_email_tokens "
+            "WHERE purpose = 'verify_email'"
+        ).fetchone()[0]
+    assert stored != verification_token
+    assert verification_token not in database.read_bytes().decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+    verified = client.post(
+        "/api/auth/email/verify",
+        headers=intent_headers(client, "verify-email"),
+        json={"token": verification_token},
+    )
+    assert verified.status_code == 200
+    assert verified.json()["verified"] is True
+    assert client.post(
+        "/api/auth/email/verify",
+        headers=intent_headers(client, "verify-email"),
+        json={"token": verification_token},
+    ).status_code == 400
+    current = client.get("/api/auth/me").json()["user"]
+    assert current["email_verified"] is True
+    assert current["email_masked"] == "r******r@example.com"
+    assert current["pending_email_masked"] is None
+
+    wrong_change = client.post(
+        "/api/auth/email/request",
+        headers=intent_headers(client, "request-email-verification"),
+        json={"email": "second@example.com", "current_password": "wrong"},
+    )
+    assert wrong_change.status_code == 400
+    changed_email = client.post(
+        "/api/auth/email/request",
+        headers=intent_headers(client, "request-email-verification"),
+        json={"email": "second@example.com", "current_password": USER_PASSWORD},
+    )
+    assert changed_email.status_code == 200
+    assert changed_email.json()["user"]["email_verification_pending"] is True
+    _, replacement_token = mailer.verifications[-1]
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE web_email_tokens SET expires_at = 0 WHERE token_hash = ?",
+            (hashlib.sha256(replacement_token.encode()).hexdigest(),),
+        )
+    assert client.post(
+        "/api/auth/email/verify",
+        headers=intent_headers(client, "verify-email"),
+        json={"token": replacement_token},
+    ).status_code == 400
+    renewed_email = client.post(
+        "/api/auth/email/request",
+        headers=intent_headers(client, "request-email-verification"),
+        json={"email": "second@example.com", "current_password": USER_PASSWORD},
+    )
+    assert renewed_email.status_code == 200
+    _, replacement_token = mailer.verifications[-1]
+    assert client.post(
+        "/api/auth/email/verify",
+        headers=intent_headers(client, "verify-email"),
+        json={"token": replacement_token},
+    ).status_code == 200
+
+    second_session = TestClient(make_app(database, email_delivery=mailer))
+    assert second_session.post(
+        "/api/auth/login",
+        headers=intent_headers(second_session, "login"),
+        json={
+            "username": "recoverable",
+            "password": USER_PASSWORD,
+            "captcha_id": captcha(second_session),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    ).status_code == 200
+
+    recovery = TestClient(make_app(database, email_delivery=mailer))
+    known = recovery.post(
+        "/api/auth/password-reset/request",
+        headers=intent_headers(recovery, "request-password-reset"),
+        json={
+            "identifier": "recoverable",
+            "captcha_id": captcha(recovery),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    unknown = recovery.post(
+        "/api/auth/password-reset/request",
+        headers=intent_headers(recovery, "request-password-reset"),
+        json={
+            "identifier": "missing@example.com",
+            "captcha_id": captcha(recovery),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == unknown.json()
+    assert len(mailer.password_resets) == 1
+    reset_recipient, reset_token = mailer.password_resets[0]
+    assert reset_recipient == "second@example.com"
+
+    reset = recovery.post(
+        "/api/auth/password-reset/confirm",
+        headers=intent_headers(recovery, "confirm-password-reset"),
+        json={"token": reset_token, "new_password": "RecoveredSecure2!"},
+    )
+    assert reset.status_code == 200
+    assert reset.json()["reset"] is True
+    assert mailer.password_changes == ["second@example.com"]
+    assert recovery.post(
+        "/api/auth/password-reset/confirm",
+        headers=intent_headers(recovery, "confirm-password-reset"),
+        json={"token": reset_token, "new_password": "AnotherSecure3!"},
+    ).status_code == 400
+    assert client.get("/api/auth/me").status_code == 401
+    assert second_session.get("/api/auth/me").status_code == 401
+
+    old_password = recovery.post(
+        "/api/auth/login",
+        headers=intent_headers(recovery, "login"),
+        json={
+            "username": "recoverable",
+            "password": USER_PASSWORD,
+            "captcha_id": captcha(recovery),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert old_password.status_code == 401
+    new_password = recovery.post(
+        "/api/auth/login",
+        headers=intent_headers(recovery, "login"),
+        json={
+            "username": "recoverable",
+            "password": "RecoveredSecure2!",
+            "captcha_id": captcha(recovery),
+            "captcha_answer": CAPTCHA_ANSWER,
+        },
+    )
+    assert new_password.status_code == 200
 
 
 def test_private_web_rooms_require_explicit_access_and_revocation_isolated(
@@ -1479,8 +1682,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260814-12" in index_html
-    assert "app.css?v=20260814-12" in index_html
+    assert "app.js?v=20260814-13" in index_html
+    assert "app.css?v=20260814-13" in index_html
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
@@ -1493,6 +1696,11 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert 'id="room-message-search-marker"' in index_html
     assert 'id="room-message-search-sequence"' in index_html
     assert 'id="register-access-code"' in index_html
+    assert 'id="register-email"' in index_html
+    assert 'id="password-reset-request-dialog"' in index_html
+    assert 'id="account-email-section"' in index_html
+    assert "/api/auth/password-reset/request" in javascript
+    assert "/api/auth/email/verify" in javascript
     assert "webRegistrationMode" in javascript
     assert "function appendMessages" in javascript
     assert "function updateReceiptLabels" in javascript

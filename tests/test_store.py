@@ -284,12 +284,52 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
         ("迁移房间一", 2),
     ]
+
+
+def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "email-migration.db"
+    store = BridgeStore(database)
+    WebAuthStore(database)
+    with store._connection() as connection:
+        before = connection.execute(
+            "SELECT user_id, username, password_hash, participant_id "
+            "FROM web_users WHERE username = 'admin'"
+        ).fetchone()
+        connection.executescript(
+            """
+            DROP TABLE web_email_tokens;
+            DROP INDEX idx_web_users_verified_email_unique;
+            DROP INDEX idx_web_users_pending_email_unique;
+            ALTER TABLE web_users DROP COLUMN email_updated_at;
+            ALTER TABLE web_users DROP COLUMN pending_email;
+            ALTER TABLE web_users DROP COLUMN email_verified_at;
+            ALTER TABLE web_users DROP COLUMN email;
+            PRAGMA user_version = 32;
+            """
+        )
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        after = connection.execute(
+            "SELECT user_id, username, password_hash, participant_id, email, "
+            "email_verified_at, pending_email, email_updated_at "
+            "FROM web_users WHERE username = 'admin'"
+        ).fetchone()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'web_email_tokens'"
+        ).fetchone() is not None
+    assert tuple(after[:4]) == tuple(before)
+    assert tuple(after[4:]) == (None, None, None, None)
 
 
 def test_room_threads_and_highlights_preserve_original_messages_across_rename(
@@ -1171,7 +1211,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1243,7 +1283,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1472,7 +1512,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -2809,7 +2849,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 32
+    assert version == 33
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -2881,7 +2921,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 32
+    assert version == 33
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -2977,7 +3017,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 32
+    assert version == 33
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -4830,7 +4870,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 33
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -4885,7 +4925,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 32
+    assert version == 33
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -5596,7 +5636,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 33
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

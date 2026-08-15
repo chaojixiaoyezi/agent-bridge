@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.29.0。
+当前版本：v0.30.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -31,6 +31,8 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - Web 看板需要登录。用户可以自行注册，登录与注册都要求一次性图形验证码；会话令牌只保存在 `HttpOnly`、`SameSite=Strict` Cookie 中。
 - 初始管理员是 `admin/admin`。这是唯一的引导例外：首次登录后必须先修改密码，未改之前不能读取或操作聊天室。
 - 新密码为 10–128 个字符，并至少包含小写字母、大写字母、数字、符号中的三类；改密会撤销该用户的其他 Web 会话。
+- 邮箱能力是可选的：未完整配置 SMTP 时注册、登录和聊天室保持原样，页面不会显示邮箱入口。启用后，注册可选填邮箱，登录用户也可用当前密码绑定或更换邮箱；只有验证成功的邮箱才能找回密码。
+- 邮箱验证链接 24 小时有效，密码重置链接 30 分钟有效，均为一次性随机令牌且数据库只存 SHA-256 哈希。找回请求对存在和不存在的账户返回完全相同的文案；重置成功后撤销该账户全部 Web 会话并要求重新登录。
 - Web 聊天室默认私有。全局管理员可以查看全部聊天室；普通用户只看得到自己创建或被管理员明确加入的聊天室，且只有这些房间的历史、搜索、成员、回执、唤醒策略与发送接口可访问。猜测房间 URL 不会自动入群；移出后立即失去读取和发言权，但 Agent 成员、Agent session 与历史消息不变。
 - 普通用户可以在自己可见的聊天室发送群消息，并直接修改自己的昵称和签名。管理员可按名字授权其创建聊天室并设置 1–100 个的同时使用上限，默认上限为 2；创建者成为该房间的所有者，可以重命名本房、管理本房 Web 成员、邀请或踢出本房 Agent、调整唤醒策略、使用结构化 `@全员`，并可把普通成员委派为聊天室管理员。
 - 受委派的聊天室管理员可以管理本房普通成员、邀请或撤销本房 Agent 邀请、踢出本房 Agent、调整唤醒策略和使用 `@全员`；不能委派或移除其他聊天室管理员、不能重命名房间，也不会自动获得布置任务或修改任务授权的权限。房间所有者与全局管理员可以升降聊天室管理员；任务权限仍由房间所有者单独治理。
@@ -263,7 +265,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索，不修改 schema。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.29.0 使用 schema 32。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.30.0 使用 schema 33。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -271,7 +273,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 
 ## 公网部署
 
-不要把默认监听端口直接映射到互联网。v0.19.0 新增显式 `AGENT_BRIDGE_PUBLIC_MODE=1`：公网模式要求管理员已更换初始密码、Agent 登记使用至少 32 字符的独立密钥、精确 Host/HTTPS Origin，以及直接 TLS 或明确的可信反向代理；任一关键条件缺失都会拒绝启动。公网 Web 注册默认关闭，也可显式设为带注册码或开放注册。
+不要把默认监听端口直接映射到互联网。v0.19.0 新增显式 `AGENT_BRIDGE_PUBLIC_MODE=1`：公网模式要求管理员已更换初始密码、Agent 登记使用至少 32 字符的独立密钥、精确 Host/HTTPS Origin，以及直接 TLS 或明确的可信反向代理；任一关键条件缺失都会拒绝启动。公网 Web 注册默认关闭，也可显式设为带注册码或开放注册。邮箱找回只有完整配置 SMTP、固定公开基址和发件地址后才启用；公网链接强制使用 HTTPS，不能从请求 Host 动态拼接。
 
 公网模式还启用 `__Host-` Secure Cookie、30 分钟滑动闲置会话、HTTPS/Host/Origin 强制校验、HSTS、安全响应头、70 KB 请求体上限，以及认证、登记、搜索、A2A 和 SSE 握手的进程内限流。进程内限流不能替代反向代理/WAF 的共享限流、连接数和带宽保护。完整配置、代理硬要求、发布与回滚步骤见 [docs/PUBLIC_SECURITY.md](docs/PUBLIC_SECURITY.md)，可从 [deploy/viewer-public.env.example](deploy/viewer-public.env.example) 开始配置。
 
@@ -300,7 +302,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.29.0
+  --label v0.30.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

@@ -1706,7 +1706,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 32")
+            conn.execute("PRAGMA user_version = 33")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -1730,6 +1730,30 @@ class BridgeStore:
                 f"NOT NULL DEFAULT {DEFAULT_WEB_USER_ROOM_LIMIT} "
                 f"CHECK (room_limit BETWEEN 1 AND {MAX_WEB_USER_ROOM_LIMIT})"
             )
+        if "avatar_key" not in columns:
+            conn.execute(
+                "ALTER TABLE web_users ADD COLUMN avatar_key TEXT "
+                "NOT NULL DEFAULT 'auto'"
+            )
+        for column, declaration in (
+            ("email", "TEXT COLLATE NOCASE"),
+            ("email_verified_at", "REAL"),
+            ("pending_email", "TEXT COLLATE NOCASE"),
+            ("email_updated_at", "REAL"),
+        ):
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE web_users ADD COLUMN {column} {declaration}"
+                )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_verified_email_unique "
+            "ON web_users(email COLLATE NOCASE) WHERE email IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_pending_email_unique "
+            "ON web_users(pending_email COLLATE NOCASE) "
+            "WHERE pending_email IS NOT NULL"
+        )
 
     @staticmethod
     def _initialize_room_message_sequences_locked(

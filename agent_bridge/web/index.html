@@ -4,9 +4,10 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260814-12">
-    <script src="/assets/app.js?v=20260814-12" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260814-13">
+    <script src="/assets/app.js?v=20260814-13" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -265,6 +266,10 @@
           <label class="field-label access-field" for="register-access-code">注册码</label>
           <input class="room-id-input" id="register-access-code" type="password" maxlength="256" autocomplete="one-time-code">
         </div>
+        <div id="register-email-wrap" hidden>
+          <label class="field-label access-field" for="register-email">邮箱（可选）</label>
+          <input class="room-id-input" id="register-email" type="email" maxlength="254" autocomplete="email" placeholder="用于验证与找回密码">
+        </div>
         <label class="field-label access-field" for="captcha-answer">验证码</label>
         <div class="captcha-row">
           <img id="captcha-image" alt="登录验证码">
@@ -274,7 +279,54 @@
         <p class="field-help" id="auth-help">默认管理员首次登录使用 admin/admin，登录后必须立即设置符合复杂度要求的新密码。</p>
         <p class="form-feedback" id="auth-feedback" role="status" aria-live="polite"></p>
         <div class="form-actions">
+          <button class="secondary-button" id="open-password-reset" type="button" hidden>忘记密码</button>
           <button class="primary-button" id="submit-auth" type="submit">登录</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="room-dialog auth-dialog" id="password-reset-request-dialog" aria-labelledby="password-reset-request-title">
+      <form class="room-form" id="password-reset-request-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ACCOUNT RECOVERY</p>
+            <h2 id="password-reset-request-title">找回密码</h2>
+          </div>
+          <button class="dialog-close" id="close-password-reset-request" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-label" for="password-reset-identifier">用户名或已验证邮箱</label>
+        <input class="room-id-input" id="password-reset-identifier" type="text" maxlength="254" autocomplete="username" required>
+        <label class="field-label access-field" for="password-reset-captcha-answer">验证码</label>
+        <div class="captcha-row">
+          <img id="password-reset-captcha-image" alt="密码找回验证码">
+          <button class="secondary-button compact-button" id="refresh-password-reset-captcha" type="button">换一张</button>
+        </div>
+        <input class="room-id-input captcha-input" id="password-reset-captcha-answer" type="text" maxlength="8" autocomplete="off" required>
+        <p class="field-help">无论账户是否存在，页面都会返回相同提示；只有已验证邮箱会收到一次性链接。</p>
+        <p class="form-feedback" id="password-reset-request-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="primary-button" id="submit-password-reset-request" type="submit">发送找回邮件</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="room-dialog auth-dialog" id="password-reset-confirm-dialog" aria-labelledby="password-reset-confirm-title">
+      <form class="room-form" id="password-reset-confirm-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">ONE-TIME LINK</p>
+            <h2 id="password-reset-confirm-title">设置新密码</h2>
+          </div>
+          <button class="dialog-close" id="close-password-reset-confirm" type="button" aria-label="关闭">×</button>
+        </div>
+        <label class="field-label" for="password-reset-new-password">新密码</label>
+        <input class="room-id-input" id="password-reset-new-password" type="password" maxlength="128" autocomplete="new-password" required>
+        <label class="field-label access-field" for="password-reset-new-password-confirm">确认新密码</label>
+        <input class="room-id-input" id="password-reset-new-password-confirm" type="password" maxlength="128" autocomplete="new-password" required>
+        <p class="field-help" id="password-reset-policy-copy">密码需为 10–128 个字符，并至少包含小写字母、大写字母、数字、符号中的三类。</p>
+        <p class="form-feedback" id="password-reset-confirm-feedback" role="status" aria-live="polite"></p>
+        <div class="form-actions">
+          <button class="primary-button" id="submit-password-reset-confirm" type="submit">更新密码</button>
         </div>
       </form>
     </dialog>
@@ -312,6 +364,22 @@
           <button class="dialog-close" id="close-account" type="button" aria-label="关闭">×</button>
         </div>
         <p class="account-identity" id="account-identity"></p>
+        <section class="account-email-section" id="account-email-section" hidden>
+          <div class="rate-section-heading">
+            <div>
+              <strong>邮箱与找回密码</strong>
+              <p id="account-email-status">尚未绑定邮箱。</p>
+            </div>
+          </div>
+          <label class="field-label" for="account-email">新邮箱</label>
+          <input class="room-id-input" id="account-email" type="email" maxlength="254" autocomplete="email" placeholder="name@example.com">
+          <label class="field-label access-field" for="account-email-password">当前密码</label>
+          <input class="room-id-input" id="account-email-password" type="password" maxlength="128" autocomplete="current-password">
+          <div class="form-actions">
+            <button class="secondary-button" id="send-email-verification" type="button">发送验证邮件</button>
+          </div>
+          <p class="form-feedback" id="account-email-feedback" role="status" aria-live="polite"></p>
+        </section>
         <section class="profile-avatar-section" aria-labelledby="profile-avatar-label">
           <div class="profile-avatar-row">
             <div class="profile-avatar-current" id="profile-avatar-current" aria-live="polite"></div>

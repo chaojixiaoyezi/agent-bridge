@@ -6,6 +6,10 @@ const state = {
   authMode: "login",
   passwordChangeRequired: false,
   webRegistrationMode: "open",
+  emailDeliveryEnabled: false,
+  captchaId: null,
+  passwordResetCaptchaId: null,
+  passwordResetToken: null,
   rooms: [],
   selectedRoom: window.localStorage.getItem("agentBridgeSelectedRoom") || null,
   filter: "",
@@ -298,12 +302,32 @@ const elements = {
   registerConfirmWrap: document.querySelector("#register-confirm-wrap"),
   registerAccessCodeWrap: document.querySelector("#register-access-code-wrap"),
   registerAccessCode: document.querySelector("#register-access-code"),
+  registerEmailWrap: document.querySelector("#register-email-wrap"),
+  registerEmail: document.querySelector("#register-email"),
   captchaImage: document.querySelector("#captcha-image"),
   captchaAnswer: document.querySelector("#captcha-answer"),
   refreshCaptcha: document.querySelector("#refresh-captcha"),
   authHelp: document.querySelector("#auth-help"),
   authFeedback: document.querySelector("#auth-feedback"),
   submitAuth: document.querySelector("#submit-auth"),
+  openPasswordReset: document.querySelector("#open-password-reset"),
+  passwordResetRequestDialog: document.querySelector("#password-reset-request-dialog"),
+  passwordResetRequestForm: document.querySelector("#password-reset-request-form"),
+  closePasswordResetRequest: document.querySelector("#close-password-reset-request"),
+  passwordResetIdentifier: document.querySelector("#password-reset-identifier"),
+  passwordResetCaptchaImage: document.querySelector("#password-reset-captcha-image"),
+  passwordResetCaptchaAnswer: document.querySelector("#password-reset-captcha-answer"),
+  refreshPasswordResetCaptcha: document.querySelector("#refresh-password-reset-captcha"),
+  passwordResetRequestFeedback: document.querySelector("#password-reset-request-feedback"),
+  submitPasswordResetRequest: document.querySelector("#submit-password-reset-request"),
+  passwordResetConfirmDialog: document.querySelector("#password-reset-confirm-dialog"),
+  passwordResetConfirmForm: document.querySelector("#password-reset-confirm-form"),
+  closePasswordResetConfirm: document.querySelector("#close-password-reset-confirm"),
+  passwordResetNewPassword: document.querySelector("#password-reset-new-password"),
+  passwordResetNewPasswordConfirm: document.querySelector("#password-reset-new-password-confirm"),
+  passwordResetPolicyCopy: document.querySelector("#password-reset-policy-copy"),
+  passwordResetConfirmFeedback: document.querySelector("#password-reset-confirm-feedback"),
+  submitPasswordResetConfirm: document.querySelector("#submit-password-reset-confirm"),
   passwordDialog: document.querySelector("#password-dialog"),
   passwordForm: document.querySelector("#password-form"),
   passwordTitle: document.querySelector("#password-title"),
@@ -318,6 +342,12 @@ const elements = {
   profileForm: document.querySelector("#profile-form"),
   closeAccount: document.querySelector("#close-account"),
   accountIdentity: document.querySelector("#account-identity"),
+  accountEmailSection: document.querySelector("#account-email-section"),
+  accountEmailStatus: document.querySelector("#account-email-status"),
+  accountEmail: document.querySelector("#account-email"),
+  accountEmailPassword: document.querySelector("#account-email-password"),
+  sendEmailVerification: document.querySelector("#send-email-verification"),
+  accountEmailFeedback: document.querySelector("#account-email-feedback"),
   profileAvatarCurrent: document.querySelector("#profile-avatar-current"),
   profileAvatarVendor: document.querySelector("#profile-avatar-vendor"),
   profileAvatarOptions: document.querySelector("#profile-avatar-options"),
@@ -616,6 +646,9 @@ function setAuthMode(mode) {
     && state.webRegistrationMode === "access_code";
   elements.registerAccessCodeWrap.hidden = !registrationCodeRequired;
   elements.registerAccessCode.required = registrationCodeRequired;
+  elements.registerEmailWrap.hidden = !(registering && state.emailDeliveryEnabled);
+  if (!registering) elements.registerEmail.value = "";
+  elements.openPasswordReset.hidden = registering || !state.emailDeliveryEnabled;
   elements.authPassword.autocomplete = registering ? "new-password" : "current-password";
   elements.authTitle.textContent = registering ? "注册 Web 用户" : "登录 Agent Bridge";
   elements.submitAuth.textContent = registering ? "注册并登录" : "登录";
@@ -640,6 +673,41 @@ async function loadCaptcha() {
   } finally {
     elements.refreshCaptcha.disabled = false;
   }
+}
+
+async function loadPasswordResetCaptcha() {
+  elements.refreshPasswordResetCaptcha.disabled = true;
+  elements.passwordResetCaptchaImage.removeAttribute("src");
+  try {
+    const payload = await fetchJson("/api/auth/captcha", { suppressAuthRedirect: true });
+    state.passwordResetCaptchaId = payload.captcha.captcha_id;
+    elements.passwordResetCaptchaImage.src = payload.captcha.image;
+    elements.passwordResetCaptchaAnswer.value = "";
+  } catch (error) {
+    state.passwordResetCaptchaId = null;
+    elements.passwordResetRequestFeedback.classList.add("error");
+    elements.passwordResetRequestFeedback.textContent = `验证码加载失败：${error.message}`;
+  } finally {
+    elements.refreshPasswordResetCaptcha.disabled = false;
+  }
+}
+
+function takeEmailActionFromHash() {
+  const raw = window.location.hash.startsWith("#")
+    ? window.location.hash.slice(1)
+    : "";
+  const separator = raw.indexOf("=");
+  if (separator < 1) return null;
+  const action = raw.slice(0, separator);
+  if (!["verify-email", "reset-password"].includes(action)) return null;
+  let token;
+  try {
+    token = decodeURIComponent(raw.slice(separator + 1));
+  } catch (_error) {
+    token = "";
+  }
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  return { action, token };
 }
 
 function showAuthScreen(message = "") {
@@ -667,6 +735,8 @@ function showAuthScreen(message = "") {
   elements.appShell.hidden = true;
   for (const dialog of [
     elements.passwordDialog,
+    elements.passwordResetRequestDialog,
+    elements.passwordResetConfirmDialog,
     elements.accountDialog,
     elements.registrationCodeDialog,
     elements.createRoomDialog,
@@ -768,6 +838,42 @@ async function enterApplication() {
 }
 
 async function bootstrapAuthentication() {
+  const emailAction = takeEmailActionFromHash();
+  let startupMessage = "";
+  try {
+    const health = await fetchJson("/api/health", { suppressAuthRedirect: true });
+    state.webRegistrationMode = health.web_registration_mode || "open";
+    state.emailDeliveryEnabled = Boolean(health.email_delivery_enabled);
+  } catch (healthError) {
+    console.error("public auth policy unavailable", healthError);
+  }
+  if (emailAction?.action === "verify-email") {
+    try {
+      const payload = await fetchJson("/api/auth/email/verify", {
+        method: "POST",
+        suppressAuthRedirect: true,
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agent-Bridge-Intent": "verify-email",
+        },
+        body: JSON.stringify({ token: emailAction.token }),
+      });
+      startupMessage = payload.message;
+    } catch (error) {
+      startupMessage = error.message;
+    }
+  }
+  if (emailAction?.action === "reset-password") {
+    state.passwordResetToken = emailAction.token;
+    elements.passwordResetConfirmForm.reset();
+    elements.passwordResetConfirmFeedback.textContent = "";
+    elements.passwordResetPolicyCopy.textContent = state.passwordPolicy?.description
+      || "密码需为 10–128 个字符，并至少包含小写字母、大写字母、数字、符号中的三类。";
+    if (!elements.passwordResetConfirmDialog.open) {
+      elements.passwordResetConfirmDialog.showModal();
+    }
+    return;
+  }
   try {
     const payload = await fetchJson("/api/auth/me", { suppressAuthRedirect: true });
     state.currentUser = payload.user;
@@ -779,13 +885,9 @@ async function bootstrapAuthentication() {
     await enterApplication();
   } catch (error) {
     if (error.status !== 401) console.error(error);
-    try {
-      const health = await fetchJson("/api/health", { suppressAuthRedirect: true });
-      state.webRegistrationMode = health.web_registration_mode || "open";
-    } catch (healthError) {
-      console.error("public auth policy unavailable", healthError);
-    }
-    showAuthScreen(error.status === 401 ? "" : `无法检查登录状态：${error.message}`);
+    showAuthScreen(
+      startupMessage || (error.status === 401 ? "" : `无法检查登录状态：${error.message}`),
+    );
   }
 }
 
@@ -3140,6 +3242,7 @@ async function refresh(options = {}) {
     ]);
     if (healthPayload) {
       state.messageRateLimits = healthPayload.message_rate_limits || null;
+      state.emailDeliveryEnabled = Boolean(healthPayload.email_delivery_enabled);
       if (healthPayload.current_user) state.currentUser = healthPayload.current_user;
     }
     state.rooms = roomPayload.rooms;
@@ -4020,6 +4123,98 @@ elements.showLogin.addEventListener("click", () => setAuthMode("login"));
 elements.showRegister.addEventListener("click", () => setAuthMode("register"));
 elements.refreshCaptcha.addEventListener("click", loadCaptcha);
 elements.authDialog.addEventListener("cancel", (event) => event.preventDefault());
+elements.openPasswordReset.addEventListener("click", () => {
+  elements.passwordResetRequestForm.reset();
+  elements.passwordResetRequestFeedback.textContent = "";
+  elements.passwordResetRequestFeedback.classList.remove("error", "success");
+  if (elements.authDialog.open) elements.authDialog.close();
+  elements.passwordResetRequestDialog.showModal();
+  loadPasswordResetCaptcha();
+});
+elements.closePasswordResetRequest.addEventListener("click", () => {
+  elements.passwordResetRequestDialog.close();
+  showAuthScreen();
+});
+elements.passwordResetRequestDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  elements.closePasswordResetRequest.click();
+});
+elements.refreshPasswordResetCaptcha.addEventListener("click", loadPasswordResetCaptcha);
+elements.passwordResetRequestForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!elements.passwordResetRequestForm.reportValidity() || !state.passwordResetCaptchaId) return;
+  elements.submitPasswordResetRequest.disabled = true;
+  elements.passwordResetRequestFeedback.classList.remove("error", "success");
+  elements.passwordResetRequestFeedback.textContent = "正在提交…";
+  try {
+    const payload = await fetchJson("/api/auth/password-reset/request", {
+      method: "POST",
+      suppressAuthRedirect: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "request-password-reset",
+      },
+      body: JSON.stringify({
+        identifier: elements.passwordResetIdentifier.value.trim(),
+        captcha_id: state.passwordResetCaptchaId,
+        captcha_answer: elements.passwordResetCaptchaAnswer.value.trim(),
+      }),
+    });
+    elements.passwordResetRequestFeedback.classList.add("success");
+    elements.passwordResetRequestFeedback.textContent = payload.message;
+    state.passwordResetCaptchaId = null;
+    elements.passwordResetCaptchaImage.removeAttribute("src");
+  } catch (error) {
+    elements.passwordResetRequestFeedback.classList.add("error");
+    elements.passwordResetRequestFeedback.textContent = error.message;
+    await loadPasswordResetCaptcha();
+  } finally {
+    elements.submitPasswordResetRequest.disabled = false;
+  }
+});
+elements.closePasswordResetConfirm.addEventListener("click", () => {
+  state.passwordResetToken = null;
+  elements.passwordResetConfirmDialog.close();
+  showAuthScreen();
+});
+elements.passwordResetConfirmDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  elements.closePasswordResetConfirm.click();
+});
+elements.passwordResetConfirmForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!elements.passwordResetConfirmForm.reportValidity() || !state.passwordResetToken) return;
+  if (elements.passwordResetNewPassword.value !== elements.passwordResetNewPasswordConfirm.value) {
+    elements.passwordResetConfirmFeedback.classList.add("error");
+    elements.passwordResetConfirmFeedback.textContent = "两次输入的新密码不一致。";
+    return;
+  }
+  elements.submitPasswordResetConfirm.disabled = true;
+  elements.passwordResetConfirmFeedback.classList.remove("error", "success");
+  elements.passwordResetConfirmFeedback.textContent = "正在更新…";
+  try {
+    const payload = await fetchJson("/api/auth/password-reset/confirm", {
+      method: "POST",
+      suppressAuthRedirect: true,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "confirm-password-reset",
+      },
+      body: JSON.stringify({
+        token: state.passwordResetToken,
+        new_password: elements.passwordResetNewPassword.value,
+      }),
+    });
+    state.passwordResetToken = null;
+    elements.passwordResetConfirmDialog.close();
+    showAuthScreen(payload.message);
+  } catch (error) {
+    elements.passwordResetConfirmFeedback.classList.add("error");
+    elements.passwordResetConfirmFeedback.textContent = error.message;
+  } finally {
+    elements.submitPasswordResetConfirm.disabled = false;
+  }
+});
 
 elements.authForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -4042,6 +4237,9 @@ elements.authForm.addEventListener("submit", async (event) => {
     };
     if (registering && state.webRegistrationMode === "access_code") {
       authenticationPayload.registration_code = elements.registerAccessCode.value;
+    }
+    if (registering && state.emailDeliveryEnabled && elements.registerEmail.value.trim()) {
+      authenticationPayload.email = elements.registerEmail.value.trim();
     }
     const payload = await fetchJson(`/api/auth/${registering ? "register" : "login"}`, {
       method: "POST",
@@ -4123,6 +4321,18 @@ elements.openAccount.addEventListener("click", async () => {
   state.profileAvatarKey = state.currentUser.avatar_key || "auto";
   elements.profileDisplayName.value = state.currentUser.display_name;
   elements.profileSignature.value = state.currentUser.signature;
+  elements.accountEmailSection.hidden = !state.emailDeliveryEnabled;
+  elements.accountEmail.value = "";
+  elements.accountEmailPassword.value = "";
+  elements.accountEmailFeedback.textContent = "";
+  elements.accountEmailFeedback.classList.remove("error", "success");
+  if (state.currentUser.email_verified) {
+    elements.accountEmailStatus.textContent = `已验证：${state.currentUser.email_masked}`;
+  } else if (state.currentUser.email_verification_pending) {
+    elements.accountEmailStatus.textContent = `等待验证：${state.currentUser.pending_email_masked}`;
+  } else {
+    elements.accountEmailStatus.textContent = "尚未绑定邮箱。";
+  }
   elements.profileFeedback.textContent = "";
   elements.profileFeedback.classList.remove("error", "success");
   elements.accountDialog.showModal();
@@ -4132,6 +4342,39 @@ elements.openAccount.addEventListener("click", async () => {
   } catch (error) {
     elements.profileFeedback.classList.add("error");
     elements.profileFeedback.textContent = `头像目录加载失败：${error.message}`;
+  }
+});
+elements.sendEmailVerification.addEventListener("click", async () => {
+  if (!elements.accountEmail.value.trim() || !elements.accountEmailPassword.value) {
+    elements.accountEmailFeedback.classList.add("error");
+    elements.accountEmailFeedback.textContent = "请输入新邮箱和当前密码。";
+    return;
+  }
+  elements.sendEmailVerification.disabled = true;
+  elements.accountEmailFeedback.classList.remove("error", "success");
+  elements.accountEmailFeedback.textContent = "正在提交…";
+  try {
+    const payload = await fetchJson("/api/auth/email/request", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Bridge-Intent": "request-email-verification",
+      },
+      body: JSON.stringify({
+        email: elements.accountEmail.value.trim(),
+        current_password: elements.accountEmailPassword.value,
+      }),
+    });
+    state.currentUser = payload.user;
+    elements.accountEmailPassword.value = "";
+    elements.accountEmailStatus.textContent = `等待验证：${state.currentUser.pending_email_masked}`;
+    elements.accountEmailFeedback.classList.add("success");
+    elements.accountEmailFeedback.textContent = payload.message;
+  } catch (error) {
+    elements.accountEmailFeedback.classList.add("error");
+    elements.accountEmailFeedback.textContent = error.message;
+  } finally {
+    elements.sendEmailVerification.disabled = false;
   }
 });
 elements.profileAvatarVendor.addEventListener("change", () => {

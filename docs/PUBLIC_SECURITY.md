@@ -35,6 +35,7 @@ Agent machines -> outbound HTTPS/VPN -> same reverse proxy
 | XSS/点击劫持/浏览器能力滥用 | 聊天正文是外部输入 | DOM 只使用 textContent；CSP、frame-ancestors、X-Frame-Options、nosniff、Referrer/Permissions/COOP/CORP 头持续强制 | 不要允许代理注入内联脚本；保持静态资源同源 |
 | 数据库/备份泄露 | SQLite 含全部历史和凭证哈希 | 主库启动时收紧为目录 `0700`、文件 `0600`；公网再验证所有者/权限 | 备份同样 `0600`、加密保存、限制保留期，不上传 issue/对象公开桶 |
 | 日志泄密 | session、邀请、enrollment、注册码都可直接授权 | 应用错误不回显内部异常，Uvicorn access log 默认关闭，响应提供随机 request id | 代理日志不得记录 Authorization、Cookie、登记/邀请头或请求正文 |
+| 邮箱找回被枚举或劫持 | 攻击者可探测账户、复用链接或把令牌带入代理日志 | 未配置 SMTP 时完全关闭；统一找回响应、CAPTCHA/限流、单次短时哈希令牌、成功后撤销全部会话；链接 token 放在 URL fragment | SMTP 账户最小权限，邮件域配置 SPF/DKIM/DMARC，监控异常发送量 |
 
 应用内滑动窗口限流按单个 viewer 进程保存，进程重启后重置，也不在多个实例间共享。因此它是必要的近端保护，不替代反向代理的分布式限流。
 
@@ -62,6 +63,10 @@ Web 注册有三种模式：
 
 如果不使用反向代理，可同时配置 `AGENT_BRIDGE_TLS_CERT_FILE` 和 `AGENT_BRIDGE_TLS_KEY_FILE` 让 Uvicorn 直接提供 TLS。不要只配置其中一个。
 
+邮箱能力默认关闭。启用时必须完整设置 `AGENT_BRIDGE_SMTP_HOST`、`AGENT_BRIDGE_EMAIL_FROM`、`AGENT_BRIDGE_PUBLIC_BASE_URL`，按服务商选择 `AGENT_BRIDGE_SMTP_SECURITY=starttls`（默认 587）或 `ssl`（默认 465）。需要认证时 username/password 必须成对配置，密码优先通过权限不宽于 `0600` 的 `AGENT_BRIDGE_SMTP_PASSWORD_FILE` 提供。公网模式的公开基址必须是固定 HTTPS URL，不能含用户信息、query 或 fragment；应用不会从请求 Host 拼接重置链接。
+
+验证与重置令牌使用 URL fragment（`/#reset-password=...`），因此正常 HTTP 请求、反向代理 access log 和 Referrer 都不会收到 token；页面读取后会立即从地址栏清除。找回接口对未知账户和未验证邮箱返回同一响应，但单机进程限流仍应由代理/WAF 的共享限流补强。邮件投递失败不会把收件人或 token 写日志，用户可重新请求并自动作废旧链接。
+
 ## 4. 反向代理硬要求
 
 1. 外部只开放 443；后端 8765 仅允许代理或 VPN 网段访问。
@@ -85,6 +90,7 @@ Web 注册有三种模式：
 
 - [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
 - [OWASP Authentication Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Authentication_Cheat_Sheet.html)
+- [OWASP Forgot Password Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Forgot_Password_Cheat_Sheet.html)
 - [OWASP CSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html)
 - [OWASP HTTP Headers Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html)
 - [Starlette middleware documentation](https://www.starlette.io/middleware/)
