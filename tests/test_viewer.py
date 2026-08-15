@@ -21,13 +21,23 @@ from agent_bridge.security import (
     ViewerSecurityConfigurationError,
     ViewerSecurityPolicy,
 )
-from agent_bridge.viewer import WEB_ROOT, _event_cursor, _sse_event, create_app
+from agent_bridge.viewer import (
+    WEB_ROOT,
+    _event_cursor,
+    _runtime_software_version,
+    _sse_event,
+    create_app,
+)
 from agent_bridge.viewer_store import ViewerRepository
 
 
 CAPTCHA_ANSWER = "ABCDE"
 ADMIN_PASSWORD = "AdminSecure1!"
 USER_PASSWORD = "MemberSecure1!"
+
+
+def test_runtime_software_version_matches_source_project() -> None:
+    assert _runtime_software_version() == "0.38.0"
 
 
 class FakeEmailDelivery:

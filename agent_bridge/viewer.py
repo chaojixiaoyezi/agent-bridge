@@ -9,6 +9,7 @@ import shlex
 import socket
 import sqlite3
 import time
+import tomllib
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -95,7 +96,11 @@ def _runtime_software_version() -> str:
     try:
         return package_version("agent-bridge")
     except PackageNotFoundError:
-        return "source"
+        try:
+            with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
+                return str(tomllib.load(handle)["project"]["version"])
+        except (KeyError, OSError, tomllib.TOMLDecodeError):
+            return "source"
 
 
 ADMIN_AUDIT_ACTIONS: dict[tuple[str, str], tuple[str, str]] = {
