@@ -51,6 +51,17 @@ function sharedRelayState(): SharedRelayState {
 	return processGlobal[SHARED_STATE_KEY];
 }
 
+export function canDeliverToPiSession(
+	targetSessionFile: string,
+	currentSessionFile?: string,
+): boolean {
+	if (fs.existsSync(targetSessionFile)) return true;
+	return Boolean(
+		currentSessionFile &&
+			path.resolve(currentSessionFile) === path.resolve(targetSessionFile),
+	);
+}
+
 function assistantText(message: unknown): string {
 	if (!message || typeof message !== "object") return "";
 	const value = message as { role?: unknown; content?: unknown };
@@ -185,7 +196,17 @@ export default function (pi: ExtensionAPI) {
 		if (shared.activeRequest) {
 			throw new Error("Pi TUI already has an active Bridge request");
 		}
-		if (!fs.existsSync(binding.transport.session_file)) {
+		const commandContext = shared.commandContext;
+		const currentSession =
+			commandContext?.sessionManager.getSessionFile() ??
+			shared.currentSessionFile;
+		// Pi assigns a stable session path before the first user message, but
+		// creates the JSONL only when that first message is accepted. The current
+		// live session is therefore a valid target even when its file has not been
+		// materialized yet. A non-current missing file still cannot be resumed.
+		if (
+			!canDeliverToPiSession(binding.transport.session_file, currentSession)
+		) {
 			throw new Error("bound Pi session file does not exist");
 		}
 		shared.activeRequest = {
@@ -196,10 +217,6 @@ export default function (pi: ExtensionAPI) {
 			started: false,
 			pendingSteers: [],
 		};
-		const commandContext = shared.commandContext;
-		const currentSession =
-			commandContext?.sessionManager.getSessionFile() ??
-			shared.currentSessionFile;
 		if (
 			currentSession &&
 			path.resolve(currentSession) ===

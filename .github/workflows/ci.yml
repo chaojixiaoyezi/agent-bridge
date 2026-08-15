@@ -49,10 +49,11 @@ jobs:
 
       - name: Validate bundled Pi extension
         run: |
-          npm exec --yes --package=@biomejs/biome@2.3.5 -- biome check integrations/pi/agent-bridge.ts
-          task_tsc=$(npm exec --yes --package=typescript@5.9.3 --package=@types/node@24.12.4 --package=@earendil-works/pi-coding-agent@0.78.0 -- which tsc)
+          npm exec --yes --package=@biomejs/biome@2.3.5 -- biome check integrations/pi/agent-bridge.ts integrations/pi/agent-bridge.test.ts
+          task_tsc=$(npm exec --yes --package=typescript@5.9.3 --package=tsx@4.20.6 --package=@types/node@24.12.4 --package=@earendil-works/pi-coding-agent@0.78.0 -- which tsc)
           task_node_modules=$(dirname "$(dirname "$task_tsc")")
           "$task_tsc" --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext --types node --typeRoots "$task_node_modules/@types" --baseUrl "$task_node_modules" integrations/pi/agent-bridge.ts
+          "$task_node_modules/.bin/tsx" --test integrations/pi/agent-bridge.test.ts
 
       - name: Check patch whitespace
         run: git diff --check
