@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+import uvicorn
+
+from agent_bridge.store import MESSAGE_COOLDOWN_SECONDS, BridgeStore
+from agent_bridge.viewer import create_app
+
+
+pytestmark = pytest.mark.browser
+
+CAPTCHA_ANSWER = "ABCDE"
+ADMIN_PASSWORD = "AdminSecure1!"
+
+
+def _browser_tests_enabled() -> bool:
+    return os.environ.get("AGENT_BRIDGE_RUN_BROWSER_TESTS", "").strip() == "1"
+
+
+def _seed_browser_database(database: Path) -> None:
+    store = BridgeStore(database)
+    for room_index, room in enumerate(("browser-room-one", "browser-room-two"), 1):
+        sender = store.register(
+            client_type=f"codex-browser-{room_index}",
+            session_alias=f"浏览器测试 Agent {room_index}",
+            conversation_id=room,
+            create_room_if_missing=True,
+        )
+        session = store.register_agent_session(
+            product="codex",
+            username=f"browser-{room_index}",
+            session_alias=f"浏览器测试 Agent {room_index}",
+            conversation_id=room,
+        )
+        assert session["participant_id"] == sender["participant_id"]
+        message_count = 72 if room_index == 1 else 4
+        for message_index in range(message_count):
+            store.send(
+                authorized_session_id=str(session["session_id"]),
+                sender_participant_id=str(session["participant_id"]),
+                conversation_id=room,
+                body_text=(
+                    f"{room} browser performance message {message_index + 1}: "
+                    "keep the room timeline bounded and stable while switching."
+                ),
+            )
+            with store._transaction() as connection:
+                connection.execute(
+                    "UPDATE messages SET created_at = created_at - ? "
+                    "WHERE message_id = (SELECT message_id FROM messages "
+                    "WHERE conversation_id = ? AND sender_participant_id = ? "
+                    "ORDER BY sequence DESC LIMIT 1)",
+                    (
+                        MESSAGE_COOLDOWN_SECONDS + 1.0,
+                        room,
+                        str(session["participant_id"]),
+                    ),
+                )
+
+
+@contextmanager
+def _running_viewer(database: Path):
+    app = create_app(
+        database,
+        captcha_generator=lambda: CAPTCHA_ANSWER,
+    )
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(128)
+    port = int(listener.getsockname()[1])
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+            lifespan="on",
+        )
+    )
+    thread = threading.Thread(
+        target=lambda: server.run(sockets=[listener]),
+        name="agent-bridge-browser-test-viewer",
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 10.0
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=2.0)
+        listener.close()
+        raise RuntimeError("browser test viewer did not start")
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10.0)
+        listener.close()
+
+
+def _login_and_change_bootstrap_password(page, base_url: str) -> dict[str, float]:
+    navigation_started = time.monotonic()
+    page.goto(base_url, wait_until="domcontentloaded")
+    page.locator("#captcha-image").wait_for(state="visible")
+    page.locator("#captcha-image[src^='data:image/png;base64,']").wait_for()
+    dom_ready_ms = (time.monotonic() - navigation_started) * 1000
+
+    authentication_started = time.monotonic()
+    page.locator("#auth-username").fill("admin")
+    page.locator("#auth-password").fill("admin")
+    page.locator("#captcha-answer").fill(CAPTCHA_ANSWER)
+    page.locator("#submit-auth").click()
+    page.locator("#password-dialog").wait_for(state="visible")
+    page.locator("#current-password").fill("admin")
+    page.locator("#new-password").fill(ADMIN_PASSWORD)
+    page.locator("#new-password-confirm").fill(ADMIN_PASSWORD)
+    page.locator("#submit-password").click()
+    page.locator("#app-shell").wait_for(state="visible")
+    page.locator(".room-card").first.wait_for(state="visible")
+    authenticated_ready_ms = (time.monotonic() - authentication_started) * 1000
+    return {
+        "dom_ready_ms": round(dom_ready_ms, 2),
+        "authenticated_ready_ms": round(authenticated_ready_ms, 2),
+    }
+
+
+def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: Path) -> None:
+    if not _browser_tests_enabled():
+        pytest.skip("set AGENT_BRIDGE_RUN_BROWSER_TESTS=1 to run Chromium E2E")
+
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    database = tmp_path / "bridge.db"
+    _seed_browser_database(database)
+
+    with _running_viewer(database) as base_url:
+        with playwright_api.sync_playwright() as playwright:
+            browser_channel = os.environ.get(
+                "AGENT_BRIDGE_BROWSER_CHANNEL",
+                "",
+            ).strip()
+            browser = playwright.chromium.launch(
+                headless=True,
+                **({"channel": browser_channel} if browser_channel else {}),
+            )
+            page = browser.new_page(viewport={"width": 1440, "height": 900})
+            console_errors: list[str] = []
+            runtime_errors: list[str] = []
+            http_errors: list[tuple[int, str]] = []
+            page.on(
+                "console",
+                lambda message: console_errors.append(message.text)
+                if message.type == "error"
+                and not message.text.startswith("Failed to load resource:")
+                else None,
+            )
+            page.on(
+                "pageerror",
+                lambda error: runtime_errors.append(str(error)),
+            )
+            page.on(
+                "response",
+                lambda response: http_errors.append((response.status, response.url))
+                if response.status >= 400
+                else None,
+            )
+
+            measurements = _login_and_change_bootstrap_password(page, base_url)
+            assert measurements["dom_ready_ms"] < 5_000
+            assert measurements["authenticated_ready_ms"] < 8_000
+
+            workspace = page.locator("#workspace")
+            timeline = page.locator(".timeline-panel")
+            rooms = page.locator(".rooms-panel")
+            assert timeline.bounding_box()["width"] > rooms.bounding_box()["width"] * 2
+            assert page.locator("#global-tools-menu").get_attribute("open") is None
+            assert page.locator("#room-tools-menu").get_attribute("open") is None
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            page.locator(".room-card", has_text="browser-room-one").click()
+            playwright_api.expect(page.locator("#active-room-title")).to_have_text(
+                "browser-room-one"
+            )
+            playwright_api.expect(
+                page.locator("#timeline article[data-message-id]")
+            ).to_have_count(60)
+            assert page.locator(".load-earlier-button").is_visible()
+
+            timeline_locator = page.locator("#timeline")
+            timeline_locator.evaluate("element => { element.scrollTop = 0; }")
+            scroll_before = timeline_locator.evaluate("element => element.scrollTop")
+            page.locator("#refresh-button").click()
+            page.wait_for_timeout(250)
+            scroll_after = timeline_locator.evaluate("element => element.scrollTop")
+            assert abs(scroll_after - scroll_before) < 4
+
+            room_switch_started = time.monotonic()
+            page.locator(".room-card", has_text="browser-room-two").click()
+            playwright_api.expect(page.locator("#active-room-title")).to_have_text(
+                "browser-room-two"
+            )
+            playwright_api.expect(
+                page.locator("#timeline article[data-message-id]")
+            ).to_have_count(4)
+            measurements["room_switch_ms"] = round(
+                (time.monotonic() - room_switch_started) * 1000,
+                2,
+            )
+            assert measurements["room_switch_ms"] < 3_000
+
+            page.locator("#toggle-rooms-panel").click()
+            assert "rooms-collapsed" in (workspace.get_attribute("class") or "")
+            page.locator("#toggle-people-panel").click()
+            assert "people-collapsed" not in (workspace.get_attribute("class") or "")
+
+            page.locator("#global-tools-menu").click()
+            page.locator("#theme-select").select_option("violet")
+            assert page.locator("html").get_attribute("data-theme") == "violet"
+            assert page.evaluate(
+                "getComputedStyle(document.documentElement).getPropertyValue('--surface-strong').trim() !== ''"
+            )
+
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.wait_for_timeout(100)
+            assert page.locator("#owner-message-form").is_visible()
+            assert page.locator("#active-room-title").is_visible()
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            resource_bytes = page.evaluate(
+                "performance.getEntriesByType('resource').reduce((sum, item) => sum + (item.transferSize || 0), 0)"
+            )
+            measurements["resource_transfer_bytes"] = int(resource_bytes)
+            assert resource_bytes < 4_000_000
+            unexpected_http_errors = [
+                (status, url)
+                for status, url in http_errors
+                if not (
+                    status == 401 and url.endswith("/api/auth/me")
+                    or status == 404 and url.endswith("/favicon.ico")
+                )
+            ]
+            assert not unexpected_http_errors, unexpected_http_errors
+            assert not console_errors, console_errors
+            assert not runtime_errors, runtime_errors
+            print("browser-performance-baseline=" + json.dumps(measurements, sort_keys=True))
+            browser.close()

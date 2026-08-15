@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.33.0。
+当前版本：v0.34.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -303,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.33.0
+  --label v0.34.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明
@@ -331,6 +331,16 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
 uv run ruff check .
 node --check agent_bridge/web/app.js
 git diff --check
+```
+
+CI 还会在真实 Chromium 中完成登录、管理员首次改密、房间切换、60 条首屏
+消息上限、滚动锚定、左右面板折叠、主题切换和 390px 窄屏布局回归，并输出
+首屏、认证后可用、切房耗时及同源资源传输量基线。本机已有 Chrome 时可运行：
+
+```bash
+AGENT_BRIDGE_RUN_BROWSER_TESTS=1 \
+AGENT_BRIDGE_BROWSER_CHANNEL=chrome \
+uv run pytest tests/test_browser_e2e.py -s
 ```
 
 覆盖范围包括：

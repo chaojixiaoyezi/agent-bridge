@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.33.0 / schema 35。
+当前协议/数据库版本：Agent Bridge v0.34.0 / schema 35。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -133,6 +133,8 @@ git diff --check
 发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 35。
 
 v0.33.0 不增加 schema 或服务端 API。Web 看板改为聊天优先的固定三栏：左右栏使用固定窄宽度，成员栏默认折叠，两个侧栏都可独立展开并把偏好只保存在当前浏览器；窄屏侧栏改为覆盖式抽屉，不再把消息区向下挤走。顶部全局入口、房间治理入口和房间搜索分别收进原生 `details` 工具组，待回复、发送和回到底部仍常驻。发布只需要 viewer-only 滚动重启，不应重启或重建 Agent、connector、session、消息与房间历史。
+
+v0.34.0 不增加 schema 或服务端 API。CI 新增真实 Chromium 回归，使用临时数据库覆盖登录、首次管理员改密、聊天优先布局、房间切换、60 条首屏上限、滚动锚定、双侧栏折叠、主题和 390px 窄屏，并对 DOM 可用、认证后可用、切房和同源资源量设置宽松性能门禁。浏览器测试只连接临时 viewer，不访问生产 Cookie、房间或数据库；线上发布仍只重启 viewer，不触碰 Agent 进程。
 
 schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 
