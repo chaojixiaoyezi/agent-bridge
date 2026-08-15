@@ -286,6 +286,20 @@ def create_app(
                 pass
             await asyncio.sleep(30)
 
+    async def operational_monitoring() -> None:
+        while True:
+            started_at = time.monotonic()
+            try:
+                await asyncio.to_thread(store.record_operational_sample)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Monitoring is deliberately sidecar-only: a sampling failure
+                # must never interrupt chat, delivery, or task execution.
+                pass
+            elapsed = time.monotonic() - started_at
+            await asyncio.sleep(max(5.0, 60.0 - elapsed))
+
     @asynccontextmanager
     async def lifespan(_: Starlette):
         maintenance = asyncio.create_task(
@@ -300,14 +314,21 @@ def create_app(
             if enable_resident_repair
             else None
         )
+        monitoring = asyncio.create_task(
+            operational_monitoring(),
+            name="agent-bridge-operational-monitoring",
+        )
         try:
             yield
         finally:
             maintenance.cancel()
+            monitoring.cancel()
             if resident_repair is not None:
                 resident_repair.cancel()
             with suppress(asyncio.CancelledError):
                 await maintenance
+            with suppress(asyncio.CancelledError):
+                await monitoring
             if resident_repair is not None:
                 with suppress(asyncio.CancelledError):
                     await resident_repair
@@ -1188,6 +1209,42 @@ def create_app(
                 store.admin_connector_health(
                     requesting_web_user_id=str(identity["user_id"]),
                 )
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def operational_monitoring_dashboard(request: Request) -> Response:
+        try:
+            identity = authenticated_admin(request)
+            hours = request.query_params.get("hours", "24")
+            payload = await asyncio.to_thread(
+                store.operational_monitoring_dashboard,
+                requesting_web_user_id=str(identity["user_id"]),
+                hours=hours,
+            )
+            if payload["latest"] is None:
+                await asyncio.to_thread(store.record_operational_sample)
+                payload = await asyncio.to_thread(
+                    store.operational_monitoring_dashboard,
+                    requesting_web_user_id=str(identity["user_id"]),
+                    hours=hours,
+                )
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def acknowledge_operational_alert(request: Request) -> Response:
+        try:
+            require_web_intent(request, intent="acknowledge-operational-alert")
+            identity = authenticated_admin(request)
+            return JSONResponse(
+                {
+                    "alert": await asyncio.to_thread(
+                        store.acknowledge_operational_alert,
+                        alert_id=request.path_params["alert_id"],
+                        acknowledged_by_web_user_id=str(identity["user_id"]),
+                    )
+                }
             )
         except Exception as exc:
             return _json_error(exc)
@@ -3590,6 +3647,16 @@ def create_app(
                 "/api/admin/connectors/health",
                 connector_health,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/admin/monitoring",
+                operational_monitoring_dashboard,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/admin/monitoring/alerts/{alert_id:str}/acknowledge",
+                acknowledge_operational_alert,
+                methods=["POST"],
             ),
             Route(
                 "/api/admin/connectors/{connector_id:str}/rotation-request",

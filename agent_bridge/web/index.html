@@ -6,8 +6,8 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260815-01">
-    <script src="/assets/app.js?v=20260815-01" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260815-02">
+    <script src="/assets/app.js?v=20260815-02" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -53,7 +53,10 @@
               </label>
               <div class="tool-button-grid">
                 <button class="access-button" id="enable-notifications" type="button">开启通知</button>
-                <button class="access-button" id="open-agent-access" type="button">Agent 接入</button>
+                <button class="access-button" id="open-agent-access" type="button">
+                  Agent 接入
+                  <span class="monitoring-alert-badge" id="monitoring-alert-badge" hidden>0</span>
+                </button>
                 <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
                 <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
                 <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
@@ -849,6 +852,27 @@
           <p class="field-help">这里只展示中央 Bridge 能验证的事实；远端机器自己的 supervisor 队列和模型进程错误仍需在对应机器查看。</p>
           <div class="connector-health-summary" id="connector-health-summary"></div>
           <p class="form-feedback" id="connector-health-feedback" role="status" aria-live="polite"></p>
+          <section class="monitoring-panel" aria-labelledby="monitoring-title">
+            <div class="monitoring-heading">
+              <div>
+                <strong id="monitoring-title">长期趋势与告警</strong>
+                <span>每分钟采样，保留 30 天；确认只表示管理员已看到，不会隐藏或强制恢复。</span>
+              </div>
+              <div class="monitoring-controls">
+                <select id="monitoring-window" aria-label="监控时间范围">
+                  <option value="1">最近 1 小时</option>
+                  <option value="24" selected>最近 24 小时</option>
+                  <option value="168">最近 7 天</option>
+                  <option value="720">最近 30 天</option>
+                </select>
+                <button class="secondary-button compact-button" id="refresh-monitoring" type="button">刷新趋势</button>
+              </div>
+            </div>
+            <div class="connector-health-summary monitoring-summary" id="monitoring-summary"></div>
+            <div class="monitoring-trends" id="monitoring-trends"></div>
+            <p class="form-feedback" id="monitoring-feedback" role="status" aria-live="polite"></p>
+            <div class="monitoring-alert-list" id="monitoring-alert-list"></div>
+          </section>
           <div class="session-list connector-health-list" id="connector-health-list"></div>
         </section>
         <section class="session-section" id="agent-session-section">

@@ -1479,6 +1479,19 @@ select option {
 .connector-health-section .session-heading strong,
 .connector-health-section .session-heading span { display: block; }
 .connector-health-section .session-heading span { margin-top: 3px; }
+.monitoring-alert-badge {
+  min-width: 17px;
+  height: 17px;
+  display: inline-grid;
+  place-items: center;
+  margin-left: 4px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--danger);
+  font-size: 8px;
+  font-weight: 800;
+}
 .connector-health-summary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1550,6 +1563,87 @@ select option {
 .connector-health-issue { padding: 3px 6px; border-radius: 999px; color: var(--muted-strong); background: var(--surface-strong); font-size: 8px; }
 .connector-health-issue.warning { color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); }
 .connector-health-issue.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.monitoring-panel {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-soft) 76%, transparent);
+}
+.monitoring-heading,
+.monitoring-controls,
+.monitoring-alert-heading,
+.monitoring-trend-heading {
+  display: flex;
+  align-items: center;
+}
+.monitoring-heading { justify-content: space-between; gap: 12px; }
+.monitoring-heading > div:first-child { min-width: 0; }
+.monitoring-heading strong,
+.monitoring-heading span { display: block; }
+.monitoring-heading strong { color: var(--text); font-size: 10px; }
+.monitoring-heading span { margin-top: 3px; color: var(--muted); font-size: 8px; }
+.monitoring-controls { flex: 0 0 auto; gap: 6px; }
+.monitoring-controls select {
+  height: 29px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface-strong);
+  font-size: 8px;
+}
+.monitoring-summary { margin-top: 10px; }
+.monitoring-trends {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin-top: 8px;
+}
+.monitoring-trend-row {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-strong);
+}
+.monitoring-trend-heading { justify-content: space-between; gap: 8px; }
+.monitoring-trend-heading strong { color: var(--muted-strong); font-size: 8px; }
+.monitoring-trend-heading span { color: var(--text); font-size: 8px; font-weight: 700; }
+.monitoring-trend-bars {
+  height: 34px;
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  margin-top: 7px;
+}
+.monitoring-trend-bar {
+  min-width: 1px;
+  flex: 1 1 0;
+  border-radius: 2px 2px 0 0;
+  background: color-mix(in srgb, var(--cyan) 76%, transparent);
+}
+.monitoring-alert-list { display: grid; gap: 7px; margin-top: 8px; }
+.monitoring-alert-card {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--amber);
+  border-radius: 10px;
+  background: var(--surface-strong);
+}
+.monitoring-alert-card.critical { border-left-color: var(--danger); }
+.monitoring-alert-card.resolved { border-left-color: var(--cyan); opacity: .72; }
+.monitoring-alert-heading { justify-content: space-between; gap: 10px; }
+.monitoring-alert-heading strong { color: var(--text); font-size: 9px; }
+.monitoring-alert-state {
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+  font-size: 7px;
+}
+.monitoring-alert-state.resolved { color: var(--cyan); background: var(--cyan-soft); }
+.monitoring-alert-detail { margin: 6px 0 0; color: var(--muted-strong); font-size: 8px; line-height: 1.55; }
+.monitoring-alert-meta { display: block; margin: 5px 0 7px; color: var(--muted); font-size: 7px; }
 .connector-device-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 9px; }
 .revoke-button { flex: none; padding: 6px 9px; border: 1px solid rgba(255,119,141,.18); border-radius: 8px; color: var(--danger); background: rgba(255,119,141,.07); font-size: 9px; cursor: pointer; }
 .revoke-button:disabled { opacity: .5; }
@@ -1631,6 +1725,10 @@ select option {
   .connector-health-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .connector-health-room-card { align-items: flex-start; flex-direction: column; }
   .connector-health-room-card span { text-align: left; }
+  .monitoring-heading { align-items: flex-start; flex-direction: column; }
+  .monitoring-controls { width: 100%; }
+  .monitoring-controls select { min-width: 0; flex: 1 1 auto; }
+  .monitoring-trends { grid-template-columns: 1fr; }
   .lifecycle-form .form-actions { margin-top: 10px; }
 }
 

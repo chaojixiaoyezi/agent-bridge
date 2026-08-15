@@ -64,6 +64,8 @@ class ViewerRepository:
                     "room_task_grants",
                     "room_tasks",
                     "room_message_markers",
+                    "operational_metric_samples",
+                    "operational_alerts",
                 )
             }
             room_states = {
@@ -1599,6 +1601,12 @@ class ViewerRepository:
                         sorted(visible),
                     ).fetchone()[0]
                 )
+            monitoring_revision = int(
+                connection.execute(
+                    "SELECT revision FROM operational_monitoring_state "
+                    "WHERE singleton = 1"
+                ).fetchone()[0]
+            )
         if not include_admin_state:
             pending_nicknames = 0
             nickname_revision = 0.0
@@ -1652,6 +1660,7 @@ class ViewerRepository:
                 "highlights",
                 highlight_revision,
             )
+            monitoring_revision = 0
             combined_task_revision: object = private_revision(
                 "task-state",
                 [task_revision, task_permission_revision],
@@ -1680,6 +1689,7 @@ class ViewerRepository:
             "receipts": receipt_revision,
             "highlights": highlight_revision,
             "rates": rate_revision,
+            "monitoring": monitoring_revision,
         }
         return {
             "cursor": max(cursor, global_sequence),
@@ -1704,6 +1714,7 @@ class ViewerRepository:
                 rate_revision,
                 receipt_revision,
                 highlight_revision,
+                monitoring_revision,
             ],
             "server_time": now,
         }

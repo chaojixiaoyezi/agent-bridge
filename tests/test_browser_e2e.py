@@ -229,6 +229,16 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 "getComputedStyle(document.documentElement).getPropertyValue('--surface-strong').trim() !== ''"
             )
 
+            page.locator("#open-agent-access").click()
+            page.locator("#agent-access-dialog").wait_for(state="visible")
+            playwright_api.expect(
+                page.locator("#monitoring-summary .connector-health-summary-card")
+            ).to_have_count(4)
+            playwright_api.expect(
+                page.locator("#monitoring-trends .monitoring-trend-row")
+            ).to_have_count(4)
+            page.locator("#close-agent-access").click()
+
             page.set_viewport_size({"width": 390, "height": 844})
             page.wait_for_timeout(100)
             assert page.locator("#owner-message-form").is_visible()

@@ -382,6 +382,25 @@ def test_web_login_registration_password_policy_profile_and_roles(
     ).status_code == 403
 
 
+def test_admin_operational_monitoring_api_is_authenticated_and_read_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    client = TestClient(make_app(database))
+    assert client.get("/api/admin/monitoring").status_code == 401
+    login_admin(client)
+
+    response = client.get("/api/admin/monitoring?hours=24")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sample_interval_seconds"] == 60
+    assert payload["retention_days"] == 30
+    assert payload["latest"] is not None
+    assert payload["sample_count"] >= 1
+    assert payload["thresholds"]["required_reply_delay_seconds"] == 300
+    assert payload["thresholds"]["reply_latency_p95_seconds"] == 600
+
+
 def test_email_verification_and_password_reset_are_optional_single_use_and_private(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1668,6 +1687,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         "receipts",
         "highlights",
         "rates",
+        "monitoring",
     }
     assert event_snapshot["changed_rooms"] == [
         {
@@ -1692,8 +1712,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260815-01" in index_html
-    assert "app.css?v=20260815-01" in index_html
+    assert "app.js?v=20260815-02" in index_html
+    assert "app.css?v=20260815-02" in index_html
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html

@@ -83,6 +83,10 @@ const state = {
   connectorHealth: null,
   connectorHealthLoadedAt: 0,
   connectorHealthRenderSignature: "",
+  monitoring: null,
+  monitoringLoadedAt: 0,
+  monitoringRenderSignature: "",
+  monitoringKnownOpenAlerts: null,
   roomsPanelCollapsed: false,
   peoplePanelCollapsed: true,
 };
@@ -92,6 +96,7 @@ const ROOM_SNAPSHOT_FRESH_MS = 15_000;
 const INITIAL_ROOM_MESSAGE_LIMIT = 60;
 const INCREMENTAL_ROOM_MESSAGE_LIMIT = 100;
 const CONNECTOR_HEALTH_CACHE_MS = 15_000;
+const MONITORING_CACHE_MS = 60_000;
 
 const elements = {
   appShell: document.querySelector("#app-shell"),
@@ -269,6 +274,7 @@ const elements = {
   webMemberFeedback: document.querySelector("#web-member-feedback"),
   webMemberResults: document.querySelector("#web-member-results"),
   openAgentAccess: document.querySelector("#open-agent-access"),
+  monitoringAlertBadge: document.querySelector("#monitoring-alert-badge"),
   agentAccessDialog: document.querySelector("#agent-access-dialog"),
   closeAgentAccess: document.querySelector("#close-agent-access"),
   agentAccessForm: document.querySelector("#agent-access-form"),
@@ -287,6 +293,12 @@ const elements = {
   connectorHealthSummary: document.querySelector("#connector-health-summary"),
   connectorHealthFeedback: document.querySelector("#connector-health-feedback"),
   connectorHealthList: document.querySelector("#connector-health-list"),
+  monitoringWindow: document.querySelector("#monitoring-window"),
+  refreshMonitoring: document.querySelector("#refresh-monitoring"),
+  monitoringSummary: document.querySelector("#monitoring-summary"),
+  monitoringTrends: document.querySelector("#monitoring-trends"),
+  monitoringFeedback: document.querySelector("#monitoring-feedback"),
+  monitoringAlertList: document.querySelector("#monitoring-alert-list"),
   refreshConnectorHealth: document.querySelector("#refresh-connector-health"),
   agentSessionSection: document.querySelector("#agent-session-section"),
   sessionList: document.querySelector("#session-list"),
@@ -793,6 +805,10 @@ function showAuthScreen(message = "") {
   state.connectorHealth = null;
   state.connectorHealthLoadedAt = 0;
   state.connectorHealthRenderSignature = "";
+  state.monitoring = null;
+  state.monitoringLoadedAt = 0;
+  state.monitoringRenderSignature = "";
+  state.monitoringKnownOpenAlerts = null;
   renderPendingCenter();
   elements.appShell.hidden = true;
   for (const dialog of [
@@ -2034,6 +2050,193 @@ function renderConnectorHealth() {
   elements.connectorHealthFeedback.textContent = health.attention_count
     ? `诊断完成：${health.attention_count} 个自动值守连接需要关注。`
     : "诊断完成：中央 Bridge 未发现自动值守异常。";
+}
+
+function formatMonitoringValue(value, kind = "count") {
+  const normalized = Number(value || 0);
+  if (kind === "duration") return normalized > 0 ? formatAge(normalized) : "—";
+  if (kind === "rate") return `${Math.round(normalized * 100)}%`;
+  return String(Math.max(0, Math.round(normalized)));
+}
+
+function renderMonitoringTrend(label, samples, key, kind = "count") {
+  const row = makeElement("section", "monitoring-trend-row");
+  const values = samples.map((sample) => Number(sample[key] || 0));
+  const maximum = Math.max(1, ...values);
+  const heading = makeElement("div", "monitoring-trend-heading");
+  heading.append(
+    makeElement("strong", "", label),
+    makeElement("span", "", formatMonitoringValue(values.at(-1) || 0, kind)),
+  );
+  row.append(heading);
+  const bars = makeElement("div", "monitoring-trend-bars");
+  for (let index = 0; index < values.length; index += 1) {
+    const bar = makeElement("span", "monitoring-trend-bar");
+    bar.style.height = `${Math.max(3, (values[index] / maximum) * 100)}%`;
+    bar.title = `${fullTime(samples[index].captured_at)} · ${formatMonitoringValue(values[index], kind)}`;
+    bars.append(bar);
+  }
+  row.append(bars);
+  return row;
+}
+
+function notifyOperationalAlerts(alerts) {
+  const current = new Set(alerts.map((alert) => alert.alert_id));
+  if (state.monitoringKnownOpenAlerts !== null) {
+    const newlyOpened = alerts.filter(
+      (alert) => !state.monitoringKnownOpenAlerts.has(alert.alert_id)
+        && !alert.acknowledged_at,
+    );
+    if (
+      newlyOpened.length
+      && "Notification" in window
+      && Notification.permission === "granted"
+      && document.hidden
+    ) {
+      new Notification("Agent Bridge 运行告警", {
+        body: newlyOpened.slice(0, 3).map((alert) => alert.title).join("、"),
+        tag: "agent-bridge-operational-alert",
+      });
+    }
+  }
+  state.monitoringKnownOpenAlerts = current;
+}
+
+function renderMonitoring() {
+  const visible = isAdmin();
+  if (!visible) {
+    elements.monitoringAlertBadge.hidden = true;
+    return;
+  }
+  const payload = state.monitoring;
+  const signature = JSON.stringify(payload || {});
+  if (signature === state.monitoringRenderSignature) return;
+  state.monitoringRenderSignature = signature;
+  elements.monitoringSummary.replaceChildren();
+  elements.monitoringTrends.replaceChildren();
+  elements.monitoringAlertList.replaceChildren();
+  if (!payload?.latest) {
+    elements.monitoringAlertBadge.hidden = true;
+    elements.monitoringFeedback.textContent = "等待首次分钟采样…";
+    return;
+  }
+  const latest = payload.latest;
+  const openAlerts = (payload.alerts || []).filter((alert) => alert.status === "open");
+  notifyOperationalAlerts(openAlerts);
+  elements.monitoringAlertBadge.hidden = openAlerts.length === 0;
+  elements.monitoringAlertBadge.textContent = openAlerts.length > 99 ? "99+" : String(openAlerts.length);
+
+  const summaryItems = [
+    [Number(latest.connector_offline_count || 0) + Number(latest.connector_failed_count || 0), "当前不可用连接", "count"],
+    [latest.required_pending_count || 0, "必须回复积压", "count"],
+    [latest.task_backlog_count || 0, "任务积压", "count"],
+    [latest.reply_latency_p95_seconds, "近 1 小时回复 P95", "duration"],
+  ];
+  for (const [value, label, kind] of summaryItems) {
+    const card = makeElement("span", `connector-health-summary-card ${(Number(value || 0) > 0 && kind === "count") ? "warning" : "healthy"}`);
+    card.append(
+      makeElement("strong", "", formatMonitoringValue(value, kind)),
+      makeElement("small", "", label),
+    );
+    elements.monitoringSummary.append(card);
+  }
+
+  const allSamples = payload.samples || [];
+  const stride = Math.max(1, Math.ceil(allSamples.length / 48));
+  const samples = allSamples.filter((_, index) => index % stride === 0);
+  if (allSamples.length && samples.at(-1)?.sample_minute !== allSamples.at(-1)?.sample_minute) {
+    samples.push(allSamples.at(-1));
+  }
+  elements.monitoringTrends.append(
+    renderMonitoringTrend("离线连接", samples, "connector_offline_count"),
+    renderMonitoringTrend("必须回复积压", samples, "required_pending_count"),
+    renderMonitoringTrend("任务积压", samples, "task_backlog_count"),
+    renderMonitoringTrend("回复 P95", samples, "reply_latency_p95_seconds", "duration"),
+  );
+
+  elements.monitoringFeedback.classList.remove("error", "success");
+  elements.monitoringFeedback.textContent = `${payload.sample_count || 0} 个分钟样本 · ${openAlerts.length} 个未解决告警 · 保留 ${payload.retention_days || 30} 天`;
+  const shownAlerts = [
+    ...openAlerts,
+    ...(payload.alerts || []).filter((alert) => alert.status === "resolved").slice(0, 6),
+  ];
+  if (!shownAlerts.length) {
+    elements.monitoringAlertList.append(makeElement("p", "muted-copy", "当前没有运行告警。"));
+    return;
+  }
+  for (const alert of shownAlerts) {
+    const card = makeElement(
+      "article",
+      `monitoring-alert-card ${alert.severity} ${alert.status}`,
+    );
+    const heading = makeElement("div", "monitoring-alert-heading");
+    heading.append(
+      makeElement("strong", "", alert.title),
+      makeElement(
+        "span",
+        `monitoring-alert-state ${alert.status}`,
+        alert.status === "resolved" ? "已自动恢复" : alert.severity === "critical" ? "严重" : "警告",
+      ),
+    );
+    card.append(
+      heading,
+      makeElement("p", "monitoring-alert-detail", alert.detail),
+      makeElement(
+        "small",
+        "monitoring-alert-meta",
+        `首次 ${fullTime(alert.first_seen_at)} · 最近 ${fullTime(alert.last_seen_at)} · ${alert.occurrence_count} 个分钟样本`,
+      ),
+    );
+    if (alert.status === "open") {
+      const acknowledge = makeElement(
+        "button",
+        "secondary-button compact-button",
+        alert.acknowledged_at ? `已由 ${alert.acknowledged_by_username || "管理员"} 确认` : "确认已看到",
+      );
+      acknowledge.type = "button";
+      acknowledge.disabled = Boolean(alert.acknowledged_at);
+      acknowledge.addEventListener("click", () => acknowledgeMonitoringAlert(alert.alert_id, acknowledge));
+      card.append(acknowledge);
+    }
+    elements.monitoringAlertList.append(card);
+  }
+}
+
+async function loadMonitoring({ force = false } = {}) {
+  if (!isAdmin()) return null;
+  const hours = Number(elements.monitoringWindow.value || 24);
+  if (
+    !force
+    && state.monitoring
+    && Number(state.monitoring.hours) === hours
+    && Date.now() - state.monitoringLoadedAt < MONITORING_CACHE_MS
+  ) {
+    return state.monitoring;
+  }
+  const payload = await fetchJson(`/api/admin/monitoring?hours=${encodeURIComponent(hours)}`);
+  state.monitoring = payload;
+  state.monitoringLoadedAt = Date.now();
+  state.monitoringRenderSignature = "";
+  renderMonitoring();
+  return payload;
+}
+
+async function acknowledgeMonitoringAlert(alertId, button) {
+  button.disabled = true;
+  try {
+    await fetchJson(
+      `/api/admin/monitoring/alerts/${encodeURIComponent(alertId)}/acknowledge`,
+      {
+        method: "POST",
+        headers: { "X-Agent-Bridge-Intent": "acknowledge-operational-alert" },
+      },
+    );
+    await loadMonitoring({ force: true });
+  } catch (error) {
+    elements.monitoringFeedback.classList.add("error");
+    elements.monitoringFeedback.textContent = `告警确认失败：${error.message}`;
+    button.disabled = false;
+  }
 }
 
 async function loadConnectorHealth({ force = false } = {}) {
@@ -3348,6 +3551,9 @@ function mergeRefreshOptions(current, incoming) {
     forceDiagnostics: Boolean(
       current.forceDiagnostics || incoming.forceDiagnostics,
     ),
+    forceMonitoring: Boolean(
+      current.forceMonitoring || incoming.forceMonitoring,
+    ),
   };
 }
 
@@ -3375,6 +3581,13 @@ async function refresh(options = {}) {
     )
       ? fetchJson("/api/admin/connectors/health")
       : Promise.resolve(null);
+    const monitoringRequest = isAdmin() && refreshPresence && (
+      options.forceMonitoring === true
+      || !state.monitoring
+      || Date.now() - state.monitoringLoadedAt >= MONITORING_CACHE_MS
+    )
+      ? fetchJson(`/api/admin/monitoring?hours=${encodeURIComponent(Number(elements.monitoringWindow.value || 24))}`)
+      : Promise.resolve(null);
     const healthRequest = mode === "full" ? fetchJson("/api/health") : Promise.resolve(null);
     const nicknameRequest = mode === "full" ? fetchNicknameRequests() : Promise.resolve(null);
     const pendingCenterRequest = fetchJson("/api/pending-responses?limit=100");
@@ -3385,6 +3598,7 @@ async function refresh(options = {}) {
       nicknamePayload,
       invitationPayload,
       connectorHealthPayload,
+      monitoringPayload,
       pendingCenterPayload,
     ] = await Promise.all([
       healthRequest,
@@ -3393,6 +3607,7 @@ async function refresh(options = {}) {
       nicknameRequest,
       invitationRequest,
       connectorHealthRequest,
+      monitoringRequest,
       pendingCenterRequest,
     ]);
     if (healthPayload) {
@@ -3412,6 +3627,11 @@ async function refresh(options = {}) {
       state.connectorHealthLoadedAt = Date.now();
       state.connectorHealthRenderSignature = "";
     }
+    if (monitoringPayload) {
+      state.monitoring = monitoringPayload;
+      state.monitoringLoadedAt = Date.now();
+      state.monitoringRenderSignature = "";
+    }
     state.pendingCenter = pendingCenterPayload;
     if (!state.selectedRoom || !state.rooms.some((room) => room.conversation_id === state.selectedRoom)) {
       state.selectedRoom = state.rooms[0]?.conversation_id || null;
@@ -3422,6 +3642,7 @@ async function refresh(options = {}) {
     renderSessions();
     renderAgentInvitations();
     renderConnectorHealth();
+    renderMonitoring();
     renderNicknameRequests();
     renderPendingCenter();
     applyUserPermissions();
@@ -5215,6 +5436,7 @@ async function openAgentAccessDialog(roomId = null) {
   renderSessions();
   renderAgentInvitations();
   renderConnectorHealth();
+  renderMonitoring();
   renderNicknameRequests();
   elements.agentAccessDialog.showModal();
   if (isAdmin()) {
@@ -5223,6 +5445,10 @@ async function openAgentAccessDialog(roomId = null) {
     loadConnectorHealth().catch((error) => {
       elements.connectorHealthFeedback.classList.add("error");
       elements.connectorHealthFeedback.textContent = `诊断失败：${error.message}`;
+    });
+    loadMonitoring().catch((error) => {
+      elements.monitoringFeedback.classList.add("error");
+      elements.monitoringFeedback.textContent = `监控读取失败：${error.message}`;
     });
   }
   if (!isAdmin()) {
@@ -5261,6 +5487,26 @@ elements.refreshConnectorHealth.addEventListener("click", async () => {
   } finally {
     elements.refreshConnectorHealth.disabled = false;
   }
+});
+elements.refreshMonitoring.addEventListener("click", async () => {
+  elements.refreshMonitoring.disabled = true;
+  elements.monitoringFeedback.classList.remove("error", "success");
+  elements.monitoringFeedback.textContent = "正在读取持久监控样本…";
+  try {
+    await loadMonitoring({ force: true });
+    elements.monitoringFeedback.classList.add("success");
+  } catch (error) {
+    elements.monitoringFeedback.classList.add("error");
+    elements.monitoringFeedback.textContent = `监控读取失败：${error.message}`;
+  } finally {
+    elements.refreshMonitoring.disabled = false;
+  }
+});
+elements.monitoringWindow.addEventListener("change", () => {
+  loadMonitoring({ force: true }).catch((error) => {
+    elements.monitoringFeedback.classList.add("error");
+    elements.monitoringFeedback.textContent = `监控读取失败：${error.message}`;
+  });
 });
 elements.agentAccessDialog.addEventListener("click", (event) => {
   if (event.target === elements.agentAccessDialog) closeAgentAccessDialog();
@@ -5391,7 +5637,7 @@ function refreshModeForEvent(changedFacets) {
   const onlyContains = (allowed) => [...changed].every((item) => allowed.has(item));
   if (onlyContains(new Set(["messages", "rooms", "receipts", "highlights"]))) return "room";
   if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts", "highlights"]))) return "task";
-  if (["participants", "memberships", "online", "sessions", "connectors"].some(
+  if (["participants", "memberships", "online", "sessions", "connectors", "monitoring"].some(
     (facet) => changed.has(facet),
   )) {
     return changed.has("tasks") ? "full" : "presence";
@@ -5453,6 +5699,7 @@ function connectOwnerEvents() {
             || changedFacets.includes("participants"),
           refreshReceipts: changedFacets.includes("receipts"),
           refreshHighlights: changedFacets.includes("highlights"),
+          forceMonitoring: changedFacets.includes("monitoring"),
         });
       }
     }

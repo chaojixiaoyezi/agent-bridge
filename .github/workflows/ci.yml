@@ -158,7 +158,8 @@ jobs:
             tests/test_store.py::test_schema_32_adds_optional_email_recovery_without_rebuilding_users \
             tests/test_store.py::test_schema_thirty_backfills_only_explicit_web_room_access \
             tests/test_store.py::test_delivery_migration_keeps_group_history_without_false_old_backlog \
-            tests/test_store.py::test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode
+            tests/test_store.py::test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode \
+            tests/test_store.py::test_operational_monitoring_persists_trends_alerts_and_recovery
 
       - name: Prove public and credential security boundaries
         run: |
