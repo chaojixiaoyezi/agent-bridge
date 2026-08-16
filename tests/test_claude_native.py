@@ -3,18 +3,126 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from agent_bridge.claude_channel import ChannelRuntime
+from agent_bridge.claude_guide import (
+    TmuxClaudeGuide,
+    tmux_guide_from_environment,
+)
+from agent_bridge.claude_launcher import build_tmux_bootstrap_command
 from agent_bridge.claude_session_hook import handle_hook
 from agent_bridge.connector import configure_resident_connector
 
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_claude_launcher_builds_one_connector_scoped_tmux_session(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "connector state"
+    state.mkdir()
+    arguments = [
+        "--state-directory",
+        str(state),
+        "--",
+        "--resume",
+        "5ac0d6f3-a939-47e0-8386-4ac3be33a38c",
+    ]
+    command = build_tmux_bootstrap_command(
+        tmux_binary="/opt/homebrew/bin/tmux",
+        state_directory=str(state),
+        launcher_arguments=arguments,
+        cwd=str(tmp_path),
+        python_binary="/private/venv/bin/python",
+    )
+    assert command[:3] == [
+        "/opt/homebrew/bin/tmux",
+        "new-session",
+        "-A",
+    ]
+    assert command[3] == "-s"
+    assert command[4].startswith("agent-bridge-claude-")
+    assert command[5:7] == ["-c", str(tmp_path)]
+    assert shlex.split(command[-1]) == [
+        "/private/venv/bin/python",
+        "-m",
+        "agent_bridge.claude_launcher",
+        *arguments,
+    ]
+
+
+def test_tmux_guide_discovers_only_a_safe_inherited_pane(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "agent_bridge.claude_guide.shutil.which",
+        lambda _name, path=None: "/opt/homebrew/bin/tmux",
+    )
+    guide = tmux_guide_from_environment(
+        {"TMUX": "/tmp/tmux.sock,1,0", "TMUX_PANE": "%42", "PATH": "/bin"}
+    )
+    assert guide == TmuxClaudeGuide(
+        binary="/opt/homebrew/bin/tmux",
+        pane="%42",
+    )
+    assert (
+        tmux_guide_from_environment(
+            {"TMUX": "/tmp/tmux.sock,1,0", "TMUX_PANE": "other:1.2"}
+        )
+        is None
+    )
+
+
+def test_tmux_guide_uses_bracketed_paste_and_one_submit(monkeypatch) -> None:
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("agent_bridge.claude_guide.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent_bridge.claude_guide.secrets.token_hex",
+        lambda _bytes: "a" * 16,
+    )
+    guide = TmuxClaudeGuide(binary="/opt/homebrew/bin/tmux", pane="%7")
+    guide.deliver("第一行\n第二行")
+    buffer_name = f"agent-bridge-{os.getpid()}-{'a' * 16}"
+    assert calls[0][0] == [
+        "/opt/homebrew/bin/tmux",
+        "load-buffer",
+        "-b",
+        buffer_name,
+        "-",
+    ]
+    assert calls[0][1]["input"] == "第一行\n第二行".encode()
+    assert calls[1][0] == [
+        "/opt/homebrew/bin/tmux",
+        "paste-buffer",
+        "-d",
+        "-p",
+        "-b",
+        buffer_name,
+        "-t",
+        "%7",
+        ";",
+        "send-keys",
+        "-t",
+        "%7",
+        "Enter",
+    ]
+    assert calls[2][0] == [
+        "/opt/homebrew/bin/tmux",
+        "delete-buffer",
+        "-b",
+        buffer_name,
+    ]
 
 
 def test_claude_launcher_preserves_resume_and_adds_one_exact_channel(
@@ -327,6 +435,7 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
         {
             "event_id": "event-channel-tool",
             "conversation_id": "工具修改的聊天室",
+            "fetched_at": 1_700_000_000,
             "required_message_ids": ["message_channel_tool"],
             "required_reply_count": 1,
             "messages": [
@@ -344,6 +453,24 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
     )
     serialized = notification.model_dump_json()
     assert "route_" not in serialized
+    assert notification.params.meta["chat_id"] == "工具修改的聊天室"
+    assert notification.params.meta["message_id"] == "event-channel-tool"
+    assert notification.params.meta["user"] == "发送者"
+    assert notification.params.meta["ts"] == "2023-11-14T22:13:20Z"
+
+    delivered: list[str] = []
+
+    class FakeGuide:
+        transport_name = "claude-tmux-guide"
+
+        @staticmethod
+        def deliver(prompt: str) -> None:
+            delivered.append(prompt)
+
+    runtime.guide = FakeGuide()  # type: ignore[assignment]
+    asyncio.run(runtime._deliver_notification(notification))
+    assert delivered == [notification.params.content]
+    assert runtime._transport_name() == "claude-tmux-guide"
     result = asyncio.run(
         runtime.call_tool(
             "agent_bridge_send",
@@ -401,6 +528,99 @@ def test_claude_channel_keeps_large_message_batch_as_valid_json(
     assert len(content) <= 96_000
     assert len(decoded) == 20
     assert all("可用历史工具读取" in message["body"] for message in decoded)
+
+
+def test_claude_channel_keeps_one_event_until_the_tui_applies_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    event_state = {"value": "fetched"}
+    waits = 0
+    received: list[str] = []
+    delivered: list[str] = []
+
+    class FakeClient:
+        def wait_native_channel_event(self, **_payload):
+            nonlocal waits
+            waits += 1
+            if waits >= 4:
+                raise asyncio.CancelledError
+            state = event_state["value"]
+            return {
+                "event": {
+                    "event_id": "event-poll-until-applied",
+                    "conversation_id": "工具修改的聊天室",
+                    "state": state,
+                    "deliverable": state == "fetched",
+                    "fetched_at": 1_700_000_000,
+                    "required_message_ids": [],
+                    "required_reply_count": 0,
+                    "message_ids": ["message-poll-until-applied"],
+                    "messages": [
+                        {
+                            "message_id": "message-poll-until-applied",
+                            "sequence": 2,
+                            "sender_participant_id": "participant_sender",
+                            "sender_display_name": "发送者",
+                            "sender_client_type": "web-user",
+                            "body": "请查看。",
+                            "reply_to": None,
+                        }
+                    ],
+                }
+            }
+
+        def receive_native_channel_event(self, **payload):
+            received.append(str(payload["stage"]))
+            event_state["value"] = "injected"
+            return {"event": {"state": "injected"}}
+
+    client = FakeClient()
+
+    class FakeState:
+        state_directory = tmp_path
+        process_epoch = "epoch-poll-until-applied"
+        connector_id = "connector_poll_until_applied"
+
+        @staticmethod
+        def client():
+            return client
+
+        @staticmethod
+        def read_lease():
+            return {
+                "connector_id": "connector_poll_until_applied",
+                "process_epoch": "epoch-poll-until-applied",
+                "lease_id": "lease-poll-until-applied",
+                "ended": False,
+            }
+
+    class FakeGuide:
+        transport_name = "claude-tmux-guide"
+
+        @staticmethod
+        def deliver(prompt: str) -> None:
+            delivered.append(prompt)
+
+    async def advance_without_waiting(_seconds: float) -> None:
+        if event_state["value"] == "injected":
+            event_state["value"] = "replied"
+
+    runtime = ChannelRuntime(FakeState())  # type: ignore[arg-type]
+    runtime.guide = FakeGuide()  # type: ignore[assignment]
+    runtime.session = object()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "agent_bridge.claude_channel.asyncio.sleep",
+        advance_without_waiting,
+    )
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runtime._poll_loop())
+    assert len(delivered) == 1
+    assert received == ["injected"]
+    route = runtime.routes["event-poll-until-applied"]
+    assert route["delivery_attempt_count"] == 1
+    assert route["completed_at"] > 0
+    assert waits == 4
 
 
 def test_claude_channel_stdio_declares_channel_capability_and_tools(

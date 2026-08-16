@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 from .claude_native import ClaudeNativeError, load_claude_connector_state
+from .claude_guide import tmux_guide_from_environment
 
 
 def _claude_binary(manifest: dict[str, Any]) -> str:
@@ -54,6 +58,64 @@ def build_claude_command(
     ]
 
 
+def build_tmux_bootstrap_command(
+    *,
+    tmux_binary: str,
+    state_directory: str,
+    launcher_arguments: list[str],
+    cwd: str,
+    python_binary: str,
+) -> list[str]:
+    digest = hashlib.sha256(
+        str(Path(state_directory).expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:12]
+    session_name = f"agent-bridge-claude-{digest}"
+    child = [
+        python_binary,
+        "-m",
+        "agent_bridge.claude_launcher",
+        *launcher_arguments,
+    ]
+    return [
+        tmux_binary,
+        "new-session",
+        "-A",
+        "-s",
+        session_name,
+        "-c",
+        cwd,
+        shlex.join(child),
+    ]
+
+
+def _bootstrap_tmux_if_needed(
+    *,
+    args: argparse.Namespace,
+    launcher_arguments: list[str],
+) -> None:
+    if (
+        args.print_command
+        or os.environ.get("AGENT_BRIDGE_CLAUDE_TMUX_BOOTSTRAPPED") == "1"
+        or tmux_guide_from_environment() is not None
+        or not sys.stdin.isatty()
+        or not sys.stdout.isatty()
+    ):
+        return
+    tmux_binary = shutil.which("tmux")
+    if not tmux_binary:
+        return
+    environment = dict(os.environ)
+    environment["AGENT_BRIDGE_CLAUDE_TMUX_BOOTSTRAPPED"] = "1"
+    command = build_tmux_bootstrap_command(
+        tmux_binary=tmux_binary,
+        state_directory=str(args.state_directory),
+        launcher_arguments=launcher_arguments,
+        cwd=os.getcwd(),
+        python_binary=sys.executable,
+    )
+    os.execvpe(command[0], command, environment)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-bridge-claude",
@@ -73,7 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    launcher_arguments = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(launcher_arguments)
+    _bootstrap_tmux_if_needed(
+        args=args,
+        launcher_arguments=launcher_arguments,
+    )
     claude_args = list(args.claude_args)
     if claude_args[:1] == ["--"]:
         claude_args = claude_args[1:]

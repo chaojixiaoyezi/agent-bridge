@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.1 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.2 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -44,7 +44,7 @@
 | 通用 supervisor | `bin/agent-bridge-supervisor` | 任意产品 adapter 的持久本机队列和同步兼容入口 |
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
 | Claude 兼容 adapter | `bin/agent-bridge-claude-wake` | 原生 Channel 未绑定或显式回退时，启动隔离 Claude Code 回合并核验成功工具结果与逐条 mention 回复 |
-| Claude Channel | `bin/agent-bridge-claude` + `bin/agent-bridge-claude-channel` | 启动/恢复精确 Claude session，通过官方 Channel 将聊天事件直接注入该本体 TUI |
+| Claude 本体通道 | `bin/agent-bridge-claude` + `bin/agent-bridge-claude-channel` | 启动/恢复精确 Claude session；优先引导到 connector 专属 tmux pane，第一方可用时保留官方 Channel 后备 |
 | Native TUI adapter | `bin/agent-bridge-tui-wake`、`agent_bridge/tui_adapter.py` | 把同房间消息和任务注入 DeepSeek/OpenCode/Hermes/Pi/Qwen 的指定真实 session，并校验回合相关性；Qwen 同时兼容旧式直接 ACP update 与 0.21 嵌套 update |
 | Pi extension | `integrations/pi/agent-bridge.ts` | 在一个 Pi TUI 内按 endpoint 隔离发现多房间 session、切换 session、steer、回传结果和心跳；当前新 session 的 JSONL 尚未落盘时也可接收首条消息 |
 | connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
@@ -100,7 +100,7 @@ Agent 第一次处理积压时：
 
 Codex worker 使用独立 task，不 resume 用户正在操作的任务。一个 `codex app-server` 和 Agent Bridge MCP 长驻；有活动 turn 时新唤醒通过 `turn/steer` 合入，避免并发重入。
 
-本体任务 worker 与只读聊天影子是两条席位。任务组件登记成功后，服务器把有任务权限 Web 用户的个人 `@` 优先路由到本体：空闲目标产生单目标 `room_tasks`，运行目标产生 `room_task_inputs`。输入在 executor 成功完成包含该输入的回合后才写 `applied_at`；页面上的“影子收到”不能替代这个回执。Codex 在活动回合中直接 `turn/steer`；Claude 的结构化任务席继续使用持久 `stream-json` session，而 v0.40.0 的聊天事件则由官方 Channel 直接注入用户启动或恢复的精确 Claude TUI。Bridge 或产品暂时中断时，未应用输入按 30 秒可重投，任务 lease 仍防止双执行。
+本体任务 worker 与只读聊天影子是两条席位。任务组件登记成功后，服务器把有任务权限 Web 用户的个人 `@` 优先路由到本体：空闲目标产生单目标 `room_tasks`，运行目标产生 `room_task_inputs`。输入在 executor 成功完成包含该输入的回合后才写 `applied_at`；页面上的“影子收到”不能替代这个回执。Codex 在活动回合中直接 `turn/steer`；Claude 的结构化任务席继续使用持久 `stream-json` session，而聊天事件由 connector 私有通道引导进用户启动或恢复的精确 Claude TUI。Bridge 或产品暂时中断时，未应用输入按 30 秒可重投，任务 lease 仍防止双执行。
 
 worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设置 `default_tools_approval_mode=approve`。身份登记由 MCP 底层按启动器固定字段自动完成，`agent_register` 不在模型白名单；预批准只覆盖读取、回复、ack、心跳和历史工具，shell、文件修改、其他 MCP 与生产操作没有被批准。
 
@@ -150,6 +150,8 @@ schema 40 增量增加 `native_session_leases`、`native_channel_events`、conne
 v0.40.0 不再增加 schema。Claude connector 每个身份生成独立的本地 plugin、唯一 MCP server selector 和启动器，避免同时运行多个 Claude 时串身份。`SessionStart`/`SessionEnd` hook 只上报 Claude 自己给出的 session id、进程 epoch、来源和工作目录；不读历史目录或中央数据库猜身份，不保存权限模式。hook 在网络请求前先写当前进程专属的 `0600` 绑定意图；如果 Bridge 短暂不可达，同一 Channel 每 2 秒有界重试，但不会选择其他 session。官方 `claude/channel` 通知直接注入这个交互 TUI，注入、模型已应用和真实群回复分别记账；断线未答消息由同一 session 的新租约重投。既有 Agent 不会因部署自动重启或切流，只有显式用 connector 的 `resident_setup.launch_command` 启动/恢复后才进入 `native_preferred`。
 
 v0.40.1 不变更协议或 schema；Claude 启动器用 `PYTHONPATH` 导入 Bridge 包而不再 `cd` 到 Bridge 仓库，因此启动和 `--resume` 都继承调用 TUI 的真实工作目录。
+
+v0.40.2 不变更协议或 schema。Claude Code 2.1.220 会在第三方 `ANTHROPIC_BASE_URL` 下以 provider gate 拒绝 `claude/channel`，即使 MCP 握手和通知发送都成功；因此不能把 MCP 的“已发送”当成模型已收到。交互式 `resident_setup.launch_command` 现在在 tmux 可用时自动为 connector 建立专属 session，已在 tmux 中则绑定当前 pane；MCP 只把经过 Bridge 鉴权、属于当前 lease 的提示用 bracketed paste 提交到这个 pane，模型仍通过 connector 私有工具完成 apply/reply。事件保持同一个 request/route 直到已应用且无必答，或全部必答已回复；未处理事件从 3 分钟开始指数退避重引导，最多 30 分钟一次。`chat_id/message_id/user/ts` 同时补齐，供第一方环境的官方 Channel 后备使用。此路径不启动第二个 Claude、不读取历史数据库猜 session、不保存权限模式，恢复同一 session 会用新 process epoch/lease 重新投递未答消息。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
@@ -268,7 +270,7 @@ bin/agent-bridge-supervisor status --database /absolute/path/wake-queue.db
 - 旧 `direct` 投递值对外映射为 `mention`；语义是公开 @。
 - Web 认证、发言频率、connector、生命周期、schema 17 房间治理、schema 18 冻结的历史 admin 聊天授权、schema 19 Agent @ 防回声、schema 20 内部 ID 可见化、schema 21 单群会话隔离、schema 25 本体席位/输入、schema 26 原生 TUI 绑定、schema 27 头像限频、schema 28 通知模式/当日免打扰、schema 31 房间展示序号、schema 32 话题串/房间要点、schema 33 可选邮箱恢复、schema 34 设备凭证治理以及 schema 39 单机运行协调迁移均为就地增量更新；v0.18.0 只增加房间内只读搜索与浏览器加载优化，v0.19.0 只增加显式公网安全模式，v0.24.0 只增加显式断线重连的可选投递压缩，v0.25.0 只增加管理员只读运行诊断，v0.26.0 只增加仓库内维护工具，v0.29.0 只扩展同房间搜索参数和页面筛选。默认未开启公网模式时，Agent `/agent/*` 接口仍不要求 Web 登录，原消息表和聊天室数据不重建。schema 14 的已接受邀请迁移为 `exhausted` 单次邀请及一个 connector；schema 15 connector 的当前房间从原邀请回填，原 enrollment 继续可用。一个 Agent 身份可加入多个群，但每个群必须有独立 connector/session；身份资料共享，聊天上下文不共享。
 - 默认管理员复用历史 `participant_web_owner`，以保持旧网页消息的发送者连续性；新注册 Web 用户各自拥有稳定 participant。
-- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 聊天值守优先使用精确 session Channel，未绑定时保留内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
+- 通用同步 supervisor 保留一个兼容版本；新 Codex 部署必须使用常驻 worker，Claude Code 聊天值守优先使用精确 session 的本体引导/Channel，未绑定时保留内置严格 adapter，五类 native TUI 使用统一 `agent-bridge-tui-wake` 和产品原生 transport。
 - 新 listener 可以连接升级后的中央服务；远端机器可分批升级，因为持久投递账不依赖某次 SSE 在线。
 
 ## 9. 发布前维护者检查表

@@ -7,6 +7,7 @@ import os
 import secrets
 import sys
 import time
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import mcp.types as types
@@ -21,12 +22,16 @@ from .claude_native import (
     ClaudeNativeError,
     load_claude_connector_state,
 )
+from .claude_guide import TmuxClaudeGuide, tmux_guide_from_environment
 from .http_client import BridgeRemoteError
 
 
 MAX_CHANNEL_CONTENT_CHARS = 96_000
 MAX_CHANNEL_MESSAGE_BODY_CHARS = 8_000
 MAX_CHANNEL_MESSAGES_JSON_CHARS = MAX_CHANNEL_CONTENT_CHARS - 4_000
+CHANNEL_RETRY_INITIAL_SECONDS = 180.0
+CHANNEL_RETRY_MAX_SECONDS = 1_800.0
+CHANNEL_STATE_POLL_SECONDS = 5.0
 
 
 class ClaudeChannelParams(BaseModel):
@@ -50,6 +55,7 @@ class ChannelRuntime:
         self.request_id = ""
         self.route_token = ""
         self.next_binding_retry_at = 0.0
+        self.guide: TmuxClaudeGuide | None = tmux_guide_from_environment()
         self.state_file = state.state_directory / "native-channel-state.json"
         self._load_runtime_state()
 
@@ -77,6 +83,17 @@ class ChannelRuntime:
             self._rotate_request(persist=False)
 
     def _persist_runtime_state(self) -> None:
+        completed = sorted(
+            (
+                (event_id, float(route.get("completed_at") or 0.0))
+                for event_id, route in self.routes.items()
+                if route.get("completed_at") is not None
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for event_id, _completed_at in completed[32:]:
+            self.routes.pop(event_id, None)
         payload = {
             "schema_version": 1,
             "process_epoch": self.state.process_epoch,
@@ -176,7 +193,7 @@ class ChannelRuntime:
                         lease_id=str(lease["lease_id"]),
                         process_epoch=self.state.process_epoch,
                         state="online",
-                        detail={"transport": "claude-channel"},
+                        detail={"transport": self._transport_name()},
                     )
             except asyncio.CancelledError:
                 raise
@@ -185,7 +202,6 @@ class ChannelRuntime:
             await asyncio.sleep(25)
 
     async def _poll_loop(self) -> None:
-        notified: set[str] = set()
         while True:
             try:
                 lease = self._active_lease()
@@ -209,17 +225,56 @@ class ChannelRuntime:
                 if not event_id:
                     raise ClaudeNativeError("Bridge returned an event without an ID")
                 route = {
+                    **dict(self.routes.get(event_id) or {}),
                     "route_token": self.route_token,
                     "lease_id": str(lease["lease_id"]),
                     "conversation_id": str(event["conversation_id"]),
                     "message_ids": list(event.get("message_ids") or []),
                 }
                 self.routes[event_id] = route
+                event_state = str(event.get("state") or "")
+                if str(route.get("last_event_state") or "") != event_state:
+                    route["last_event_state"] = event_state
+                    route["state_changed_at"] = time.time()
+                    self.routes[event_id] = route
                 self._persist_runtime_state()
-                if bool(event.get("deliverable", True)) and event_id not in notified:
+                required_count = int(event.get("required_reply_count") or 0)
+                if event_state == "replied" or (
+                    event_state == "applied" and required_count == 0
+                ):
+                    route["completed_at"] = time.time()
+                    self.routes[event_id] = route
+                    self._rotate_request()
+                    continue
+                if event_state not in {"fetched", "injected", "applied"}:
+                    self.routes.pop(event_id, None)
+                    self._rotate_request()
+                    continue
+                attempts = int(route.get("delivery_attempt_count") or 0)
+                last_delivery_at = float(route.get("last_delivery_at") or 0.0)
+                retry_reference = max(
+                    last_delivery_at,
+                    float(route.get("state_changed_at") or 0.0),
+                )
+                retry_after = min(
+                    CHANNEL_RETRY_INITIAL_SECONDS
+                    * (2 ** min(max(0, attempts - 1), 8)),
+                    CHANNEL_RETRY_MAX_SECONDS,
+                )
+                should_deliver = (
+                    bool(event.get("deliverable", True)) and attempts == 0
+                ) or (
+                    attempts > 0
+                    and time.time() - retry_reference >= retry_after
+                )
+                if should_deliver:
                     notification = self._notification(event)
-                    await self.session.send_notification(notification)  # type: ignore[arg-type]
-                    notified.add(event_id)
+                    await self._deliver_notification(notification)
+                    route["delivery_attempt_count"] = attempts + 1
+                    route["last_delivery_at"] = time.time()
+                    route["transport"] = self._transport_name()
+                    self.routes[event_id] = route
+                    self._persist_runtime_state()
                 if bool(event.get("deliverable", True)):
                     await asyncio.to_thread(
                         self.client.receive_native_channel_event,
@@ -230,8 +285,8 @@ class ChannelRuntime:
                         route_token=self.route_token,
                         stage="injected",
                     )
-                notified.discard(event_id)
-                self._rotate_request()
+                if not should_deliver:
+                    await asyncio.sleep(CHANNEL_STATE_POLL_SECONDS)
             except asyncio.CancelledError:
                 raise
             except BridgeRemoteError as exc:
@@ -240,6 +295,27 @@ class ChannelRuntime:
             except Exception as exc:
                 self._record_error(exc)
                 await asyncio.sleep(1.0)
+
+    def _transport_name(self) -> str:
+        return (
+            self.guide.transport_name
+            if self.guide is not None
+            else "claude-channel"
+        )
+
+    async def _deliver_notification(
+        self,
+        notification: ClaudeChannelNotification,
+    ) -> None:
+        if self.guide is not None:
+            await asyncio.to_thread(
+                self.guide.deliver,
+                notification.params.content,
+            )
+            return
+        if self.session is None:
+            raise ClaudeNativeError("Claude channel session is not initialized")
+        await self.session.send_notification(notification)  # type: ignore[arg-type]
 
     def _notification(self, event: dict[str, Any]) -> ClaudeChannelNotification:
         messages: list[dict[str, Any]] = []
@@ -287,6 +363,21 @@ class ChannelRuntime:
                 separators=(",", ":"),
             )
         event_id = str(event["event_id"])
+        sender_names = list(
+            dict.fromkeys(
+                str(message.get("sender_display_name") or "").strip()
+                for message in messages
+                if str(message.get("sender_display_name") or "").strip()
+            )
+        )
+        sender = ", ".join(sender_names)[:200] or "Agent Bridge"
+        try:
+            timestamp = datetime.fromtimestamp(
+                float(event.get("fetched_at") or time.time()),
+                tz=UTC,
+            ).isoformat().replace("+00:00", "Z")
+        except (TypeError, ValueError, OverflowError, OSError):
+            timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         content = (
             "Agent Bridge 向当前精确 Claude 会话送达了聊天室事件。\n"
             f"聊天室：{event['conversation_id']}\n"
@@ -303,6 +394,10 @@ class ChannelRuntime:
             params=ClaudeChannelParams(
                 content=content,
                 meta={
+                    "chat_id": str(event["conversation_id"]),
+                    "message_id": event_id,
+                    "user": sender,
+                    "ts": timestamp,
                     "conversation_id": str(event["conversation_id"]),
                     "event_id": event_id,
                     "required_reply_count": str(
@@ -404,7 +499,7 @@ class ChannelRuntime:
                     lease_id=str(lease["lease_id"]),
                     process_epoch=self.state.process_epoch,
                     state="online",
-                    detail={"transport": "claude-channel", "last_tool": name},
+                    detail={"transport": self._transport_name(), "last_tool": name},
                 )
             except Exception as exc:
                 self._record_error(exc)
@@ -569,7 +664,7 @@ async def run_server(state: ClaudeConnectorState) -> None:
 
     server: Server[None] = Server(
         "agent-bridge-native",
-        version="0.40.1",
+        version="0.40.2",
         instructions=(
             "Agent Bridge room messages are injected into this exact Claude Code "
             "session. Use the provided tools for all room output; terminal transcript "
