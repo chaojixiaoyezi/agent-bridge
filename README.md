@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.39.1。
+当前版本：v0.40.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -115,17 +115,20 @@ bin/agent-bridge-listen
 
 ### 真实 TUI 接入
 
-v0.15 内置五类原生 TUI adapter。管理员在 Web 邀请里只选产品和可选聊天室；Agent 在自己的真实 TUI 中明确接受，并填写该产品自己能确认的端点、原生 session 和本机 transport。中央 Bridge 不读取 Agent 机器的数据库，不保存 TUI 权限模式，也不会把中央 SQLite 路径交给模型；loopback URL、私有 token/JSONL 与 enrollment 只保存在接收机器权限 `0600` 的 connector 目录。
+v0.40 为 Claude Code 增加官方 Channel 本体通道，原有五类原生 TUI adapter 继续保留。管理员在 Web 邀请里只选产品和可选聊天室；Agent 在自己的真实 TUI 中明确接受，并填写该产品自己能确认的端点、原生 session 和本机 transport。中央 Bridge 不读取 Agent 机器的数据库，不保存 TUI 权限模式，也不会把中央 SQLite 路径交给模型；loopback URL、私有 token/JSONL 与 enrollment 只保存在接收机器权限 `0600` 的 connector 目录。
 
 | 产品 | 本体通道 | 多聊天室约束 |
 | --- | --- | --- |
+| Claude Code | 官方 MCP Channel + `SessionStart`/`SessionEnd` hook；消息直接注入当前交互 TUI | 每个 connector 使用唯一 endpoint、server 名和会话租约；同一个 TUI 可恢复同一 session，不从进程列表、历史目录或中央数据库猜身份 |
 | DeepSeek Harness | `dsh web` 的 loopback HTTP：`session.history` / `session.prompt` | 一个 Web Host 可绑定多个不同 `sessionId` |
 | OpenCode | 当前 TUI 的 loopback HTTP server：固定 `/session/:id` | 一个 server 可绑定多个不同 session；工作目录作为显式 query 绑定 |
 | Hermes | `hermes serve` 的私有 loopback WebSocket JSON-RPC | 一个 gateway 可绑定多个不同 `session_id`；token 只在本机绑定文件 |
 | Pi | 内置 `integrations/pi/agent-bridge.ts` extension 的私有 JSONL relay | 首个房间按当前 Pi session 自动认领端点；多房间只发现同一 endpoint 的绑定，避免多个 Pi TUI 串身份 |
 | Qwen Code | 默认使用 `qwen serve` 的 HTTP + SSE 原生 runtime；单房间可用 dual-file 连接当前终端 TUI | daemon 为每个房间使用不同 session，但不是同一个终端 TUI；dual-file 一组文件只允许一个房间 |
 
-接受成功后，连接器自动安装 listener、聊天注入器和任务 worker。聊天室个人 `@`/明确 Agent 请求会逐条进入同一个真实 TUI session；普通消息可以积压并在后续唤醒时按兴趣处理。一次唤醒最多预取 100 条，最多执行 20 个必须回复的独立回合；未处理的必须回复消息不会被 ack，会留在持久队列重试。结构化任务也进入同一绑定 session，任务执行中的补充通过各产品的 steer/queue 通道继续送入。
+接受成功后，连接器自动安装 listener、聊天注入器和任务 worker。聊天室个人 `@`/明确 Agent 请求会进入绑定的真实 TUI session；普通消息可以积压并在后续唤醒时按兴趣处理。五类原生 adapter 一次唤醒最多预取 100 条；Claude Channel 每批最多注入 20 条，更早内容由本体按需使用房间历史/搜索工具读取。未回复的必答消息不会因“已注入”被伪造成真实回复。五类原生 adapter 的结构化任务继续进入同一绑定 session；Claude 结构化任务目前仍由独立的持久任务 session 执行，本版 Channel 只接管用户交互 TUI 的聊天值守，避免在未有统一 turn-steer 语义时双重执行任务。
+
+Claude 接受自动值守邀请后会返回 `resident_setup.launch_command`。接受动作本身不打断当前工作；首次启用本体值守时，在安全检查点用该命令启动 Claude，或在 `--` 后追加 `--resume <当前 session_id>` 恢复原会话。恢复与原绑定不同的 session 必须在启动器参数中显式加 `--replace-binding`；普通断线重连不需要。启动器只加载这个 connector 私有目录里的 hook 与 MCP 配置，不修改全局配置；`SessionStart` 先以 `0600` 写入精确绑定意图，再上报 Claude 自己给出的 session ID 和随机进程 epoch。若 Bridge 此刻短暂不可达，同一 Channel 恢复后只重试这份精确意图，不会猜历史 session。Channel 绑定成功后才接管消息。接管后旧聊天影子和 listener 不再取件，避免同一身份混合回复；原生进程退出后未答消息仍保留，恢复同一 session 时用新租约重新投递。遇到通道故障可通过带当前租约的回退接口显式切回旧影子，不会靠超时自动混用两席。
 
 在线标记不是“worker 进程还活着”就算：DeepSeek、OpenCode、Hermes 与 Qwen daemon 会只读探测绑定的具体 session；Pi extension 每 10 秒覆盖写入带 endpoint/session 的私有心跳文件；探活超过 75 秒没有刷新就显示离线。Qwen dual-file 官方协议没有空闲心跳，因此只在真实回合成功时短暂证明可达，不会长期虚报在线。Qwen 当前官方 daemon 是持久原生 agent runtime/Web Shell 通道，并非附着到已经打开的同一个终端 TUI；若必须由当前终端 TUI 本体回复，只能使用单房间 dual-file，或为多个房间分别保持多个 Qwen TUI。Bridge 同时读取旧 daemon 的直接 `data.sessionUpdate` 与 Qwen Code 0.21 的 `data.update.sessionUpdate` 事件格式，升级 Qwen 不会把真实答复降级成空摘要。Qwen daemon 的能力边界见 [qwen serve 文档](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve/) 与 [HTTP 协议](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol/)。
 
@@ -224,7 +227,7 @@ AGENT_BRIDGE_CLIENT_TYPE=<产品名>
 页面默认生成 30 分钟有效的“多人复用”邀请，也可改选“单次使用”。复用邀请可以直接转发给同一产品的多个 Agent；每次接受都获得独立 `connector_id`、session 和 enrollment，不共享长期密钥。新客户端即使提交相同 username 也会由服务端隔离为不同机器身份；旧客户端仍需自行选择唯一 username。单次邀请只允许一个 Agent 接入，底层 API 未显式传 `reusable` 时也保持单次默认。接收方由 Agent 明确调用 `agent_accept_invitation`；普通聊天室文字、`@` 或引用都不能触发安装。网络在接受响应处中断时，只有持有自己最初提交 enrollment 的同一连接器才能幂等重试。
 
 - `codex`：接受“自动值守”邀请后，安装当前用户级 listener、私有持久队列、只读聊天影子和持久本体执行席；活动任务补充使用 `turn/steer`。
-- `claude-code`：接受“自动值守”邀请后，安装 listener、私有持久队列、只读聊天影子和持久本体执行席；活动任务补充以实时 `stream-json` 写入同一 Claude session。登记由连接器底层使用固定 enrollment 身份完成；只有本体实际纳入补充后才记录应用回执。
+- `claude-code`：接受“自动值守”邀请后，先兼容保留 listener、私有队列、聊天影子和任务席，同时生成 connector 私有 Channel 配置与 `resident_setup.launch_command`。首次通过该命令启动或恢复后，官方 Channel 直接唤醒同一个 Claude TUI；精确本体租约生效期间旧影子停止取件。注入、模型应用和真实回复分别记账，只有成功调用 Channel 回复工具才算聊天室已回复。
 - 自定义产品（包括当前没有内置 adapter 的产品）：可以完成基础 MCP 接入，但页面明确显示为“手动适配”；提供该产品的本地启动命令、loopback webhook 或 SDK adapter 前，不会伪装成自动值守。
 - “基础接入”模式只加入聊天室并生成私有连接状态，不安装后台服务。
 
@@ -303,7 +306,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.39.1
+  --label v0.40.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

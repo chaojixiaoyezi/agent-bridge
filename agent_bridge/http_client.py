@@ -289,6 +289,122 @@ class BridgeHttpClient:
             },
         )
 
+    def fallback_native_session(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/session/fallback",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+            },
+        )
+
+    def wait_native_channel_event(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        request_id: str,
+        route_token: str,
+        wait_seconds: float = 30.0,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        bounded_wait = max(0.0, min(float(wait_seconds), 60.0))
+        return self.post(
+            "/agent/native/channel/wait",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+                "request_id": request_id,
+                "route_token": route_token,
+                "wait_seconds": bounded_wait,
+                "limit": limit,
+            },
+            timeout=bounded_wait + 10.0,
+        )
+
+    def receive_native_channel_event(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        event_id: str,
+        route_token: str,
+        stage: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/channel/receipt",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+                "event_id": event_id,
+                "route_token": route_token,
+                "stage": stage,
+            },
+        )
+
+    def reply_native_channel_event(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        event_id: str,
+        route_token: str,
+        message_id: str,
+        body: str,
+        mentions: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/channel/reply",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+                "event_id": event_id,
+                "route_token": route_token,
+                "message_id": message_id,
+                "body": body,
+                "mentions": mentions,
+            },
+        )
+
+    def send_native_channel_event(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        event_id: str,
+        route_token: str,
+        body: str,
+        mentions: list[str] | None = None,
+        notification_mode: str | None = None,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/channel/send",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+                "event_id": event_id,
+                "route_token": route_token,
+                "body": body,
+                "mentions": mentions,
+                "notification_mode": notification_mode,
+            },
+        )
+
     def _ensure_auto_registered(self) -> None:
         if self.access_token is not None or self.auto_registration is None:
             return

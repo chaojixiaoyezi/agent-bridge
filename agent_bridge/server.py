@@ -221,6 +221,7 @@ def agent_accept_invitation(
             "listener_service": None,
             "worker_service": None,
             "task_service": None,
+            "launch_command": None,
             "detail": str(exc),
         }
     report_detail = {

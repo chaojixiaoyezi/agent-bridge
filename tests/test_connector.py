@@ -12,7 +12,10 @@ import pytest
 import agent_bridge.claude_adapter as claude_adapter
 import agent_bridge.invitation_cli as invitation_cli
 import agent_bridge.server as bridge_server
-from agent_bridge.connector import configure_resident_connector
+from agent_bridge.connector import (
+    configure_claude_channel_artifacts,
+    configure_resident_connector,
+)
 from agent_bridge.connector import ConnectorSetupError
 
 
@@ -212,6 +215,93 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert task["ProgramArguments"][0].endswith("agent-bridge-task-worker")
     assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "codex"
     assert json.loads(manifest_file.read_text(encoding="utf-8"))["schema_version"] == 3
+
+
+def test_claude_connector_installs_generic_exact_session_channel(
+    tmp_path: Path,
+) -> None:
+    result = configure_resident_connector(
+        connector_id="connector_claudechannel123",
+        enrollment_token="enroll_claude-channel-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="claude-code",
+        username="青禾",
+        signature="真实会话值守。",
+        conversation_id="工具修改的聊天室",
+        adapter_kind="claude-code",
+        requested_mode="resident",
+        roles=["developer"],
+        capabilities=["chat"],
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    state = Path(result.state_directory)
+    manifest = json.loads((state / "connector.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 4
+    channel = manifest["claude_channel"]
+    assert channel["tui_endpoint_id"].startswith("claude-c")
+    assert channel["selector"].startswith("server:agent-bridge-c")
+    assert result.launch_command == tuple(channel["launch_command"])
+    assert result.public_payload()["launch_command"] == channel["launch_command"]
+
+    plugin = state / "claude-plugin"
+    plugin_manifest = json.loads(
+        (plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+    mcp = json.loads(
+        (state / "claude-channel.mcp.json").read_text(encoding="utf-8")
+    )
+    hooks = json.loads((plugin / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    assert plugin_manifest["name"].startswith("agent-bridge-c")
+    assert plugin_manifest["author"] == {"name": "Agent Bridge"}
+    server = channel["server_name"]
+    assert mcp["mcpServers"][server]["command"].endswith(
+        "agent-bridge-claude-channel"
+    )
+    assert set(hooks["hooks"]) == {"SessionStart", "SessionEnd"}
+    serialized_plugin = json.dumps(
+        {"manifest": plugin_manifest, "mcp": mcp, "hooks": hooks},
+        ensure_ascii=False,
+    )
+    assert "enroll_claude-channel-private-token" not in serialized_plugin
+
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    before = {
+        path.name: path.read_bytes() for path in launch_agents.glob("*.plist")
+    }
+    upgraded = configure_claude_channel_artifacts(state, home=tmp_path)
+    after = {
+        path.name: path.read_bytes() for path in launch_agents.glob("*.plist")
+    }
+    assert upgraded["selector"] == channel["selector"]
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        "agent-bridge-claude",
+        "agent-bridge-claude-channel",
+        "agent-bridge-claude-session-hook",
+    ],
+)
+def test_claude_native_launchers_import_package_outside_checkout(
+    tmp_path: Path,
+    launcher: str,
+) -> None:
+    completed = subprocess.run(
+        [str(BRIDGE_ROOT / "bin" / launcher), "--help"],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert launcher in completed.stdout
 
 
 def test_connector_refuses_to_overwrite_identity_or_enrollment(

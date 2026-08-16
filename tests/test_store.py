@@ -5118,6 +5118,252 @@ def test_native_session_lease_is_exact_idempotent_and_explicitly_replaceable(
     } <= delivery_columns
 
 
+def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "claude-channel-room"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    enrollment = "enroll_" + "n" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-channel-owner",
+        signature="真实 Claude 会话。",
+        enrollment_token=enrollment,
+    )
+    shadow = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=accepted["connector_id"],
+        connector_component="chat",
+        product="claude-code",
+        username=accepted["username"],
+        signature="真实 Claude 会话。",
+    )
+    sender = register(store, client="codex", name="channel-sender", room=room)
+    bound = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="claude-channel-endpoint",
+        native_session_id="claude-channel-session",
+        process_epoch="epoch-channel-one",
+        binding_source="resume",
+    )
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id=room,
+        body_text="@native-channel-owner 请确认这条消息。",
+        mentions=[accepted["participant_id"]],
+        notification_mode="mention",
+    )
+    lease_id = bound["lease"]["lease_id"]
+    request_id = "request_native_channel_one"
+    route_token = "route_" + "r" * 48
+    event = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="epoch-channel-one",
+        request_id=request_id,
+        route_token=route_token,
+        wait_seconds=0,
+    )
+    assert event["timed_out"] is False
+    assert event["event"]["message_ids"] == [message["message_id"]]
+    assert event["event"]["required_message_ids"] == [message["message_id"]]
+
+    retried = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="epoch-channel-one",
+        request_id=request_id,
+        route_token=route_token,
+        wait_seconds=0,
+    )
+    assert retried["event"]["event_id"] == event["event"]["event_id"]
+    with pytest.raises(AuthenticationError, match="token does not match"):
+        store.wait_native_channel_event(
+            participant_id=accepted["participant_id"],
+            authorized_session_id=accepted["session_id"],
+            connector_id=accepted["connector_id"],
+            lease_id=lease_id,
+            process_epoch="epoch-channel-one",
+            request_id=request_id,
+            route_token="route_" + "x" * 48,
+            wait_seconds=0,
+        )
+
+    shadow_wait = store.wait_messages(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=shadow["session_id"],
+        wait_seconds=0,
+    )
+    assert shadow_wait["messages"] == []
+    assert shadow_wait["native_handoff"]["active"] is True
+    listener_snapshot = store.notification_snapshot(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=shadow["session_id"],
+        after_sequence=0,
+    )
+    assert listener_snapshot["has_new"] is False
+    assert listener_snapshot["has_room_activity"] is False
+    assert listener_snapshot["native_handoff"]["active"] is True
+
+    event_id = event["event"]["event_id"]
+    store.receive_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="epoch-channel-one",
+        event_id=event_id,
+        route_token=route_token,
+        stage="injected",
+    )
+    applied = store.receive_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="epoch-channel-one",
+        event_id=event_id,
+        route_token=route_token,
+        stage="applied",
+    )
+    assert applied["event"]["state"] == "applied"
+    with store._connection() as connection:
+        delivery = connection.execute(
+            "SELECT state, delivery_stage FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (message["message_id"], accepted["participant_id"]),
+        ).fetchone()
+    assert tuple(delivery) == ("delivered", "native_applied")
+
+    replied = store.reply_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="epoch-channel-one",
+        event_id=event_id,
+        route_token=route_token,
+        message_id=message["message_id"],
+        body_text="收到，我正在真实会话里处理。",
+    )
+    assert replied["native_event"]["state"] == "replied"
+    assert replied["remaining_required_reply_count"] == 0
+
+
+def test_native_channel_rebind_redelivers_unanswered_event_and_can_fallback(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "claude-channel-rebind"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    enrollment = "enroll_" + "z" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-rebind-owner",
+        signature="重连测试。",
+        enrollment_token=enrollment,
+    )
+    shadow = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=accepted["connector_id"],
+        connector_component="chat",
+        product="claude-code",
+        username=accepted["username"],
+        signature="重连测试。",
+    )
+    sender = register(store, client="codex", name="rebind-sender", room=room)
+    first = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="claude-rebind-endpoint",
+        native_session_id="claude-rebind-session",
+        process_epoch="epoch-rebind-one",
+        binding_source="resume",
+    )
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id=room,
+        body_text="请回复重连测试。",
+        mentions=[accepted["participant_id"]],
+        notification_mode="mention",
+    )
+    first_event = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=first["lease"]["lease_id"],
+        process_epoch="epoch-rebind-one",
+        request_id="request_rebind_one",
+        route_token="route_" + "a" * 48,
+        wait_seconds=0,
+    )
+    second = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="claude-rebind-endpoint",
+        native_session_id="claude-rebind-session",
+        process_epoch="epoch-rebind-two",
+        binding_source="resume",
+    )
+    second_event = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=second["lease"]["lease_id"],
+        process_epoch="epoch-rebind-two",
+        request_id="request_rebind_two",
+        route_token="route_" + "b" * 48,
+        wait_seconds=0,
+    )
+    assert second_event["event"]["message_ids"] == [message["message_id"]]
+    assert second_event["event"]["event_id"] != first_event["event"]["event_id"]
+    fallback = store.fallback_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=second["lease"]["lease_id"],
+        process_epoch="epoch-rebind-two",
+    )
+    assert fallback["connector"]["native_delivery"]["mode"] == "legacy_shadow"
+    shadow_wait = store.wait_messages(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=shadow["session_id"],
+        wait_seconds=0,
+    )
+    assert [item["message_id"] for item in shadow_wait["messages"]] == [
+        message["message_id"]
+    ]
+
+
 def test_native_tui_invitation_requires_confirmation_and_unique_room_session(
     tmp_path: Path,
 ) -> None:

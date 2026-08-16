@@ -6,6 +6,7 @@ import os
 import platform
 import plistlib
 import secrets
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ class ConnectorSetupResult:
     worker_service: str | None
     task_service: str | None
     detail: str
+    launch_command: tuple[str, ...] | None = None
 
     def public_payload(self) -> dict[str, Any]:
         return {
@@ -76,6 +78,9 @@ class ConnectorSetupResult:
             "worker_service": self.worker_service,
             "task_service": self.task_service,
             "detail": self.detail,
+            "launch_command": (
+                list(self.launch_command) if self.launch_command else None
+            ),
         }
 
 
@@ -288,6 +293,175 @@ def _activate_systemd(units: list[Path]) -> None:
     )
 
 
+def _claude_channel_configuration(
+    *,
+    connector_id: str,
+    state_directory: Path,
+) -> dict[str, Any]:
+    suffix = _service_suffix(connector_id)
+    plugin_name = f"agent-bridge-{suffix}"
+    server_name = f"agent-bridge-{suffix}"
+    plugin_root = state_directory / "claude-plugin"
+    mcp_config_file = state_directory / "claude-channel.mcp.json"
+    launcher = PROJECT_ROOT / "bin" / "agent-bridge-claude"
+    return {
+        "plugin_name": plugin_name,
+        "plugin_root": str(plugin_root),
+        "server_name": server_name,
+        "selector": f"server:{server_name}",
+        "mcp_config_file": str(mcp_config_file),
+        "tui_endpoint_id": f"claude-{suffix}",
+        "state_directory": str(state_directory),
+        "launch_command": [
+            str(launcher),
+            "--state-directory",
+            str(state_directory),
+        ],
+    }
+
+
+def _write_claude_channel_plugin(
+    *,
+    configuration: dict[str, Any],
+) -> None:
+    """Install connector-local hooks plus a direct, uniquely named channel."""
+
+    plugin_root = Path(str(configuration["plugin_root"]))
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(plugin_root, 0o700)
+    (plugin_root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (plugin_root / "hooks").mkdir(parents=True, exist_ok=True)
+    for directory in (plugin_root / ".claude-plugin", plugin_root / "hooks"):
+        os.chmod(directory, 0o700)
+    plugin_name = str(configuration["plugin_name"])
+    server_name = str(configuration["server_name"])
+    state_directory = str(configuration["state_directory"])
+    channel_command = str(PROJECT_ROOT / "bin" / "agent-bridge-claude-channel")
+    hook_command = str(
+        PROJECT_ROOT / "bin" / "agent-bridge-claude-session-hook"
+    )
+    _atomic_private_write(
+        plugin_root / ".claude-plugin" / "plugin.json",
+        (
+            json.dumps(
+                {
+                    "name": plugin_name,
+                    "version": "0.40.0",
+                    "author": {"name": "Agent Bridge"},
+                    "description": (
+                        "Route authenticated Agent Bridge room notifications "
+                        "into the exact live Claude Code session."
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    _atomic_private_write(
+        Path(str(configuration["mcp_config_file"])),
+        (
+            json.dumps(
+                {
+                    "mcpServers": {
+                        server_name: {
+                            "command": channel_command,
+                            "args": [
+                                "--state-directory",
+                                state_directory,
+                            ],
+                        }
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    quoted_hook = " ".join(
+        [
+            shlex.quote(hook_command),
+            "--state-directory",
+            shlex.quote(state_directory),
+        ]
+    )
+    _atomic_private_write(
+        plugin_root / "hooks" / "hooks.json",
+        (
+            json.dumps(
+                {
+                    "description": (
+                        "Bind and end the exact Agent Bridge Claude session lease."
+                    ),
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": quoted_hook,
+                                        "timeout": 10,
+                                    }
+                                ]
+                            }
+                        ],
+                        "SessionEnd": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": quoted_hook,
+                                        "timeout": 10,
+                                    }
+                                ]
+                            }
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def configure_claude_channel_artifacts(
+    state_directory: str | Path,
+    *,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """Upgrade Claude channel files without touching any resident service."""
+
+    state = Path(state_directory).expanduser().resolve()
+    manifest_file = state / "connector.json"
+    try:
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise ConnectorSetupError("Claude connector manifest is invalid") from exc
+    if str(manifest.get("adapter_kind") or "") != "claude-code":
+        raise ConnectorSetupError("connector is not a Claude Code connector")
+    connector_id = opaque_id(
+        str(manifest.get("connector_id") or ""),
+        field="connector_id",
+    )
+    del home
+    configuration = _claude_channel_configuration(
+        connector_id=connector_id,
+        state_directory=state,
+    )
+    manifest["schema_version"] = max(int(manifest.get("schema_version") or 0), 4)
+    manifest["claude_channel"] = configuration
+    _atomic_private_write(
+        manifest_file,
+        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+    _write_claude_channel_plugin(configuration=configuration)
+    return configuration
+
+
 def configure_resident_connector(
     *,
     connector_id: str,
@@ -416,8 +590,16 @@ def configure_resident_connector(
         connector_id=connector,
     )
     source_thread_id = str(execution_source_thread_id or "").strip()
+    claude_channel = (
+        _claude_channel_configuration(
+            connector_id=connector,
+            state_directory=state_directory,
+        )
+        if adapter == "claude-code" and mode == "resident" and enable_resident
+        else None
+    )
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4 if claude_channel is not None else 3,
         "connector_id": connector,
         "bridge_url": normalized_url,
         "product": normalized_product,
@@ -436,11 +618,14 @@ def configure_resident_connector(
         "workspace_path": str(workspace),
         "execution_source_thread_id": source_thread_id or None,
         "enrollment_token_file": str(enrollment_file),
+        "claude_channel": claude_channel,
     }
     _atomic_private_write(
         manifest_file,
         (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
     )
+    if claude_channel is not None:
+        _write_claude_channel_plugin(configuration=claude_channel)
     if native_binding is not None:
         _atomic_private_write(
             tui_binding_file,
@@ -670,6 +855,11 @@ def configure_resident_connector(
                 if native_binding is not None
                 else "listener、聊天值守和任务执行席位已配置为当前用户的常驻服务。"
             ),
+            launch_command=(
+                tuple(str(value) for value in claude_channel["launch_command"])
+                if claude_channel is not None
+                else None
+            ),
         )
 
     if host_system == "Linux":
@@ -726,6 +916,11 @@ def configure_resident_connector(
                 if native_binding is not None
                 else "listener、聊天值守和任务执行席位已配置为当前用户的 systemd 服务。"
             ),
+            launch_command=(
+                tuple(str(value) for value in claude_channel["launch_command"])
+                if claude_channel is not None
+                else None
+            ),
         )
 
     return ConnectorSetupResult(
@@ -738,4 +933,9 @@ def configure_resident_connector(
         worker_service=None,
         task_service=None,
         detail="当前操作系统暂不支持自动安装；已生成私有连接配置。",
+        launch_command=(
+            tuple(str(value) for value in claude_channel["launch_command"])
+            if claude_channel is not None
+            else None
+        ),
     )

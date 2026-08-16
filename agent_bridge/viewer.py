@@ -2283,6 +2283,164 @@ def create_app(
             },
         )
 
+    async def fallback_native_agent_session(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"connector_id", "lease_id", "process_epoch"},
+            allowed={"connector_id", "lease_id", "process_epoch"},
+            operation=lambda auth, payload: store.fallback_native_agent_session(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                lease_id=payload["lease_id"],
+                process_epoch=payload["process_epoch"],
+            ),
+        )
+
+    async def wait_native_channel_event(request: Request) -> Response:
+        try:
+            auth = _authenticate_request(request, store)
+            payload = await _json_body(
+                request,
+                required={
+                    "connector_id",
+                    "lease_id",
+                    "process_epoch",
+                    "request_id",
+                    "route_token",
+                },
+                allowed={
+                    "connector_id",
+                    "lease_id",
+                    "process_epoch",
+                    "request_id",
+                    "route_token",
+                    "wait_seconds",
+                    "limit",
+                },
+            )
+            result = await asyncio.to_thread(
+                store.wait_native_channel_event,
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                lease_id=payload["lease_id"],
+                process_epoch=payload["process_epoch"],
+                request_id=payload["request_id"],
+                route_token=payload["route_token"],
+                wait_seconds=payload.get("wait_seconds", 30),
+                limit=payload.get("limit", 20),
+            )
+            return JSONResponse(result)
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def receive_native_channel_event(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "stage",
+            },
+            allowed={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "stage",
+            },
+            operation=lambda auth, payload: store.receive_native_channel_event(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                lease_id=payload["lease_id"],
+                process_epoch=payload["process_epoch"],
+                event_id=payload["event_id"],
+                route_token=payload["route_token"],
+                stage=payload["stage"],
+            ),
+        )
+
+    async def reply_native_channel_event(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "message_id",
+                "body",
+            },
+            allowed={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "message_id",
+                "body",
+                "mentions",
+            },
+            operation=lambda auth, payload: store.reply_native_channel_event(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                lease_id=payload["lease_id"],
+                process_epoch=payload["process_epoch"],
+                event_id=payload["event_id"],
+                route_token=payload["route_token"],
+                message_id=payload["message_id"],
+                body_text=payload["body"],
+                mentions=payload.get("mentions"),
+            ),
+        )
+
+    async def send_native_channel_event(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "body",
+            },
+            allowed={
+                "connector_id",
+                "lease_id",
+                "process_epoch",
+                "event_id",
+                "route_token",
+                "body",
+                "mentions",
+                "notification_mode",
+            },
+            operation=lambda auth, payload: store.send_native_channel_event(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                lease_id=payload["lease_id"],
+                process_epoch=payload["process_epoch"],
+                event_id=payload["event_id"],
+                route_token=payload["route_token"],
+                body_text=payload["body"],
+                mentions=payload.get("mentions"),
+                notification_mode=payload.get("notification_mode"),
+            ),
+        )
+
     async def agent_heartbeat(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -3730,7 +3888,10 @@ def create_app(
                     "一句 signature，再从邀请候选中自主选择 avatar_key，并在当前工作"
                     "目录执行下列 agent-bridge-accept 命令；"
                     "邀请令牌通过标准输入传入。成功后简要报告结果。不要修改全局 MCP "
-                    "配置，也不要要求用户重启现有 Claude Code 会话。"
+                    "配置。接受结果会返回 resident_setup.launch_command；首次启用本体"
+                    "值守时，用它启动，或在 -- 后追加 --resume 当前 Claude session。"
+                    "之后始终通过同一"
+                    "命令恢复，Bridge 才能把消息精确注入这个 TUI。"
                 )
                 direct_arguments = [
                     direct_accept_command,
@@ -3754,6 +3915,7 @@ def create_app(
                 quick_start = {
                     "kind": "claude-code-direct-accept",
                     "requires_mcp_restart": False,
+                    "requires_tui_resume": True,
                     "command": direct_command,
                     "agent_prompt": acceptance_prompt + "\n" + direct_command,
                 }
@@ -3873,6 +4035,12 @@ def create_app(
                 }
             if requested_mode == "resident" and effective_adapter_kind != "manual":
                 setup_note = f"本邀请支持 {effective_adapter_kind} 自动值守；接受后会在本机安装当前用户级 listener、真实 TUI 注入器和任务 worker。"
+                if normalized_product == "claude-code":
+                    setup_note += (
+                        " Claude 首次用 resident_setup.launch_command 启动或恢复后，"
+                        "精确 SessionStart hook 才切换为本体 Channel；切换前旧影子继续"
+                        "兼容运行，切换后旧影子停止取件，不会混用两个身份。"
+                    )
             elif requested_mode == "resident":
                 setup_note = (
                     "该自定义产品暂无内置唤醒适配器；接受后完成基础接入，并生成私有连接配置，"
@@ -3932,7 +4100,8 @@ def create_app(
             if quick_start and quick_start["kind"] == "claude-code-direct-accept":
                 instruction_lines.extend(
                     [
-                        "Claude Code 推荐快速接入（直接把下面整段发给 Claude Code；无需修改全局 MCP 配置，也无需重启现有 TUI/MCP）：",
+                        "Claude Code 推荐快速接入（直接把下面整段发给 Claude Code；无需修改全局 MCP 配置）：",
+                        "接受本身不打断当前工作；要启用真实本体推送，完成当前安全检查点后，用返回的 resident_setup.launch_command 在 -- 后加 --resume <当前 session_id> 恢复一次。之后断线继续用同一命令恢复，不能从数据库猜身份。",
                         str(quick_start["agent_prompt"]),
                     ]
                 )
@@ -4388,6 +4557,31 @@ def create_app(
             Route(
                 "/agent/native/session/end",
                 end_native_agent_session,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/native/session/fallback",
+                fallback_native_agent_session,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/native/channel/wait",
+                wait_native_channel_event,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/native/channel/receipt",
+                receive_native_channel_event,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/native/channel/reply",
+                reply_native_channel_event,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/native/channel/send",
+                send_native_channel_event,
                 methods=["POST"],
             ),
             Route("/agent/heartbeat", agent_heartbeat, methods=["POST"]),

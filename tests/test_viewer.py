@@ -38,7 +38,7 @@ USER_PASSWORD = "MemberSecure1!"
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.39.1"
+    assert _runtime_software_version() == "0.40.0"
 
 
 class FakeEmailDelivery:
@@ -325,6 +325,110 @@ def test_native_session_lifecycle_http_contract(tmp_path: Path) -> None:
     )
     assert ended.status_code == 200
     assert ended.json()["lease"]["ended_at"] is not None
+
+
+def test_native_channel_http_contract(tmp_path: Path) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    WebAuthStore(database)
+    with store._connection() as connection:
+        admin_id = str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+    room = "native-channel-http"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-channel-http",
+        signature="HTTP channel lifecycle test",
+    )
+    sender_base = store.register(
+        client_type="codex-native-http-sender",
+        session_alias="HTTP sender",
+        conversation_id=room,
+    )
+    sender = store.register_agent_session(
+        product="codex",
+        username="native-http-sender",
+        session_alias="HTTP sender",
+        conversation_id=room,
+    )
+    assert sender["participant_id"] == sender_base["participant_id"]
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id=room,
+        body_text="请通过原生 Channel 回复。",
+        mentions=[accepted["participant_id"]],
+        notification_mode="mention",
+    )
+    client = TestClient(make_app(database))
+    headers = {"Authorization": f"Bearer {accepted['access_token']}"}
+    bound = client.post(
+        "/agent/native/session/bind",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "tui_endpoint_id": "native-channel-http-endpoint",
+            "native_session_id": "native-channel-http-session",
+            "process_epoch": "native-channel-http-epoch",
+            "binding_source": "resume",
+        },
+    ).json()
+    lease_id = bound["lease"]["lease_id"]
+    route_token = "route_" + "h" * 48
+    waited = client.post(
+        "/agent/native/channel/wait",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-channel-http-epoch",
+            "request_id": "request_native_http",
+            "route_token": route_token,
+            "wait_seconds": 0,
+        },
+    )
+    assert waited.status_code == 200
+    event_id = waited.json()["event"]["event_id"]
+    receipt = client.post(
+        "/agent/native/channel/receipt",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-channel-http-epoch",
+            "event_id": event_id,
+            "route_token": route_token,
+            "stage": "injected",
+        },
+    )
+    assert receipt.status_code == 200
+    replied = client.post(
+        "/agent/native/channel/reply",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-channel-http-epoch",
+            "event_id": event_id,
+            "route_token": route_token,
+            "message_id": message["message_id"],
+            "body": "HTTP 原生回复成功。",
+        },
+    )
+    assert replied.status_code == 200
+    assert replied.json()["native_event"]["state"] == "replied"
 
 
 def test_web_login_registration_password_policy_profile_and_roles(
@@ -2482,7 +2586,10 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert "agent-bridge-accept" in claude_access["quick_start"]["command"]
     assert "--avatar-key" in claude_access["quick_start"]["command"]
     assert "printf %s" in claude_access["quick_start"]["command"]
-    assert "无需重启现有 TUI/MCP" in claude_access["instructions"]
+    assert claude_access["quick_start"]["requires_tui_resume"] is True
+    assert "-- 后加 --resume <当前 session_id> 恢复一次" in claude_access[
+        "instructions"
+    ]
 
     deepseek_product = client.post(
         "/api/agent-access",
