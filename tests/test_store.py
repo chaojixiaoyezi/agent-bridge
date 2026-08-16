@@ -2409,6 +2409,75 @@ def test_visible_at_alias_is_inferred_at_start_middle_and_end(
         assert sent["mentions"] == [receiver["participant_id"]]
 
 
+def test_exact_named_coordination_request_recovers_missing_at_for_legacy_sender(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="协调者")
+    receiver = register(store, client="codex", name="青禾")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="codex-青禾，请检查这次迁移并回复结论。",
+    )
+
+    assert sent["mentions"] == [receiver["participant_id"]]
+    assert sent["notification_mode"] == "mention"
+    assert sent["coordination_routing"] == {
+        "requested": True,
+        "notified": True,
+        "source": "named_member",
+        "target_participant_ids": [receiver["participant_id"]],
+    }
+    assert sent["mention_routing"]["notified"] is True
+
+
+def test_explicit_ordinary_coordination_is_not_silently_promoted(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="协调者")
+    register(store, client="codex", name="青禾")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="codex-青禾，请检查这次迁移并回复结论。",
+        notification_mode="ordinary",
+    )
+
+    assert sent["mentions"] == []
+    assert sent["notification_mode"] == "ordinary"
+    assert sent["coordination_routing"]["notified"] is False
+    assert "direct_request_sent_as_ordinary" in sent[
+        "coordination_routing"
+    ]["warning"]
+    assert "ordinary_message_queued" in sent["mention_routing"]["warning"]
+
+
+def test_unresolved_visible_at_is_reported_without_guessing_a_target(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    sender = register(store, client="claude-code", name="协调者")
+    register(store, client="codex", name="青禾")
+
+    sent = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="@大橘 请检查这次迁移。",
+    )
+
+    assert sent["mentions"] == []
+    assert sent["notification_mode"] == "ordinary"
+    assert sent["mention_routing"]["unresolved_visible"] == ["大橘"]
+    assert "visible_mention_unresolved" in sent["mention_routing"]["warning"]
+
+
 def test_explicit_review_request_routes_named_member_without_at(
     tmp_path: Path,
 ) -> None:

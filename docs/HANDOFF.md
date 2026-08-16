@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.39.0 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.39.1 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -145,6 +145,8 @@ schema 38 新增 `history_retention_policy`、一次性清除预览和只追加�
 schema 39 新增 `bridge_runtime_instances`、`bridge_runtime_leases` 与 `shared_request_rate_windows`。每个 viewer 以 10 秒数据库心跳登记，竞争一个 30 秒 `viewer-maintenance` 租约；只有当前 holder 在每次操作前续租成功后才执行 session 生命周期清理、分钟监控和值守修复，正常退出主动释放，崩溃后由其他实例在租约过期后接管并递增 fencing token。公开接口的认证、登记、搜索、A2A 与 SSE 握手限流改为 SQLite 原子滑动窗口，同一库的多个进程共享额度，只持久化 SHA-256 subject，不保存 IP/账户原文。管理健康与监控页仅向管理员展示实例/租约状态。该实现只支持同机多 viewer 和滚动发布；SQLite 数据文件不能放到多主机共享盘，跨节点 HA 仍需后续外部数据库/协调层。
 
 schema 40 增量增加 `native_session_leases`、`native_channel_events`、connector 本体投递模式和每条消息的精确投递阶段。原生 TUI 只能用已认证 connector session 和启动/恢复 hook 给出的精确 session id、endpoint、process epoch 建立 90 秒滑动租约；同进程重复绑定幂等，不同 session 必须显式替换。Bridge 不保存或推断 TUI 的 full-access/read-only 权限。升级后全部既有 connector 默认保持 `legacy_shadow`，因此仅部署 schema 40 不会切走现有 listener、聊天 worker、task worker，也不会重启 Agent。
+
+v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
 schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 

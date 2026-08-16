@@ -3064,6 +3064,126 @@ class BridgeStore:
         return sorted(set(inferred))
 
     @staticmethod
+    def _visible_at_tokens(body_text: str) -> list[str]:
+        """Return bounded user-visible @ tokens while ignoring email addresses."""
+
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9._%+-])@"
+            r"(?P<alias>[^\s@，,。.!！?？:：;；、()（）\[\]【】<>《》"
+            r"'\"`]{1,128})"
+        )
+        result: list[str] = []
+        for match in pattern.finditer(body_text):
+            visible = str(match.group("alias") or "").strip()
+            if visible and visible not in result:
+                result.append(visible)
+        return result[:MAX_MENTIONS_PER_MESSAGE]
+
+    @classmethod
+    def _mention_routing_diagnostics_locked(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        conversation_id: str,
+        sender_participant_id: str,
+        body_text: str,
+        mentioned_participant_ids: Sequence[str],
+        notification_mode: str,
+        wake_all_agents: bool,
+        notification_targeted: bool,
+    ) -> dict[str, Any]:
+        """Explain notification routing without making fuzzy prose authoritative."""
+
+        rows = conn.execute(
+            """
+            SELECT participant.participant_id,
+                   participant.client_type,
+                   participant.display_name
+            FROM memberships AS membership
+            JOIN participants AS participant
+              ON participant.participant_id = membership.participant_id
+            WHERE membership.conversation_id = ?
+              AND membership.active = 1
+              AND participant.participant_id != ?
+            ORDER BY membership.joined_at, participant.participant_id
+            """,
+            (conversation_id, sender_participant_id),
+        ).fetchall()
+        aliases: dict[str, set[str]] = {}
+        participants: dict[str, dict[str, str]] = {}
+        for row in rows:
+            participant_id = str(row["participant_id"])
+            participants[participant_id] = {
+                "participant_id": participant_id,
+                "display_name": str(row["display_name"]),
+                "client_type": str(row["client_type"]),
+            }
+            for value in (row["display_name"], row["client_type"]):
+                visible = str(value or "").strip()
+                if visible:
+                    aliases.setdefault(visible.casefold(), set()).add(participant_id)
+
+        visible_tokens = cls._visible_at_tokens(body_text)
+        resolved_visible: list[dict[str, str]] = []
+        unresolved_visible: list[str] = []
+        ambiguous_visible: list[str] = []
+        reserved_visible: list[str] = []
+        for visible in visible_tokens:
+            if visible.casefold() == "全员".casefold():
+                if wake_all_agents:
+                    resolved_visible.append(
+                        {"visible": visible, "kind": "wake_all"}
+                    )
+                else:
+                    reserved_visible.append(visible)
+                continue
+            targets = aliases.get(visible.casefold(), set())
+            if len(targets) == 1:
+                resolved_visible.append(
+                    {
+                        "visible": visible,
+                        "kind": "participant",
+                        "participant_id": next(iter(targets)),
+                    }
+                )
+            elif len(targets) > 1:
+                ambiguous_visible.append(visible)
+            else:
+                unresolved_visible.append(visible)
+
+        target_ids = list(dict.fromkeys(mentioned_participant_ids))
+        targets = [
+            participants[participant_id]
+            for participant_id in target_ids
+            if participant_id in participants
+        ]
+        warning = None
+        if unresolved_visible or ambiguous_visible or reserved_visible:
+            warning = (
+                "visible_mention_unresolved: one or more visible @ names did not "
+                "produce a structured notification; call agent_participants and "
+                "resend with exact same-room participant IDs in mentions"
+            )
+        elif notification_mode == "ordinary":
+            warning = (
+                "ordinary_message_queued: no Agent is immediately notified; use "
+                "notification_mode=mention with a structured target when timely "
+                "attention is expected"
+            )
+        return {
+            "notification_mode": notification_mode,
+            "notified": bool(notification_targeted),
+            "target_participants": targets,
+            "wake_all_agents": wake_all_agents,
+            "visible_tokens": visible_tokens,
+            "resolved_visible": resolved_visible,
+            "unresolved_visible": unresolved_visible,
+            "ambiguous_visible": ambiguous_visible,
+            "reserved_visible": reserved_visible,
+            "warning": warning,
+        }
+
+    @staticmethod
     def _is_direct_review_request(body_text: str) -> bool:
         """Identify only explicit requests for review or confirmation.
 
@@ -12888,6 +13008,8 @@ class BridgeStore:
         task_target_kind: str | None = None
         task_target_ids: list[str] = []
         review_routing: dict[str, Any] | None = None
+        coordination_routing: dict[str, Any] | None = None
+        mention_routing: dict[str, Any] | None = None
         sender_seat = "unknown"
         web_identity: sqlite3.Row | None = None
         body_routing: list[dict[str, Any]] = []
@@ -13045,8 +13167,9 @@ class BridgeStore:
                 not _owner_ui
                 and not _web_user
                 and normalized_message_kind == "message"
-                and self._is_direct_review_request(normalized_body)
+                and self._is_direct_agent_reply_request(normalized_body)
             ):
+                is_review_request = self._is_direct_review_request(normalized_body)
                 review_targets = list(normalized_mentions)
                 review_source = "structured_or_visible_mention"
                 if normalized_audience in {"participant", "role"}:
@@ -13084,19 +13207,41 @@ class BridgeStore:
                     normalized_audience not in {"participant", "role"}
                     and not review_targets
                 ):
-                    review_routing = {
+                    warning_code = (
+                        "review_or_confirmation_target_required"
+                        if is_review_request
+                        else "coordination_target_required"
+                    )
+                    coordination_routing = {
                         "requested": True,
                         "notified": False,
                         "source": "unresolved",
                         "target_participant_ids": [],
                         "warning": (
-                            "review_or_confirmation_target_required: no reviewer "
-                            "was notified; immediately resend with a same-room "
-                            "member's exact name, structured mentions, reply_to, "
-                            "or a participant/role audience"
+                            f"{warning_code}: no target was notified; immediately "
+                            "resend with a same-room member's exact name, structured "
+                            "mentions, reply_to, or a participant/role audience"
                         ),
                     }
-                if normalized_audience != "role":
+                elif (
+                    requested_notification_mode == "ordinary"
+                    and normalized_audience == "room"
+                    and normalized_reply is None
+                ):
+                    coordination_routing = {
+                        "requested": True,
+                        "notified": False,
+                        "source": "explicit_ordinary",
+                        "target_participant_ids": [],
+                        "warning": (
+                            "direct_request_sent_as_ordinary: an exact target name "
+                            "was found, but notification_mode=ordinary explicitly "
+                            "kept this in backlog; resend in mention mode if timely "
+                            "attention is expected"
+                        ),
+                    }
+                    review_targets = []
+                if normalized_audience != "role" and review_targets:
                     for review_target in review_targets:
                         if review_target not in normalized_mentions:
                             normalized_mentions.append(review_target)
@@ -13105,13 +13250,15 @@ class BridgeStore:
                         "mentions cannot contain more than "
                         f"{MAX_MENTIONS_PER_MESSAGE} entries"
                     )
-                if review_routing is None:
-                    review_routing = {
+                if coordination_routing is None:
+                    coordination_routing = {
                         "requested": True,
                         "notified": True,
                         "source": review_source,
                         "target_participant_ids": sorted(set(review_targets)),
                     }
+                if is_review_request:
+                    review_routing = dict(coordination_routing)
             if normalized_forward:
                 source = conn.execute(
                     "SELECT conversation_id, message_kind FROM messages "
@@ -13148,6 +13295,16 @@ class BridgeStore:
                     "ordinary mode cannot include mentions, reply_to, @全员, or a "
                     "participant/role audience"
                 )
+            mention_routing = self._mention_routing_diagnostics_locked(
+                conn,
+                conversation_id=conversation,
+                sender_participant_id=sender,
+                body_text=normalized_body,
+                mentioned_participant_ids=normalized_mentions,
+                notification_mode=effective_notification_mode,
+                wake_all_agents=normalized_wake_all,
+                notification_targeted=has_notification_target,
+            )
             self._assert_speaking_cooldown(
                 conn,
                 participant_id=sender,
@@ -13325,6 +13482,10 @@ class BridgeStore:
                 payload["body_routing"] = body_routing
             if review_routing is not None:
                 payload["review_routing"] = review_routing
+            if coordination_routing is not None:
+                payload["coordination_routing"] = coordination_routing
+            if mention_routing is not None:
+                payload["mention_routing"] = mention_routing
         return payload
 
     def send_owner_message(
