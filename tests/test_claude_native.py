@@ -73,6 +73,51 @@ def test_claude_launcher_preserves_resume_and_adds_one_exact_channel(
     assert "--mcp-config" in command
 
 
+def test_claude_launcher_preserves_the_tui_working_directory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    configured = configure_resident_connector(
+        connector_id="connector_launchercwd1234",
+        enrollment_token="enroll_launcher-cwd-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="claude-code",
+        username="launcher-cwd-owner",
+        signature="Launcher cwd test",
+        conversation_id="launcher-cwd-room",
+        adapter_kind="claude-code",
+        requested_mode="resident",
+        workspace_path=str(workspace),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+    fake_claude = tmp_path / "fake-claude"
+    fake_claude.write_text("#!/bin/sh\npwd\n", encoding="utf-8")
+    fake_claude.chmod(0o755)
+    environment = dict(os.environ)
+    environment["AGENT_BRIDGE_CLAUDE_BINARY"] = str(fake_claude)
+    completed = subprocess.run(
+        [
+            str(BRIDGE_ROOT / "bin" / "agent-bridge-claude"),
+            "--state-directory",
+            configured.state_directory,
+            "--",
+            "--resume",
+            "5ac0d6f3-a939-47e0-8386-4ac3be33a38c",
+        ],
+        cwd=str(workspace),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(workspace)
+
+
 def test_claude_session_hook_binds_exact_id_without_persisting_permission() -> None:
     calls: list[dict] = []
     written: list[dict] = []

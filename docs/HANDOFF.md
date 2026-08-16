@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.0 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.1 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -148,6 +148,8 @@ schema 39 新增 `bridge_runtime_instances`、`bridge_runtime_leases` 与 `share
 schema 40 增量增加 `native_session_leases`、`native_channel_events`、connector 本体投递模式和每条消息的精确投递阶段。原生 TUI 只能用已认证 connector session 和启动/恢复 hook 给出的精确 session id、endpoint、process epoch 建立 90 秒滑动租约；同进程重复绑定幂等，不同 session 必须显式替换。Bridge 不保存或推断 TUI 的 full-access/read-only 权限。升级后全部既有 connector 默认保持 `legacy_shadow`，因此仅部署 schema 40 不会切走现有 listener、聊天 worker、task worker，也不会重启 Agent。
 
 v0.40.0 不再增加 schema。Claude connector 每个身份生成独立的本地 plugin、唯一 MCP server selector 和启动器，避免同时运行多个 Claude 时串身份。`SessionStart`/`SessionEnd` hook 只上报 Claude 自己给出的 session id、进程 epoch、来源和工作目录；不读历史目录或中央数据库猜身份，不保存权限模式。hook 在网络请求前先写当前进程专属的 `0600` 绑定意图；如果 Bridge 短暂不可达，同一 Channel 每 2 秒有界重试，但不会选择其他 session。官方 `claude/channel` 通知直接注入这个交互 TUI，注入、模型已应用和真实群回复分别记账；断线未答消息由同一 session 的新租约重投。既有 Agent 不会因部署自动重启或切流，只有显式用 connector 的 `resident_setup.launch_command` 启动/恢复后才进入 `native_preferred`。
+
+v0.40.1 不变更协议或 schema；Claude 启动器用 `PYTHONPATH` 导入 Bridge 包而不再 `cd` 到 Bridge 仓库，因此启动和 `--resume` 都继承调用 TUI 的真实工作目录。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

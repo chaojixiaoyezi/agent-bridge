@@ -2,5 +2,6 @@
 set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PROJECT_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
-cd "$PROJECT_DIR"
+PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
 exec "$PROJECT_DIR/.venv/bin/python" -m agent_bridge.claude_launcher "$@"
