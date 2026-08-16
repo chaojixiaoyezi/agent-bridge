@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.38.0。
+当前版本：v0.39.0。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -266,7 +266,7 @@ participant 由认证 session 确定，不由模型在每次调用中自由填�
 - Web 登录只作用于聊天室和管理类 `/api/*` 看板接口；公开健康检查只暴露最小探活信息，不会给现有 `/agent/*` 登记和消息链增加 Web 账户依赖。
 - `session_alias` 继续接受；新客户端应改用 `signature`。
 - 原 participant、membership、session、message、receipt 和房间历史原样保留。
-- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序；v0.32.3 只兼容 Qwen Code 0.21 的嵌套 SSE 消息结构；v0.32.4 只固化五类真产品 E2E 与清理证据；v0.33.0 只调整 Web 聊天优先布局；v0.34.0 只增加真实浏览器回归门禁；v0.35.0 的 schema 36 只增加分钟监控、告警和索引；v0.36.0 的 schema 37 只增加 Web 治理审计账本；v0.37.0 的 schema 38 只增加管理员跨房搜索、完整导出与手动历史正文治理；v0.38.0 的 schema 39 只增加同机 viewer 实例、维护租约与共享请求限流状态，不改变消息路由、在线 Agent、connector 或默认永久保留语义。
+- 升级启动会就地增量迁移，不重建旧 connector、participant、Agent session、消息或房间历史。v0.27.0 为历史消息回填每个聊天室独立、连续且不可变的 `room_sequence` 展示号；v0.28.0 只新增引用串读取投影及与原消息关联的置顶/决策标记；v0.29.0 只扩展同房间只读搜索；v0.30.0 只为 Web 用户增量增加可空邮箱状态和一次性令牌表；v0.31.0 只为每个 connector 增加哈希凭证轮换元数据、24 小时旧凭证宽限和单设备撤销审计；v0.32.0 不新增权限状态，只让新库不再创建 `tui_access_mode`，旧库保留列结构但把历史值清为 `unknown` 并永久忽略。原全局 `sequence` 继续只作为同步游标和兼容 API 参数，因此 listener、回执、任务定位与旧客户端不会跳号或重放。v0.26.0 的维护发布门禁及此前消息/通知语义全部保留。v0.32.1 仅扩展远端 CI；v0.32.2 只修正 Pi 当前新会话首条消息的落盘时序；v0.32.3 只兼容 Qwen Code 0.21 的嵌套 SSE 消息结构；v0.32.4 只固化五类真产品 E2E 与清理证据；v0.33.0 只调整 Web 聊天优先布局；v0.34.0 只增加真实浏览器回归门禁；v0.35.0 的 schema 36 只增加分钟监控、告警和索引；v0.36.0 的 schema 37 只增加 Web 治理审计账本；v0.37.0 的 schema 38 只增加管理员跨房搜索、完整导出与手动历史正文治理；v0.38.0 的 schema 39 只增加同机 viewer 实例、维护租约与共享请求限流状态；v0.39.0 的 schema 40 增量增加原生 TUI 会话租约、投递阶段与 Channel 事件账本，但默认仍为 `legacy_shadow`，没有完成显式本体绑定的现有 Agent 路由完全不变。
 - Agent 模型与 adapter 子进程不会继承 `AGENT_BRIDGE_DB` 或 `AGENT_BRIDGE_HOME`；中央 SQLite 只由 Bridge 服务端持有，Agent 侧只通过受限 HTTP/MCP 接口读取自己聊天室的数据。
 - 已解决的旧定向消息不会被重新制造为大量未读；仍开放的旧消息会进入房间成员的持久 backlog。
 - 既有“participant 私聊已升级为同房间公开 `@`”语义保持不变，所有成员继续拥有一致上下文。
@@ -303,7 +303,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.38.0
+  --label v0.39.0
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

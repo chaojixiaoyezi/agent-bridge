@@ -227,6 +227,68 @@ class BridgeHttpClient:
                     self._register_from_fixed_identity()
             return self._post(path, payload, authenticated=True, timeout=timeout)
 
+    def bind_native_session(
+        self,
+        *,
+        connector_id: str,
+        tui_endpoint_id: str,
+        native_session_id: str,
+        process_epoch: str,
+        binding_source: str,
+        replace_existing_session: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/session/bind",
+            {
+                "connector_id": connector_id,
+                "tui_endpoint_id": tui_endpoint_id,
+                "native_session_id": native_session_id,
+                "process_epoch": process_epoch,
+                "binding_source": binding_source,
+                "replace_existing_session": bool(replace_existing_session),
+                "metadata": metadata or {},
+            },
+        )
+
+    def heartbeat_native_session(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        state: str = "online",
+        active_task_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/session/heartbeat",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+                "state": state,
+                "active_task_id": active_task_id,
+                "detail": detail or {},
+            },
+        )
+
+    def end_native_session(
+        self,
+        *,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/agent/native/session/end",
+            {
+                "connector_id": connector_id,
+                "lease_id": lease_id,
+                "process_epoch": process_epoch,
+            },
+        )
+
     def _ensure_auto_registered(self) -> None:
         if self.access_token is not None or self.auto_registration is None:
             return

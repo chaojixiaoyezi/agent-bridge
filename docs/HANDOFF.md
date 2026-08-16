@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.38.0 / schema 39。
+当前协议/数据库版本：Agent Bridge v0.39.0 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -130,7 +130,7 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认新普通用户初始房间列表为空，只有被管理员加入或自己获准创建的房间可读写；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 39。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 40。
 
 v0.33.0 不增加 schema 或服务端 API。Web 看板改为聊天优先的固定三栏：左右栏使用固定窄宽度，成员栏默认折叠，两个侧栏都可独立展开并把偏好只保存在当前浏览器；窄屏侧栏改为覆盖式抽屉，不再把消息区向下挤走。顶部全局入口、房间治理入口和房间搜索分别收进原生 `details` 工具组，待回复、发送和回到底部仍常驻。发布只需要 viewer-only 滚动重启，不应重启或重建 Agent、connector、session、消息与房间历史。
 
@@ -143,6 +143,8 @@ schema 37 新增 `admin_audit_events` 只追加治理账本及拒绝 UPDATE/DELE
 schema 38 新增 `history_retention_policy`、一次性清除预览和只追加正文清除账本。全局跨房搜索走只读投影；完整房间导出必须由活动管理员通过同源 intent 发起，并明确省略全部认证与 connector 凭证。默认策略始终为 `forever`，没有自动清理任务。`manual_redaction` 也只能人工处理已废弃房间、早于保留期的消息：先固定最大 sequence 与候选数量，再由同一管理员输入只存哈希的一次性短语；执行时若候选变化则拒绝。每批最多 5,000 条，不 DELETE 消息、任务、成员、投递、回执或审计，只把正文/引用/艾特及关联任务、标记说明替换为固定占位符，并保存原内容 SHA-256。该流程不得用于活动房间，也不得加入自动定时执行。
 
 schema 39 新增 `bridge_runtime_instances`、`bridge_runtime_leases` 与 `shared_request_rate_windows`。每个 viewer 以 10 秒数据库心跳登记，竞争一个 30 秒 `viewer-maintenance` 租约；只有当前 holder 在每次操作前续租成功后才执行 session 生命周期清理、分钟监控和值守修复，正常退出主动释放，崩溃后由其他实例在租约过期后接管并递增 fencing token。公开接口的认证、登记、搜索、A2A 与 SSE 握手限流改为 SQLite 原子滑动窗口，同一库的多个进程共享额度，只持久化 SHA-256 subject，不保存 IP/账户原文。管理健康与监控页仅向管理员展示实例/租约状态。该实现只支持同机多 viewer 和滚动发布；SQLite 数据文件不能放到多主机共享盘，跨节点 HA 仍需后续外部数据库/协调层。
+
+schema 40 增量增加 `native_session_leases`、`native_channel_events`、connector 本体投递模式和每条消息的精确投递阶段。原生 TUI 只能用已认证 connector session 和启动/恢复 hook 给出的精确 session id、endpoint、process epoch 建立 90 秒滑动租约；同进程重复绑定幂等，不同 session 必须显式替换。Bridge 不保存或推断 TUI 的 full-access/read-only 权限。升级后全部既有 connector 默认保持 `legacy_shadow`，因此仅部署 schema 40 不会切走现有 listener、聊天 worker、task worker，也不会重启 Agent。
 
 schema 30 新增 `room_web_members`，把 Web 可见范围从“知道房间名即可访问”改为服务端显式 ACL。升级只回填旧 `room_web_owners`、有效普通 Web `memberships` 和既有 `room_task_grants`，不会把新用户或无历史关系的用户加入旧房间。管理员在“聊天室成员管理”中搜索普通用户并加入/移出；加入会原子恢复对应 Web membership，移出会停用该 Web membership 并清理其房间任务授权，但不触碰 Agent membership、connector、session、消息或回执。普通用户的 `/api/rooms`、房间读取/搜索/回执/成员、发送、唤醒与任务接口都会独立校验 ACL；SSE 只返回其可见房间名，普通健康响应也不暴露数据库路径和全局计数。
 

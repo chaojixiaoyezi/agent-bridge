@@ -81,6 +81,7 @@ RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 10.0
 RUNTIME_LEASE_TTL_SECONDS = 30.0
 RUNTIME_INSTANCE_ACTIVE_SECONDS = 45.0
 RUNTIME_INSTANCE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+NATIVE_SESSION_LEASE_SECONDS = 90.0
 TASK_CLAIM_LEASE_SECONDS = 10 * 60.0
 TASK_INPUT_REDELIVERY_SECONDS = 30.0
 TASK_STATUSES = {
@@ -796,6 +797,17 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
     first_delivered_at REAL,
     last_delivered_at REAL,
     acked_at REAL,
+    delivery_stage TEXT NOT NULL DEFAULT 'queued'
+        CHECK (delivery_stage IN (
+            'queued', 'legacy_delivered', 'native_injected',
+            'native_applied', 'replied', 'legacy_acked', 'cancelled'
+        )),
+    native_session_id TEXT,
+    native_event_id TEXT,
+    native_injected_at REAL,
+    native_applied_at REAL,
+    native_replied_at REAL,
+    shadow_seen_at REAL,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     PRIMARY KEY (message_id, participant_id),
     FOREIGN KEY (message_id) REFERENCES messages(message_id),
@@ -1274,6 +1286,12 @@ CREATE TABLE IF NOT EXISTS agent_connectors (
     tui_last_seen_at REAL,
     tui_active_task_id TEXT,
     tui_detail_json TEXT NOT NULL DEFAULT '{}',
+    native_delivery_mode TEXT NOT NULL DEFAULT 'legacy_shadow'
+        CHECK (native_delivery_mode IN ('legacy_shadow', 'native_preferred')),
+    native_lease_id TEXT,
+    native_process_epoch TEXT,
+    native_lease_expires_at REAL,
+    native_binding_source TEXT,
     created_at REAL NOT NULL,
     revoked_at REAL,
     revoked_by_web_user_id TEXT,
@@ -1314,6 +1332,65 @@ CREATE TABLE IF NOT EXISTS connector_component_readiness (
 
 CREATE INDEX IF NOT EXISTS idx_connector_component_readiness_seen
     ON connector_component_readiness(last_seen_at DESC);
+"""
+
+
+NATIVE_SESSION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS native_session_leases (
+    lease_id TEXT PRIMARY KEY,
+    connector_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    tui_endpoint_id TEXT NOT NULL,
+    native_session_id TEXT NOT NULL,
+    process_epoch TEXT NOT NULL,
+    binding_source TEXT NOT NULL
+        CHECK (binding_source IN ('startup', 'resume')),
+    started_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    ended_at REAL,
+    superseded_at REAL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY (connector_id) REFERENCES agent_connectors(connector_id),
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_native_session_leases_connector_activity
+    ON native_session_leases(connector_id, ended_at, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_native_session_leases_identity
+    ON native_session_leases(
+        tui_endpoint_id, native_session_id, process_epoch, expires_at DESC
+    );
+
+CREATE TABLE IF NOT EXISTS native_channel_events (
+    event_id TEXT PRIMARY KEY,
+    connector_id TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    message_ids_json TEXT NOT NULL DEFAULT '[]',
+    route_token_hash TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'fetched'
+        CHECK (state IN (
+            'fetched', 'injected', 'applied', 'replied',
+            'superseded', 'cancelled'
+        )),
+    fetched_at REAL NOT NULL,
+    injected_at REAL,
+    applied_at REAL,
+    replied_at REAL,
+    superseded_at REAL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (connector_id) REFERENCES agent_connectors(connector_id),
+    FOREIGN KEY (lease_id) REFERENCES native_session_leases(lease_id),
+    FOREIGN KEY (participant_id) REFERENCES participants(participant_id),
+    FOREIGN KEY (conversation_id) REFERENCES rooms(conversation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_native_channel_events_connector_state
+    ON native_channel_events(connector_id, state, fetched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_native_channel_events_lease_state
+    ON native_channel_events(lease_id, state, fetched_at DESC);
 """
 
 
@@ -1939,6 +2016,42 @@ class BridgeStore:
                     "ALTER TABLE message_deliveries ADD COLUMN actionable INTEGER "
                     "NOT NULL DEFAULT 0 CHECK (actionable IN (0, 1))"
                 )
+            delivery_stage_added = "delivery_stage" not in delivery_columns
+            delivery_additions = {
+                "delivery_stage": (
+                    "TEXT NOT NULL DEFAULT 'queued' "
+                    "CHECK (delivery_stage IN ("
+                    "'queued', 'legacy_delivered', 'native_injected', "
+                    "'native_applied', 'replied', 'legacy_acked', 'cancelled'"
+                    "))"
+                ),
+                "native_session_id": "TEXT",
+                "native_event_id": "TEXT",
+                "native_injected_at": "REAL",
+                "native_applied_at": "REAL",
+                "native_replied_at": "REAL",
+                "shadow_seen_at": "REAL",
+            }
+            for name, declaration in delivery_additions.items():
+                if name not in delivery_columns:
+                    conn.execute(
+                        f"ALTER TABLE message_deliveries "
+                        f"ADD COLUMN {name} {declaration}"
+                    )
+            if delivery_stage_added:
+                conn.execute(
+                    """
+                    UPDATE message_deliveries
+                    SET delivery_stage = CASE state
+                        WHEN 'pending' THEN 'queued'
+                        WHEN 'delivered' THEN 'legacy_delivered'
+                        WHEN 'acked' THEN 'legacy_acked'
+                        WHEN 'cancelled' THEN 'cancelled'
+                        ELSE 'queued'
+                    END
+                    """
+                )
+            conn.executescript(NATIVE_SESSION_SCHEMA)
             conn.executescript(AUTHORIZATION_SCHEMA)
             conn.executescript(CHAT_AUTHORIZATION_SCHEMA)
             self._freeze_legacy_chat_authorizations(conn)
@@ -1976,7 +2089,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 39")
+            conn.execute("PRAGMA user_version = 40")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -2553,6 +2666,15 @@ class BridgeStore:
             "tui_last_seen_at": "REAL",
             "tui_active_task_id": "TEXT",
             "tui_detail_json": "TEXT NOT NULL DEFAULT '{}'",
+            "native_delivery_mode": (
+                "TEXT NOT NULL DEFAULT 'legacy_shadow' "
+                "CHECK (native_delivery_mode IN "
+                "('legacy_shadow', 'native_preferred'))"
+            ),
+            "native_lease_id": "TEXT",
+            "native_process_epoch": "TEXT",
+            "native_lease_expires_at": "REAL",
+            "native_binding_source": "TEXT",
         }
         for name, declaration in additions.items():
             if name not in connector_columns:
@@ -4613,7 +4735,8 @@ class BridgeStore:
             conn.execute(
                 """
                 UPDATE message_deliveries
-                SET state = 'cancelled', actionable = 0
+                SET state = 'cancelled', delivery_stage = 'cancelled',
+                    actionable = 0
                 WHERE participant_id = ?
                   AND state IN ('pending', 'delivered')
                   AND message_id IN (
@@ -5841,6 +5964,34 @@ class BridgeStore:
                     else None
                 ),
                 "detail": json.loads(str(row["tui_detail_json"] or "{}")),
+            },
+            "native_delivery": {
+                "mode": str(row["native_delivery_mode"] or "legacy_shadow"),
+                "lease_id": (
+                    str(row["native_lease_id"])
+                    if row["native_lease_id"] is not None
+                    else None
+                ),
+                "process_epoch": (
+                    str(row["native_process_epoch"])
+                    if row["native_process_epoch"] is not None
+                    else None
+                ),
+                "lease_expires_at": (
+                    float(row["native_lease_expires_at"])
+                    if row["native_lease_expires_at"] is not None
+                    else None
+                ),
+                "binding_source": (
+                    str(row["native_binding_source"])
+                    if row["native_binding_source"] is not None
+                    else None
+                ),
+                "lease_active": bool(
+                    row["native_lease_id"] is not None
+                    and row["native_lease_expires_at"] is not None
+                    and float(row["native_lease_expires_at"]) > now
+                ),
             },
             "revoked_at": (
                 float(row["revoked_at"]) if row["revoked_at"] is not None else None
@@ -7182,6 +7333,351 @@ class BridgeStore:
                 (connector,),
             ).fetchone()
         return self._agent_connector_payload(row, now=now)
+
+    @staticmethod
+    def _native_session_lease_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "lease_id": str(row["lease_id"]),
+            "connector_id": str(row["connector_id"]),
+            "participant_id": str(row["participant_id"]),
+            "tui_endpoint_id": str(row["tui_endpoint_id"]),
+            "native_session_id": str(row["native_session_id"]),
+            "process_epoch": str(row["process_epoch"]),
+            "binding_source": str(row["binding_source"]),
+            "started_at": float(row["started_at"]),
+            "last_seen_at": float(row["last_seen_at"]),
+            "expires_at": float(row["expires_at"]),
+            "ended_at": (
+                float(row["ended_at"]) if row["ended_at"] is not None else None
+            ),
+            "superseded_at": (
+                float(row["superseded_at"])
+                if row["superseded_at"] is not None
+                else None
+            ),
+            "metadata": json.loads(str(row["metadata_json"] or "{}")),
+        }
+
+    def bind_native_agent_session(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        tui_endpoint_id: str,
+        native_session_id: str,
+        process_epoch: str,
+        binding_source: str,
+        replace_existing_session: bool = False,
+        metadata: object = None,
+    ) -> dict[str, Any]:
+        """Bind one exact, live TUI process to its durable connector.
+
+        The binding comes from the TUI lifecycle hook.  It is never inferred
+        from a process list, transcript directory, or central database scan.
+        Re-running a hook for the same process epoch is idempotent.  A distinct
+        native session must opt into replacement explicitly.
+        """
+
+        participant = opaque_id(participant_id, field="participant_id")
+        authorized = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        endpoint = opaque_id(tui_endpoint_id, field="tui_endpoint_id")
+        native_session = opaque_id(
+            native_session_id,
+            field="native_session_id",
+        )
+        epoch = opaque_id(process_epoch, field="process_epoch")
+        source = str(binding_source or "").strip().lower()
+        if source not in {"startup", "resume"}:
+            raise ValidationError("binding_source must be startup or resume")
+        normalized_metadata = self._connector_detail(metadata)
+        now = time.time()
+        expires_at = now + NATIVE_SESSION_LEASE_SECONDS
+        with self._transaction() as conn:
+            live_session = self._require_live_session(
+                conn,
+                session_id=authorized,
+                participant_id=participant,
+                now=now,
+            )
+            if str(live_session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            connector_row = self._agent_connector_row_locked(conn, connector)
+            if (
+                str(connector_row["accepted_participant_id"]) != participant
+                or connector_row["revoked_at"] is not None
+                or str(connector_row["invitation_status"]) == "revoked"
+            ):
+                raise AuthenticationError("active connector binding was not found")
+            bound_endpoint = str(connector_row["tui_endpoint_id"] or "")
+            if bound_endpoint and not self._constant_time_eq(bound_endpoint, endpoint):
+                raise AuthenticationError("native TUI endpoint does not match")
+            bound_session = str(connector_row["tui_native_session_id"] or "")
+            if (
+                bound_session
+                and not self._constant_time_eq(bound_session, native_session)
+                and not bool(replace_existing_session)
+            ):
+                raise ConflictError(
+                    "connector is bound to another native TUI session; "
+                    "explicit replacement is required"
+                )
+
+            existing = conn.execute(
+                """
+                SELECT * FROM native_session_leases
+                WHERE connector_id = ? AND native_session_id = ?
+                  AND process_epoch = ? AND ended_at IS NULL
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                (connector, native_session, epoch),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    UPDATE native_session_leases
+                    SET superseded_at = COALESCE(superseded_at, ?),
+                        ended_at = COALESCE(ended_at, ?)
+                    WHERE connector_id = ? AND ended_at IS NULL
+                    """,
+                    (now, now, connector),
+                )
+                lease_id = f"lease_{uuid.uuid4().hex}"
+                conn.execute(
+                    """
+                    INSERT INTO native_session_leases (
+                        lease_id, connector_id, participant_id,
+                        tui_endpoint_id, native_session_id, process_epoch,
+                        binding_source, started_at, last_seen_at, expires_at,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lease_id,
+                        connector,
+                        participant,
+                        endpoint,
+                        native_session,
+                        epoch,
+                        source,
+                        now,
+                        now,
+                        expires_at,
+                        compact_json(normalized_metadata),
+                    ),
+                )
+            else:
+                lease_id = str(existing["lease_id"])
+                conn.execute(
+                    """
+                    UPDATE native_session_leases
+                    SET last_seen_at = ?, expires_at = ?,
+                        binding_source = ?, metadata_json = ?
+                    WHERE lease_id = ?
+                    """,
+                    (
+                        now,
+                        expires_at,
+                        source,
+                        compact_json(normalized_metadata),
+                        lease_id,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET tui_endpoint_id = ?, tui_native_session_id = ?,
+                    tui_state = 'online', tui_last_seen_at = ?,
+                    native_delivery_mode = 'native_preferred',
+                    native_lease_id = ?, native_process_epoch = ?,
+                    native_lease_expires_at = ?, native_binding_source = ?,
+                    connector_last_seen_at = ?, updated_at = ?
+                WHERE connector_id = ?
+                """,
+                (
+                    endpoint,
+                    native_session,
+                    now,
+                    lease_id,
+                    epoch,
+                    expires_at,
+                    source,
+                    now,
+                    now,
+                    connector,
+                ),
+            )
+            lease = conn.execute(
+                "SELECT * FROM native_session_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            updated_connector = self._agent_connector_row_locked(conn, connector)
+        return {
+            "lease": self._native_session_lease_payload(lease),
+            "connector": self._agent_connector_payload(
+                updated_connector,
+                now=now,
+            ),
+        }
+
+    def heartbeat_native_agent_session(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+        state: str = "online",
+        active_task_id: str | None = None,
+        detail: object = None,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        authorized = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        lease = opaque_id(lease_id, field="lease_id")
+        epoch = opaque_id(process_epoch, field="process_epoch")
+        normalized_state = str(state or "").strip().lower()
+        if normalized_state not in TUI_STATES - {"unbound", "awaiting_confirmation"}:
+            raise ValidationError("unsupported native TUI state")
+        task_id = (
+            opaque_id(active_task_id, field="active_task_id")
+            if str(active_task_id or "").strip()
+            else None
+        )
+        normalized_detail = self._connector_detail(detail)
+        now = time.time()
+        expires_at = now + NATIVE_SESSION_LEASE_SECONDS
+        with self._transaction() as conn:
+            live_session = self._require_live_session(
+                conn,
+                session_id=authorized,
+                participant_id=participant,
+                now=now,
+            )
+            if str(live_session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            row = conn.execute(
+                "SELECT * FROM native_session_leases WHERE lease_id = ?",
+                (lease,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("native TUI lease was not found")
+            if (
+                str(row["connector_id"]) != connector
+                or str(row["participant_id"]) != participant
+                or not self._constant_time_eq(str(row["process_epoch"]), epoch)
+            ):
+                raise AuthenticationError("native TUI lease does not match")
+            if row["ended_at"] is not None or float(row["expires_at"]) <= now:
+                raise ConflictError("native TUI lease expired; bind the session again")
+            current = conn.execute(
+                "SELECT native_lease_id FROM agent_connectors "
+                "WHERE connector_id = ? AND revoked_at IS NULL",
+                (connector,),
+            ).fetchone()
+            if current is None or str(current["native_lease_id"] or "") != lease:
+                raise ConflictError("native TUI lease has been superseded")
+            conn.execute(
+                "UPDATE native_session_leases SET last_seen_at = ?, expires_at = ?, "
+                "metadata_json = ? WHERE lease_id = ?",
+                (now, expires_at, compact_json(normalized_detail), lease),
+            )
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET tui_state = ?, tui_last_seen_at = ?,
+                    tui_active_task_id = ?, tui_detail_json = ?,
+                    native_lease_expires_at = ?, connector_last_seen_at = ?,
+                    updated_at = ?
+                WHERE connector_id = ? AND native_lease_id = ?
+                """,
+                (
+                    normalized_state,
+                    now,
+                    task_id,
+                    compact_json(normalized_detail),
+                    expires_at,
+                    now,
+                    now,
+                    connector,
+                    lease,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM native_session_leases WHERE lease_id = ?",
+                (lease,),
+            ).fetchone()
+        return self._native_session_lease_payload(updated)
+
+    def end_native_agent_session(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        lease_id: str,
+        process_epoch: str,
+    ) -> dict[str, Any]:
+        participant = opaque_id(participant_id, field="participant_id")
+        authorized = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        lease = opaque_id(lease_id, field="lease_id")
+        epoch = opaque_id(process_epoch, field="process_epoch")
+        now = time.time()
+        with self._transaction() as conn:
+            live_session = self._require_live_session(
+                conn,
+                session_id=authorized,
+                participant_id=participant,
+                now=now,
+            )
+            if str(live_session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            row = conn.execute(
+                "SELECT * FROM native_session_leases WHERE lease_id = ?",
+                (lease,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("native TUI lease was not found")
+            if (
+                str(row["connector_id"]) != connector
+                or str(row["participant_id"]) != participant
+                or not self._constant_time_eq(str(row["process_epoch"]), epoch)
+            ):
+                raise AuthenticationError("native TUI lease does not match")
+            conn.execute(
+                "UPDATE native_session_leases SET ended_at = COALESCE(ended_at, ?), "
+                "expires_at = MIN(expires_at, ?) WHERE lease_id = ?",
+                (now, now, lease),
+            )
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET tui_state = 'offline', tui_last_seen_at = ?,
+                    tui_active_task_id = NULL,
+                    native_lease_id = NULL, native_process_epoch = NULL,
+                    native_lease_expires_at = NULL,
+                    connector_last_seen_at = ?, updated_at = ?
+                WHERE connector_id = ? AND native_lease_id = ?
+                """,
+                (now, now, now, connector, lease),
+            )
+            updated = conn.execute(
+                "SELECT * FROM native_session_leases WHERE lease_id = ?",
+                (lease,),
+            ).fetchone()
+        return self._native_session_lease_payload(updated)
 
     def report_agent_tui_state(
         self,
@@ -12807,7 +13303,8 @@ class BridgeStore:
                 conn.execute(
                     f"""
                     UPDATE message_deliveries
-                    SET state = 'cancelled', actionable = 0
+                    SET state = 'cancelled', delivery_stage = 'cancelled',
+                        actionable = 0
                     WHERE message_id = ?
                       AND participant_id IN ({placeholders})
                       AND state IN ('pending', 'delivered')
@@ -13222,7 +13719,8 @@ class BridgeStore:
             conn.execute(
                 """
                 UPDATE message_deliveries
-                SET state = 'cancelled', actionable = 0
+                SET state = 'cancelled', delivery_stage = 'cancelled',
+                    actionable = 0
                 WHERE message_id = ?
                   AND participant_id IN (
                       SELECT participant.participant_id
@@ -14711,7 +15209,8 @@ class BridgeStore:
                 conn.executemany(
                     """
                     UPDATE message_deliveries
-                    SET state = 'cancelled', reasons_json = ?, actionable = 0
+                    SET state = 'cancelled', delivery_stage = 'cancelled',
+                        reasons_json = ?, actionable = 0
                     WHERE message_id = ? AND participant_id = ?
                       AND state IN ('pending', 'delivered')
                     """,
@@ -15571,6 +16070,13 @@ class BridgeStore:
                        delivery.first_delivered_at AS delivery_first_delivered_at,
                        delivery.last_delivered_at AS delivery_last_delivered_at,
                        delivery.acked_at AS delivery_acked_at,
+                       delivery.delivery_stage AS delivery_stage,
+                       delivery.native_session_id AS delivery_native_session_id,
+                       delivery.native_event_id AS delivery_native_event_id,
+                       delivery.native_injected_at AS delivery_native_injected_at,
+                       delivery.native_applied_at AS delivery_native_applied_at,
+                       delivery.native_replied_at AS delivery_native_replied_at,
+                       delivery.shadow_seen_at AS delivery_shadow_seen_at,
                        delivery.attempt_count AS delivery_attempt_count
                 FROM message_deliveries AS delivery
                 JOIN messages AS message
@@ -15641,6 +16147,17 @@ class BridgeStore:
                                delivery.last_delivered_at
                                    AS delivery_last_delivered_at,
                                delivery.acked_at AS delivery_acked_at,
+                               delivery.delivery_stage AS delivery_stage,
+                               delivery.native_session_id
+                                   AS delivery_native_session_id,
+                               delivery.native_event_id AS delivery_native_event_id,
+                               delivery.native_injected_at
+                                   AS delivery_native_injected_at,
+                               delivery.native_applied_at
+                                   AS delivery_native_applied_at,
+                               delivery.native_replied_at
+                                   AS delivery_native_replied_at,
+                               delivery.shadow_seen_at AS delivery_shadow_seen_at,
                                delivery.attempt_count AS delivery_attempt_count
                         FROM messages AS message
                         JOIN message_deliveries AS delivery
@@ -15694,6 +16211,12 @@ class BridgeStore:
                     """
                     UPDATE message_deliveries
                     SET state = 'delivered',
+                        delivery_stage = CASE
+                            WHEN delivery_stage IN (
+                                'native_injected', 'native_applied', 'replied'
+                            ) THEN delivery_stage
+                            ELSE 'legacy_delivered'
+                        END,
                         first_delivered_at = COALESCE(first_delivered_at, ?),
                         last_delivered_at = ?,
                         attempt_count = attempt_count + 1
@@ -15735,6 +16258,13 @@ class BridgeStore:
                            delivery.last_delivered_at
                                AS delivery_last_delivered_at,
                            delivery.acked_at AS delivery_acked_at,
+                           delivery.delivery_stage AS delivery_stage,
+                           delivery.native_session_id AS delivery_native_session_id,
+                           delivery.native_event_id AS delivery_native_event_id,
+                           delivery.native_injected_at AS delivery_native_injected_at,
+                           delivery.native_applied_at AS delivery_native_applied_at,
+                           delivery.native_replied_at AS delivery_native_replied_at,
+                           delivery.shadow_seen_at AS delivery_shadow_seen_at,
                            delivery.attempt_count AS delivery_attempt_count
                     FROM messages AS message
                     JOIN message_deliveries AS delivery
@@ -16324,6 +16854,11 @@ class BridgeStore:
                 """
                 UPDATE message_deliveries
                 SET state = 'acked',
+                    delivery_stage = CASE
+                        WHEN native_replied_at IS NOT NULL THEN 'replied'
+                        WHEN native_applied_at IS NOT NULL THEN 'native_applied'
+                        ELSE 'legacy_acked'
+                    END,
                     first_delivered_at = COALESCE(first_delivered_at, ?),
                     last_delivered_at = COALESCE(last_delivered_at, ?),
                     acked_at = ?

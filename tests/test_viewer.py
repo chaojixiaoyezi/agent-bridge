@@ -29,6 +29,7 @@ from agent_bridge.viewer import (
     create_app,
 )
 from agent_bridge.viewer_store import ViewerRepository
+from agent_bridge.web_auth import WebAuthStore
 
 
 CAPTCHA_ANSWER = "ABCDE"
@@ -37,7 +38,7 @@ USER_PASSWORD = "MemberSecure1!"
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.38.0"
+    assert _runtime_software_version() == "0.39.0"
 
 
 class FakeEmailDelivery:
@@ -257,6 +258,73 @@ def test_agent_wait_exposes_explicit_offline_compaction_metadata(
     assert calls == [
         (receiver["participant_id"], receiver["session_id"], 17)
     ]
+
+
+def test_native_session_lifecycle_http_contract(tmp_path: Path) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    WebAuthStore(database)
+    with store._connection() as connection:
+        admin_id = str(
+            connection.execute(
+                "SELECT user_id FROM web_users WHERE username = 'admin'"
+            ).fetchone()[0]
+        )
+    store.create_user_room("native-http-room")
+    invitation = store.create_agent_invitation(
+        conversation_id="native-http-room",
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-http",
+        signature="HTTP lifecycle test",
+    )
+    client = TestClient(make_app(database))
+    headers = {"Authorization": f"Bearer {accepted['access_token']}"}
+
+    bound = client.post(
+        "/agent/native/session/bind",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "tui_endpoint_id": "native-http-endpoint",
+            "native_session_id": "native-http-session",
+            "process_epoch": "native-http-epoch",
+            "binding_source": "resume",
+        },
+    )
+    assert bound.status_code == 200
+    lease_id = bound.json()["lease"]["lease_id"]
+
+    heartbeat = client.post(
+        "/agent/native/session/heartbeat",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-http-epoch",
+            "state": "busy",
+        },
+    )
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["lease"]["lease_id"] == lease_id
+
+    ended = client.post(
+        "/agent/native/session/end",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-http-epoch",
+        },
+    )
+    assert ended.status_code == 200
+    assert ended.json()["lease"]["ended_at"] is not None
 
 
 def test_web_login_registration_password_policy_profile_and_roles(
