@@ -14870,6 +14870,18 @@ class BridgeStore:
               AND membership.active = 1
               AND membership.participant_id IN ({placeholders})
               AND web_user.user_id IS NULL
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM agent_connectors AS native_connector
+                    WHERE native_connector.accepted_participant_id =
+                          membership.participant_id
+                      AND native_connector.conversation_id =
+                          membership.conversation_id
+                      AND native_connector.setup_status = 'configured'
+                      AND native_connector.revoked_at IS NULL
+                      AND native_connector.native_delivery_mode =
+                          'native_preferred'
+              )
             """,
             (conversation_id, *requested),
         ).fetchall()
@@ -14889,6 +14901,9 @@ class BridgeStore:
         A running task receives an exact durable input. An idle body seat gets
         a new single-target task. Targets without a proven task component stay
         on the normal chat path so rolling upgrades never black-hole mentions.
+        Targets whose connector has selected native_preferred also stay on that
+        path, including while offline, so resume reaches the same real TUI
+        instead of silently switching the public identity to an executor seat.
         """
 
         conversation = str(message["conversation_id"])

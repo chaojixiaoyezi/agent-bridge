@@ -5267,6 +5267,119 @@ def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
     assert replied["remaining_required_reply_count"] == 0
 
 
+def test_native_preferred_web_mentions_stay_with_tui_until_explicit_task(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    room = "claude-native-web-room"
+    create_owned_room(store, auth, admin, room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=str(admin["user_id"]),
+    )
+    enrollment = "enroll_" + "w" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-web-owner",
+        signature="普通聊天由真实 TUI 接收。",
+        enrollment_token=enrollment,
+    )
+    store.report_agent_connector_setup(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        setup_status="configured",
+        detail={"test": True},
+    )
+    executor = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=accepted["connector_id"],
+        connector_component="task",
+        connector_protocol_version=2,
+        product="claude-code",
+        username=accepted["username"],
+        signature="显式结构化任务执行席。",
+    )
+    bound = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="claude-native-web-endpoint",
+        native_session_id="claude-native-web-session",
+        process_epoch="epoch-native-web-one",
+        binding_source="resume",
+    )
+
+    mentioned = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id=room,
+        body_text="@native-web-owner 请在当前 TUI 回复这条普通聊天。",
+        mentions=[accepted["participant_id"]],
+    )
+    assert "body_routing" not in mentioned
+    assert "task" not in mentioned
+    event = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=bound["lease"]["lease_id"],
+        process_epoch="epoch-native-web-one",
+        request_id="request_native_web_one",
+        route_token="route_" + "w" * 48,
+        wait_seconds=0,
+    )
+    assert event["event"]["message_ids"] == [mentioned["message_id"]]
+
+    store.end_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=bound["lease"]["lease_id"],
+        process_epoch="epoch-native-web-one",
+    )
+    queued_for_resume = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id=room,
+        body_text="@native-web-owner 断线期间也请留给原 TUI 恢复后处理。",
+        mentions=[accepted["participant_id"]],
+    )
+    assert "body_routing" not in queued_for_resume
+    with store._connection() as connection:
+        queued_delivery = connection.execute(
+            "SELECT state, delivery_stage FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (queued_for_resume["message_id"], accepted["participant_id"]),
+        ).fetchone()
+        accidental_tasks = connection.execute(
+            "SELECT COUNT(*) FROM room_tasks WHERE source_message_id IN (?, ?)",
+            (mentioned["message_id"], queued_for_resume["message_id"]),
+        ).fetchone()[0]
+    assert tuple(queued_delivery) == ("pending", "queued")
+    assert accidental_tasks == 0
+
+    explicit = store.send_web_task(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id=room,
+        body_text="/任务 执行明确的结构化检查。",
+        target_participant_ids=[accepted["participant_id"]],
+    )
+    claimed = store.claim_next_task(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=executor["session_id"],
+    )
+    assert claimed is not None
+    assert claimed["task_id"] == explicit["task"]["task_id"]
+
+
 def test_native_channel_rebind_redelivers_unanswered_event_and_can_fallback(
     tmp_path: Path,
 ) -> None:

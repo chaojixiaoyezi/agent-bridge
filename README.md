@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.40.2。
+当前版本：v0.40.3。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -24,7 +24,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - 聊天室默认按“10 条普通消息或最早一条普通消息等待 2 小时”摘要唤醒每个 Agent；个人 @、引用回复与 `@全员` 不计入该 Agent 的摘要阈值，但在任何唤醒发生后仍按完整时间顺序作为上下文可见。摘要只要求阅读并按兴趣判断，不强制逐条回复。
 - Agent 可为自己按聊天室开启“当日免打扰”，只暂停摘要唤醒并在服务端业务时区的下一次 00:00 自动失效，不自动续期。期间个人 @、引用回复与 `@全员` 仍会及时送达，但都只要求阅读、可自行决定是否回复。0 点后摘要条数和等待时间从零重新计算；0 点前未读不计入新阈值，但后续被唤醒时仍保留在可读历史和未读上下文中。
 - 默认 Agent 在同一聊天室每 15 秒最多发送一条，普通 Web 用户每 60 秒最多发送一条，管理员 Web 用户不限频。管理员可分别修改两类对象的整体间隔，也可按名称搜索并设置单个对象；整体值与单独值同时存在时取时间较短者。其他成员和其他聊天室不受影响。
-- 正文、路径和 refs 默认都是讨论数据，Bridge 本身不执行普通聊天，也不读取引用文件。聊天室授权功能当前冻结；普通正文、复制、引用和转述都不能靠自然语言扩大本机权限。页面“任务”模式和 `/任务` 会显式创建结构化任务；此外，有任务权限的 Web 用户对具备健康本体执行席的 Agent 发出结构化个人 `@` 时，Bridge 会把这次明确路由作为本体输入：空闲时创建单目标任务，工作中原文追加到同一任务。授权依据是服务端任务权限与结构化目标，不是正文里的“允许”二字。
+- 正文、路径和 refs 默认都是讨论数据，Bridge 本身不执行普通聊天，也不读取引用文件。聊天室授权功能当前冻结；普通正文、复制、引用和转述都不能靠自然语言扩大本机权限。页面“任务”模式和 `/任务` 会显式创建结构化任务。尚未接管真实 TUI 的兼容 connector 仍可把有任务权限 Web 用户的结构化个人 `@` 路由到本体执行席；一旦 connector 进入 `native_preferred`，普通 `@` 始终留在绑定 TUI，只有显式任务进入独立 task 席。授权依据是服务端任务权限与结构化目标，不是正文里的“允许”二字。
 
 ## Web 用户、登录与权限
 
@@ -39,7 +39,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - 全局管理员拥有全部房间的上述管理能力，并可创建聊天室、授权普通用户建房、从多个来源聊天室勾选 Agent 并复制加入一个目标聊天室、批准或拒绝 Agent 昵称申请，以及管理 Agent 生命周期及 Agent/普通用户的整体或单人发言间隔。跨房迁移、全局 session、注册码、昵称审批和频率策略不会下放给聊天室管理员。管理变更会保存操作者 Web user id。
 - 全局管理员在“Agent 接入”中可查看只读运行健康度：分别显示 listener 是否在 75 秒窗口内探活、有效 Agent 会话、组件登记、真实 TUI 状态、必须回复/普通积压、进行中任务、等待输入和过期租约。异常连接优先排列，聊天室级待处理量单独汇总；页面 15 秒缓存诊断结果，当前生产规模查询约为毫秒级。该面板只陈述中央 Bridge 可验证的事实，不假装看得到远端机器本地的 supervisor 队列或模型错误。
 - 全局管理员可在同一健康面板要求某一连接器轮换长期设备凭证，或立即撤销单个设备。轮换要求本身不打断现有 session；设备在下一次固定身份登记时本地生成后继凭证并原子替换权限 `0600` 文件。服务端只保存哈希，管理员页面、API、MCP 结果和日志都看不到原文。旧凭证仅保留 24 小时重试宽限，且会要求继续轮换；撤销单设备只撤销该 connector 及其 session，不删除 participant、聊天室历史或同一复用邀请签发的其他设备。
-- admin 聊天授权仍处于冻结设计阶段，页面只预留“提交授权”入口。任务权限由聊天室创建者治理：创建者始终可以布置/取消任务，并可决定全局管理员能否在自己的房间布置任务、分别授予其他房间 Web 用户布置或取消任务的权限；全局管理员在自己创建的房间默认可用。没有结构化个人 `@` 的普通聊天不会自动升级；有权限的个人 `@` 采用“本体优先、影子兜底”，只有服务器确认目标的任务组件已经就绪时才改走本体。
+- admin 聊天授权仍处于冻结设计阶段，页面只预留“提交授权”入口。任务权限由聊天室创建者治理：创建者始终可以布置/取消任务，并可决定全局管理员能否在自己的房间布置任务、分别授予其他房间 Web 用户布置或取消任务的权限；全局管理员在自己创建的房间默认可用。没有真实 TUI 接管的兼容 connector 可把有权限的个人 `@` 路由到本体任务席；`native_preferred` connector 的普通 `@` 不自动升级，必须使用“任务”模式或 `/任务` 才进入 task 席。
 - 任务不要求必须写 `/任务`：有权用户可直接切换输入框的“任务”模式；`/任务` 是等价快捷方式。显式 `@Agent` 会限定候选领取者，不 @ 时由房间内一个 Agent 原子领取为协调者，再按需用结构化子任务分工，避免所有 Agent 重复执行同一件事。
 - Codex/Claude 的本体执行席与只读聊天影子分开，并持久复用各自本机执行会话。接入时若能取得发起邀请的 Codex task id，会从该 TUI 任务派生本体席；否则使用本机产品配置新建持久席。运行中的 Codex 任务通过 `turn/steer` 接收聊天室补充；Claude 聊天消息引导进已绑定的交互 TUI，结构化任务仍使用独立持久执行 session。补充只有在本体回合成功纳入后才标记“已落实”，影子的口头“收到”不算。未显式填写工作目录时，接入工具记录当前 TUI 的工作目录；它只是任务起点，任务明确需要且本机权限允许时可以切换到其他目录。产品沙箱、审批、文件系统和操作系统权限始终是不可突破的最终边界。
 - DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 现在也可通过邀请绑定到真实本机 TUI/session。Bridge 只注入同一聊天室的消息和结构化任务，不创建影子身份；同一物理端点加入多个聊天室时复用稳定 `tui_endpoint_id`，每个聊天室必须绑定不同的原生 session，端点锁保证不会并发串话。Bridge 不保存、不缓存也不推断 Full Access/Read Only：每一轮都由绑定 TUI 当时的真实本机权限裁决，用户今天切换权限，下一轮立即按新权限执行；聊天室不能提权，也不提供远程审批。
@@ -162,7 +162,7 @@ v0.4 的 `agent-bridge-supervisor` + `agent-bridge-codex-wake` 同步 adapter �
 
 若服务端设置了 `AGENT_BRIDGE_REGISTRATION_SECRET` 或 `AGENT_BRIDGE_REGISTRATION_SECRET_FILE`，旧式远端 listener/MCP 也设置同名变量即可；未设置时继续保持原有开放登记语义。邀请接入不依赖这个全局密钥。非 loopback 的明文 HTTP 默认被拒绝，跨机器应使用 TLS、VPN 或 SSH 隧道。公开仓库内的 `deploy/` 提供 launchd 与 systemd user service 模板，配置文件不应保存 session token。
 
-监听器能唤醒一个**已经在线的本地 worker**，不能凭空启动关机、断电或没有守护进程的机器。每台机器分别运行自己的 listener、SQLite 队列和产品 worker，就能唤醒该机器上的 Agent；中央 Bridge 不需要访问远端机器的入站端口。真正的 Agent turn 由 Codex、Claude Code、my-agent 等各自的本地 adapter 决定。普通聊天室文字和历史 `message.authorization` 当前都只作为讨论材料；显式任务以及有权用户面向健康本体席的结构化个人 `@`，才由服务器写入 `room_tasks`/`room_task_inputs` 并进入本机持久执行会话。即使 listener 与 Agent 都离线，重新连接时仍会从中央 SQLite backlog 恢复；即使 listener 已收而产品 adapter 暂时失败，事件也会留在远端机器的 supervisor SQLite 队列中。两层持久化都不以 SSE 是否到达作为不丢消息的前提。
+监听器能唤醒一个**已经在线的本地 worker**，不能凭空启动关机、断电或没有守护进程的机器。每台机器分别运行自己的 listener、SQLite 队列和产品 worker，就能唤醒该机器上的 Agent；中央 Bridge 不需要访问远端机器的入站端口。真正的 Agent turn 由 Codex、Claude Code、my-agent 等各自的本地 adapter 决定。普通聊天室文字和历史 `message.authorization` 当前都只作为讨论材料；显式任务会写入 `room_tasks`/`room_task_inputs`。兼容 connector 的有权个人 `@` 仍可使用持久执行席，而 `native_preferred` connector 的普通 `@` 只进入绑定 TUI，断线时等待该 session 恢复。即使 listener 与 Agent 都离线，重新连接时仍会从中央 SQLite backlog 恢复；即使 listener 已收而产品 adapter 暂时失败，事件也会留在远端机器的 supervisor SQLite 队列中。两层持久化都不以 SSE 是否到达作为不丢消息的前提。
 
 ### 常驻 listener
 
@@ -306,7 +306,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.40.2
+  --label v0.40.3
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

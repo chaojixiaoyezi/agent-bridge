@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.2 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.3 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -9,7 +9,7 @@
 1. 中央 Bridge SQLite 的 `messages`、`message_deliveries`、`receipts`、`memberships`、`participants` 和 `agent_sessions` 是聊天室事实的唯一权威。
 2. SSE 只发送不含正文的唤醒元数据。断线、休眠或 listener 停止不会删除消息。
 3. 每台 Agent 机器的 `wake-queue.db` 是“中央事件已到本机、产品暂未成功处理”的持久权威。
-4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。聊天授权功能当前冻结：普通正文、引用、复制和转述都不能靠自然语言扩大本机权限；旧 `message.authorization` 仅作兼容元数据，不得被聊天 worker 执行。只有服务器根据房间任务权限写入 `room_tasks`/`room_task_inputs` 的结构化输入能进入本体执行席。有任务权限的 Web 用户对任务组件已就绪的 Agent 发出结构化个人 `@`，本身就是明确的服务端路由：空闲时创建单目标任务，工作中追加到同一任务；没有结构化目标的普通聊天仍只讨论。
+4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。聊天授权功能当前冻结：普通正文、引用、复制和转述都不能靠自然语言扩大本机权限；旧 `message.authorization` 仅作兼容元数据，不得被聊天 worker 执行。只有服务器根据房间任务权限写入 `room_tasks`/`room_task_inputs` 的结构化输入能进入本体执行席。兼容 connector 可把有权限 Web 用户的结构化个人 `@` 路由到 task 席；目标进入 `native_preferred` 后，普通 `@` 改由绑定 TUI 处理，只有显式 `/任务`/任务模式进入独立执行席。
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
@@ -100,7 +100,7 @@ Agent 第一次处理积压时：
 
 Codex worker 使用独立 task，不 resume 用户正在操作的任务。一个 `codex app-server` 和 Agent Bridge MCP 长驻；有活动 turn 时新唤醒通过 `turn/steer` 合入，避免并发重入。
 
-本体任务 worker 与只读聊天影子是两条席位。任务组件登记成功后，服务器把有任务权限 Web 用户的个人 `@` 优先路由到本体：空闲目标产生单目标 `room_tasks`，运行目标产生 `room_task_inputs`。输入在 executor 成功完成包含该输入的回合后才写 `applied_at`；页面上的“影子收到”不能替代这个回执。Codex 在活动回合中直接 `turn/steer`；Claude 的结构化任务席继续使用持久 `stream-json` session，而聊天事件由 connector 私有通道引导进用户启动或恢复的精确 Claude TUI。Bridge 或产品暂时中断时，未应用输入按 30 秒可重投，任务 lease 仍防止双执行。
+本体任务 worker 与只读聊天影子是两条席位。兼容 connector 的任务组件登记成功后，服务器可把有任务权限 Web 用户的个人 `@` 路由到本体：空闲目标产生单目标 `room_tasks`，运行目标产生 `room_task_inputs`。connector 进入 `native_preferred` 后，普通 `@` 不再走这条兼容路由，而是等待绑定 TUI；显式任务仍进入 task 席。输入在 executor 成功完成包含该输入的回合后才写 `applied_at`；页面上的“影子收到”不能替代这个回执。Codex 在活动回合中直接 `turn/steer`；Claude 的结构化任务席继续使用持久 `stream-json` session，而聊天事件由 connector 私有通道引导进用户启动或恢复的精确 Claude TUI。Bridge 或产品暂时中断时，未应用输入按 30 秒可重投，任务 lease 仍防止双执行。
 
 worker 对 MCP 使用显式 `enabled_tools` 白名单，并仅对该白名单设置 `default_tools_approval_mode=approve`。身份登记由 MCP 底层按启动器固定字段自动完成，`agent_register` 不在模型白名单；预批准只覆盖读取、回复、ack、心跳和历史工具，shell、文件修改、其他 MCP 与生产操作没有被批准。
 
@@ -152,6 +152,8 @@ v0.40.0 不再增加 schema。Claude connector 每个身份生成独立的本地
 v0.40.1 不变更协议或 schema；Claude 启动器用 `PYTHONPATH` 导入 Bridge 包而不再 `cd` 到 Bridge 仓库，因此启动和 `--resume` 都继承调用 TUI 的真实工作目录。
 
 v0.40.2 不变更协议或 schema。Claude Code 2.1.220 会在第三方 `ANTHROPIC_BASE_URL` 下以 provider gate 拒绝 `claude/channel`，即使 MCP 握手和通知发送都成功；因此不能把 MCP 的“已发送”当成模型已收到。交互式 `resident_setup.launch_command` 现在在 tmux 可用时自动为 connector 建立专属 session，已在 tmux 中则绑定当前 pane；MCP 只把经过 Bridge 鉴权、属于当前 lease 的提示用 bracketed paste 提交到这个 pane，模型仍通过 connector 私有工具完成 apply/reply。事件保持同一个 request/route 直到已应用且无必答，或全部必答已回复；未处理事件从 3 分钟开始指数退避重引导，最多 30 分钟一次。`chat_id/message_id/user/ts` 同时补齐，供第一方环境的官方 Channel 后备使用。此路径不启动第二个 Claude、不读取历史数据库猜 session、不保存权限模式，恢复同一 session 会用新 process epoch/lease 重新投递未答消息。
+
+v0.40.3 不变更协议或 schema。普通 Web 个人 `@` 在目标 connector 已进入 `native_preferred` 后不再自动改道到独立 task 席；它保持普通聊天投递并由绑定的真实 TUI 获取，TUI 断线时也继续等待原 session 恢复。只有显式 `/任务`/结构化任务继续进入持久执行席。显式回退到 `legacy_shadow` 后旧兼容路由才重新生效，避免同一公开身份在 TUI 与独立 executor 之间无提示切换。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
