@@ -64,7 +64,7 @@ Bridge 不需要识别所有 Agent 产品。每个可达目标提供一个本机
 - supervisor 启动 adapter 前会删除 token 和登记密钥环境变量；不要要求把 token 放进 adapter 参数；
 - 聊天 adapter 不得把普通聊天室正文直接转成宿主命令，也不得解释旧聊天授权元数据来实施。只有本体 executor 可执行已领取的结构化任务或服务端校验过的个人本体输入；执行范围取原文的自然必要范围，并受本机产品权限硬约束。纯讨论、无结构化目标的疑问或“先别动手”不触发实施。
 
-Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP、私有文件 relay 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 间普通 `agent_mention` 保持可选回复；正文明确要求目标执行、回答、复核或确认时，服务端写入 `agent_request`，各 worker 将其和人类个人 `mention` 一样纳入逐条回复证据。纯收到或边界确认仍不得升级，避免回声。
+Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 与 Qwen Code 已有内置实现。其他本机 Agent 只需实现上述 adapter，无需修改中央 Bridge。若目标进程可由 CLI、Unix socket、loopback HTTP、私有文件 relay 或产品 SDK 启动 turn，它就属于“本机可达”；关机、断电或没有守护进程的机器不属于这个范围。Agent 顶层结构化个人 @ 与引用回复中新带入的第三方个人 @ 写入 `agent_request`；引用回复对原作者的 @ 写入可选 `agent_mention`。各 worker 只按这些结构字段落实一跳回复合同，不按正文措辞猜测。
 
 OpenCode 1.15.13、Pi 0.78.0、Hermes 0.19.1、Qwen Code 0.21.12 与 DeepSeek Harness 0.1.0-rc.6 的隔离双 session 真产品结果见 [REAL_PRODUCT_E2E.md](REAL_PRODUCT_E2E.md)。该证据区分了“Bridge 客户端重连但产品 runtime 常开”与“产品/机器重启”，也记录了 DeepSeek 参考源码 rc.5 和实测 npm rc.6 的版本边界。
 
@@ -80,7 +80,7 @@ listener 是产品无关的统一通知层；全部内置 adapter 禁止再生�
 
 ## 4. 优先级、积压和 token 成本
 
-- `mention`：个人公开 @、引用唤醒或授权 `@全员`，最高优先级。只有投递原因含 `mention` 的个人 @ 是强制回复；`reply_wake`/`wake_all` 只启动 turn。
+- `mention`：个人公开 @、引用唤醒或授权 `@全员`，最高优先级。投递原因含 `mention` 或 `agent_request` 时强制回复；`agent_mention`、`reply_wake` 与 `wake_all` 只启动 turn。
 - `important`：关注或角色目标。
 - `normal`：普通房间活动。
 
@@ -93,7 +93,7 @@ Agent 第一次处理积压时：
 1. `agent_wait(limit=20)` 先拿个人 @，再拿引用/全员唤醒，最后是普通积压；
 2. 若 `has_more` 可继续，单轮最多五页共 100 条；模型完成判断后，adapter 以固定身份确定性 `ack` 已读但未回复的可选消息；
 3. 需要旧上下文时先用 `agent_search_history` 定位，再以 `around_sequence` 调 `agent_history`；
-4. 个人 @ 必须优先、逐条用 `agent_reply` 回复；顶层目标正常引用，目标本身已是回复时服务端自动改为顶层续聊并结构化通知其发送者，避免一层引用限制卡住强制回复；`reply_wake`/`wake_all` 与普通积压可逐条引用、合并回答或不回复；
+4. `mention`/`agent_request` 必须优先、逐条用 `agent_reply` 回复；顶层目标正常引用，目标本身已是回复时服务端自动改为顶层续聊并结构化通知其发送者；`agent_mention`/`reply_wake`/`wake_all` 与普通积压可逐条引用、合并回答或不回复；
 5. 搜索和历史读取不改变投递状态；不能处理的待办可 `release`。
 
 ## 5. 内置产品 worker 的安全与完成条件
@@ -158,6 +158,8 @@ v0.40.3 不变更协议或 schema。普通 Web 个人 `@` 在目标 connector �
 v0.40.4 不变更协议或 schema。Claude Channel 在首次注入一批消息后立即换用新的 request/route 拉取后续消息；旧事件仍保存自己的私有 route，由独立监视循环观察 apply/reply 状态，并按原有 3 分钟起的指数退避重新引导。这样未用 `agent_bridge_reply` 精确闭环的旧请求仍会被提醒，但不会把后来个人 `@` 堵在同一个幂等请求后面。模型提示同时明确：已经用 `agent_bridge_send` 发表内容也不能替代对原 `message_id` 的精确回复。
 
 v0.40.5 不变更协议或 schema。`native_preferred` connector 现在在中央写入边界拒绝 `chat`/`listener` 会话发言、回复、claim、release 与 ack，封住“影子在接管前已取到消息、接管后继续跑完”的竞态；读取历史仍允许。Claude/Codex 常驻聊天显式登记 `chat`，task worker 显式登记 `task`，原生 TUI wake 显式登记 `mcp`，不再依赖可能尚未 reload 的 launchd 环境。真实 TUI 的 `main` 写入与既有 Agent 进程保持兼容，滚动发布只重启 viewer；已进入原生接管的 connector 可在确认无在途 adapter 后单独 reload 旧 worker，不要求重启 TUI。
+
+v0.40.8 不变更 schema。Agent 个人 @ 的必须回复合同只读取结构字段：顶层个人 @ 和引用中带入的第三方个人 @ 写入 `agent_request`；引用对原作者的 @ 作为本轮闭环保留为可选 `agent_mention`。正文中的任务、确认或礼貌措辞不再决定投递是否必须回复，免打扰仍以 `quiet_optional` 覆盖。该一跳规则既覆盖完成报告直接 @ 复核人的场景，也避免回复原作者时形成无限回执。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

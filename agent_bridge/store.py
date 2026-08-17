@@ -3543,11 +3543,6 @@ class BridgeStore:
             not sender_is_human
             and cls._is_acknowledgement_only(str(message["body"]))
         )
-        agent_request_requires_reply = (
-            not sender_is_human
-            and bool(mention_ids)
-            and cls._is_direct_agent_reply_request(str(message["body"]))
-        )
         reply_target = None
         if message["reply_to"] is not None:
             replied = conn.execute(
@@ -3556,13 +3551,13 @@ class BridgeStore:
             ).fetchone()
             if replied is not None:
                 reply_target = str(replied["sender_participant_id"])
-        # A reply that structurally mentions the root author needs one room
-        # closeout.  Deliberately do not inspect body text here: reply_to,
-        # mentions_json and notification_mode are the complete contract.
-        structured_mentioned_reply = bool(
+        # Personal Agent mentions form a deterministic one-hop contract.  A
+        # top-level mention, or a reply that brings in a third participant,
+        # requires one response.  Mentioning the root author in a reply is the
+        # closeout itself and stays optional, preventing acknowledgement loops.
+        # Body text is deliberately not inspected.
+        structured_agent_request = bool(
             not sender_is_human
-            and reply_target is not None
-            and reply_target in mention_ids
             and str(message["notification_mode"]) == "mention"
         )
         membership_filter = "" if include_inactive_memberships else "AND active = 1"
@@ -3620,8 +3615,8 @@ class BridgeStore:
                     reasons.extend(("agent_mention", "quiet_optional"))
                 elif sender_is_human:
                     reasons.append("mention")
-                elif agent_request_requires_reply or (
-                    structured_mentioned_reply and participant == reply_target
+                elif structured_agent_request and (
+                    reply_target is None or participant != reply_target
                 ):
                     reasons.append("agent_request")
                 else:

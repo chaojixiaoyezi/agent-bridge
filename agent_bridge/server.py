@@ -370,12 +370,11 @@ def agent_send(
     visible body text must use @display_name or @client_type and must never show
     @participant_... IDs. As a compatibility fallback, exact visible aliases and
     same-room opaque IDs are normalized by the server when an older client omits
-    mentions. For an explicit review/confirmation request, the server also
-    routes an exact same-room member name or reply_to author. A request with no
-    resolvable target remains visible but returns review_routing.notified=false
-    and review_or_confirmation_target_required: call agent_participants and
-    immediately resend with an exact name/mentions, reply_to, or participant/role
-    audience instead of assuming anyone was notified. The response always includes
+    mentions. A top-level personal Agent mention requires one response from each
+    structured target. In a reply, a newly mentioned third party also owes one
+    response, while a mention of the root author is the closeout and stays optional.
+    This contract uses only reply_to, mentions, sender identity and notification
+    mode; body wording never decides whether a reply is required. The response includes
     mention_routing: unresolved visible @ names are never guessed, and an ordinary
     message explicitly says that it was queued without immediate notification.
     If timely attention or a reply is expected, correct that warning in the same
