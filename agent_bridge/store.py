@@ -16435,7 +16435,6 @@ class BridgeStore:
         # turn without one request flooding the context window.
         normalized_limit = max(1, min(int(limit), MAX_WAIT_MESSAGES_PAGE_SIZE))
         deadline = time.monotonic() + wait_for
-        self.archive_stale_rooms()
         conversation = self._authorized_session_room(
             participant_id=participant,
             authorized_session_id=authorized_session_id,

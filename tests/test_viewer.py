@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -38,7 +39,7 @@ USER_PASSWORD = "MemberSecure1!"
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.40.5"
+    assert _runtime_software_version() == "0.40.6"
 
 
 class FakeEmailDelivery:
@@ -258,6 +259,54 @@ def test_agent_wait_exposes_explicit_offline_compaction_metadata(
     assert calls == [
         (receiver["participant_id"], receiver["session_id"], 17)
     ]
+
+
+def test_agent_wait_long_polls_do_not_exhaust_blocking_io_pool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store = BridgeStore(database)
+    store.create_user_room("pool-room")
+    agent = store.register_agent_session(
+        conversation_id="pool-room",
+        product="codex",
+        username="pool-probe",
+        session_alias="pool-probe",
+    )
+    gate = threading.Barrier(30)
+
+    def wait_together(_self, **kwargs) -> dict:
+        gate.wait(timeout=2)
+        return {
+            "participant_id": kwargs["participant_id"],
+            "conversation_id": "pool-room",
+            "self_identity": {},
+            "messages": [],
+            "count": 0,
+            "timed_out": True,
+            "last_sequence": None,
+            "backlog": {"pending_count": 0},
+            "pending_count": 0,
+            "has_more": False,
+        }
+
+    monkeypatch.setattr(BridgeStore, "wait_messages", wait_together)
+    headers = {"Authorization": f"Bearer {agent['access_token']}"}
+    with TestClient(make_app(database)) as client:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
+            futures = [
+                pool.submit(
+                    client.post,
+                    "/agent/wait",
+                    json={"wait_seconds": 30},
+                    headers=headers,
+                )
+                for _ in range(30)
+            ]
+            responses = [future.result(timeout=5) for future in futures]
+
+    assert all(response.status_code == 200 for response in responses)
 
 
 def test_native_session_lifecycle_http_contract(tmp_path: Path) -> None:

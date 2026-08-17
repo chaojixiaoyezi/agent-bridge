@@ -11,6 +11,7 @@ import sqlite3
 import time
 import tomllib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -90,6 +91,13 @@ from .web_auth import (
 WEB_ROOT = Path(__file__).with_name("web")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_BIND_HOSTS = {"127.0.0.1", "0.0.0.0"}
+# Agent chat, task, native-channel, and SSE long polls all use ``to_thread``.
+# Python's CPU-derived default (22 workers on the primary deployment host) is
+# smaller than the live connector count, which can strand an immediate
+# ``agent_wait(wait_seconds=0)`` behind unrelated 20-30 second polls.  Threads
+# are created lazily, so this keeps enough headroom without paying for 128 idle
+# threads on smaller installations.
+BLOCKING_IO_MAX_WORKERS = 128
 
 
 def _runtime_software_version() -> str:
@@ -541,6 +549,11 @@ def create_app(
             if await runtime_leadership_confirmed(application):
                 try:
                     await asyncio.to_thread(store.clear_inactive_sessions)
+                    # Room abandonment is lifecycle maintenance, not part of
+                    # every latency-sensitive Agent read.  Running it once per
+                    # minute also prevents many long-poll clients racing to do
+                    # the same global sweep.
+                    await asyncio.to_thread(store.archive_stale_rooms)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -621,6 +634,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: Starlette):
+        # Long polls must not consume the entire executor and delay an explicit
+        # mention read until the MCP client's ten-second transport timeout.
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(
+                max_workers=BLOCKING_IO_MAX_WORKERS,
+                thread_name_prefix="agent-bridge-io",
+            )
+        )
         await refresh_runtime_leadership(application)
         coordinator = asyncio.create_task(
             runtime_coordination(application),

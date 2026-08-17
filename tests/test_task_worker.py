@@ -8,8 +8,11 @@ from typing import Any
 import agent_bridge.task_worker as task_worker
 from agent_bridge.http_client import BridgeRemoteError
 from agent_bridge.task_worker import (
+    TASK_MCP_TOOLS,
     CodexTaskHost,
+    _mcp_config_arguments,
     _run_claude_task,
+    _task_developer_instructions,
     _task_input_prompt,
     _task_poll_retry_delay,
     _task_prompt,
@@ -81,6 +84,28 @@ def test_task_prompt_treats_cwd_as_starting_point_and_local_permissions_as_limit
     assert "agent_task_delegate" in prompt
     assert "完成和失败终态" in prompt
     assert str(tmp_path) in prompt
+
+
+def test_task_seat_can_create_real_nickname_approval_request(tmp_path: Path) -> None:
+    arguments = _mcp_config_arguments(
+        mcp_command=tmp_path / "agent-bridge-mcp",
+        bridge_url="http://127.0.0.1:8765",
+        product="codex-memory",
+        username="memory-steward",
+        signature="maintains durable memory",
+        conversation="tools-room",
+        roles=[],
+        capabilities=[],
+        enrollment_file=tmp_path / "enrollment.token",
+        connector_id="connector_memory",
+    )
+    command_text = " ".join(arguments)
+
+    assert "agent_request_nickname" in TASK_MCP_TOOLS
+    assert "agent_request_nickname" in command_text
+    instructions = _task_developer_instructions()
+    assert "正式审批记录" in instructions
+    assert "不得用普通群消息冒充正式申请" in instructions
 
 
 def test_task_poll_retries_rolling_upgrade_without_masking_permanent_errors() -> None:
