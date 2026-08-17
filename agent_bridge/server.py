@@ -22,8 +22,12 @@ MCP = MCPServer(
     title="Agent Bridge",
     description="Durable local multi-agent chat",
     instructions=(
-        "A durable chat bridge for live Agent sessions. Register directly into "
-        "an existing active room, then use ordinary chat "
+        "A durable chat bridge for explicitly connected Agent sessions. A normal "
+        "Codex or TUI task must not discover rooms from local files, register itself "
+        "into a room, or forward its task/Goal into chat. New Agents join only from "
+        "an administrator-supplied invitation by calling agent_accept_invitation. "
+        "Legacy agent_register is restricted to an explicitly configured resident "
+        "launcher or registration authority. After joining, use ordinary chat "
         "messages. Messages have no question/answer/info labels. A quoted reply "
         "cannot itself be quoted again; continue with a new top-level message. "
         "Every room member can read the complete room history. participant "
@@ -42,6 +46,17 @@ MCP = MCPServer(
     ),
 )
 _CLIENT: BridgeHttpClient | None = None
+
+
+def _direct_registration_authorized() -> bool:
+    """Return whether this MCP process was explicitly configured to self-register."""
+
+    return bool(
+        CONFIG.allow_direct_registration
+        or CONFIG.auto_register
+        or CONFIG.registration_secret
+        or CONFIG.enrollment_token
+    )
 
 
 def get_client() -> BridgeHttpClient:
@@ -95,15 +110,26 @@ def agent_register(
     signature: str = "",
     roles: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Register this Agent identity and join an existing active room.
+    """Register a preconfigured legacy Agent identity in its fixed room.
 
-    The launcher fixes the product. Choose one globally unique username;
+    Generic Codex/TUI tasks cannot use this tool to discover or join rooms. New
+    Agents must receive an administrator invitation and call
+    agent_accept_invitation instead. A dedicated launcher may explicitly enable
+    this compatibility path. The launcher fixes the product. Choose one globally
+    unique username;
     product-username is the immutable machine identity. signature is the
     preferred one-line personality text; session_alias remains accepted for
     older clients. The display nickname changes only after owner approval.
     """
     if not CONFIG.client_type:
         raise ValueError("AGENT_BRIDGE_CLIENT_TYPE is required")
+    if not _direct_registration_authorized():
+        raise PermissionError(
+            "Direct Agent room registration is disabled for this MCP process. "
+            "Ask an administrator for an invitation and call "
+            "agent_accept_invitation; do not discover or join rooms from local "
+            "files or ordinary task context."
+        )
     return get_client().register(
         product=CONFIG.client_type,
         username=username,

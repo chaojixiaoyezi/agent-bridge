@@ -18,7 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="agent-bridge",
         description=(
             "Owner administration and read-only inspection. Agent chat uses "
-            "open registration plus authenticated short-lived sessions."
+            "invitation or explicitly authorized registration plus authenticated "
+            "short-lived sessions."
         ),
     )
     parser.add_argument("--database", help="Override bridge.db path")

@@ -1,6 +1,6 @@
 # Agent Bridge 公网安全边界
 
-本文件描述 v0.19.0 引入、截至 v0.40.5 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
+本文件描述 v0.19.0 引入、截至 v0.40.9 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
 
 ## 1. 先看结论
 
@@ -27,7 +27,7 @@ Agent machines -> outbound HTTPS/VPN -> same reverse proxy
 | 风险 | 为什么危险 | 当前应用内处理 | 仍需基础设施处理 |
 | --- | --- | --- | --- |
 | 任意 Web 注册 | 当前产品语义是登录用户可读取聊天室；开放注册等于把全部房间历史交给任意注册者 | 公网默认关闭；可显式选择 `access_code` 或 `open` | 注册码须走独立安全渠道，定期轮换 |
-| 开放 Agent 登记 | 攻击者可创建 Agent 身份、加入已有房间或消耗资源 | 公网强制独立高熵登记密钥；邀请/enrollment 仍各自限权 | 密钥文件 `0600`，不要写 argv、仓库或日志 |
+| 开放 Agent 登记 | 攻击者或加载了全局 MCP 的普通项目会话可创建 Agent 身份、加入已有房间、泄露任务 Goal 或消耗资源 | 公网强制独立高熵登记密钥；普通 MCP 默认拒绝直接登记；邀请/enrollment 仍各自限权 | 密钥文件 `0600`，不要写 argv、仓库或日志；不要把登记密钥注入所有 TUI |
 | 明文会话劫持 | Cookie、聊天室正文和 Agent token 可被窃听 | 公网只接受 HTTPS scope，Cookie 使用 `__Host-`、`Secure`、`HttpOnly`、`SameSite=Strict`，默认 30 分钟滑动闲置 TTL | 反向代理启用现代 TLS，HTTP 入口只重定向且不承载应用 |
 | Host/代理头伪造 | 可污染 Origin 判断、公开 URL 和客户端 IP，从而绕过 CSRF 或限流 | 精确 Trusted Host、精确 HTTPS Origin；禁止 `FORWARDED_ALLOW_IPS=*` | 只有代理可连接后端；代理覆盖而非追加客户端自带转发头 |
 | CSRF | 登录 Cookie 会自动随浏览器请求发送 | 所有写操作继续要求精确 Origin、`Sec-Fetch-Site` 和逐动作自定义 intent；Cookie 再用 SameSite 防御 | 不要在同一可注册域下托管不可信应用 |
@@ -54,6 +54,8 @@ AGENT_BRIDGE_WEB_REGISTRATION_MODE=access_code
 ```
 
 Agent 登记密钥至少 32 字符，其 secret 文件和直接 TLS 私钥都必须是普通文件且权限不宽于 `0600`。Web 注册码由管理员登录后生成，默认单次、24 小时有效，数据库只保存哈希。旧部署仍可显式配置 `AGENT_BRIDGE_WEB_REGISTRATION_SECRET_FILE` 作为固定码兼容入口，但新部署不推荐使用。
+
+全局安装 MCP 只表示“工具可见”，不表示该 Codex/TUI 任务已经成为聊天室成员。普通进程不带邀请、connector enrollment、固定常驻配置或显式 `AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION=1` 时，`agent_register` 在发出 HTTP 请求前即失败。生产 viewer 的登记密钥是第二道服务端门禁，用来阻止绕过 MCP 直接请求 `/agent/register`；该密钥只提供给受管常驻进程或迁移工具，邀请型 connector 使用自己的 enrollment，不共享它。
 
 Web 注册有三种模式：
 

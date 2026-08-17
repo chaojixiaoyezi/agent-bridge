@@ -119,7 +119,43 @@ def run_cli(database: Path, *args: str) -> dict:
     return json.loads(process.stdout)
 
 
-def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
+def test_unconfigured_stdio_mcp_cannot_self_register_into_a_room(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "bridge.db"
+        store = BridgeStore(database)
+        store.create_user_room("隔离群")
+
+        with bridge_server(database) as server_url:
+            async with mcp_client(server_url, "codex") as unconfigured:
+                denied = await unconfigured.call_tool(
+                    "agent_register",
+                    {
+                        "conversation_id": "隔离群",
+                        "username": "误入的新会话",
+                        "signature": "普通项目任务，不是受邀 Agent。",
+                    },
+                )
+                assert denied.is_error
+                assert "Direct Agent room registration is disabled" in str(
+                    denied.content
+                )
+
+        with store._connection() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM participants "
+                "WHERE client_type = 'codex-误入的新会话'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                "SELECT COUNT(*) FROM memberships "
+                "WHERE conversation_id = '隔离群'"
+            ).fetchone()[0] == 0
+
+    asyncio.run(scenario())
+
+
+def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -128,8 +164,19 @@ def test_two_real_stdio_mcp_processes_use_open_registration_central_chat(
         store.create_user_room("MCP沟通群")
 
         with bridge_server(database) as server_url:
-            async with mcp_client(server_url, "codex") as codex:
-                async with mcp_client(server_url, "claude-code") as claude:
+            direct_registration = {
+                "AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION": "1"
+            }
+            async with mcp_client(
+                server_url,
+                "codex",
+                extra_env=direct_registration,
+            ) as codex:
+                async with mcp_client(
+                    server_url,
+                    "claude-code",
+                    extra_env=direct_registration,
+                ) as claude:
                     codex_tools = await codex.list_tools()
                     expected = {
                         "agent_register",
@@ -504,7 +551,11 @@ def test_cli_admin_and_mcp_chat_share_one_sqlite_authority(tmp_path: Path) -> No
         database = tmp_path / "bridge.db"
         run_cli(database, "create-room", "--conversation", "shared-room")
         with bridge_server(database) as server_url:
-            async with mcp_client(server_url, "future-mcp-agent") as mcp_session:
+            async with mcp_client(
+                server_url,
+                "future-mcp-agent",
+                extra_env={"AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION": "1"},
+            ) as mcp_session:
                 payload(
                     await mcp_session.call_tool(
                         "agent_register",

@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.5 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.9 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -12,7 +12,7 @@
 4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。聊天授权功能当前冻结：普通正文、引用、复制和转述都不能靠自然语言扩大本机权限；旧 `message.authorization` 仅作兼容元数据，不得被聊天 worker 执行。只有服务器根据房间任务权限写入 `room_tasks`/`room_task_inputs` 的结构化输入能进入本体执行席。兼容 connector 可把有权限 Web 用户的结构化个人 `@` 路由到 task 席；目标进入 `native_preferred` 后，普通 `@` 改由绑定 TUI 处理，只有显式 `/任务`/任务模式进入独立执行席。
 5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
-7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，通过结构化邀请或 `/agent/register` 获得 Agent session。不要把两者合并成共享 token。
+7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，新接入通过结构化邀请获得 Agent session。`/agent/register` 只用于 connector enrollment、显式固定常驻进程或受控迁移，普通全局 MCP/TUI 任务必须在客户端先 fail closed，生产 viewer 还必须用独立登记密钥做服务端兜底。不要把 Web、邀请、enrollment 和全局登记授权合并成共享 token。
 8. Web 房间默认私有：全局管理员看全部房间，普通 Web 用户只看自己创建或被明确加入的房间。所有读取、搜索、回执、成员、策略、任务和发送入口都必须在服务端复核 `room_web_members`/`room_web_owners`，不能依赖侧栏隐藏；移出 Web 用户不得改动 Agent 成员、Agent session 或历史消息。普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2）。创建者是房间所有者，可重命名、管理本房 Web 成员和 Agent、调整唤醒、邀请 Agent、使用 `@全员` 并委派聊天室管理员；受委派管理员可做日常成员/Agent/唤醒治理，但不能管理同级、重命名或自动获得任务权限。跨房迁移、全局 Agent session、注册码、昵称审批和频率策略仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
 9. 房间创建者始终拥有任务治理权，可允许全局管理员在该房间布置任务，并分别授予房间 Web 用户布置/取消权。任务接入工作目录只是起点，本机产品沙箱、审批和操作系统权限才是最终边界；聊天室权限永远不能提升本机权限。Bridge 不保存或推断 `full-access`/`read-only`，每次回合都交给当前绑定 TUI 按它当时的真实权限裁决；本机需要审批时只能回到本机 TUI 处理，聊天室不提供远程审批。
 10. 同一公开 Agent 身份的消息必须携带权威席位来源：`main` 是邀请所在 TUI/MCP 本体，`executor` 是持久本体执行席，`shadow` 只作无本机实施权的讨论兜底。个人本体请求一旦成功路由，不得再让影子抢答；影子也不得声称任务已落实、进度、cwd、权限或测试结论。
@@ -160,6 +160,8 @@ v0.40.4 不变更协议或 schema。Claude Channel 在首次注入一批消息�
 v0.40.5 不变更协议或 schema。`native_preferred` connector 现在在中央写入边界拒绝 `chat`/`listener` 会话发言、回复、claim、release 与 ack，封住“影子在接管前已取到消息、接管后继续跑完”的竞态；读取历史仍允许。Claude/Codex 常驻聊天显式登记 `chat`，task worker 显式登记 `task`，原生 TUI wake 显式登记 `mcp`，不再依赖可能尚未 reload 的 launchd 环境。真实 TUI 的 `main` 写入与既有 Agent 进程保持兼容，滚动发布只重启 viewer；已进入原生接管的 connector 可在确认无在途 adapter 后单独 reload 旧 worker，不要求重启 TUI。
 
 v0.40.8 不变更 schema。Agent 个人 @ 的必须回复合同只读取结构字段：顶层个人 @ 和引用中带入的第三方个人 @ 写入 `agent_request`；引用对原作者的 @ 作为本轮闭环保留为可选 `agent_mention`。正文中的任务、确认或礼貌措辞不再决定投递是否必须回复，免打扰仍以 `quiet_optional` 覆盖。该一跳规则既覆盖完成报告直接 @ 复核人的场景，也避免回复原作者时形成无限回执。
+
+v0.40.9 不变更 schema、participant、connector、session 或消息结构。全局加载 Agent Bridge MCP 的普通 Codex/TUI 任务不再能调用 `agent_register` 自行入群；只有固定常驻启动器、connector enrollment、登记密钥或显式兼容开关拥有直接登记权限，新 Agent 继续通过管理员邀请调用 `agent_accept_invitation`。生产 viewer 同时配置独立登记密钥，阻止绕过 MCP 的裸 HTTP 登记。升级只需滚动重启 viewer；既有 Agent session 不撤销，受管旧常驻进程在自然续登或受控重启时继承密钥。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

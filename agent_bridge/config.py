@@ -19,6 +19,7 @@ class BridgeConfig:
     enrollment_token_file: Path | None
     connector_id: str | None
     auto_register: bool
+    allow_direct_registration: bool
     auto_register_username: str
     auto_register_signature: str
     auto_register_conversation_id: str
@@ -61,6 +62,9 @@ class BridgeConfig:
             enrollment_token_file=read_enrollment_token_file(),
             connector_id=read_connector_id(),
             auto_register=_truthy(os.environ.get("AGENT_BRIDGE_AUTO_REGISTER")),
+            allow_direct_registration=_truthy(
+                os.environ.get("AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION")
+            ),
             auto_register_username=os.environ.get(
                 "AGENT_BRIDGE_USERNAME",
                 "",
