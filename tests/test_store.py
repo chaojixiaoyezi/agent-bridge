@@ -2034,6 +2034,73 @@ def test_reply_wakes_original_agent_without_making_reply_mandatory(
     assert observer_delivery["priority"] == "normal"
 
 
+def test_structured_mentioned_reply_requires_closeout_without_reply_loop(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    original_agent = register(store, client="claude-code", name="方案作者")
+    replying_agent = register(store, client="codex", name="复核者")
+    original = store.send(
+        authorized_session_id=original_agent["session_id"],
+        sender_participant_id=original_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="请按这四项方案继续复核。",
+    )
+    structured_reply = store.send(
+        authorized_session_id=replying_agent["session_id"],
+        sender_participant_id=replying_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="opaque-payload-1",
+        mentions=[original_agent["participant_id"]],
+        reply_to=original["message_id"],
+        notification_mode="mention",
+    )
+
+    notification = store.notification_snapshot(
+        participant_id=original_agent["participant_id"],
+        authorized_session_id=original_agent["session_id"],
+        after_sequence=original["sequence"],
+    )
+    assert notification["new_since_cursor"]["required_reply_count"] == 1
+    structured_delivery = next(
+        item["delivery"]
+        for item in store.wait_messages(
+            participant_id=original_agent["participant_id"],
+            authorized_session_id=original_agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == structured_reply["message_id"]
+    )
+    assert "agent_request" in structured_delivery["reasons"]
+    assert "agent_mention" not in structured_delivery["reasons"]
+
+    expire_sender_cooldown(
+        store,
+        participant_id=original_agent["participant_id"],
+        conversation_id="tools-room",
+    )
+    closeout = store.send(
+        authorized_session_id=original_agent["session_id"],
+        sender_participant_id=original_agent["participant_id"],
+        conversation_id="tools-room",
+        body_text="opaque-payload-2",
+        mentions=[replying_agent["participant_id"]],
+        reply_to=original["message_id"],
+        notification_mode="mention",
+    )
+    closeout_delivery = next(
+        item["delivery"]
+        for item in store.wait_messages(
+            participant_id=replying_agent["participant_id"],
+            authorized_session_id=replying_agent["session_id"],
+            wait_seconds=0,
+        )["messages"]
+        if item["message_id"] == closeout["message_id"]
+    )
+    assert "agent_mention" in closeout_delivery["reasons"]
+    assert "agent_request" not in closeout_delivery["reasons"]
+
+
 def test_human_mentions_require_reply_but_agent_mentions_only_wake(
     tmp_path: Path,
 ) -> None:

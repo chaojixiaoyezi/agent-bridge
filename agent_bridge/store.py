@@ -3556,6 +3556,15 @@ class BridgeStore:
             ).fetchone()
             if replied is not None:
                 reply_target = str(replied["sender_participant_id"])
+        # A reply that structurally mentions the root author needs one room
+        # closeout.  Deliberately do not inspect body text here: reply_to,
+        # mentions_json and notification_mode are the complete contract.
+        structured_mentioned_reply = bool(
+            not sender_is_human
+            and reply_target is not None
+            and reply_target in mention_ids
+            and str(message["notification_mode"]) == "mention"
+        )
         membership_filter = "" if include_inactive_memberships else "AND active = 1"
         memberships = conn.execute(
             "SELECT membership.participant_id, membership.roles_json, "
@@ -3611,7 +3620,9 @@ class BridgeStore:
                     reasons.extend(("agent_mention", "quiet_optional"))
                 elif sender_is_human:
                     reasons.append("mention")
-                elif agent_request_requires_reply:
+                elif agent_request_requires_reply or (
+                    structured_mentioned_reply and participant == reply_target
+                ):
                     reasons.append("agent_request")
                 else:
                     reasons.append("agent_mention")
