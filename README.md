@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.40.3。
+当前版本：v0.40.4。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -25,6 +25,7 @@ Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天�
 - Agent 可为自己按聊天室开启“当日免打扰”，只暂停摘要唤醒并在服务端业务时区的下一次 00:00 自动失效，不自动续期。期间个人 @、引用回复与 `@全员` 仍会及时送达，但都只要求阅读、可自行决定是否回复。0 点后摘要条数和等待时间从零重新计算；0 点前未读不计入新阈值，但后续被唤醒时仍保留在可读历史和未读上下文中。
 - 默认 Agent 在同一聊天室每 15 秒最多发送一条，普通 Web 用户每 60 秒最多发送一条，管理员 Web 用户不限频。管理员可分别修改两类对象的整体间隔，也可按名称搜索并设置单个对象；整体值与单独值同时存在时取时间较短者。其他成员和其他聊天室不受影响。
 - 正文、路径和 refs 默认都是讨论数据，Bridge 本身不执行普通聊天，也不读取引用文件。聊天室授权功能当前冻结；普通正文、复制、引用和转述都不能靠自然语言扩大本机权限。页面“任务”模式和 `/任务` 会显式创建结构化任务。尚未接管真实 TUI 的兼容 connector 仍可把有任务权限 Web 用户的结构化个人 `@` 路由到本体执行席；一旦 connector 进入 `native_preferred`，普通 `@` 始终留在绑定 TUI，只有显式任务进入独立 task 席。授权依据是服务端任务权限与结构化目标，不是正文里的“允许”二字。
+- Claude 原生 TUI 中，每批聊天室事件使用独立请求通道；一批已送达但尚未精确回复时由后台独立提醒，不会再阻塞后续个人 `@`。明确请求必须用 `agent_bridge_reply` 回复原消息，普通 `agent_bridge_send` 不能冒充该闭环。
 
 ## Web 用户、登录与权限
 
@@ -306,7 +307,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
   --viewer-plist "$HOME/Library/LaunchAgents/com.xiaoyezi.agent-bridge-viewer.plist" \
   --connector-queues-root "$HOME/Library/Application Support/AgentBridge" \
   --expected-registration-mode access_code \
-  --label v0.40.3
+  --label v0.40.4
 ```
 
 生产库存在 Web 或本地 MCP 写入者时不得直接替换数据库。恢复演练成功只证明

@@ -530,40 +530,39 @@ def test_claude_channel_keeps_large_message_batch_as_valid_json(
     assert all("可用历史工具读取" in message["body"] for message in decoded)
 
 
-def test_claude_channel_keeps_one_event_until_the_tui_applies_it(
+def test_claude_channel_rotates_after_injection_without_blocking_new_events(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    event_state = {"value": "fetched"}
-    waits = 0
-    received: list[str] = []
+    request_ids: list[str] = []
+    received: list[tuple[str, str]] = []
     delivered: list[str] = []
 
     class FakeClient:
-        def wait_native_channel_event(self, **_payload):
-            nonlocal waits
-            waits += 1
-            if waits >= 4:
+        def wait_native_channel_event(self, **payload):
+            request_id = str(payload["request_id"])
+            request_ids.append(request_id)
+            index = len(request_ids)
+            if index > 2:
                 raise asyncio.CancelledError
-            state = event_state["value"]
+            suffix = "one" if index == 1 else "two"
             return {
                 "event": {
-                    "event_id": "event-poll-until-applied",
+                    "event_id": f"event-nonblocking-{suffix}",
                     "conversation_id": "工具修改的聊天室",
-                    "state": state,
-                    "deliverable": state == "fetched",
+                    "state": "fetched",
+                    "deliverable": True,
                     "fetched_at": 1_700_000_000,
-                    "required_message_ids": [],
-                    "required_reply_count": 0,
-                    "message_ids": ["message-poll-until-applied"],
+                    "required_message_ids": [f"message-nonblocking-{suffix}"],
+                    "required_reply_count": 1,
+                    "message_ids": [f"message-nonblocking-{suffix}"],
                     "messages": [
                         {
-                            "message_id": "message-poll-until-applied",
-                            "sequence": 2,
+                            "message_id": f"message-nonblocking-{suffix}",
+                            "sequence": index,
                             "sender_participant_id": "participant_sender",
                             "sender_display_name": "发送者",
                             "sender_client_type": "web-user",
-                            "body": "请查看。",
+                            "body": f"请查看第 {index} 条。",
                             "reply_to": None,
                         }
                     ],
@@ -571,16 +570,15 @@ def test_claude_channel_keeps_one_event_until_the_tui_applies_it(
             }
 
         def receive_native_channel_event(self, **payload):
-            received.append(str(payload["stage"]))
-            event_state["value"] = "injected"
+            received.append((str(payload["event_id"]), str(payload["stage"])))
             return {"event": {"state": "injected"}}
 
     client = FakeClient()
 
     class FakeState:
         state_directory = tmp_path
-        process_epoch = "epoch-poll-until-applied"
-        connector_id = "connector_poll_until_applied"
+        process_epoch = "epoch-nonblocking-events"
+        connector_id = "connector_nonblocking_events"
 
         @staticmethod
         def client():
@@ -589,9 +587,9 @@ def test_claude_channel_keeps_one_event_until_the_tui_applies_it(
         @staticmethod
         def read_lease():
             return {
-                "connector_id": "connector_poll_until_applied",
-                "process_epoch": "epoch-poll-until-applied",
-                "lease_id": "lease-poll-until-applied",
+                "connector_id": "connector_nonblocking_events",
+                "process_epoch": "epoch-nonblocking-events",
+                "lease_id": "lease-nonblocking-events",
                 "ended": False,
             }
 
@@ -602,25 +600,118 @@ def test_claude_channel_keeps_one_event_until_the_tui_applies_it(
         def deliver(prompt: str) -> None:
             delivered.append(prompt)
 
-    async def advance_without_waiting(_seconds: float) -> None:
-        if event_state["value"] == "injected":
-            event_state["value"] = "replied"
-
     runtime = ChannelRuntime(FakeState())  # type: ignore[arg-type]
     runtime.guide = FakeGuide()  # type: ignore[assignment]
     runtime.session = object()  # type: ignore[assignment]
-    monkeypatch.setattr(
-        "agent_bridge.claude_channel.asyncio.sleep",
-        advance_without_waiting,
-    )
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(runtime._poll_loop())
+    assert len(delivered) == 2
+    assert received == [
+        ("event-nonblocking-one", "injected"),
+        ("event-nonblocking-two", "injected"),
+    ]
+    assert len(set(request_ids)) == 3
+    assert runtime.request_id == request_ids[-1]
+    for index, suffix in enumerate(("one", "two")):
+        route = runtime.routes[f"event-nonblocking-{suffix}"]
+        assert route["request_id"] == request_ids[index]
+        assert route["delivery_attempt_count"] == 1
+        assert route.get("completed_at") is None
+
+
+def test_claude_channel_retries_old_route_without_rotating_current_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    waited: list[dict] = []
+    delivered: list[str] = []
+
+    class FakeClient:
+        def wait_native_channel_event(self, **payload):
+            waited.append(payload)
+            return {
+                "event": {
+                    "event_id": "event-monitored-old",
+                    "conversation_id": "工具修改的聊天室",
+                    "state": "applied",
+                    "deliverable": False,
+                    "fetched_at": 1_700_000_000,
+                    "required_message_ids": ["message-monitored-old"],
+                    "required_reply_count": 1,
+                    "message_ids": ["message-monitored-old"],
+                    "messages": [
+                        {
+                            "message_id": "message-monitored-old",
+                            "sequence": 1,
+                            "sender_participant_id": "participant_sender",
+                            "sender_display_name": "发送者",
+                            "sender_client_type": "web-user",
+                            "body": "请精确回复。",
+                            "reply_to": None,
+                        }
+                    ],
+                }
+            }
+
+    client = FakeClient()
+
+    class FakeState:
+        state_directory = tmp_path
+        process_epoch = "epoch-monitor-old"
+        connector_id = "connector_monitor_old"
+
+        @staticmethod
+        def client():
+            return client
+
+    class FakeGuide:
+        transport_name = "claude-tmux-guide"
+
+        @staticmethod
+        def deliver(prompt: str) -> None:
+            delivered.append(prompt)
+
+    runtime = ChannelRuntime(FakeState())  # type: ignore[arg-type]
+    runtime.guide = FakeGuide()  # type: ignore[assignment]
+    runtime.current_lease_id = "lease-monitor-old"
+    current_request = runtime.request_id
+    current_token = runtime.route_token
+    runtime.routes = {
+        "event-monitored-old": {
+            "request_id": "request_monitored_old",
+            "route_token": "route_" + "m" * 48,
+            "lease_id": "lease-monitor-old",
+            "conversation_id": "工具修改的聊天室",
+            "message_ids": ["message-monitored-old"],
+            "last_event_state": "injected",
+            "state_changed_at": 1.0,
+            "delivery_attempt_count": 1,
+            "last_delivery_at": 1.0,
+        }
+    }
+    monkeypatch.setattr(
+        "agent_bridge.claude_channel.CHANNEL_RETRY_INITIAL_SECONDS",
+        0.0,
+    )
+    asyncio.run(
+        runtime._monitor_routes_once(
+            {
+                "lease_id": "lease-monitor-old",
+                "connector_id": "connector_monitor_old",
+                "process_epoch": "epoch-monitor-old",
+                "ended": False,
+            }
+        )
+    )
     assert len(delivered) == 1
-    assert received == ["injected"]
-    route = runtime.routes["event-poll-until-applied"]
-    assert route["delivery_attempt_count"] == 1
-    assert route["completed_at"] > 0
-    assert waits == 4
+    assert waited[0]["request_id"] == "request_monitored_old"
+    assert waited[0]["wait_seconds"] == 0
+    assert runtime.request_id == current_request
+    assert runtime.route_token == current_token
+    route = runtime.routes["event-monitored-old"]
+    assert route["last_event_state"] == "applied"
+    assert route["delivery_attempt_count"] == 2
+    assert route.get("completed_at") is None
 
 
 def test_claude_channel_stdio_declares_channel_capability_and_tools(
