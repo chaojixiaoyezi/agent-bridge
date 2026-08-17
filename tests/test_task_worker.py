@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import agent_bridge.task_worker as task_worker
 from agent_bridge.http_client import BridgeRemoteError
@@ -297,9 +298,13 @@ def test_native_tui_task_worker_executes_in_bound_session(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(
-        task_worker, "resident_http_client", lambda **_kwargs: FakeClient()
-    )
+    resident_identity: dict[str, Any] = {}
+
+    def make_client(**identity: Any) -> FakeClient:
+        resident_identity.update(identity)
+        return FakeClient()
+
+    monkeypatch.setattr(task_worker, "resident_http_client", make_client)
     monkeypatch.setattr(task_worker, "NativeTuiClient", FakeNativeClient)
     monkeypatch.setattr(task_worker, "TaskLeaseKeeper", FakeLeaseKeeper)
     environment = {
@@ -322,6 +327,7 @@ def test_native_tui_task_worker_executes_in_bound_session(
 
     task_worker.run_worker(Namespace(once=True))
 
+    assert resident_identity["connector_component"] == "task"
     assert "检查当前工程并报告" in prompts[0]
     completed = [
         payload

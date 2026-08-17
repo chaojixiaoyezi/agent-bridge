@@ -777,6 +777,7 @@ class CodexThreadHost:
                 conversation_id=self.conversation,
                 roles=self.roles,
                 capabilities=self.capabilities,
+                connector_component="chat",
             )
         return self._completion_client
 

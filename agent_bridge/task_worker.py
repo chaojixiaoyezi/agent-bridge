@@ -786,6 +786,7 @@ def run_worker(args: argparse.Namespace) -> None:
         conversation_id=conversation,
         roles=roles,
         capabilities=capabilities,
+        connector_component="task",
     )
     native_binding = None
     native_client = None

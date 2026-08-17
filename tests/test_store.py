@@ -5222,6 +5222,32 @@ def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
     assert listener_snapshot["has_room_activity"] is False
     assert listener_snapshot["native_handoff"]["active"] is True
 
+    with pytest.raises(ConflictError, match="native TUI owns this Agent identity"):
+        store.send(
+            authorized_session_id=shadow["session_id"],
+            sender_participant_id=accepted["participant_id"],
+            conversation_id=room,
+            body_text="这条影子消息不应在本体接管后发出。",
+        )
+    with pytest.raises(ConflictError, match="native TUI owns this Agent identity"):
+        store.reply(
+            authorized_session_id=shadow["session_id"],
+            participant_id=accepted["participant_id"],
+            message_id=message["message_id"],
+            body_text="这条影子回复不应发出。",
+        )
+    for action in ("claim", "release", "ack"):
+        with pytest.raises(
+            ConflictError,
+            match="native TUI owns this Agent identity",
+        ):
+            store.message_action(
+                participant_id=accepted["participant_id"],
+                message_id=message["message_id"],
+                action=action,
+                authorized_session_id=shadow["session_id"],
+            )
+
     event_id = event["event"]["event_id"]
     store.receive_native_channel_event(
         participant_id=accepted["participant_id"],
@@ -5265,6 +5291,7 @@ def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
     )
     assert replied["native_event"]["state"] == "replied"
     assert replied["remaining_required_reply_count"] == 0
+    assert replied["reply"]["sender_seat"] == "main"
 
 
 def test_native_preferred_web_mentions_stay_with_tui_until_explicit_task(

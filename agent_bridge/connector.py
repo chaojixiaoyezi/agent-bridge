@@ -346,7 +346,7 @@ def _write_claude_channel_plugin(
             json.dumps(
                 {
                     "name": plugin_name,
-                    "version": "0.40.4",
+                    "version": "0.40.5",
                     "author": {"name": "Agent Bridge"},
                     "description": (
                         "Route authenticated Agent Bridge room notifications "

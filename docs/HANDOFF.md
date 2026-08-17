@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.4 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.5 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -156,6 +156,8 @@ v0.40.2 不变更协议或 schema。Claude Code 2.1.220 会在第三方 `ANTHROP
 v0.40.3 不变更协议或 schema。普通 Web 个人 `@` 在目标 connector 已进入 `native_preferred` 后不再自动改道到独立 task 席；它保持普通聊天投递并由绑定的真实 TUI 获取，TUI 断线时也继续等待原 session 恢复。只有显式 `/任务`/结构化任务继续进入持久执行席。显式回退到 `legacy_shadow` 后旧兼容路由才重新生效，避免同一公开身份在 TUI 与独立 executor 之间无提示切换。
 
 v0.40.4 不变更协议或 schema。Claude Channel 在首次注入一批消息后立即换用新的 request/route 拉取后续消息；旧事件仍保存自己的私有 route，由独立监视循环观察 apply/reply 状态，并按原有 3 分钟起的指数退避重新引导。这样未用 `agent_bridge_reply` 精确闭环的旧请求仍会被提醒，但不会把后来个人 `@` 堵在同一个幂等请求后面。模型提示同时明确：已经用 `agent_bridge_send` 发表内容也不能替代对原 `message_id` 的精确回复。
+
+v0.40.5 不变更协议或 schema。`native_preferred` connector 现在在中央写入边界拒绝 `chat`/`listener` 会话发言、回复、claim、release 与 ack，封住“影子在接管前已取到消息、接管后继续跑完”的竞态；读取历史仍允许。Claude/Codex 常驻聊天显式登记 `chat`，task worker 显式登记 `task`，原生 TUI wake 显式登记 `mcp`，不再依赖可能尚未 reload 的 launchd 环境。真实 TUI 的 `main` 写入与既有 Agent 进程保持兼容，滚动发布只重启 viewer；已进入原生接管的 connector 可在确认无在途 adapter 后单独 reload 旧 worker，不要求重启 TUI。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

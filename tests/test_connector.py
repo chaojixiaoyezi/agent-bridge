@@ -687,10 +687,16 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
             return wait_result
 
     completion_client = CompletionClient()
+    resident_identity: dict = {}
+
+    def make_completion_client(**identity):
+        resident_identity.update(identity)
+        return completion_client
+
     monkeypatch.setattr(
         claude_adapter,
         "resident_http_client",
-        lambda **_identity: completion_client,
+        make_completion_client,
     )
 
     def successful_run(command, **kwargs):
@@ -741,6 +747,7 @@ def test_claude_adapter_uses_only_bridge_tools_and_requires_reply_evidence(
     }
     claude_adapter.run_claude(batch)
 
+    assert resident_identity["connector_component"] == "chat"
     assert captured["shell"] is False
     assert "AGENT_BRIDGE_ENROLLMENT_TOKEN" not in captured["env"]
     command_text = " ".join(captured["command"])

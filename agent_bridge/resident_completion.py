@@ -20,6 +20,7 @@ def resident_http_client(
     conversation_id: str,
     roles: Sequence[str],
     capabilities: Sequence[str],
+    connector_component: str | None = None,
 ) -> BridgeHttpClient:
     """Build a private deterministic client for post-turn bookkeeping."""
 
@@ -28,6 +29,7 @@ def resident_http_client(
         registration_secret=read_registration_secret(),
         enrollment_token=read_enrollment_token(),
         connector_id=read_connector_id(),
+        connector_component=connector_component,
         enrollment_token_file=read_enrollment_token_file(),
         enrollment_token_loader=read_enrollment_token,
         auto_registration={

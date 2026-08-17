@@ -639,6 +639,7 @@ def run_claude(batch: dict[str, Any]) -> None:
         conversation_id=conversation,
         roles=roles,
         capabilities=capabilities,
+        connector_component="chat",
     )
     for page_number in range(1, MAX_PREFETCH_PAGES + 1):
         try:

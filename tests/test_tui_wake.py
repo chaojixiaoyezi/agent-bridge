@@ -88,6 +88,7 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
         ]
     )
     prompts: list[str] = []
+    resident_identity: dict[str, Any] = {}
 
     class FakeNative:
         def __init__(self, _binding: Any) -> None:
@@ -98,7 +99,12 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
             return f"回复第 {len(prompts)} 条", []
 
     monkeypatch.setattr(tui_wake, "load_native_tui_binding", lambda _path: binding)
-    monkeypatch.setattr(tui_wake, "resident_http_client", lambda **_kwargs: bridge)
+
+    def make_bridge(**identity: Any) -> FakeBridgeClient:
+        resident_identity.update(identity)
+        return bridge
+
+    monkeypatch.setattr(tui_wake, "resident_http_client", make_bridge)
     monkeypatch.setattr(tui_wake, "NativeTuiClient", FakeNative)
 
     def acknowledge(_client: Any, message_ids: set[str]) -> None:
@@ -110,6 +116,7 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
     tui_wake.run_native_wake({"event_count": 2})
 
     assert [item["message_id"] for item in bridge.replies] == ["msg-1", "msg-2"]
+    assert resident_identity["connector_component"] == "mcp"
     assert bridge.pending == {}
     assert '"message_id":"msg-2"' not in prompts[0]
     assert '"message_id":"msg-3"' in prompts[0]

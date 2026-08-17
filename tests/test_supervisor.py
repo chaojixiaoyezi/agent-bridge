@@ -673,6 +673,7 @@ def test_resident_codex_worker_deterministically_acks_only_optional_messages(
     assert captured["client"] is completion_client
     assert captured["message_ids"] == {"msg-optional"}
     assert captured["identity"]["conversation_id"] == "tools-room"
+    assert captured["identity"]["connector_component"] == "chat"
 
 
 def test_resident_codex_worker_compacts_reconnect_backlog_via_bridge(

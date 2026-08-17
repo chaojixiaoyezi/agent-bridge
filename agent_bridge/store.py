@@ -14030,6 +14030,10 @@ class BridgeStore:
                     conversation_id=conversation,
                     now=now,
                 )
+                self._require_session_write_authority_locked(
+                    conn,
+                    session=live_session,
+                )
                 sender_seat = {
                     "mcp": "main",
                     "chat": "shadow",
@@ -17955,7 +17959,7 @@ class BridgeStore:
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
             if authorized_session_id is not None:
-                self._require_live_room_session(
+                live_session = self._require_live_room_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -17964,6 +17968,10 @@ class BridgeStore:
                     participant_id=participant,
                     conversation_id=str(row["conversation_id"]),
                     now=now,
+                )
+                self._require_session_write_authority_locked(
+                    conn,
+                    session=live_session,
                 )
             delivery = self._require_eligible_row(conn, participant, row)
             if str(row["audience_kind"]) not in {"participant", "role"}:
@@ -18022,7 +18030,7 @@ class BridgeStore:
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
             if authorized_session_id is not None:
-                self._require_live_room_session(
+                live_session = self._require_live_room_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -18031,6 +18039,10 @@ class BridgeStore:
                     participant_id=participant,
                     conversation_id=str(row["conversation_id"]),
                     now=now,
+                )
+                self._require_session_write_authority_locked(
+                    conn,
+                    session=live_session,
                 )
             self._require_active_room(conn, str(row["conversation_id"]))
             if str(row["claimed_by"] or "") != participant:
@@ -18071,7 +18083,7 @@ class BridgeStore:
             if row is None:
                 raise NotFoundError(f"unknown message: {message}")
             if authorized_session_id is not None:
-                self._require_live_room_session(
+                live_session = self._require_live_room_session(
                     conn,
                     session_id=opaque_id(
                         authorized_session_id,
@@ -18080,6 +18092,10 @@ class BridgeStore:
                     participant_id=participant,
                     conversation_id=str(row["conversation_id"]),
                     now=now,
+                )
+                self._require_session_write_authority_locked(
+                    conn,
+                    session=live_session,
                 )
             delivery = self._require_eligible_row(conn, participant, row)
             actionable = bool(delivery["actionable"])
@@ -18294,6 +18310,34 @@ class BridgeStore:
                 f"use a room-specific connector for {conversation_id}"
             )
         return row
+
+    @staticmethod
+    def _require_session_write_authority_locked(
+        conn: sqlite3.Connection,
+        *,
+        session: sqlite3.Row,
+    ) -> None:
+        """Fence legacy shadow writes after an exact native TUI takes ownership."""
+
+        component = str(session["component"] or "unknown")
+        connector_id = str(session["connector_id"] or "")
+        if component not in {"chat", "listener"} or not connector_id:
+            return
+        connector = conn.execute(
+            "SELECT native_delivery_mode FROM agent_connectors "
+            "WHERE connector_id = ? AND accepted_participant_id = ? "
+            "AND revoked_at IS NULL",
+            (connector_id, str(session["participant_id"])),
+        ).fetchone()
+        if (
+            connector is not None
+            and str(connector["native_delivery_mode"] or "")
+            == "native_preferred"
+        ):
+            raise ConflictError(
+                "native TUI owns this Agent identity; shadow chat writes are "
+                "disabled until the connector explicitly returns to legacy shadow mode"
+            )
 
     def _authorized_session_room(
         self,

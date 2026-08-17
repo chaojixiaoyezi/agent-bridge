@@ -166,6 +166,7 @@ def run_native_wake(batch: dict[str, Any]) -> None:
         conversation_id=conversation,
         roles=roles,
         capabilities=capabilities,
+        connector_component="mcp",
     )
     with endpoint_turn_lock(lock_file, blocking=False) as acquired:
         if not acquired:
