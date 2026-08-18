@@ -12,6 +12,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from agent_bridge.claude_channel import ChannelRuntime
+from agent_bridge.claude_native import ClaudeNativeError
 from agent_bridge.claude_guide import (
     TmuxClaudeGuide,
     tmux_guide_from_environment,
@@ -399,6 +400,13 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
             calls.append(("send", payload))
             return {"message": {"message_id": "message_out"}}
 
+        def download_attachment(self, **payload):
+            calls.append(("download", payload))
+            return {
+                "attachment_id": payload["attachment_id"],
+                "saved_path": str(payload["destination_path"]),
+            }
+
         def heartbeat_native_session(self, **payload):
             calls.append(("heartbeat", payload))
             return {"lease_id": payload["lease_id"]}
@@ -429,6 +437,7 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
             "lease_id": "lease-channel-tool",
             "conversation_id": "工具修改的聊天室",
             "message_ids": ["message_channel_tool"],
+            "attachment_ids": ["attachment_channel_tool"],
         }
     }
     notification = runtime._notification(
@@ -447,6 +456,34 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
                     "sender_client_type": "codex-sender",
                     "body": "请确认。",
                     "reply_to": None,
+                    "visibility": {
+                        "kind": "restricted",
+                        "target_kind": "participants",
+                        "recipients": [
+                            {
+                                "participant_id": "participant_receiver",
+                                "display_name": "接收者",
+                            }
+                        ],
+                    },
+                    "attachments": [
+                        {
+                            "attachment_id": "attachment_channel_tool",
+                            "kind": "image",
+                            "filename": "设计图.png",
+                            "media_type": "image/png",
+                            "size_bytes": 128,
+                            "sha256": "a" * 64,
+                        }
+                    ],
+                    "links": [
+                        {
+                            "link_id": "link_channel_tool",
+                            "url": "https://example.com/spec",
+                            "host": "example.com",
+                            "display": "example.com/spec",
+                        }
+                    ],
                 }
             ],
         }
@@ -457,6 +494,20 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
     assert notification.params.meta["message_id"] == "event-channel-tool"
     assert notification.params.meta["user"] == "发送者"
     assert notification.params.meta["ts"] == "2023-11-14T22:13:20Z"
+    notification_messages = json.loads(
+        notification.params.content.split("MESSAGES_JSON:\n", 1)[1]
+    )
+    assert notification_messages[0]["visibility"] == {
+        "kind": "restricted",
+        "target_kind": "participants",
+    }
+    assert notification_messages[0]["attachments"][0]["attachment_id"] == (
+        "attachment_channel_tool"
+    )
+    assert notification_messages[0]["links"][0]["url"] == (
+        "https://example.com/spec"
+    )
+    assert "recipients" not in notification_messages[0]["visibility"]
 
     delivered: list[str] = []
 
@@ -486,6 +537,43 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
     assert calls[0][0] == "send"
     assert calls[0][1]["route_token"].startswith("route_")
     assert calls[0][1]["notification_mode"] == "mention"
+    destination = tmp_path / "received" / "设计图.png"
+    downloaded = asyncio.run(
+        runtime.call_tool(
+            "agent_bridge_download_attachment",
+            {
+                "event_id": "event-channel-tool",
+                "attachment_id": "attachment_channel_tool",
+                "destination_path": str(destination),
+            },
+        )
+    )
+    assert downloaded == {
+        "attachment_id": "attachment_channel_tool",
+        "saved_path": str(destination),
+    }
+    assert calls[2] == (
+        "download",
+        {
+            "attachment_id": "attachment_channel_tool",
+            "destination_path": str(destination),
+            "overwrite": False,
+        },
+    )
+    with pytest.raises(
+        ClaudeNativeError,
+        match="attachment_id is not part of this event",
+    ):
+        asyncio.run(
+            runtime.call_tool(
+                "agent_bridge_download_attachment",
+                {
+                    "event_id": "event-channel-tool",
+                    "attachment_id": "attachment_other_event",
+                    "destination_path": str(destination),
+                },
+            )
+        )
 
 
 def test_claude_channel_keeps_large_message_batch_as_valid_json(
@@ -530,6 +618,60 @@ def test_claude_channel_keeps_large_message_batch_as_valid_json(
     assert all("可用历史工具读取" in message["body"] for message in decoded)
 
 
+def test_claude_channel_bounds_many_first_class_links_without_invalid_json(
+    tmp_path: Path,
+) -> None:
+    class FakeState:
+        state_directory = tmp_path
+        process_epoch = "epoch-channel-links"
+        connector_id = "connector_channel_links"
+
+        @staticmethod
+        def client():
+            return object()
+
+    runtime = ChannelRuntime(FakeState())  # type: ignore[arg-type]
+    messages = [
+        {
+            "message_id": f"message_links_{index}",
+            "sequence": index,
+            "sender_participant_id": "participant_sender",
+            "sender_display_name": "发送者",
+            "sender_client_type": "web-user",
+            "body": "",
+            "reply_to": None,
+            "links": [
+                {
+                    "link_id": f"link_{index}_{link_index}",
+                    "url": (
+                        f"https://example.com/{index}/{link_index}/"
+                        + "x" * 1_900
+                    ),
+                    "host": "example.com",
+                    "display": f"example.com/{index}/{link_index}",
+                }
+                for link_index in range(8)
+            ],
+        }
+        for index in range(20)
+    ]
+    notification = runtime._notification(
+        {
+            "event_id": "event-channel-links",
+            "conversation_id": "链接群",
+            "required_message_ids": [],
+            "required_reply_count": 0,
+            "messages": messages,
+        }
+    )
+    decoded = json.loads(
+        notification.params.content.split("MESSAGES_JSON:\n", 1)[1]
+    )
+    assert len(notification.params.content) <= 96_000
+    assert sum(int(item.get("links_omitted_count") or 0) for item in decoded) > 0
+    assert any(item["links"] for item in decoded)
+
+
 def test_claude_channel_rotates_after_injection_without_blocking_new_events(
     tmp_path: Path,
 ) -> None:
@@ -564,6 +706,20 @@ def test_claude_channel_rotates_after_injection_without_blocking_new_events(
                             "sender_client_type": "web-user",
                             "body": f"请查看第 {index} 条。",
                             "reply_to": None,
+                            "attachments": (
+                                [
+                                    {
+                                        "attachment_id": "attachment-nonblocking-one",
+                                        "kind": "file",
+                                        "filename": "说明.txt",
+                                        "media_type": "text/plain",
+                                        "size_bytes": 4,
+                                        "sha256": "b" * 64,
+                                    }
+                                ]
+                                if index == 1
+                                else []
+                            ),
                         }
                     ],
                 }
@@ -617,6 +773,10 @@ def test_claude_channel_rotates_after_injection_without_blocking_new_events(
         assert route["request_id"] == request_ids[index]
         assert route["delivery_attempt_count"] == 1
         assert route.get("completed_at") is None
+    assert runtime.routes["event-nonblocking-one"]["attachment_ids"] == [
+        "attachment-nonblocking-one"
+    ]
+    assert runtime.routes["event-nonblocking-two"]["attachment_ids"] == []
 
 
 def test_claude_channel_retries_old_route_without_rotating_current_request(
@@ -759,6 +919,7 @@ def test_claude_channel_stdio_declares_channel_capability_and_tools(
                     "agent_bridge_participants",
                     "agent_bridge_history",
                     "agent_bridge_search_history",
+                    "agent_bridge_download_attachment",
                 }
 
     asyncio.run(scenario())

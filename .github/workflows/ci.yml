@@ -167,7 +167,9 @@ jobs:
             tests/test_store.py::test_operational_monitoring_persists_trends_alerts_and_recovery \
             tests/test_store.py::test_runtime_coordination_has_one_leader_and_fenced_failover \
             tests/test_store.py::test_admin_audit_ledger_is_append_only_filterable_and_admin_only \
-            tests/test_store.py::test_history_governance_is_manual_abandoned_only_and_append_only
+            tests/test_store.py::test_history_governance_is_manual_abandoned_only_and_append_only \
+            tests/test_store.py::test_schema_42_adds_message_assets_without_rewriting_existing_messages \
+            tests/test_store.py::test_restricted_attachment_visibility_delivery_history_and_links
 
       - name: Prove public and credential security boundaries
         run: |
@@ -179,6 +181,7 @@ jobs:
             tests/test_viewer.py::test_two_viewers_share_one_runtime_leader_and_report_admin_status \
             tests/test_viewer.py::test_private_web_rooms_require_explicit_access_and_revocation_isolated \
             tests/test_viewer.py::test_admin_rotates_and_revokes_one_connector_without_exposing_credentials \
+            tests/test_viewer.py::test_web_composite_attachment_message_and_agent_download_acl \
             tests/test_store.py::test_connector_enrollment_rotation_and_device_revoke_are_isolated \
             tests/test_credential_cli.py \
             tests/test_email_delivery.py

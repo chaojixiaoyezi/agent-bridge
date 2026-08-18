@@ -1077,6 +1077,24 @@ class MessageRoutingMixin:
             return
         mention_ids = set(json.loads(str(message["mentions_json"] or "[]")))
         candidates = cls._delivery_candidates_locked(conn, message)
+        restriction = conn.execute(
+            "SELECT 1 FROM message_restrictions WHERE message_id = ?",
+            (str(message["message_id"]),),
+        ).fetchone()
+        if restriction is not None:
+            allowed_recipients = {
+                str(row["participant_id"])
+                for row in conn.execute(
+                    "SELECT participant_id FROM message_restriction_recipients "
+                    "WHERE message_id = ?",
+                    (str(message["message_id"]),),
+                ).fetchall()
+            }
+            candidates = [
+                item
+                for item in candidates
+                if str(item["participant_id"]) in allowed_recipients
+            ]
         candidate_ids = {str(item["participant_id"]) for item in candidates}
         missing_mentions = sorted(mention_ids - candidate_ids)
         if missing_mentions:

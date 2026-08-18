@@ -16,7 +16,12 @@ function updateComposer(room) {
   const effectiveCooldown = state.messageRateLimits?.current_user_effective_cooldown_seconds ?? 60;
   elements.ownerMessageBody.disabled = !canSpeak;
   elements.sendOwnerMessage.disabled = !canSpeak;
+  elements.chooseComposerFiles.disabled = !canSpeak || state.composerMode === "task";
+  elements.toggleComposerLink.disabled = !canSpeak || state.composerMode === "task";
   elements.composerTaskMode.hidden = !(canSpeak && room?.can_assign_tasks);
+  elements.composerTaskMode.disabled = Boolean(
+    state.composerAttachments.length || state.composerLinks.length,
+  );
   elements.composerChatMode.classList.toggle("active", state.composerMode === "chat");
   elements.composerTaskMode.classList.toggle("active", state.composerMode === "task");
   elements.sendOwnerMessage.textContent = state.composerMode === "task" ? "提交任务" : "发送";
@@ -29,6 +34,7 @@ function updateComposer(room) {
       : `${state.currentUser?.display_name || "Web 用户"}发言（${isAdmin() ? "不限频" : `每个房间间隔 ${formatCooldown(effectiveCooldown)}`}）；Enter 发送，Shift+Enter 换行…`
     : room ? "废弃聊天室仅保留历史，不能继续发言。" : "先选择一个使用中的聊天室。";
   if (!canSpeak) elements.ownerMessageFeedback.textContent = "";
+  renderComposerAssets();
   updateComposerContext();
 }
 
@@ -36,7 +42,18 @@ function updateComposerContext() {
   const replied = state.composerReplyTo
     ? state.messages.find((message) => message.message_id === state.composerReplyTo)
     : null;
-  if (replied) {
+  if (state.composerAttachments.length) {
+    const mentionIds = selectedMentionIds(elements.ownerMessageBody.value);
+    elements.composerContext.hidden = false;
+    elements.composerContextTitle.textContent = "定向文件/图片 · 整条消息受限";
+    if (state.composerWakeAll) {
+      elements.composerContextBody.textContent = "文字、链接和附件只发给本聊天室当前全部 Agent。";
+    } else if (mentionIds.length) {
+      elements.composerContextBody.textContent = `只发给：${mentionIds.map(participantName).join("、")}。其他 Agent 不会收到正文、文件名、缩略图或下载地址。`;
+    } else {
+      elements.composerContextBody.textContent = "发送前请在正文中 @ 至少一个 Agent，或选择 @全员。";
+    }
+  } else if (replied) {
     elements.composerContext.hidden = false;
     elements.composerContextTitle.textContent = `回复 ${replied.sender_display_name || replied.sender_client_type}`;
     elements.composerContextBody.textContent = replied.body.slice(0, 140);
@@ -60,7 +77,11 @@ function updateComposerContext() {
 
 function setComposerMode(mode) {
   const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
-  if (mode === "task" && !room?.can_assign_tasks) return;
+  if (mode === "task" && (
+    !room?.can_assign_tasks
+    || state.composerAttachments.length
+    || state.composerLinks.length
+  )) return;
   ensureComposerPanelExpanded();
   state.composerMode = mode === "task" ? "task" : "chat";
   state.composerWakeAll = false;
@@ -151,9 +172,184 @@ function addComposerMention(person, range = null) {
 function selectedMentionIds(bodyText) {
   const ids = [];
   for (const [participantId, token] of state.composerMentions.entries()) {
-    if (bodyText.includes(token)) ids.push(participantId);
+    const escaped = token.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const pattern = new RegExp(
+      `${escaped}(?=$|[\\s,，。.!！?？:：;；、)）\\]】}>》])`,
+      "iu",
+    );
+    if (pattern.test(bodyText)) ids.push(participantId);
   }
   return ids;
+}
+
+const COMPOSER_MAX_ATTACHMENTS = 5;
+const COMPOSER_MAX_ATTACHMENT_BYTES = 12 * 1024 * 1024;
+const COMPOSER_MAX_TOTAL_BYTES = 25 * 1024 * 1024;
+const COMPOSER_MAX_LINKS = 8;
+const COMPOSER_INLINE_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
+function normalizedComposerLink(rawValue) {
+  const value = String(rawValue || "").trim();
+  if (!value || value.length > 2048) throw new Error("链接长度应为 1–2048 个字符。");
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (error) {
+    throw new Error("请输入完整的 http:// 或 https:// 链接。");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new Error("链接必须是无内嵌账号密码的 HTTP(S) 地址。");
+  }
+  return parsed.href;
+}
+
+function clearComposerAssets() {
+  for (const item of state.composerAttachments) {
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  }
+  state.composerAttachments = [];
+  state.composerLinks = [];
+  elements.composerFileInput.value = "";
+  elements.composerLinkUrl.value = "";
+  elements.composerLinkEntry.hidden = true;
+  renderComposerAssets();
+  updateComposerContext();
+}
+
+function addComposerFiles(files) {
+  const additions = [...files];
+  if (!additions.length) return;
+  if (state.composerAttachments.length + additions.length > COMPOSER_MAX_ATTACHMENTS) {
+    throw new Error(`一条消息最多添加 ${COMPOSER_MAX_ATTACHMENTS} 个文件或图片。`);
+  }
+  let total = state.composerAttachments.reduce((sum, item) => sum + item.file.size, 0);
+  for (const file of additions) {
+    if (file.size <= 0) throw new Error(`「${file.name}」是空文件，不能发送。`);
+    if (file.size > COMPOSER_MAX_ATTACHMENT_BYTES) {
+      throw new Error(`「${file.name}」超过单个 12 MB 限制。`);
+    }
+    total += file.size;
+    if (total > COMPOSER_MAX_TOTAL_BYTES) throw new Error("附件合计不能超过 25 MB。");
+  }
+  for (const file of additions) {
+    const previewUrl = COMPOSER_INLINE_IMAGE_TYPES.has(file.type)
+      ? URL.createObjectURL(file)
+      : null;
+    state.composerAttachments.push({
+      id: window.crypto.randomUUID(),
+      file,
+      previewUrl,
+    });
+  }
+  state.composerMode = "chat";
+  renderComposerAssets();
+  updateComposer(state.rooms.find((room) => room.conversation_id === state.selectedRoom));
+}
+
+function addComposerLink(rawValue) {
+  const url = normalizedComposerLink(rawValue);
+  if (state.composerLinks.includes(url)) return;
+  if (state.composerLinks.length >= COMPOSER_MAX_LINKS) {
+    throw new Error(`一条消息最多添加 ${COMPOSER_MAX_LINKS} 个链接。`);
+  }
+  state.composerLinks.push(url);
+  elements.composerLinkUrl.value = "";
+  elements.composerLinkEntry.hidden = true;
+  renderComposerAssets();
+  updateComposerContext();
+}
+
+function composerLinksForMessage(bodyText) {
+  const result = [...state.composerLinks];
+  const candidates = String(bodyText || "").match(/https?:\/\/[^\s<>"']+/giu) || [];
+  for (const candidate of candidates) {
+    const trimmed = candidate.replace(/[，。！？；：、）】》,.!?;:)\]]+$/u, "");
+    if (!trimmed) continue;
+    let normalized;
+    try {
+      normalized = normalizedComposerLink(trimmed);
+    } catch (error) {
+      continue;
+    }
+    if (!result.includes(normalized)) result.push(normalized);
+  }
+  if (result.length > COMPOSER_MAX_LINKS) {
+    throw new Error(`一条消息最多包含 ${COMPOSER_MAX_LINKS} 个不同链接。`);
+  }
+  return result;
+}
+
+function renderComposerAssets() {
+  const hasItems = state.composerAttachments.length || state.composerLinks.length;
+  elements.composerAssetTray.hidden = !hasItems;
+  elements.composerAssetItems.replaceChildren();
+  if (!hasItems) return;
+  const parts = [];
+  if (state.composerAttachments.length) parts.push(`${state.composerAttachments.length} 个文件/图片`);
+  if (state.composerLinks.length) parts.push(`${state.composerLinks.length} 个链接`);
+  elements.composerAssetTitle.textContent = parts.join(" · ");
+  if (state.composerAttachments.length) {
+    const mentionIds = selectedMentionIds(elements.ownerMessageBody.value);
+    elements.composerAssetRecipient.textContent = state.composerWakeAll
+      ? "仅当前全部 Agent 可见"
+      : mentionIds.length
+        ? `仅 ${mentionIds.map(participantName).join("、")} 可见`
+        : "需要先 @ 接收 Agent";
+    elements.composerAssetRecipient.classList.toggle("warning", !state.composerWakeAll && !mentionIds.length);
+  } else {
+    elements.composerAssetRecipient.textContent = "链接按普通聊天室消息发送";
+    elements.composerAssetRecipient.classList.remove("warning");
+  }
+  for (const item of state.composerAttachments) {
+    const card = makeElement("div", "composer-asset-item attachment");
+    if (item.previewUrl) {
+      const image = document.createElement("img");
+      image.src = item.previewUrl;
+      image.alt = "";
+      card.append(image);
+    } else {
+      card.append(makeElement("span", "composer-file-mark", "FILE"));
+    }
+    const copy = makeElement("span", "composer-asset-copy");
+    copy.append(makeElement("strong", "", item.file.name));
+    copy.append(makeElement("small", "", formatBytes(item.file.size)));
+    card.append(copy);
+    const remove = makeElement("button", "composer-asset-remove", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `移除 ${item.file.name}`);
+    remove.addEventListener("click", () => {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      state.composerAttachments = state.composerAttachments.filter((candidate) => candidate.id !== item.id);
+      renderComposerAssets();
+      updateComposer(state.rooms.find((room) => room.conversation_id === state.selectedRoom));
+    });
+    card.append(remove);
+    elements.composerAssetItems.append(card);
+  }
+  for (const url of state.composerLinks) {
+    const parsed = new URL(url);
+    const card = makeElement("div", "composer-asset-item link");
+    card.append(makeElement("span", "composer-link-mark", "↗"));
+    const copy = makeElement("span", "composer-asset-copy");
+    copy.append(makeElement("strong", "", parsed.hostname));
+    copy.append(makeElement("small", "", `${parsed.pathname}${parsed.search}`.slice(0, 100) || "/"));
+    card.append(copy);
+    const remove = makeElement("button", "composer-asset-remove", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `移除链接 ${parsed.hostname}`);
+    remove.addEventListener("click", () => {
+      state.composerLinks = state.composerLinks.filter((candidate) => candidate !== url);
+      renderComposerAssets();
+      updateComposerContext();
+    });
+    card.append(remove);
+    elements.composerAssetItems.append(card);
+  }
 }
 
 function renderActiveRoomHeader(roomId = state.selectedRoom) {
@@ -261,6 +457,7 @@ async function selectRoom(roomId) {
   state.participantFilter = "";
   elements.participantSearch.value = "";
   state.composerMentions.clear();
+  clearComposerAssets();
   state.composerMode = "chat";
   state.taskPermissions = null;
   clearComposerContext();

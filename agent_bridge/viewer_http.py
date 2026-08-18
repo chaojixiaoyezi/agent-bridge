@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
@@ -186,6 +187,11 @@ async def _agent_json_call(
 
 
 def _json_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            {"error": str(exc.detail or "invalid HTTP request")},
+            status_code=exc.status_code,
+        )
     if isinstance(exc, HttpInputError):
         return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
     if isinstance(exc, (AuthenticationError, WebAuthenticationError)):

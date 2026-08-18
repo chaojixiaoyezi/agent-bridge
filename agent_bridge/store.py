@@ -104,6 +104,7 @@ from .message_composer import (
     ROOM_WAKE_POLICY_SCHEMA,
     MessageComposerMixin,
 )
+from .message_assets import MESSAGE_ASSET_SCHEMA, MessageAssetMixin
 from .message_delivery import (
     ROOM_MESSAGE_SEQUENCE_SCHEMA as ROOM_MESSAGE_SEQUENCE_SCHEMA,
     MessageDeliveryMixin,
@@ -159,6 +160,7 @@ class BridgeStore(
     StoreMigrationMixin,
     AdminAuditMixin,
     HistoryGovernanceMixin,
+    MessageAssetMixin,
     MessageRateMixin,
     MessageRoutingMixin,
     MessageComposerMixin,
@@ -189,6 +191,15 @@ class BridgeStore(
         business_timezone: str | None = None,
     ) -> None:
         self.database = Path(database).expanduser()
+        configured_attachment_root = os.environ.get(
+            "AGENT_BRIDGE_ATTACHMENT_ROOT",
+            "",
+        ).strip()
+        self.attachment_root = (
+            Path(configured_attachment_root).expanduser().resolve()
+            if configured_attachment_root
+            else (self.database.parent / "attachments").resolve()
+        )
         self.poll_interval_seconds = max(0.05, min(float(poll_interval_seconds), 2.0))
         (
             self.business_timezone,
@@ -376,6 +387,7 @@ class BridgeStore(
             self._backfill_legacy_rooms(conn)
             self._initialize_room_message_sequences_locked(conn)
             conn.executescript(WEB_AUTH_SCHEMA)
+            conn.executescript(MESSAGE_ASSET_SCHEMA)
             self._migrate_web_user_room_permissions(conn)
             conn.executescript(ROOM_GOVERNANCE_SCHEMA)
             conn.executescript(ROOM_KNOWLEDGE_SCHEMA)
@@ -566,12 +578,13 @@ class BridgeStore(
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 41")
+            conn.execute("PRAGMA user_version = 42")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
         except OSError:
             pass
+        self._initialize_message_asset_storage()
 
 
     def _connect(self) -> sqlite3.Connection:

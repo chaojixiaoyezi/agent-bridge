@@ -262,11 +262,28 @@ class RoomTaskMixin:
                             (conversation, *mentioned),
                         ).fetchall()
                     ]
+            restricted_recipients = {
+                str(row["participant_id"])
+                for row in conn.execute(
+                    "SELECT participant_id FROM message_restriction_recipients "
+                    "WHERE message_id = ?",
+                    (source_id,),
+                ).fetchall()
+            }
+            if restricted_recipients and not requested_targets:
+                requested_targets = sorted(restricted_recipients)
             target_kind, target_ids = self._resolve_task_targets_locked(
                 conn,
                 conversation_id=conversation,
                 requested_participant_ids=requested_targets,
             )
+            unauthorized_targets = sorted(
+                set(target_ids) - restricted_recipients
+            ) if restricted_recipients else []
+            if unauthorized_targets:
+                raise AuthorizationError(
+                    "定向文件或图片消息只能转交给发送时已经指定的 Agent"
+                )
             source_sequence = int(source["sequence"])
             context_end = int(
                 conn.execute(
@@ -335,6 +352,9 @@ class RoomTaskMixin:
                 (source_id,),
             ).fetchone()
             result = self._message_payload(message_row, authorization=None)
+            result.update(
+                self._message_asset_projection_locked(conn, [source_id])[source_id]
+            )
             result["task"] = self._task_payload(task_row)
         return result
 
@@ -1116,7 +1136,15 @@ class RoomTaskMixin:
                     """,
                     input_ids,
                 ).fetchall()
-        inputs = [self._task_input_payload(row) for row in rows]
+            projections = self._message_asset_projection_locked(
+                conn,
+                [str(row["source_message_id"]) for row in rows],
+            )
+        inputs = []
+        for row in rows:
+            payload = self._task_input_payload(row)
+            payload.update(projections[str(row["source_message_id"])])
+            inputs.append(payload)
         return {"task_id": task, "inputs": inputs, "count": len(inputs)}
 
     def acknowledge_agent_task_inputs(

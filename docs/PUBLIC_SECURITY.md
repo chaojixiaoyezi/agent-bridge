@@ -1,6 +1,6 @@
 # Agent Bridge 公网安全边界
 
-本文件描述 v0.19.0 引入、截至 v0.40.9 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
+本文件描述 v0.19.0 引入、截至 v0.43.0 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
 
 ## 1. 先看结论
 
@@ -31,9 +31,10 @@ Agent machines -> outbound HTTPS/VPN -> same reverse proxy
 | 明文会话劫持 | Cookie、聊天室正文和 Agent token 可被窃听 | 公网只接受 HTTPS scope，Cookie 使用 `__Host-`、`Secure`、`HttpOnly`、`SameSite=Strict`，默认 30 分钟滑动闲置 TTL | 反向代理启用现代 TLS，HTTP 入口只重定向且不承载应用 |
 | Host/代理头伪造 | 可污染 Origin 判断、公开 URL 和客户端 IP，从而绕过 CSRF 或限流 | 精确 Trusted Host、精确 HTTPS Origin；禁止 `FORWARDED_ALLOW_IPS=*` | 只有代理可连接后端；代理覆盖而非追加客户端自带转发头 |
 | CSRF | 登录 Cookie 会自动随浏览器请求发送 | 所有写操作继续要求精确 Origin、`Sec-Fetch-Site` 和逐动作自定义 intent；Cookie 再用 SameSite 防御 | 不要在同一可注册域下托管不可信应用 |
-| 爆破与资源消耗 | CAPTCHA 生成、scrypt、全文检索和连接建立都可耗 CPU/SQLite | CAPTCHA、登录 IP/账户、注册 IP/账户、改密、Agent 登记、邀请接受、房间搜索、A2A 和 SSE 握手有 SQLite 共享滑动窗口；同库 viewer 原子共享额度且只存 subject 哈希；全局请求体上限 70,000 字节 | 跨节点/分布式攻击仍必须由代理/WAF做共享限流、连接数和带宽限制 |
+| 爆破与资源消耗 | CAPTCHA 生成、scrypt、全文检索、文件上传和连接建立都可耗 CPU/SQLite/磁盘 | CAPTCHA、登录 IP/账户、注册 IP/账户、改密、Agent 登记、邀请接受、附件上传、房间搜索、A2A 和 SSE 握手有 SQLite 共享滑动窗口；普通 JSON 上限 70,000 字节，整个 ASGI 请求上限 26 MiB，单文件 12 MiB、一条最多 5 个且合计 25 MiB | 跨节点/分布式攻击仍必须由代理/WAF做共享限流、连接数、慢速上传和带宽限制 |
 | XSS/点击劫持/浏览器能力滥用 | 聊天正文是外部输入 | DOM 只使用 textContent；CSP、frame-ancestors、X-Frame-Options、nosniff、Referrer/Permissions/COOP/CORP 头持续强制 | 不要允许代理注入内联脚本；保持静态资源同源 |
-| 数据库/备份泄露 | SQLite 含全部历史和凭证哈希 | 主库启动时收紧为目录 `0700`、文件 `0600`；公网再验证所有者/权限 | 备份同样 `0600`、加密保存、限制保留期，不上传 issue/对象公开桶 |
+| 数据库/附件/备份泄露 | SQLite 含全部历史和凭证哈希，私有 blob 含文件原文 | 主库与附件根目录启动时收紧为目录 `0700`、文件 `0600`；Web 下载复核房间 ACL，Agent 下载同时复核当前同房 session 与固化接收名单；引用回复继承且不能扩大名单；快照只复制 SQLite 实际引用的 blob | 备份同样 `0600`、加密保存、限制保留期，不上传 issue/对象公开桶 |
+| 外链预览与 SSRF | 服务端若主动访问聊天链接，可能探测内网、云元数据或泄露来源地址 | 链接只校验并存储绝对 HTTP(S) URL，页面直接显示同源生成的链接卡；Bridge 不抓标题、图片、favicon 或任何远程预览 | 出口防火墙仍应阻止服务进程访问不必要的内网和云元数据地址 |
 | 日志泄密 | session、邀请、enrollment、注册码都可直接授权 | 应用错误不回显内部异常，Uvicorn access log 默认关闭，响应提供随机 request id | 代理日志不得记录 Authorization、Cookie、登记/邀请头或请求正文 |
 | 邮箱找回被枚举或劫持 | 攻击者可探测账户、复用链接或把令牌带入代理日志 | 未配置 SMTP 时完全关闭；统一找回响应、CAPTCHA/限流、单次短时哈希令牌、成功后撤销全部会话；链接 token 放在 URL fragment | SMTP 账户最小权限，邮件域配置 SPF/DKIM/DMARC，监控异常发送量 |
 
@@ -75,7 +76,7 @@ Web 注册有三种模式：
 2. 覆盖 `X-Forwarded-For`、`X-Forwarded-Proto=https`，不要信任客户端传入值。
 3. SSE 路径 `/api/events`、`/agent/events` 关闭响应缓冲，读取超时大于 60 秒。
 4. 对认证、注册、搜索和无效 token 使用共享限流；对同一 IP 的 SSE 并发数设上限。
-5. 请求体上限不高于应用的 70,000 字节；拒绝异常 Content-Length 和慢速上传。
+5. 普通 JSON/API 请求体上限不高于 70,000 字节；文件上传路径的整个请求不高于 26 MiB。拒绝异常 Content-Length、慢速上传和超额并发上传。
 6. 不缓存 HTML、API 或 SSE；只有版本化 `/assets/` 和头像可长缓存。
 7. 保存安全事件和 request id，但必须删去 Authorization、Cookie、邀请、enrollment、登记密钥、注册码和正文。
 
@@ -86,7 +87,7 @@ Web 注册有三种模式：
 3. 准备两个不同 secret 和 TLS/代理配置；先在临时端口运行公网模式预检。
 4. 验证错误 Host、HTTP、错误 Origin、无登记密钥、错误注册码和超大请求全部被拒绝。
 5. 验证已有 Web 用户、邀请 connector、enrollment 重连、SSE 和聊天室发言正常。
-6. 再切换反向代理流量。代码回滚必须使用发布前快照和当前维护工具演练，不能让任意旧版本直接改写已迁移到 schema 41 的生产库；撤回代理配置本身不会重建消息、session、connector 或 receipt。
+6. 再切换反向代理流量。代码回滚必须使用发布前快照和当前维护工具演练，不能让任意旧版本直接改写已迁移到 schema 42 的生产库；快照必须同时包含清单列出的附件 blob。撤回代理配置本身不会重建消息、session、connector 或 receipt。
 
 ## 6. 依据
 

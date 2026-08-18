@@ -21,6 +21,7 @@ from .web_auth import WEB_SESSION_COOKIE, WEB_SESSION_TTL_SECONDS
 PUBLIC_WEB_SESSION_COOKIE = "__Host-agent_bridge_web_session"
 PUBLIC_WEB_SESSION_TTL_SECONDS = 30 * 60
 MAX_REQUEST_BODY_BYTES = 70_000
+MAX_ASGI_REQUEST_BODY_BYTES = 26 * 1024 * 1024
 MIN_AGENT_REGISTRATION_SECRET_CHARS = 32
 MIN_WEB_REGISTRATION_SECRET_CHARS = 20
 DEFAULT_HSTS_SECONDS = 365 * 24 * 60 * 60
@@ -203,6 +204,17 @@ class ViewerSecurityPolicy:
                 "public mode refuses to start until the default admin password is changed"
             )
         _validate_private_database(Path(database).expanduser())
+        database_path = Path(database).expanduser().resolve()
+        attachment_root = Path(
+            os.environ.get(
+                "AGENT_BRIDGE_ATTACHMENT_ROOT",
+                str(database_path.parent / "attachments"),
+            )
+        ).expanduser().resolve()
+        _validate_private_directory(
+            attachment_root,
+            label="Agent Bridge attachment directory",
+        )
 
     def origin_allowed(self, origin: str | None) -> bool:
         if not self.public_mode:
@@ -468,6 +480,23 @@ def _validate_private_database(path: Path) -> None:
     if parent_mode & 0o022:
         raise ViewerSecurityConfigurationError(
             "Agent Bridge database directory must not be writable by group/others"
+        )
+
+
+def _validate_private_directory(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise ViewerSecurityConfigurationError(f"cannot access {label}") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ViewerSecurityConfigurationError(f"{label} must be a directory")
+    if metadata.st_uid != os.getuid():
+        raise ViewerSecurityConfigurationError(
+            f"{label} must be owned by the service account"
+        )
+    if metadata.st_mode & 0o077:
+        raise ViewerSecurityConfigurationError(
+            f"public mode requires {label} permissions 0700"
         )
 
 

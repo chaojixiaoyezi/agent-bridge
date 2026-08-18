@@ -872,12 +872,38 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const activeRoom = state.rooms.find((room) => room.conversation_id === state.selectedRoom);
   const message = elements.ownerMessageBody.value;
-  if (!activeRoom || activeRoom.status !== "active" || !message.trim()) return;
+  const hasStructuredContent = state.composerAttachments.length || state.composerLinks.length;
+  if (!activeRoom || activeRoom.status !== "active") return;
+  if (!message.trim() && !hasStructuredContent) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = "请输入文字，或添加文件、图片、链接。";
+    return;
+  }
   const slashTask = message.trimStart().startsWith("/任务");
   const taskMode = state.composerMode === "task" || slashTask;
   if (taskMode && !activeRoom.can_assign_tasks) {
     elements.ownerMessageFeedback.classList.add("error");
     elements.ownerMessageFeedback.textContent = "你没有在这个聊天室布置任务的权限。";
+    return;
+  }
+  if (taskMode && hasStructuredContent) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = "文件、图片和链接请用聊天模式发送；发送后仍可转为任务。";
+    return;
+  }
+  const mentionIds = selectedMentionIds(message);
+  const wakeAll = Boolean(state.composerWakeAll && activeRoom.can_wake_all);
+  let messageLinks;
+  try {
+    messageLinks = taskMode ? [] : composerLinksForMessage(message);
+  } catch (error) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = error.message;
+    return;
+  }
+  if (state.composerAttachments.length && !wakeAll && !mentionIds.length) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = "文件和图片必须先 @ 至少一个接收 Agent，或选择 @全员。";
     return;
   }
   elements.sendOwnerMessage.disabled = true;
@@ -888,25 +914,39 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
     const payload = taskMode
       ? {
           body: message,
-          target_participant_ids: selectedMentionIds(message),
+          target_participant_ids: mentionIds,
           reply_to: state.composerReplyTo,
         }
       : {
           body: message,
-          mentions: selectedMentionIds(message),
+          mentions: mentionIds,
+          links: messageLinks,
           reply_to: state.composerReplyTo,
-          wake_all_agents: Boolean(state.composerWakeAll && activeRoom.can_wake_all),
+          wake_all_agents: wakeAll,
         };
-    await fetchJson(`/api/rooms/${encodeURIComponent(activeRoom.conversation_id)}/${path}`, {
+    const requestOptions = {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
         "X-Agent-Bridge-Intent": taskMode ? "send-task" : "send-message",
       },
-      body: JSON.stringify(payload),
-    });
+    };
+    if (state.composerAttachments.length) {
+      const form = new FormData();
+      form.set("body", message);
+      form.set("mentions", JSON.stringify(mentionIds));
+      form.set("links", JSON.stringify(messageLinks));
+      form.set("reply_to", state.composerReplyTo || "");
+      form.set("wake_all_agents", String(wakeAll));
+      for (const item of state.composerAttachments) form.append("files", item.file, item.file.name);
+      requestOptions.body = form;
+    } else {
+      requestOptions.headers["Content-Type"] = "application/json";
+      requestOptions.body = JSON.stringify(payload);
+    }
+    await fetchJson(`/api/rooms/${encodeURIComponent(activeRoom.conversation_id)}/${path}`, requestOptions);
     elements.ownerMessageBody.value = "";
     state.composerMentions.clear();
+    clearComposerAssets();
     clearComposerContext();
     hideMentionMenu();
     elements.ownerMessageFeedback.classList.add("success");
@@ -934,8 +974,73 @@ elements.wakeAllAgents.addEventListener("click", () => {
   if (!activeRoom?.can_wake_all || activeRoom.status !== "active") return;
   state.composerWakeAll = !state.composerWakeAll;
   if (state.composerWakeAll) state.composerReplyTo = null;
+  renderComposerAssets();
   updateComposerContext();
   elements.ownerMessageBody.focus();
+});
+
+elements.chooseComposerFiles.addEventListener("click", () => {
+  if (state.composerMode === "task") return;
+  elements.composerFileInput.click();
+});
+elements.composerFileInput.addEventListener("change", () => {
+  try {
+    addComposerFiles(elements.composerFileInput.files || []);
+    elements.ownerMessageFeedback.classList.remove("error");
+    elements.ownerMessageFeedback.textContent = "已加入消息；请确认定向接收 Agent。";
+  } catch (error) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = error.message;
+  } finally {
+    elements.composerFileInput.value = "";
+  }
+});
+elements.toggleComposerLink.addEventListener("click", () => {
+  if (state.composerMode === "task") return;
+  elements.composerLinkEntry.hidden = !elements.composerLinkEntry.hidden;
+  if (!elements.composerLinkEntry.hidden) elements.composerLinkUrl.focus();
+});
+elements.cancelComposerLink.addEventListener("click", () => {
+  elements.composerLinkEntry.hidden = true;
+  elements.composerLinkUrl.value = "";
+});
+function commitComposerLink() {
+  try {
+    addComposerLink(elements.composerLinkUrl.value);
+    elements.ownerMessageFeedback.classList.remove("error");
+    elements.ownerMessageFeedback.textContent = "链接已作为可点击卡片加入消息。";
+  } catch (error) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = error.message;
+  }
+}
+elements.addComposerLink.addEventListener("click", commitComposerLink);
+elements.composerLinkUrl.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    commitComposerLink();
+  } else if (event.key === "Escape") {
+    elements.cancelComposerLink.click();
+  }
+});
+elements.ownerMessageForm.addEventListener("dragover", (event) => {
+  if (!event.dataTransfer?.types.includes("Files") || state.composerMode === "task") return;
+  event.preventDefault();
+  elements.ownerMessageForm.classList.add("drop-target");
+});
+elements.ownerMessageForm.addEventListener("dragleave", () => {
+  elements.ownerMessageForm.classList.remove("drop-target");
+});
+elements.ownerMessageForm.addEventListener("drop", (event) => {
+  elements.ownerMessageForm.classList.remove("drop-target");
+  if (!event.dataTransfer?.files?.length || state.composerMode === "task") return;
+  event.preventDefault();
+  try {
+    addComposerFiles(event.dataTransfer.files);
+  } catch (error) {
+    elements.ownerMessageFeedback.classList.add("error");
+    elements.ownerMessageFeedback.textContent = error.message;
+  }
 });
 
 elements.ownerMessageBody.addEventListener("keydown", (event) => {
@@ -956,7 +1061,24 @@ elements.ownerMessageBody.addEventListener("keydown", (event) => {
     elements.ownerMessageForm.requestSubmit();
   }
 });
-elements.ownerMessageBody.addEventListener("input", updateMentionMenu);
+elements.ownerMessageBody.addEventListener("input", () => {
+  updateMentionMenu();
+  renderComposerAssets();
+  updateComposerContext();
+});
+elements.ownerMessageBody.addEventListener("paste", (event) => {
+  if (state.composerMode === "task") return;
+  const pasted = event.clipboardData?.getData("text/plain")?.trim() || "";
+  if (!/^https?:\/\/\S+$/iu.test(pasted)) return;
+  try {
+    addComposerLink(pasted);
+  } catch (error) {
+    return;
+  }
+  event.preventDefault();
+  elements.ownerMessageFeedback.classList.remove("error");
+  elements.ownerMessageFeedback.textContent = "已识别为链接卡片；不会当作普通文字，也不会抓取远程预览。";
+});
 elements.ownerMessageBody.addEventListener("click", updateMentionMenu);
 elements.ownerMessageBody.addEventListener("blur", () => window.setTimeout(hideMentionMenu, 120));
 

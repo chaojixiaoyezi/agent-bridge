@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -486,6 +487,64 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             ).to_have_count(50)
             assert "跨聊天室" in page.locator("#history-search-feedback").inner_text()
             page.locator("#close-history-governance").click()
+
+            page.locator("#global-tools-menu").evaluate(
+                "element => { element.open = false; }"
+            )
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+                "/w8AAusB9Y9Z4L8AAAAASUVORK5CYII="
+            )
+            page.locator("#composer-file-input").set_input_files(
+                {
+                    "name": "browser-evidence.png",
+                    "mimeType": "image/png",
+                    "buffer": png,
+                }
+            )
+            playwright_api.expect(page.locator("#composer-asset-tray")).to_be_visible()
+            playwright_api.expect(
+                page.locator("#composer-asset-recipient")
+            ).to_contain_text("需要先 @")
+            page.locator("#toggle-composer-link").click()
+            page.locator("#composer-link-url").fill("https://example.com/browser-spec")
+            page.locator("#add-composer-link").click()
+            composer_textarea.fill("请结合图片和链接检查这项内容。")
+            page.locator("#send-owner-message").click()
+            playwright_api.expect(
+                page.locator("#owner-message-feedback")
+            ).to_contain_text("必须先 @")
+
+            page.locator("#wake-all-agents").click()
+            playwright_api.expect(
+                page.locator("#composer-asset-recipient")
+            ).to_contain_text("当前全部 Agent")
+            with page.expect_response(
+                lambda response: response.url.endswith(
+                    "/api/rooms/browser-room-two/messages"
+                )
+                and response.request.method == "POST"
+                and response.status == 201
+            ):
+                page.locator("#send-owner-message").click()
+            playwright_api.expect(
+                page.locator("#timeline article[data-message-id]")
+            ).to_have_count(5)
+            composite_message = page.locator(
+                "#timeline article[data-message-id]"
+            ).last
+            playwright_api.expect(
+                composite_message.locator(".restricted-message-badge")
+            ).to_have_text("定向内容")
+            playwright_api.expect(
+                composite_message.locator(".message-image-card")
+            ).to_have_count(1)
+            playwright_api.expect(
+                composite_message.locator(".message-link-card")
+            ).to_have_count(1)
+            playwright_api.expect(
+                composite_message.locator(".message-visibility-label")
+            ).to_contain_text("发送时本聊天室的全部 Agent")
 
             page.set_viewport_size({"width": 390, "height": 844})
             page.wait_for_timeout(100)

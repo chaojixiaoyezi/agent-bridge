@@ -688,16 +688,18 @@ class NativeSessionMixin:
                 continue
             if self._native_event_message_requires_reply(row):
                 required_message_ids.append(message_id)
-            messages.append(
-                self._message_payload(
-                    row,
-                    authorization=self._chat_authorization_for_message_locked(
-                        conn,
-                        message_id=message_id,
-                        recipient_participant_id=str(event["participant_id"]),
-                    ),
-                )
+            payload = self._message_payload(
+                row,
+                authorization=self._chat_authorization_for_message_locked(
+                    conn,
+                    message_id=message_id,
+                    recipient_participant_id=str(event["participant_id"]),
+                ),
             )
+            payload.update(
+                self._message_asset_projection_locked(conn, [message_id])[message_id]
+            )
+            messages.append(payload)
         state = str(event["state"])
         return {
             "event_id": str(event["event_id"]),

@@ -183,6 +183,9 @@ function createMessageElement(message) {
   const signature = message.sender_signature || message.sender_alias || "未填写签名";
   senderLine.append(makeElement("span", "client-label", `${signature} · ${message.sender_client_type}`));
   senderLine.append(makeElement("span", "route-badge", routeLabel(message)));
+  if (message.visibility?.kind === "restricted") {
+    senderLine.append(makeElement("span", "restricted-message-badge", "定向内容"));
+  }
   for (const marker of messageMarkers) {
     const markerLabel = marker.marker_kind === "decision" ? "决策" : "置顶";
     const markerBadge = makeElement(
@@ -211,7 +214,68 @@ function createMessageElement(message) {
   head.append(senderLine);
   head.append(makeElement("time", "message-time", fullTime(message.created_at)));
   article.append(head);
-  article.append(makeElement("p", "message-body", message.body));
+  if (message.body) article.append(makeElement("p", "message-body", message.body));
+
+  if (message.visibility?.kind === "restricted") {
+    const recipients = message.visibility.recipients || [];
+    const targetLabel = message.visibility.target_kind === "room_agents"
+      ? "发送时本聊天室的全部 Agent"
+      : recipients.map((item) => item.display_name || item.client_type || item.participant_id).join("、");
+    article.append(makeElement(
+      "p",
+      "message-visibility-label",
+      `仅 ${targetLabel || "指定 Agent"} 可读取此消息的文字、链接和附件`,
+    ));
+  }
+
+  if (message.attachments?.length) {
+    const assets = makeElement("div", "message-assets");
+    for (const attachment of message.attachments) {
+      const url = `/api/rooms/${encodeURIComponent(message.conversation_id)}/attachments/${encodeURIComponent(attachment.attachment_id)}`;
+      if (attachment.kind === "image") {
+        const link = makeElement("a", "message-image-card");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.title = `${attachment.filename} · ${formatBytes(attachment.size_bytes)}`;
+        const image = document.createElement("img");
+        image.src = url;
+        image.alt = attachment.filename;
+        image.loading = "lazy";
+        image.decoding = "async";
+        link.append(image);
+        assets.append(link);
+      } else {
+        const link = makeElement("a", "message-file-card");
+        link.href = url;
+        link.download = attachment.filename;
+        link.append(makeElement("span", "message-file-mark", "FILE"));
+        const copy = makeElement("span", "message-file-copy");
+        copy.append(makeElement("strong", "", attachment.filename));
+        copy.append(makeElement("small", "", `${formatBytes(attachment.size_bytes)} · 下载并由本地权限决定如何使用`));
+        link.append(copy);
+        assets.append(link);
+      }
+    }
+    article.append(assets);
+  }
+
+  if (message.links?.length) {
+    const links = makeElement("div", "message-links");
+    for (const item of message.links) {
+      const link = makeElement("a", "message-link-card");
+      link.href = item.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.append(makeElement("span", "message-link-mark", "↗"));
+      const copy = makeElement("span", "message-link-copy");
+      copy.append(makeElement("strong", "", item.host));
+      copy.append(makeElement("small", "", item.display));
+      link.append(copy);
+      links.append(link);
+    }
+    article.append(links);
+  }
 
   if (message.task) {
     const task = message.task;
@@ -321,7 +385,7 @@ function createMessageElement(message) {
   }
   article.append(makeElement("p", "receipt-label", `#${roomSequence(message)} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
 
-  if (message.refs.length) {
+  if (message.refs?.length) {
     const refs = makeElement("div", "ref-list");
     for (const ref of message.refs) {
       const label = ref.label ? `${ref.label} · ` : "";
@@ -412,7 +476,8 @@ function createMessageElement(message) {
     }
     article.append(knowledgeActions);
   }
-  if (isAdmin() && message.message_kind !== "forward" && state.rooms.some(
+  if (isAdmin() && message.message_kind !== "forward"
+    && message.visibility?.kind !== "restricted" && state.rooms.some(
     (room) => room.status === "active" && room.conversation_id !== message.conversation_id
   )) {
     const forwardButton = makeElement("button", "message-reply-button forward-button", "转发");
@@ -435,7 +500,7 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${item.reply_count || 0}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${item.reply_count || 0}:${item.visibility?.kind || "room"}:${(item.attachments || []).map((asset) => asset.attachment_id).join(",")}:${(item.links || []).map((link) => link.link_id).join(",")}`).join("|")}`;
 }
 
 function renderMessages(

@@ -14,7 +14,7 @@ for entrypoint in bin/*; do sh -n "$entrypoint"; done
 git diff --check
 ```
 
-默认 `pytest` 使用临时 SQLite，覆盖 schema 迁移、身份与房间隔离、消息和投递账、SSE 重放、MCP stdio、listener/supervisor 重试、Codex/Claude/native TUI 契约、Web 权限、安全边界、快照恢复和 viewer-only 发布。`browser` 与 `live_codex` 测试默认只标记跳过，不会连接用户浏览器或调用真实模型。
+默认 `pytest` 使用临时 SQLite，覆盖 schema 迁移、身份与房间隔离、消息和投递账、定向附件接收名单、结构化链接、鉴权下载、SSE 重放、MCP stdio、listener/supervisor 重试、Codex/Claude/native TUI 契约、Web 权限、安全边界、含附件快照恢复和 viewer-only 发布。`browser` 与 `live_codex` 测试默认只标记跳过，不会连接用户浏览器或调用真实模型。
 
 其中 `tests/test_reliability_scenarios.py` 是不依赖模型输出的 P1 可靠性门禁：
 
@@ -44,7 +44,7 @@ AGENT_BRIDGE_BROWSER_CHANNEL=chrome \
 uv run pytest tests/test_browser_e2e.py -s
 ```
 
-它启动随机 loopback 端口和临时数据库，验证登录、首次改密、聊天优先布局、房间切换、滚动锚点、侧栏、主题、窄屏和资源/耗时门禁。测试不读取生产 Cookie、房间或 `bridge.db`。
+它启动随机 loopback 端口和临时数据库，验证登录、首次改密、聊天优先布局、房间切换、滚动锚点、侧栏、主题、文件选择与本地图片预览、未指定 Agent 时阻止附件发送、`@全员` 复合消息、结构化链接卡、窄屏和资源/耗时门禁。测试不读取生产 Cookie、房间或 `bridge.db`。
 
 ## 3. 真实 Codex 隔离冒烟
 
@@ -71,7 +71,7 @@ uv run pytest tests/test_live_codex_e2e.py -s
 
 ## 4. 发布合同
 
-CI 的 `Migration, security, and release contracts` 单独核对旧库就地迁移、消息行数、公开模式 fail-closed、私有房间 ACL、凭证轮换、运行主租约和快照恢复。发布前还应运行：
+CI 的 `Migration, security, and release contracts` 单独核对旧库就地迁移、消息行数、定向附件 ACL、公开模式 fail-closed、私有房间 ACL、凭证轮换、运行主租约和含附件快照恢复。发布前还应运行：
 
 ```bash
 bin/agent-bridge-maintain --database "$PWD/bridge.db" \

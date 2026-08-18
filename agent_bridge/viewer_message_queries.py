@@ -4,10 +4,11 @@ import json
 import sqlite3
 from typing import Any
 
+from .message_assets import MessageAssetMixin
 from .validation import conversation_id as validate_conversation_id
 
 
-class ViewerMessageQueries:
+class ViewerMessageQueries(MessageAssetMixin):
     """Read-only message, thread, search, and receipt projections."""
 
     def messages(
@@ -161,12 +162,20 @@ class ViewerMessageQueries:
                 """,
                 parameters,
             ).fetchall()
+            projections = self._message_asset_projection_locked(
+                connection,
+                [str(row["message_id"]) for row in rows],
+            )
         ordered_rows = (
             rows
             if after_sequence is not None or around_sequence is not None
             else reversed(rows)
         )
-        result = [self._message_payload(row) for row in ordered_rows]
+        result = []
+        for row in ordered_rows:
+            payload = self._message_payload(row)
+            payload.update(projections[str(row["message_id"])])
+            result.append(payload)
         return result
 
     def message_thread(
@@ -224,9 +233,17 @@ class ViewerMessageQueries:
                     normalized_limit + 1,
                 ),
             ).fetchall()
+            projections = self._message_asset_projection_locked(
+                connection,
+                [str(row["message_id"]) for row in rows],
+            )
         has_more = total_reply_count + 1 > normalized_limit
         page = rows[:normalized_limit]
-        messages = [self._thread_message_payload(row) for row in page]
+        messages = []
+        for row in page:
+            payload = self._thread_message_payload(row)
+            payload.update(projections[str(row["message_id"])])
+            messages.append(payload)
         return {
             "conversation_id": conversation,
             "root_message_id": root_message_id,
@@ -448,8 +465,13 @@ class ViewerMessageQueries:
         clauses = ["message.conversation_id = ?"]
         parameters: list[Any] = [conversation]
         if normalized_query:
-            clauses.append("instr(lower(message.body), lower(?)) > 0")
-            parameters.append(normalized_query)
+            clauses.append(
+                "(instr(lower(message.body), lower(?)) > 0 OR EXISTS ("
+                "SELECT 1 FROM message_links AS searched_link "
+                "WHERE searched_link.message_id = message.message_id "
+                "AND instr(lower(searched_link.url), lower(?)) > 0))"
+            )
+            parameters.extend((normalized_query, normalized_query))
         if normalized_sender is not None:
             clauses.append("message.sender_participant_id = ?")
             parameters.append(normalized_sender)
@@ -615,9 +637,14 @@ class ViewerMessageQueries:
         if normalized_query:
             clauses.append(
                 "(instr(lower(message.body), lower(?)) > 0 "
-                "OR instr(lower(message.conversation_id), lower(?)) > 0)"
+                "OR instr(lower(message.conversation_id), lower(?)) > 0 "
+                "OR EXISTS (SELECT 1 FROM message_links AS searched_link "
+                "WHERE searched_link.message_id = message.message_id "
+                "AND instr(lower(searched_link.url), lower(?)) > 0))"
             )
-            parameters.extend((normalized_query, normalized_query))
+            parameters.extend(
+                (normalized_query, normalized_query, normalized_query)
+            )
         if normalized_conversation is not None:
             clauses.append("message.conversation_id = ?")
             parameters.append(normalized_conversation)

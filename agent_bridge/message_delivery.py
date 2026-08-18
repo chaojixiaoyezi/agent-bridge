@@ -1040,8 +1040,13 @@ class MessageDeliveryMixin:
                 if delivered is not None:
                     delivered_rows.append(delivered)
         with self._connection() as conn:
-            return [
-                self._message_payload(
+            projections = self._message_asset_projection_locked(
+                conn,
+                [str(row["message_id"]) for row in delivered_rows],
+            )
+            messages = []
+            for row in delivered_rows:
+                payload = self._message_payload(
                     row,
                     authorization=self._chat_authorization_for_message_locked(
                         conn,
@@ -1049,8 +1054,9 @@ class MessageDeliveryMixin:
                         recipient_participant_id=participant_id,
                     ),
                 )
-                for row in delivered_rows
-            ]
+                payload.update(projections[str(row["message_id"])])
+                messages.append(payload)
+            return messages
 
     def _apply_room_wake_policies(
         self,

@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.24 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.43.0 / schema 42。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -10,7 +10,7 @@
 2. SSE 只发送不含正文的唤醒元数据。断线、休眠或 listener 停止不会删除消息。
 3. 每台 Agent 机器的 `wake-queue.db` 是“中央事件已到本机、产品暂未成功处理”的持久权威。
 4. Agent 产品必须在收到唤醒后自行读取 Bridge，聊天室正文不能通过 adapter 命令行传入。聊天授权功能当前冻结：普通正文、引用、复制和转述都不能靠自然语言扩大本机权限；旧 `message.authorization` 仅作兼容元数据，不得被聊天 worker 执行。只有服务器根据房间任务权限写入 `room_tasks`/`room_task_inputs` 的结构化输入能进入本体执行席。兼容 connector 可把有权限 Web 用户的结构化个人 `@` 路由到 task 席；目标进入 `native_preferred` 后，普通 `@` 改由绑定 TUI 处理，只有显式 `/任务`/任务模式进入独立执行席。
-5. 房间消息对所有成员可见。`mentions` 和旧 `audience_kind=participant` 都是公开 @，不是私信。
+5. 普通房间消息对所有成员可见，`mentions` 和旧 `audience_kind=participant` 都只是公开 @。唯一内容可见性例外是 Web 文件/图片复合消息：发送时由服务端把结构化个人 @ 或当时的 `@全员` Agent 固化为不可扩大的接收名单，未列入者在 history/search/wait/native/task/download 各入口都不可见；同条文字和结构化链接随附件一起受限，引用回复继承且不能扩大原名单。链接单独发送时仍是公开的一等消息内容，服务端禁止抓取远程预览。房间授权 Web 用户保留管理与审计视图。
 6. session token 只在 listener 或 MCP 进程内存中存在；单次或多人复用邀请的原始 token 都只在创建响应出现一次；数据库对 session、邀请和 enrollment 都只存哈希。enrollment 原文只能保存在接收方权限 `0600` 的专用文件，不能进入 plist/systemd 环境值、参数、日志或 cursor。
 7. Web 用户与 Agent 身份是两条独立认证链：看板 `/api/*` 使用 Web session Cookie；Agent 不登录 Web 账户，新接入通过结构化邀请获得 Agent session。`/agent/register` 只用于 connector enrollment、显式固定常驻进程或受控迁移，普通全局 MCP/TUI 任务必须在客户端先 fail closed，生产 viewer 还必须用独立登记密钥做服务端兜底。不要把 Web、邀请、enrollment 和全局登记授权合并成共享 token。
 8. Web 房间默认私有：全局管理员看全部房间，普通 Web 用户只看自己创建或被明确加入的房间。所有读取、搜索、回执、成员、策略、任务和发送入口都必须在服务端复核 `room_web_members`/`room_web_owners`，不能依赖侧栏隐藏；移出 Web 用户不得改动 Agent 成员、Agent session 或历史消息。普通 Web 用户默认不能创建聊天室；管理员可单独授权并设置上限（默认 2）。创建者是房间所有者，可重命名、管理本房 Web 成员和 Agent、调整唤醒、邀请 Agent、使用 `@全员` 并委派聊天室管理员；受委派管理员可做日常成员/Agent/唤醒治理，但不能管理同级、重命名或自动获得任务权限。跨房迁移、全局 Agent session、注册码、昵称审批和频率策略仍须全局管理员。Agent 自建房间继续保留原有“两间使用中房间”配额。
@@ -39,7 +39,7 @@
 | 组件 | 入口 | 职责 |
 |---|---|---|
 | 中央网页/API | `bin/agent-bridge-viewer` | Web 登录/注册、房间、历史、身份、投递账、SSE、管理员审批 |
-| MCP | `bin/agent-bridge-mcp` | Agent 登记、读取、回复、ack、历史分页 |
+| MCP | `bin/agent-bridge-mcp` | Agent 登记、读取、回复、ack、历史分页和接收名单内附件的校验下载 |
 | listener | `bin/agent-bridge-listen` | 保持 SSE，自动重新登记，把元数据交给本机 sink |
 | 通用 supervisor | `bin/agent-bridge-supervisor` | 任意产品 adapter 的持久本机队列和同步兼容入口 |
 | Codex worker | `bin/agent-bridge-codex-worker` | 独立持久 Codex task、app-server、turn steering 和工具完成证据 |
@@ -131,7 +131,7 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认新普通用户初始房间列表为空，只有被管理员加入或自己获准创建的房间可读写；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 41。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 42。
 
 v0.33.0 不增加 schema 或服务端 API。Web 看板改为聊天优先的固定三栏：左右栏使用固定窄宽度，成员栏默认折叠，两个侧栏都可独立展开并把偏好只保存在当前浏览器；窄屏侧栏改为覆盖式抽屉，不再把消息区向下挤走。顶部全局入口、房间治理入口和房间搜索分别收进原生 `details` 工具组，待回复、发送和回到底部仍常驻。发布只需要 viewer-only 滚动重启，不应重启或重建 Agent、connector、session、消息与房间历史。
 
@@ -234,6 +234,8 @@ v0.42.22 保持 schema 41、接口、权限和聊天室投递语义不变，把 
 v0.42.23 保持 schema 41、接口、权限、消息正文和 Agent 投递语义不变，在全局系统顶栏与聊天室之间增加与左右栏同尺寸的上下折叠按钮；收起后仍保留恢复入口，并把释放的 46px 高度交给聊天面板。信息密度由两级扩为“简洁/标准/详细”：真正简洁模式的每条消息只显示头像、名字、正文和回复，标准模式承接旧版 `compact` 偏好，详细模式保持原完整投影。顶部栏、密度和既有边界状态仍只写当前浏览器 localStorage；全局工具弹层固定在聊天面板之上，折叠和切换继续保持当前阅读锚点。现有 Agent/worker/TUI 不重启。验证证据见 [web-topbar-density-v0.42.23-2026-08-18.json](evidence/web-topbar-density-v0.42.23-2026-08-18.json)。
 
 v0.42.24 保持 schema 41、接口、权限、消息正文和 Agent 投递语义不变，在真正简洁模式中恢复发送时间，并把时间紧跟在发送者名字右侧；长名字允许在狭窄聊天区内收缩，时间不会重新顶到消息行最右端。标准与详细模式布局不变，现有 Agent/worker/TUI 不重启。验证证据见 [web-simple-time-v0.42.24-2026-08-18.json](evidence/web-simple-time-v0.42.24-2026-08-18.json)。
+
+v0.43.0 将 schema 增量升级为 42，增加不可变的消息接收名单、私有附件元数据与结构化链接表。Web 可把文字、链接和最多 5 个文件/图片组成一条消息；存在附件时必须结构化 @ Agent 或使用有权限的 `@全员`，且整条消息只投递、检索和展示给发送时固化的 Agent，后加入者不会继承，引用回复也只能继承或缩小原名单。链接单独发送仍是公开卡片，Bridge 不抓取远程预览。附件字节写入数据库旁权限 `0700/0600` 的私有 blob 目录，Agent 只能用当前同房 session 和接收名单经 `agent_download_attachment` 原子校验下载；Web 下载继续复核房间 ACL。快照会复制 SQLite 实际引用的 blob，同时仍能在升级前读取没有附件表的 schema 41 数据库。旧消息、房间序号、普通公开 @、现有 Agent session、connector、listener、worker 和 TUI 进程不重建。验证证据见 [restricted-message-assets-v0.43.0-2026-08-18.json](evidence/restricted-message-assets-v0.43.0-2026-08-18.json)。
 
 v0.42.21 保持 schema 41、接口、权限和聊天室投递语义不变，继续修正 Web 看板视觉：聊天室侧栏的新建与收缩按钮进入同一 82px 控制槽，使用相同 34px 尺寸和精确纵坐标，展开态不再出现一高一低；系统管理中的原生配色下拉改为六张可键盘切换的氛围卡，同时预览背景、面板、强调色与冷暖感。补齐独立“青岚”深色主题，并让六套主题共同驱动背景光晕、细网格和半透明面板高光；隐藏的原生 select 继续保留兼容。现有 Agent/worker/TUI 不重启。验证证据见 [web-atmosphere-theme-studio-2026-08-18.json](evidence/web-atmosphere-theme-studio-2026-08-18.json)。
 

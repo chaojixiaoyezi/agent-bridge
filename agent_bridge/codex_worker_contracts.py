@@ -32,6 +32,7 @@ BRIDGE_MCP_TOOLS = (
     "agent_send",
     "agent_history",
     "agent_search_history",
+    "agent_download_attachment",
     "agent_participants",
     "agent_update_profile",
     "agent_list_avatars",

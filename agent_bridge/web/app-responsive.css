@@ -63,6 +63,13 @@
   .room-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
   .sync-time { display: none; }
   .timeline-heading-tools { gap: 5px; }
+  .composer-actions { align-items: flex-end; }
+  .composer-left-actions { flex-wrap: wrap; gap: 6px; }
+  .composer-feedback { flex-basis: 100%; }
+  .composer-link-entry { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .composer-link-entry .quiet-icon-button { grid-column: 3; grid-row: 1; }
+  .composer-link-entry .secondary-button { grid-column: 2 / -1; }
+  .message-image-card { width: min(260px, 100%); }
   .tool-menu > summary { height: 30px; padding: 0 8px; font-size: 9px; }
   .room-message-search-shell { width: min(560px, calc(100vw - 34px)); }
   .room-message-search { grid-template-columns: minmax(100px, .45fr) minmax(120px, 1fr) auto; }

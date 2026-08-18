@@ -493,6 +493,10 @@
   padding: 13px 18px 15px;
   background: rgba(7, 9, 14, .72);
 }
+.message-composer.drop-target {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--cyan) 72%, transparent);
+  background: color-mix(in srgb, var(--cyan-soft) 48%, var(--surface-strong));
+}
 .composer-resize-bar {
   position: relative;
   flex: none;
@@ -610,11 +614,112 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .mention-option:hover { background: rgba(85,214,199,.08); }
 .mention-option strong { color: var(--cyan); font-size: 11px; }
 .mention-option span { overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.composer-link-entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, var(--purple) 24%, var(--line));
+  border-radius: 11px;
+  color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 6%, var(--surface-soft));
+}
+.composer-link-entry[hidden] { display: none; }
+.composer-link-entry input {
+  min-width: 0;
+  border: 0;
+  outline: none;
+  color: var(--text);
+  background: transparent;
+  font-size: 10px;
+}
+.quiet-icon-button {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.composer-asset-tray {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 18%, var(--line));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--cyan-soft) 30%, var(--surface-soft));
+}
+.composer-asset-tray[hidden] { display: none; }
+.composer-asset-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.composer-asset-summary strong { color: var(--muted-strong); font-size: 9px; }
+.composer-asset-summary span { color: var(--cyan); font-size: 9px; text-align: right; }
+.composer-asset-summary span.warning { color: var(--danger); }
+.composer-asset-items { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 1px; }
+.composer-asset-item {
+  min-width: 150px;
+  max-width: 220px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-strong) 82%, transparent);
+}
+.composer-asset-item img { width: 34px; height: 34px; flex: none; border-radius: 7px; object-fit: cover; }
+.composer-file-mark,
+.composer-link-mark {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  flex: none;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 12%, var(--surface-soft));
+  font-size: 8px;
+  font-weight: 800;
+}
+.composer-link-mark { color: var(--cyan); background: var(--cyan-soft); font-size: 15px; }
+.composer-asset-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.composer-asset-copy strong,
+.composer-asset-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-asset-copy strong { color: var(--text); font-size: 9px; }
+.composer-asset-copy small { color: var(--muted); font-size: 8px; }
+.composer-asset-remove {
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  flex: none;
+  border: 0;
+  border-radius: 50%;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.composer-asset-remove:hover { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .composer-actions { min-height: 36px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 8px; }
 .composer-left-actions { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .composer-mode { display: inline-flex; flex: none; padding: 2px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-soft); }
 .composer-mode-button { padding: 4px 9px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; font-size: 9px; cursor: pointer; }
 .composer-mode-button.active { color: var(--surface-strong); background: var(--cyan); }
+.composer-content-tools { display: inline-flex; align-items: center; gap: 4px; }
+.composer-content-button {
+  height: 27px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted-strong);
+  background: transparent;
+  font-size: 9px;
+  cursor: pointer;
+}
+.composer-content-button:hover { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--line)); background: var(--cyan-soft); }
+.composer-content-button:disabled { cursor: not-allowed; opacity: .42; }
 .composer-action-buttons { display: flex; align-items: center; gap: 8px; }
 #wake-all-agents.active { color: #061412; border-color: var(--cyan); background: var(--cyan); }
 .composer-feedback { color: var(--muted); font-size: 10px; }
@@ -648,6 +753,76 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 }
 
 .message:last-child { padding-bottom: 5px; }
+.restricted-message-badge {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--purple) 30%, var(--line));
+  border-radius: 999px;
+  color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 8%, transparent);
+  font-size: 8px;
+}
+.message-visibility-label {
+  margin: 7px 0 0;
+  color: var(--purple);
+  font-size: 9px;
+}
+.message-assets,
+.message-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.message-image-card {
+  width: min(210px, 46%);
+  max-height: 190px;
+  display: block;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+.message-image-card img { width: 100%; height: 100%; max-height: 190px; display: block; object-fit: cover; }
+.message-file-card,
+.message-link-card {
+  min-width: min(260px, 100%);
+  max-width: 420px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  color: inherit;
+  text-decoration: none;
+  background: color-mix(in srgb, var(--surface-soft) 82%, transparent);
+}
+.message-file-card:hover,
+.message-link-card:hover { border-color: color-mix(in srgb, var(--cyan) 30%, var(--line)); background: var(--cyan-soft); }
+.message-file-mark,
+.message-link-mark {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 10%, var(--surface-soft));
+  font-size: 8px;
+  font-weight: 800;
+}
+.message-link-mark { color: var(--cyan); background: var(--cyan-soft); font-size: 16px; }
+.message-file-copy,
+.message-link-copy { min-width: 0; display: grid; gap: 3px; }
+.message-file-copy strong,
+.message-file-copy small,
+.message-link-copy strong,
+.message-link-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-file-copy strong,
+.message-link-copy strong { color: var(--text); font-size: 10px; }
+.message-file-copy small,
+.message-link-copy small { color: var(--muted); font-size: 8px; }
 .message-head { justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .sender-line { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .message-avatar { width: 27px; height: 27px; border-radius: 9px; }
@@ -903,10 +1078,12 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
   white-space: nowrap;
 }
 .workspace.simple-view .message-head .sender-line > :not(.message-avatar):not(strong),
-.workspace.simple-view .message > :not(.message-head):not(.message-body):not(.message-direct-reply) {
+.workspace.simple-view .message > :not(.message-head):not(.message-body):not(.message-assets):not(.message-links):not(.message-direct-reply) {
   display: none !important;
 }
 .workspace.simple-view .message-body { margin-left: 40px; font-size: 13px; line-height: 1.58; }
+.workspace.simple-view .message-assets,
+.workspace.simple-view .message-links { margin-left: 40px; }
 .workspace.simple-view .message-direct-reply {
   margin: 5px 0 0 40px;
   padding: 2px 0;

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -103,6 +104,7 @@ def create_snapshot(
     output_root: str | Path,
     viewer_plist: str | Path | None = None,
     connector_queues_root: str | Path | None = None,
+    attachment_root: str | Path | None = None,
     label: str | None = None,
     repo_root: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -129,6 +131,66 @@ def create_snapshot(
                 role="central",
             )
         )
+
+        resolved_attachment_root = (
+            Path(attachment_root).expanduser().resolve()
+            if attachment_root is not None
+            else Path(
+                os.environ.get(
+                    "AGENT_BRIDGE_ATTACHMENT_ROOT",
+                    str(source_database.parent / "attachments"),
+                )
+            ).expanduser().resolve()
+        )
+        with _readonly_sqlite(partial / relative_database) as snapshot_connection:
+            attachment_table_exists = snapshot_connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'message_attachments'"
+            ).fetchone()
+            attachment_ids = (
+                [
+                    str(row[0])
+                    for row in snapshot_connection.execute(
+                        "SELECT attachment_id FROM message_attachments "
+                        "ORDER BY attachment_id"
+                    ).fetchall()
+                ]
+                if attachment_table_exists is not None
+                else []
+            )
+        for attachment_id in attachment_ids:
+            source_attachment = (
+                resolved_attachment_root
+                / "blobs"
+                / attachment_id[-2:]
+                / f"{attachment_id}.blob"
+            )
+            if not source_attachment.is_file():
+                raise MaintenanceError(
+                    "referenced message attachment is missing: "
+                    f"{source_attachment}"
+                )
+            relative_attachment = (
+                Path("attachments")
+                / "blobs"
+                / attachment_id[-2:]
+                / f"{_safe_snapshot_label(attachment_id)}.blob"
+            )
+            destination_attachment = partial / relative_attachment
+            _secure_directory(destination_attachment.parent)
+            shutil.copyfile(source_attachment, destination_attachment)
+            _secure_file(destination_attachment)
+            artifacts.append(
+                {
+                    "kind": "file",
+                    "role": "message_attachment",
+                    "attachment_id": attachment_id,
+                    "source": str(source_attachment),
+                    "path": relative_attachment.as_posix(),
+                    "size_bytes": destination_attachment.stat().st_size,
+                    "sha256": _sha256(destination_attachment),
+                }
+            )
 
         if connector_queues_root is not None:
             queue_root = Path(connector_queues_root).expanduser().resolve()
@@ -304,18 +366,45 @@ def rehearse_restore(
     if root is not None:
         _secure_directory(root)
     with tempfile.TemporaryDirectory(prefix="agent-bridge-restore-", dir=root) as tmp:
-        rehearsal_database = Path(tmp) / "bridge.db"
+        rehearsal_root = Path(tmp)
+        rehearsal_database = rehearsal_root / "bridge.db"
         source = _artifact_path(bundle, central_artifacts[0]["path"])
         shutil.copyfile(source, rehearsal_database)
         _secure_file(rehearsal_database)
+        attachment_artifacts = [
+            artifact
+            for artifact in manifest["artifacts"]
+            if isinstance(artifact, dict)
+            and artifact.get("kind") == "file"
+            and artifact.get("role") == "message_attachment"
+        ]
+        for artifact in attachment_artifacts:
+            attachment_source = _artifact_path(bundle, artifact["path"])
+            attachment_destination = rehearsal_root / str(artifact["path"])
+            _secure_directory(attachment_destination.parent)
+            shutil.copyfile(attachment_source, attachment_destination)
+            _secure_file(attachment_destination)
         before = database_diagnostics(rehearsal_database)
-        BridgeStore(rehearsal_database)
+        restored_store = BridgeStore(rehearsal_database)
         after = database_diagnostics(rehearsal_database)
         _assert_database_healthy(after, label="restored rehearsal database")
         if after["user_version"] < before["user_version"]:
             raise MaintenanceError("restore rehearsal reduced the schema version")
         if not _counts_do_not_decrease(before["counts"], after["counts"]):
             raise MaintenanceError("restore rehearsal lost database rows")
+        for artifact in attachment_artifacts:
+            attachment_id = str(artifact.get("attachment_id") or "")
+            restored_attachment = restored_store._attachment_blob_path(attachment_id)
+            if not restored_attachment.is_file():
+                raise MaintenanceError(
+                    "restore rehearsal did not place a referenced attachment: "
+                    f"{attachment_id}"
+                )
+            if _sha256(restored_attachment) != str(artifact["sha256"]):
+                raise MaintenanceError(
+                    "restore rehearsal attachment hash changed: "
+                    f"{attachment_id}"
+                )
     return {
         "status": "ok",
         "manifest": str(path),
@@ -323,5 +412,6 @@ def rehearse_restore(
         "schema_before": before["user_version"],
         "schema_after": after["user_version"],
         "counts_preserved": True,
+        "restored_attachment_count": len(attachment_artifacts),
         "live_database_modified": False,
     }

@@ -1,10 +1,11 @@
 [project]
 name = "agent-bridge"
-version = "0.42.24"
+version = "0.43.0"
 description = "Durable multi-agent rooms with chat, structured tasks, and resident execution"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp[cli]",
+    "python-multipart>=0.0.22,<1",
     "starlette>=1.0,<2",
     "uvicorn>=0.40,<1",
     "websockets>=15,<16",

@@ -35,6 +35,24 @@ def test_snapshot_verify_and_restore_rehearsal_are_non_destructive(
     database = tmp_path / "live" / "bridge.db"
     store = BridgeStore(database)
     store.create_user_room("maintenance-room")
+    recipient = store.register_agent_session(
+        product="codex",
+        username="snapshot-recipient",
+        signature="接收快照附件。",
+        conversation_id="maintenance-room",
+    )
+    attachment_message = store.send_owner_message(
+        conversation_id="maintenance-room",
+        body_text="快照必须带上附件。",
+        mentions=[recipient["participant_id"]],
+        attachments=[
+            {
+                "filename": "snapshot.txt",
+                "media_type": "text/plain",
+                "content": b"snapshot attachment",
+            }
+        ],
+    )
     before_bytes = database.read_bytes()
     viewer_plist = tmp_path / "viewer.plist"
     viewer_plist.write_text("viewer-service\n", encoding="utf-8")
@@ -57,10 +75,19 @@ def test_snapshot_verify_and_restore_rehearsal_are_non_destructive(
     verification = verify_snapshot(manifest)
     rehearsal = rehearse_restore(manifest, work_root=tmp_path / "rehearsals")
 
-    assert snapshot["artifact_count"] == 3
+    assert snapshot["artifact_count"] == 4
     assert verification["status"] == "ok"
     assert verification["artifacts"][0]["counts"]["rooms"] == 1
+    attachment_artifact = next(
+        item
+        for item in verification["artifacts"]
+        if item["role"] == "message_attachment"
+    )
+    assert attachment_artifact["sha256"] == attachment_message["attachments"][0][
+        "sha256"
+    ]
     assert rehearsal["counts_preserved"] is True
+    assert rehearsal["restored_attachment_count"] == 1
     assert rehearsal["live_database_modified"] is False
     assert database.read_bytes() == before_bytes
     assert database_diagnostics(database)["counts"]["rooms"] == 1
@@ -84,6 +111,26 @@ def test_snapshot_verification_rejects_tampering(tmp_path: Path) -> None:
 
     with pytest.raises(MaintenanceError, match="size changed"):
         verify_snapshot(manifest_path)
+
+
+def test_snapshot_accepts_pre_attachment_schema_database(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE legacy_data (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO legacy_data VALUES ('preserved')")
+        connection.execute("PRAGMA user_version = 41")
+
+    snapshot = create_snapshot(
+        database=database,
+        output_root=tmp_path / "backups",
+        label="schema-41",
+        repo_root=tmp_path,
+    )
+
+    assert snapshot["artifact_count"] == 1
+    verification = verify_snapshot(snapshot["manifest"])
+    assert verification["status"] == "ok"
+    assert verification["artifacts"][0]["user_version"] == 41
 
 
 def test_parse_launchctl_list_excludes_viewer_and_stopped_jobs() -> None:

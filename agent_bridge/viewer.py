@@ -16,7 +16,7 @@ from starlette.requests import Request
 from .config import BridgeConfig
 from .email_delivery import EmailDelivery, SMTPEmailDelivery
 from .security import (
-    MAX_REQUEST_BODY_BYTES,
+    MAX_ASGI_REQUEST_BODY_BYTES,
     PublicTransportMiddleware,
     SlidingWindowRateLimiter,
     ViewerSecurityPolicy,
@@ -171,7 +171,7 @@ def create_app(
     app = Starlette(
         debug=False,
         lifespan=lifespan,
-        max_body_size=MAX_REQUEST_BODY_BYTES,
+        max_body_size=MAX_ASGI_REQUEST_BODY_BYTES,
         routes=[
             *build_public_routes(
                 web_root=WEB_ROOT,

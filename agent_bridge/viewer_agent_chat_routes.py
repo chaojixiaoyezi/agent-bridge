@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .avatars import avatar_catalog_payload
@@ -145,6 +146,7 @@ def build_agent_chat_routes(
                 "reply_to",
                 "refs",
                 "mentions",
+                "links",
                 "notification_mode",
             },
             operation=lambda auth, payload: store.send(
@@ -157,6 +159,7 @@ def build_agent_chat_routes(
                 reply_to=payload.get("reply_to"),
                 refs=payload.get("refs"),
                 mentions=payload.get("mentions"),
+                links=payload.get("links"),
                 notification_mode=payload.get("notification_mode"),
             ),
         )
@@ -394,6 +397,40 @@ def build_agent_chat_routes(
             ),
         )
 
+    async def agent_download_attachment(request: Request) -> Response:
+        try:
+            auth = _authenticate_request(request, store)
+            payload = await _json_body(
+                request,
+                required={"attachment_id"},
+                allowed={"attachment_id"},
+            )
+            record = store.attachment_record(
+                attachment_id=payload["attachment_id"],
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+            )
+            encoded_filename = base64.urlsafe_b64encode(
+                str(record["filename"]).encode("utf-8")
+            ).decode("ascii")
+            return FileResponse(
+                record["path"],
+                media_type="application/octet-stream",
+                filename=record["filename"],
+                content_disposition_type="attachment",
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Attachment-Filename-B64": encoded_filename,
+                    "X-Attachment-Media-Type": str(record["media_type"]),
+                    "X-Attachment-Kind": str(record["kind"]),
+                    "X-Attachment-Size": str(record["size_bytes"]),
+                    "X-Attachment-SHA256": str(record["sha256"]),
+                },
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
     async def agent_participants(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -436,6 +473,11 @@ def build_agent_chat_routes(
             Route(
                 "/agent/history/search",
                 agent_search_history,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/attachments/download",
+                agent_download_attachment,
                 methods=["POST"],
             ),
             Route("/agent/participants", agent_participants, methods=["POST"]),

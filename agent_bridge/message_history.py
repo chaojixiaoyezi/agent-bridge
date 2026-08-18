@@ -45,6 +45,7 @@ class MessageHistoryMixin:
                 "before_sequence, after_sequence, and around_sequence cannot "
                 "be used together"
             )
+        visibility_sql = self._participant_message_visibility_sql("messages")
         with self._transaction() as conn:
             now = time.time()
             self._archive_stale_rooms_locked(conn, now=now)
@@ -62,36 +63,54 @@ class MessageHistoryMixin:
             self._require_membership(conn, participant, conversation)
             if after_sequence is not None:
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE conversation_id = ? "
-                    "AND sequence > ? ORDER BY sequence LIMIT ?",
-                    (conversation, int(after_sequence), normalized_limit),
+                    f"SELECT * FROM messages WHERE conversation_id = ? "
+                    f"AND sequence > ? AND {visibility_sql} "
+                    "ORDER BY sequence LIMIT ?",
+                    (
+                        conversation,
+                        int(after_sequence),
+                        participant,
+                        normalized_limit,
+                    ),
                 ).fetchall()
             elif around_sequence is not None:
                 center = max(0, int(around_sequence))
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE conversation_id = ? "
+                    f"SELECT * FROM messages WHERE conversation_id = ? "
+                    f"AND {visibility_sql} "
                     "ORDER BY ABS(sequence - ?), sequence LIMIT ?",
-                    (conversation, center, normalized_limit),
+                    (conversation, participant, center, normalized_limit),
                 ).fetchall()
             elif before_sequence is None:
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE conversation_id = ? "
-                    "ORDER BY sequence DESC LIMIT ?",
-                    (conversation, normalized_limit),
+                    f"SELECT * FROM messages WHERE conversation_id = ? "
+                    f"AND {visibility_sql} ORDER BY sequence DESC LIMIT ?",
+                    (conversation, participant, normalized_limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM messages WHERE conversation_id = ? "
-                    "AND sequence < ? ORDER BY sequence DESC LIMIT ?",
-                    (conversation, int(before_sequence), normalized_limit),
+                    f"SELECT * FROM messages WHERE conversation_id = ? "
+                    f"AND sequence < ? AND {visibility_sql} "
+                    "ORDER BY sequence DESC LIMIT ?",
+                    (
+                        conversation,
+                        int(before_sequence),
+                        participant,
+                        normalized_limit,
+                    ),
                 ).fetchall()
         if around_sequence is not None:
             ordered_rows = sorted(rows, key=lambda row: int(row["sequence"]))
         else:
             ordered_rows = rows if after_sequence is not None else list(reversed(rows))
         with self._connection() as conn:
-            messages = [
-                self._message_payload(
+            projections = self._message_asset_projection_locked(
+                conn,
+                [str(row["message_id"]) for row in ordered_rows],
+            )
+            messages = []
+            for row in ordered_rows:
+                payload = self._message_payload(
                     row,
                     authorization=self._chat_authorization_for_message_locked(
                         conn,
@@ -99,8 +118,8 @@ class MessageHistoryMixin:
                         recipient_participant_id=participant,
                     ),
                 )
-                for row in ordered_rows
-            ]
+                payload.update(projections[str(row["message_id"])])
+                messages.append(payload)
         first_sequence = messages[0]["sequence"] if messages else None
         last_sequence = messages[-1]["sequence"] if messages else None
         with self._connection() as conn:
@@ -108,17 +127,17 @@ class MessageHistoryMixin:
                 has_earlier = bool(
                     first_sequence is not None
                     and conn.execute(
-                        "SELECT 1 FROM messages WHERE conversation_id = ? "
-                        "AND sequence < ? LIMIT 1",
-                        (conversation, first_sequence),
+                        f"SELECT 1 FROM messages WHERE conversation_id = ? "
+                        f"AND sequence < ? AND {visibility_sql} LIMIT 1",
+                        (conversation, first_sequence, participant),
                     ).fetchone()
                 )
                 has_later = bool(
                     last_sequence is not None
                     and conn.execute(
-                        "SELECT 1 FROM messages WHERE conversation_id = ? "
-                        "AND sequence > ? LIMIT 1",
-                        (conversation, last_sequence),
+                        f"SELECT 1 FROM messages WHERE conversation_id = ? "
+                        f"AND sequence > ? AND {visibility_sql} LIMIT 1",
+                        (conversation, last_sequence, participant),
                     ).fetchone()
                 )
                 has_more = has_earlier or has_later
@@ -126,18 +145,18 @@ class MessageHistoryMixin:
                 has_more = bool(
                     last_sequence is not None
                     and conn.execute(
-                        "SELECT 1 FROM messages WHERE conversation_id = ? "
-                        "AND sequence > ? LIMIT 1",
-                        (conversation, last_sequence),
+                        f"SELECT 1 FROM messages WHERE conversation_id = ? "
+                        f"AND sequence > ? AND {visibility_sql} LIMIT 1",
+                        (conversation, last_sequence, participant),
                     ).fetchone()
                 )
             else:
                 has_more = bool(
                     first_sequence is not None
                     and conn.execute(
-                        "SELECT 1 FROM messages WHERE conversation_id = ? "
-                        "AND sequence < ? LIMIT 1",
-                        (conversation, first_sequence),
+                        f"SELECT 1 FROM messages WHERE conversation_id = ? "
+                        f"AND sequence < ? AND {visibility_sql} LIMIT 1",
+                        (conversation, first_sequence, participant),
                     ).fetchone()
                 )
         return {
@@ -250,8 +269,15 @@ class MessageHistoryMixin:
             parameters.append(normalized_before)
         for term in terms:
             escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            conditions.append("message.body LIKE ? ESCAPE '\\'")
-            parameters.append(f"%{escaped}%")
+            conditions.append(
+                "(message.body LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM message_links AS searched_link "
+                "WHERE searched_link.message_id = message.message_id "
+                "AND searched_link.url LIKE ? ESCAPE '\\'))"
+            )
+            parameters.extend((f"%{escaped}%", f"%{escaped}%"))
+        conditions.append(self._participant_message_visibility_sql("message"))
+        parameters.append(participant)
         parameters.append(normalized_limit)
 
         now = time.time()
@@ -287,8 +313,13 @@ class MessageHistoryMixin:
             ).fetchall()
 
         with self._connection() as conn:
-            results = [
-                self._history_search_payload(
+            projections = self._message_asset_projection_locked(
+                conn,
+                [str(row["message_id"]) for row in rows],
+            )
+            results = []
+            for row in rows:
+                result = self._history_search_payload(
                     row,
                     terms=terms,
                     authorization=self._chat_authorization_for_message_locked(
@@ -297,8 +328,8 @@ class MessageHistoryMixin:
                         recipient_participant_id=participant,
                     ),
                 )
-                for row in rows
-            ]
+                result.update(projections[str(row["message_id"])])
+                results.append(result)
         return {
             "conversation_id": conversation,
             "query": normalized_query,

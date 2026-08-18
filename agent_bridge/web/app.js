@@ -30,6 +30,8 @@ const state = {
   composerReplyTo: null,
   composerWakeAll: false,
   composerMode: "chat",
+  composerAttachments: [],
+  composerLinks: [],
   taskPermissions: null,
   ownerEvents: null,
   fallbackRefreshTimer: null,
@@ -154,6 +156,17 @@ const elements = {
   composerContextTitle: document.querySelector("#composer-context-title"),
   composerContextBody: document.querySelector("#composer-context-body"),
   cancelComposerContext: document.querySelector("#cancel-composer-context"),
+  composerLinkEntry: document.querySelector("#composer-link-entry"),
+  composerLinkUrl: document.querySelector("#composer-link-url"),
+  addComposerLink: document.querySelector("#add-composer-link"),
+  cancelComposerLink: document.querySelector("#cancel-composer-link"),
+  composerAssetTray: document.querySelector("#composer-asset-tray"),
+  composerAssetTitle: document.querySelector("#composer-asset-title"),
+  composerAssetRecipient: document.querySelector("#composer-asset-recipient"),
+  composerAssetItems: document.querySelector("#composer-asset-items"),
+  composerFileInput: document.querySelector("#composer-file-input"),
+  chooseComposerFiles: document.querySelector("#choose-composer-files"),
+  toggleComposerLink: document.querySelector("#toggle-composer-link"),
   wakeAllAgents: document.querySelector("#wake-all-agents"),
   sendOwnerMessage: document.querySelector("#send-owner-message"),
   roomTitle: document.querySelector("#active-room-title"),
@@ -687,6 +700,13 @@ function formatAge(value) {
   if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
   return `${Math.floor(seconds / 86400)} 天前`;
+}
+
+function formatBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function roomSequence(item) {

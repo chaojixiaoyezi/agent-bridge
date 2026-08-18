@@ -1,0 +1,55 @@
+{
+  "artifact": "restricted-message-assets",
+  "version": "0.43.0",
+  "date": "2026-08-18",
+  "baseline_commit": "1eeb971a69e9dffca71e86e43e81f8c9800c7fdc",
+  "schema_version": 42,
+  "scope": {
+    "links": "HTTP(S) links are stored and rendered as first-class cards. Link-only messages remain room-visible and Agent Bridge performs no remote preview fetch.",
+    "composite_message": "An authenticated Web user can send optional text, structured links, and up to five files or raster images as one message.",
+    "fixed_recipients": "A message containing a file or image requires structured Agent recipients or authorized @all. Its text, links, filenames, thumbnails, history, search, delivery, native event, task input, and download access use one immutable recipient ACL.",
+    "reply_confinement": "Replies inherit the fixed ACL and cannot expand it. @all materializes current Agent participant IDs at send time, excludes Web identities, and does not include later joiners.",
+    "attachment_storage": "Private blobs use database-adjacent 0700 directories and 0600 files. Agent downloads require a live same-room session and fixed-recipient membership, then verify size and SHA-256 before an atomic local save.",
+    "web_audit": "A Web user with room access retains the room management and audit view; Web downloads re-check the exact room ACL.",
+    "rolling_upgrade": "Schema 41 migrates incrementally to 42 without rewriting messages, room sequences, sessions, connectors, deliveries, or receipts. Snapshot and restore rehearsal include every SQLite-referenced blob."
+  },
+  "limits": {
+    "attachments_per_message": 5,
+    "bytes_per_attachment": 12582912,
+    "bytes_per_message": 26214400,
+    "links_per_message": 8,
+    "asgi_request_bytes": 27262976,
+    "public_uploads_per_user_per_minute": 12
+  },
+  "verification": {
+    "pytest": "297 passed, 2 skipped",
+    "real_chrome_e2e": "1 passed",
+    "browser_metrics": {
+      "dom_ready_ms": 101.56,
+      "authenticated_ready_ms": 324.78,
+      "room_switch_ms": 24.05,
+      "resource_transfer_bytes": 670254
+    },
+    "covered_boundaries": [
+      "schema 41 to 42 preservation",
+      "fixed personal and @all recipient materialization",
+      "later-joiner history and download denial",
+      "restricted reply and task non-expansion",
+      "history, search, wait, native channel, task-input, export, and forward behavior",
+      "Web multipart validation and room ACL",
+      "Agent download re-authentication, hash verification, atomic save, and redirect rejection",
+      "attachment-aware snapshot verification and restore rehearsal",
+      "real browser file selection, local image preview, no-target block, @all send, link card, and restricted rendering",
+      "Codex, Claude resident, Claude native Channel, task worker, and native TUI attachment contracts"
+    ],
+    "additional_gates": [
+      "uv lock --check",
+      "ruff check",
+      "python compileall",
+      "node --check for every Web JavaScript asset",
+      "sh -n for every bin entrypoint",
+      "plutil -lint for macOS launchd templates",
+      "git diff --check"
+    ]
+  }
+}

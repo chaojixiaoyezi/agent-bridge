@@ -171,6 +171,272 @@ def grant_web_room_access(
     )
 
 
+def test_restricted_attachment_visibility_delivery_history_and_links(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    admin = login_admin_identity(auth)
+    target = register(store, client="codex", name="附件接收者")
+    bystander = register(store, client="claude-code", name="附件旁观者")
+    image = b"\x89PNG\r\n\x1a\n" + b"restricted-image"
+
+    message = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="tools-room",
+        body_text="请只让接收者检查这张图。",
+        mentions=[target["participant_id"]],
+        links=["https://example.com/review?q=1"],
+        attachments=[
+            {
+                "filename": "../设计图.png",
+                "media_type": "image/svg+xml",
+                "content": image,
+            }
+        ],
+    )
+
+    assert message["visibility"]["kind"] == "restricted"
+    assert [
+        item["participant_id"] for item in message["visibility"]["recipients"]
+    ] == [target["participant_id"]]
+    assert message["attachments"][0]["kind"] == "image"
+    assert message["attachments"][0]["filename"] == "设计图.png"
+    assert message["attachments"][0]["media_type"] == "image/png"
+    assert message["links"][0]["url"] == "https://example.com/review?q=1"
+
+    target_history = store.history(
+        participant_id=target["participant_id"],
+        authorized_session_id=target["session_id"],
+        conversation_id="tools-room",
+    )
+    assert [item["message_id"] for item in target_history["messages"]] == [
+        message["message_id"]
+    ]
+    bystander_history = store.history(
+        participant_id=bystander["participant_id"],
+        authorized_session_id=bystander["session_id"],
+        conversation_id="tools-room",
+    )
+    assert bystander_history["messages"] == []
+    assert store.search_history(
+        participant_id=bystander["participant_id"],
+        authorized_session_id=bystander["session_id"],
+        conversation_id="tools-room",
+        query="接收者",
+    )["results"] == []
+
+    attachment_id = message["attachments"][0]["attachment_id"]
+    allowed = store.attachment_record(
+        attachment_id=attachment_id,
+        participant_id=target["participant_id"],
+        authorized_session_id=target["session_id"],
+    )
+    assert allowed["path"].read_bytes() == image
+    with pytest.raises(AuthorizationError):
+        store.attachment_record(
+            attachment_id=attachment_id,
+            participant_id=bystander["participant_id"],
+            authorized_session_id=bystander["session_id"],
+        )
+    restricted_reply = store.reply(
+        authorized_session_id=target["session_id"],
+        participant_id=target["participant_id"],
+        message_id=message["message_id"],
+        body_text="我已按定向范围查看，回复也不能泄露给旁观者。",
+    )["reply"]
+    assert restricted_reply["visibility"]["kind"] == "restricted"
+    assert [
+        item["participant_id"]
+        for item in restricted_reply["visibility"]["recipients"]
+    ] == [target["participant_id"]]
+    assert restricted_reply["message_id"] not in {
+        item["message_id"]
+        for item in store.history(
+            participant_id=bystander["participant_id"],
+            authorized_session_id=bystander["session_id"],
+            conversation_id="tools-room",
+        )["messages"]
+    }
+    with pytest.raises(AuthorizationError, match="not visible"):
+        store.send(
+            authorized_session_id=bystander["session_id"],
+            sender_participant_id=bystander["participant_id"],
+            conversation_id="tools-room",
+            body_text="不能绕过固定接收名单回复。",
+            reply_to=message["message_id"],
+        )
+    with pytest.raises(AuthorizationError, match="cannot expand"):
+        store.send_web_message(
+            authorized_session_id=str(admin["session_id"]),
+            participant_id=str(admin["participant_id"]),
+            conversation_id="tools-room",
+            body_text="不能借回复把附件扩散给旁观者。",
+            reply_to=message["message_id"],
+            mentions=[bystander["participant_id"]],
+            attachments=[
+                {
+                    "filename": "blocked.txt",
+                    "media_type": "text/plain",
+                    "content": b"must be cleaned after rollback",
+                }
+            ],
+        )
+    with pytest.raises(AuthorizationError, match="task reply cannot expand"):
+        store.send_web_task(
+            authorized_session_id=str(admin["session_id"]),
+            participant_id=str(admin["participant_id"]),
+            conversation_id="tools-room",
+            body_text="不能把定向上下文作为任务扩散给旁观者。",
+            reply_to=message["message_id"],
+            target_participant_ids=[bystander["participant_id"]],
+        )
+    assert not list(store._attachment_staging_root().glob("*.part"))
+    with store._connection() as connection:
+        deliveries = connection.execute(
+            "SELECT participant_id FROM message_deliveries WHERE message_id = ?",
+            (message["message_id"],),
+        ).fetchall()
+    assert [str(row["participant_id"]) for row in deliveries] == [
+        target["participant_id"]
+    ]
+    with pytest.raises(AuthorizationError, match="发送时已经指定"):
+        store.convert_web_message_to_task(
+            authorized_session_id=str(admin["session_id"]),
+            participant_id=str(admin["participant_id"]),
+            message_id=message["message_id"],
+            target_participant_ids=[bystander["participant_id"]],
+        )
+    converted = store.convert_web_message_to_task(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        message_id=message["message_id"],
+        target_participant_ids=[target["participant_id"]],
+    )
+    assert converted["task"]["target_participant_ids"] == [
+        target["participant_id"]
+    ]
+    assert converted["attachments"] == message["attachments"]
+    exported = store.export_room_history(
+        requesting_web_user_id=str(admin["user_id"]),
+        conversation_id="tools-room",
+    )
+    exported_message = next(
+        item
+        for item in exported["messages"]
+        if item["message_id"] == message["message_id"]
+    )
+    assert exported_message["visibility"] == message["visibility"]
+    assert exported_message["attachments"] == message["attachments"]
+    assert exported_message["links"] == message["links"]
+
+    public_link = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="tools-room",
+        body_text="",
+        links=["https://example.org/docs"],
+    )
+    assert public_link["visibility"] == {"kind": "room"}
+    assert public_link["links"][0]["host"] == "example.org"
+    assert public_link["message_id"] in {
+        item["message_id"]
+        for item in store.history(
+            participant_id=bystander["participant_id"],
+            authorized_session_id=bystander["session_id"],
+            conversation_id="tools-room",
+        )["messages"]
+    }
+    assert [
+        item["message_id"]
+        for item in store.search_history(
+            participant_id=bystander["participant_id"],
+            authorized_session_id=bystander["session_id"],
+            conversation_id="tools-room",
+            query="example.org/docs",
+        )["results"]
+    ] == [public_link["message_id"]]
+    assert [
+        item["message_id"]
+        for item in ViewerRepository(store.database).search_messages(
+            "tools-room",
+            query="example.org/docs",
+        )["results"]
+    ] == [public_link["message_id"]]
+
+    wake_all = store.send_web_message(
+        authorized_session_id=str(admin["session_id"]),
+        participant_id=str(admin["participant_id"]),
+        conversation_id="tools-room",
+        body_text="这份文件只给发送时已经在场的全部 Agent。",
+        wake_all_agents=True,
+        attachments=[
+            {
+                "filename": "current-agents.txt",
+                "media_type": "text/plain",
+                "content": b"fixed recipients",
+            }
+        ],
+    )
+    assert wake_all["visibility"]["target_kind"] == "room_agents"
+    assert {
+        item["participant_id"]
+        for item in wake_all["visibility"]["recipients"]
+    } == {target["participant_id"], bystander["participant_id"]}
+
+    later_joiner = register(store, client="pi", name="稍后加入者")
+    later_history = store.history(
+        participant_id=later_joiner["participant_id"],
+        authorized_session_id=later_joiner["session_id"],
+        conversation_id="tools-room",
+    )
+    assert wake_all["message_id"] not in {
+        item["message_id"] for item in later_history["messages"]
+    }
+    with pytest.raises(AuthorizationError):
+        store.attachment_record(
+            attachment_id=wake_all["attachments"][0]["attachment_id"],
+            participant_id=later_joiner["participant_id"],
+            authorized_session_id=later_joiner["session_id"],
+        )
+
+
+def test_schema_42_adds_message_assets_without_rewriting_existing_messages(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "schema-41.db"
+    store = BridgeStore(database)
+    sender = register(store, client="codex", name="迁移附件发送者")
+    original = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="tools-room",
+        body_text="旧消息保持公开且原文不变。",
+    )
+    with store._transaction() as connection:
+        for table in (
+            "message_links",
+            "message_attachments",
+            "message_restriction_recipients",
+            "message_restrictions",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("PRAGMA user_version = 41")
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
+        row = connection.execute(
+            "SELECT body FROM messages WHERE message_id = ?",
+            (original["message_id"],),
+        ).fetchone()
+        assert str(row["body"]) == original["body"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM message_restrictions"
+        ).fetchone()[0] == 0
+
+
 def test_message_display_sequences_are_independent_per_room(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     first_sender = register(
@@ -297,7 +563,7 @@ def test_operational_monitoring_persists_trends_alerts_and_recovery(
     assert unavailable["status"] == "resolved"
     assert unavailable["resolved_at"] is not None
     with store._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert connection.execute(
             "SELECT COUNT(*) FROM operational_metric_samples"
         ).fetchone()[0] == 1
@@ -343,7 +609,7 @@ def test_schema_41_adds_native_latency_columns_without_rebuilding_samples(
             "SELECT * FROM operational_metric_samples WHERE sample_minute = ?",
             (original_minute,),
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
     assert set(new_columns).issubset(columns)
     assert preserved is not None
     assert int(preserved["sample_minute"]) == original_minute
@@ -986,7 +1252,7 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
@@ -1025,7 +1291,7 @@ def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
             "email_verified_at, pending_email, email_updated_at "
             "FROM web_users WHERE username = 'admin'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'web_email_tokens'"
@@ -1913,7 +2179,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1985,7 +2251,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -2214,7 +2480,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -3713,7 +3979,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 41
+    assert version == 42
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -3785,7 +4051,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 41
+    assert version == 42
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -3881,7 +4147,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 41
+    assert version == 42
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -5449,7 +5715,7 @@ def test_native_session_lease_is_exact_idempotent_and_explicitly_replaceable(
                 "PRAGMA table_info(message_deliveries)"
             ).fetchall()
         }
-    assert schema_version == 41
+    assert schema_version == 42
     assert tuple(connector) == ("offline", "native_preferred", None)
     assert {
         "delivery_stage",
@@ -5990,7 +6256,7 @@ def test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode(
         values = connection.execute(
             "SELECT DISTINCT tui_access_mode FROM agent_connectors"
         ).fetchall()
-    assert version == 41
+    assert version == 42
     assert [str(row[0]) for row in values] == ["unknown"]
 
 
@@ -6235,6 +6501,14 @@ def test_authorized_personal_mentions_route_to_idle_body_then_steer_active_task(
         conversation_id="本体值守群",
         body_text="@body-agent 每次 sleep 不超过 4 分钟，立即按这个新要求调整。",
         mentions=[agent["participant_id"]],
+        links=["https://example.com/live-input"],
+        attachments=[
+            {
+                "filename": "live-input.txt",
+                "media_type": "text/plain",
+                "content": b"new requirement evidence",
+            }
+        ],
     )
     assert followup["body_routing"][0]["mode"] == "steer"
     assert followup["body_routing"][0]["task_id"] == claimed["task_id"]
@@ -6247,6 +6521,9 @@ def test_authorized_personal_mentions_route_to_idle_body_then_steer_active_task(
     assert inputs["count"] == 1
     assert inputs["inputs"][0]["body"] == followup["body"]
     assert inputs["inputs"][0]["issuer_role"] == "admin"
+    assert inputs["inputs"][0]["attachments"] == followup["attachments"]
+    assert inputs["inputs"][0]["links"] == followup["links"]
+    assert inputs["inputs"][0]["visibility"] == followup["visibility"]
     assert store.poll_agent_task_inputs(
         participant_id=agent["participant_id"],
         authorized_session_id=executor["session_id"],
@@ -6490,7 +6767,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -6545,7 +6822,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 41
+    assert version == 42
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -7156,6 +7433,7 @@ def test_admin_explicit_cross_room_forward_preserves_provenance_without_authorit
     source = store.send_owner_message(
         conversation_id="转发源群",
         body_text="@forward-target 这段内容只有显式转发才能进入目标群。",
+        links=["https://example.com/forward-source"],
     )
     captcha_challenge = auth.create_captcha()
     admin, session_token = auth.login(
@@ -7177,6 +7455,9 @@ def test_admin_explicit_cross_room_forward_preserves_provenance_without_authorit
     assert "来源「转发源群」" in forwarded["body"]
     assert "请在目标群继续讨论" in forwarded["body"]
     assert forwarded["mentions"] == []
+    assert [item["url"] for item in forwarded["links"]] == [
+        item["url"] for item in source["links"]
+    ]
     target_wait = store.wait_messages(
         participant_id=target_agent["participant_id"],
         authorized_session_id=target_agent["session_id"],
@@ -7256,7 +7537,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 42
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

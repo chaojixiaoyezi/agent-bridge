@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from .resident_health import local_resident_snapshot, room_resident_detail
+from .message_assets import (
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_TOTAL_BYTES,
+    MAX_MESSAGE_ATTACHMENTS,
+)
 from .security import ViewerSecurityPolicy
 from .store import BridgeStore
 from .validation import opaque_id
@@ -260,24 +267,135 @@ def build_room_routes(
         try:
             require_web_intent(request, intent="send-message")
             identity = authenticated_web_user(request)
-            payload = await _json_body(
-                request,
-                required={"body"},
-                allowed={"body", "mentions", "reply_to", "wake_all_agents"},
-            )
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            content_type = request.headers.get("content-type", "").split(";", 1)[0]
+            attachments: list[dict[str, object]] = []
+            if content_type.strip().lower() == "multipart/form-data":
+                if policy.public_mode:
+                    enforce_rate(
+                        request,
+                        "web-attachment-upload",
+                        subject=identity["user_id"],
+                        limit=12,
+                        window_seconds=60,
+                    )
+                async with request.form(
+                    max_files=MAX_MESSAGE_ATTACHMENTS,
+                    max_fields=12,
+                    max_part_size=MAX_ATTACHMENT_BYTES + 1,
+                ) as form:
+                    allowed_fields = {
+                        "body",
+                        "mentions",
+                        "links",
+                        "reply_to",
+                        "wake_all_agents",
+                        "files",
+                    }
+                    unsupported = {
+                        key for key, _value in form.multi_items()
+                        if key not in allowed_fields
+                    }
+                    if unsupported:
+                        raise ValueError(
+                            "unsupported fields: " + ", ".join(sorted(unsupported))
+                        )
+
+                    def structured_array(field: str) -> list:
+                        raw = str(form.get(field) or "[]")
+                        try:
+                            value = json.loads(raw)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(f"{field} must be a JSON array") from exc
+                        if not isinstance(value, list):
+                            raise ValueError(f"{field} must be a JSON array")
+                        return value
+
+                    wake_raw = str(form.get("wake_all_agents") or "false").lower()
+                    if wake_raw not in {"true", "false", "1", "0"}:
+                        raise ValueError("wake_all_agents must be a boolean")
+                    payload = {
+                        "body": str(form.get("body") or ""),
+                        "mentions": structured_array("mentions"),
+                        "links": structured_array("links"),
+                        "reply_to": str(form.get("reply_to") or "") or None,
+                        "wake_all_agents": wake_raw in {"true", "1"},
+                    }
+                    total_size = 0
+                    for uploaded in form.getlist("files"):
+                        if not isinstance(uploaded, UploadFile):
+                            raise ValueError("files must use multipart file parts")
+                        content = await uploaded.read(MAX_ATTACHMENT_BYTES + 1)
+                        if len(content) > MAX_ATTACHMENT_BYTES:
+                            raise ValueError(
+                                f"each attachment must be at most {MAX_ATTACHMENT_BYTES} bytes"
+                            )
+                        total_size += len(content)
+                        if total_size > MAX_ATTACHMENTS_TOTAL_BYTES:
+                            raise ValueError(
+                                "attachment total exceeds "
+                                f"{MAX_ATTACHMENTS_TOTAL_BYTES} bytes"
+                            )
+                        attachments.append(
+                            {
+                                "filename": uploaded.filename,
+                                "media_type": uploaded.content_type,
+                                "content": content,
+                            }
+                        )
+            else:
+                payload = await _json_body(
+                    request,
+                    required=set(),
+                    allowed={
+                        "body",
+                        "mentions",
+                        "links",
+                        "reply_to",
+                        "wake_all_agents",
+                    },
+                )
             return JSONResponse(
                 {
                     "message": store.send_web_message(
                         authorized_session_id=str(identity["session_id"]),
                         participant_id=str(identity["participant_id"]),
-                        conversation_id=request.path_params["conversation_id"],
-                        body_text=payload["body"],
+                        conversation_id=conversation,
+                        body_text=payload.get("body", ""),
                         mentions=payload.get("mentions"),
+                        links=payload.get("links"),
+                        attachments=attachments,
                         reply_to=payload.get("reply_to"),
                         wake_all_agents=payload.get("wake_all_agents", False),
                     )
                 },
                 status_code=201,
+            )
+        except Exception as exc:
+            return _json_error(exc)
+
+    async def web_attachment(request: Request) -> Response:
+        try:
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            record = store.attachment_record(
+                attachment_id=request.path_params["attachment_id"],
+                conversation_id=conversation,
+            )
+            return FileResponse(
+                record["path"],
+                media_type=record["media_type"],
+                filename=record["filename"],
+                content_disposition_type=(
+                    "inline" if record["kind"] == "image" else "attachment"
+                ),
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Attachment-SHA256": str(record["sha256"]),
+                },
             )
         except Exception as exc:
             return _json_error(exc)
@@ -551,6 +669,11 @@ def build_room_routes(
             "/api/rooms/{conversation_id:str}/messages",
             web_send_message,
             methods=["POST"],
+        ),
+        Route(
+            "/api/rooms/{conversation_id:str}/attachments/{attachment_id:str}",
+            web_attachment,
+            methods=["GET"],
         ),
         Route(
             "/api/rooms/{conversation_id:str}/tasks",

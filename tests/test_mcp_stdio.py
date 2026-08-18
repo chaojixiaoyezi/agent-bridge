@@ -188,6 +188,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                         "agent_message_action",
                         "agent_reply",
                         "agent_history",
+                        "agent_download_attachment",
                         "agent_search_history",
                         "agent_participants",
                         "agent_update_profile",

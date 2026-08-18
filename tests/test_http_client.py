@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import stat
 import threading
 from http.client import RemoteDisconnected
@@ -22,6 +24,56 @@ FIXED_IDENTITY: dict[str, Any] = {
     "roles": ["reviewer"],
     "capabilities": ["history"],
 }
+
+
+def test_attachment_download_is_hash_verified_and_atomic(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"private attachment content"
+    encoded_filename = base64.urlsafe_b64encode("../证据.txt".encode()).decode()
+
+    class Response:
+        def __init__(self) -> None:
+            self.offset = 0
+            self.headers = {
+                "X-Attachment-Filename-B64": encoded_filename,
+                "X-Attachment-Size": str(len(content)),
+                "X-Attachment-SHA256": hashlib.sha256(content).hexdigest(),
+                "X-Attachment-Kind": "file",
+                "X-Attachment-Media-Type": "text/plain",
+            }
+
+        def read(self, limit: int) -> bytes:
+            chunk = content[self.offset : self.offset + limit]
+            self.offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            return None
+
+    captured: dict[str, str] = {}
+
+    def open_request(request: Request, *, timeout: float):
+        assert timeout == 30
+        captured.update(dict(request.header_items()))
+        return Response()
+
+    monkeypatch.setattr("agent_bridge.http_client.urlopen", open_request)
+    client = BridgeHttpClient("https://bridge.example.test")
+    client.access_token = "session-private"
+    result = client.download_attachment(
+        attachment_id="attachment_private",
+        destination_path=tmp_path,
+    )
+
+    destination = tmp_path / "证据.txt"
+    assert destination.read_bytes() == content
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert result["saved_path"] == str(destination)
+    assert result["sha256"] == hashlib.sha256(content).hexdigest()
+    assert captured["Authorization"] == "Bearer session-private"
+    assert not list(tmp_path.glob("*.part"))
 
 
 def test_resident_client_registers_before_first_call_and_renews_once_on_401(

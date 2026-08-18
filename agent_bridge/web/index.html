@@ -6,17 +6,17 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260818-05">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-05">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-05">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-05">
-    <script src="/assets/app.js?v=20260818-05" defer></script>
-    <script src="/assets/app-layout.js?v=20260818-05" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260818-05" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260818-05" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260818-05" defer></script>
-    <script src="/assets/app-governance.js?v=20260818-05" defer></script>
-    <script src="/assets/app-interactions.js?v=20260818-05" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260818-06">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-06">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-06">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-06">
+    <script src="/assets/app.js?v=20260818-06" defer></script>
+    <script src="/assets/app-layout.js?v=20260818-06" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260818-06" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260818-06" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260818-06" defer></script>
+    <script src="/assets/app-governance.js?v=20260818-06" defer></script>
+    <script src="/assets/app-interactions.js?v=20260818-06" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -468,15 +468,36 @@
                 rows="2"
                 placeholder="选择使用中的聊天室后，你可以在这里发言…"
                 disabled
-                required
               ></textarea>
               <div class="mention-menu" id="mention-menu" hidden></div>
+            </div>
+            <div class="composer-link-entry" id="composer-link-entry" hidden>
+              <span aria-hidden="true">↗</span>
+              <input id="composer-link-url" type="url" maxlength="2048" inputmode="url" autocomplete="off" placeholder="粘贴 https:// 链接，不会由 Bridge 抓取预览">
+              <button class="secondary-button compact-button" id="add-composer-link" type="button">加入消息</button>
+              <button class="quiet-icon-button" id="cancel-composer-link" type="button" aria-label="取消添加链接">×</button>
+            </div>
+            <div class="composer-asset-tray" id="composer-asset-tray" hidden>
+              <div class="composer-asset-summary">
+                <strong id="composer-asset-title">消息内容</strong>
+                <span id="composer-asset-recipient"></span>
+              </div>
+              <div class="composer-asset-items" id="composer-asset-items"></div>
             </div>
             <div class="composer-actions">
               <div class="composer-left-actions">
                 <div class="composer-mode" role="group" aria-label="发送类型">
                   <button class="composer-mode-button active" id="composer-chat-mode" type="button">聊天</button>
                   <button class="composer-mode-button" id="composer-task-mode" type="button">本体任务</button>
+                </div>
+                <div class="composer-content-tools" role="group" aria-label="添加消息内容">
+                  <input id="composer-file-input" type="file" multiple hidden>
+                  <button class="composer-content-button" id="choose-composer-files" type="button" title="添加文件或图片；必须指定 Agent 或 @全员">
+                    <span aria-hidden="true">＋</span> 文件/图片
+                  </button>
+                  <button class="composer-content-button" id="toggle-composer-link" type="button" title="添加可点击链接卡片">
+                    <span aria-hidden="true">↗</span> 链接
+                  </button>
                 </div>
                 <span class="composer-feedback" id="owner-message-feedback" role="status" aria-live="polite"></span>
               </div>

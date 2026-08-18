@@ -25,6 +25,7 @@ BRIDGE_TOOLS = (
     "agent_message_action",
     "agent_history",
     "agent_search_history",
+    "agent_download_attachment",
     "agent_participants",
     "agent_heartbeat",
     "agent_update_profile",

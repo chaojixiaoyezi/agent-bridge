@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 from http.client import HTTPException
@@ -10,6 +13,8 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from .message_assets import MAX_ATTACHMENT_BYTES, _safe_filename
 
 
 MAX_BRIDGE_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -227,6 +232,190 @@ class BridgeHttpClient:
                     self._register_from_fixed_identity()
             return self._post(path, payload, authenticated=True, timeout=timeout)
 
+    def download_attachment(
+        self,
+        *,
+        attachment_id: str,
+        destination_path: str | Path,
+        overwrite: bool = False,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Download one server-authorized attachment with hash verification."""
+
+        self._ensure_auto_registered()
+        previous_token = self.access_token
+        try:
+            return self._download_attachment_once(
+                attachment_id=attachment_id,
+                destination_path=destination_path,
+                overwrite=overwrite,
+                timeout=timeout,
+            )
+        except BridgeRemoteError as exc:
+            if exc.status_code != 401 or self.auto_registration is None:
+                raise
+            with self._registration_lock:
+                if self.access_token == previous_token:
+                    self.access_token = None
+                    self._register_from_fixed_identity()
+            return self._download_attachment_once(
+                attachment_id=attachment_id,
+                destination_path=destination_path,
+                overwrite=overwrite,
+                timeout=timeout,
+            )
+
+    def _download_attachment_once(
+        self,
+        *,
+        attachment_id: str,
+        destination_path: str | Path,
+        overwrite: bool,
+        timeout: float,
+    ) -> dict[str, Any]:
+        if not self.access_token:
+            raise BridgeRemoteError("call agent_register before using chat tools")
+        request = Request(
+            f"{self.base_url}/agent/attachments/download",
+            data=json.dumps(
+                {"attachment_id": str(attachment_id)},
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            headers={
+                "Accept": "application/octet-stream",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.access_token}",
+                "User-Agent": "agent-bridge-mcp/0.3",
+            },
+            method="POST",
+        )
+        try:
+            response = urlopen(request, timeout=max(1.0, float(timeout)))
+        except HTTPError as exc:
+            try:
+                raw = _response_bytes(exc)
+            except (OSError, HTTPException):
+                raw = b""
+            try:
+                error_payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                error_payload = {}
+            raise BridgeRemoteError(
+                str(error_payload.get("error") or f"bridge HTTP {exc.code}"),
+                status_code=exc.code,
+            ) from exc
+        except (URLError, OSError, HTTPException) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+            raise BridgeRemoteError(f"cannot reach Agent Bridge: {reason}") from exc
+
+        temporary: Path | None = None
+        try:
+            encoded_filename = response.headers.get("X-Attachment-Filename-B64", "")
+            try:
+                original_filename = base64.b64decode(
+                    encoded_filename.encode("ascii"),
+                    altchars=b"-_",
+                    validate=True,
+                ).decode("utf-8")
+            except (ValueError, UnicodeDecodeError):
+                original_filename = f"{attachment_id}.bin"
+            original_filename = _safe_filename(original_filename)
+            raw_destination = str(destination_path).strip()
+            if not raw_destination:
+                raise BridgeRemoteError("destination_path cannot be empty")
+            destination = Path(raw_destination).expanduser()
+            if destination.is_dir():
+                destination = destination / original_filename
+            destination = destination.resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists() and not overwrite:
+                raise BridgeRemoteError(
+                    f"destination already exists: {destination}; set overwrite=true "
+                    "to replace it"
+                )
+            try:
+                declared_size = int(
+                    response.headers.get("X-Attachment-Size", "0") or 0
+                )
+            except (TypeError, ValueError) as exc:
+                raise BridgeRemoteError(
+                    "attachment size header is invalid"
+                ) from exc
+            if not 1 <= declared_size <= MAX_ATTACHMENT_BYTES:
+                raise BridgeRemoteError("attachment exceeded the safety limit")
+            expected_sha256 = response.headers.get("X-Attachment-SHA256", "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise BridgeRemoteError("attachment hash header is invalid")
+            temporary = destination.parent / (
+                f".{destination.name}.{secrets.token_hex(8)}.part"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    while True:
+                        chunk = response.read(64 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_ATTACHMENT_BYTES:
+                            raise BridgeRemoteError(
+                                "attachment exceeded the safety limit"
+                            )
+                        digest.update(chunk)
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            actual_sha256 = digest.hexdigest()
+            if declared_size and size != declared_size:
+                raise BridgeRemoteError("attachment size verification failed")
+            if expected_sha256 and actual_sha256 != expected_sha256:
+                raise BridgeRemoteError("attachment hash verification failed")
+            if overwrite:
+                os.replace(temporary, destination)
+            else:
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError as exc:
+                    raise BridgeRemoteError(
+                        f"destination already exists: {destination}"
+                    ) from exc
+                temporary.unlink()
+            temporary = None
+            try:
+                os.chmod(destination, 0o600)
+            except OSError:
+                pass
+            return {
+                "attachment_id": str(attachment_id),
+                "saved_path": str(destination),
+                "filename": original_filename,
+                "kind": response.headers.get("X-Attachment-Kind", "file"),
+                "media_type": response.headers.get(
+                    "X-Attachment-Media-Type",
+                    "application/octet-stream",
+                ),
+                "size_bytes": size,
+                "sha256": actual_sha256,
+            }
+        finally:
+            response.close()
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
     def bind_native_session(
         self,
         *,

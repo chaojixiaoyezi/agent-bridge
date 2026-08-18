@@ -85,6 +85,7 @@ class MessageComposerMixin:
         reply_to: str | None = None,
         refs: Sequence[dict[str, Any]] | None = None,
         mentions: Sequence[str] | None = None,
+        links: Sequence[str] | None = None,
         notification_mode: str | None = None,
         wake_all_agents: bool = False,
         _owner_ui: bool = False,
@@ -94,6 +95,7 @@ class MessageComposerMixin:
         _suppress_chat_authorization: bool = False,
         _suppress_mention_inference: bool = False,
         _task_request: dict[str, Any] | None = None,
+        _staged_attachments: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         session = opaque_id(
             authorized_session_id,
@@ -101,7 +103,12 @@ class MessageComposerMixin:
         )
         sender = opaque_id(sender_participant_id, field="sender_participant_id")
         conversation = validate_conversation_id(conversation_id)
-        normalized_body = body(body_text)
+        normalized_links = self._normalize_message_links(links)
+        staged_attachments = list(_staged_attachments or [])
+        raw_body = str(body_text or "")
+        normalized_body = body(raw_body) if raw_body.strip() else ""
+        if not normalized_body and not normalized_links and not staged_attachments:
+            normalized_body = body(raw_body)
         normalized_audience = str(audience_kind or "").strip().lower()
         if normalized_audience not in AUDIENCE_KINDS:
             raise ValidationError(f"unsupported audience_kind: {normalized_audience}")
@@ -140,6 +147,14 @@ class MessageComposerMixin:
             raise ValidationError("cross-room forwards require one source message")
         if (normalized_message_kind == "task") != bool(_task_request):
             raise ValidationError("structured task messages require task metadata")
+        if staged_attachments and not (_owner_ui or _web_user):
+            raise AuthorizationError(
+                "only an authenticated Web user can upload files or images"
+            )
+        if staged_attachments and normalized_message_kind != "message":
+            raise ValidationError(
+                "files and images are supported only in ordinary chat messages"
+            )
         if normalized_wake_all and normalized_audience != "room":
             raise ValidationError("wake_all_agents requires a room audience")
         normalized_target = self._normalize_audience_value(
@@ -163,6 +178,8 @@ class MessageComposerMixin:
         sender_seat = "unknown"
         web_identity: sqlite3.Row | None = None
         body_routing: list[dict[str, Any]] = []
+        inherited_restriction_target_kind: str | None = None
+        inherited_restriction_recipients: list[str] = []
 
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
@@ -265,7 +282,7 @@ class MessageComposerMixin:
                 if normalized_wake_all:
                     raise AuthorizationError("Agent 不能发起结构化 @全员")
             internal_mentions: list[str] = []
-            if not _suppress_mention_inference:
+            if not _suppress_mention_inference and normalized_body:
                 normalized_body, internal_mentions = (
                     self._rewrite_internal_text_mentions_locked(
                         conn,
@@ -276,11 +293,12 @@ class MessageComposerMixin:
                 )
             # A display name can be longer than its opaque ID, so enforce the
             # body limit again after the user-visible rewrite.
-            normalized_body = body(normalized_body)
+            if normalized_body:
+                normalized_body = body(normalized_body)
             for inferred in internal_mentions:
                 if inferred not in normalized_mentions:
                     normalized_mentions.append(inferred)
-            if not _suppress_mention_inference:
+            if not _suppress_mention_inference and normalized_body:
                 for inferred in self._infer_text_mentions_locked(
                     conn,
                     conversation_id=conversation,
@@ -317,6 +335,42 @@ class MessageComposerMixin:
                         "reply chains are limited to one level; continue the "
                         "conversation with a new message"
                     )
+                reply_restriction = conn.execute(
+                    "SELECT target_kind FROM message_restrictions "
+                    "WHERE message_id = ?",
+                    (normalized_reply,),
+                ).fetchone()
+                if reply_restriction is not None:
+                    inherited_restriction_target_kind = str(
+                        reply_restriction["target_kind"]
+                    )
+                    inherited_restriction_recipients = [
+                        str(row["participant_id"])
+                        for row in conn.execute(
+                            "SELECT participant_id "
+                            "FROM message_restriction_recipients "
+                            "WHERE message_id = ? ORDER BY participant_id",
+                            (normalized_reply,),
+                        ).fetchall()
+                    ]
+                    if (
+                        not _owner_ui
+                        and not _web_user
+                        and sender not in inherited_restriction_recipients
+                    ):
+                        raise AuthorizationError(
+                            "reply target is not visible to this Agent"
+                        )
+                    if _task_request is not None:
+                        unauthorized_task_targets = sorted(
+                            set(task_target_ids)
+                            - set(inherited_restriction_recipients)
+                        )
+                        if unauthorized_task_targets:
+                            raise AuthorizationError(
+                                "a task reply cannot expand the fixed recipients "
+                                "of a restricted message"
+                            )
             if (
                 not _owner_ui
                 and not _web_user
@@ -525,6 +579,24 @@ class MessageComposerMixin:
                 "SELECT * FROM messages WHERE message_id = ?",
                 (message_id,),
             ).fetchone()
+            self._persist_message_assets_locked(
+                conn,
+                message_id=message_id,
+                links=normalized_links,
+                attachments=staged_attachments,
+                conversation_id=conversation,
+                sender_participant_id=sender,
+                mentioned_participant_ids=normalized_mentions,
+                wake_all_agents=normalized_wake_all,
+                created_by_web_user_id=(
+                    str(web_identity["user_id"])
+                    if web_identity is not None
+                    else None
+                ),
+                created_at=now,
+                inherited_target_kind=inherited_restriction_target_kind,
+                inherited_recipient_ids=inherited_restriction_recipients,
+            )
             task_payload = None
             if _task_request is not None:
                 conn.execute(
@@ -630,6 +702,9 @@ class MessageComposerMixin:
                     recipient_participant_id=None,
                 ),
             )
+            payload.update(
+                self._message_asset_projection_locked(conn, [message_id])[message_id]
+            )
             if task_payload is not None:
                 payload["task"] = task_payload
             if body_routing:
@@ -650,20 +725,31 @@ class MessageComposerMixin:
         mentions: Sequence[str] | None = None,
         wake_all_agents: bool = False,
         reply_to: str | None = None,
+        links: Sequence[str] | None = None,
+        attachments: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Send one owner-authored room message through the local web authority."""
-        return self.send(
-            authorized_session_id=OWNER_AUTHORIZATION_ID,
-            sender_participant_id=OWNER_PARTICIPANT_ID,
-            conversation_id=conversation_id,
-            body_text=body_text,
-            audience_kind="room",
-            audience_value="*",
-            mentions=mentions,
-            wake_all_agents=wake_all_agents,
-            reply_to=reply_to,
-            _owner_ui=True,
-        )
+        staged = self._stage_message_attachments(attachments)
+        try:
+            result = self.send(
+                authorized_session_id=OWNER_AUTHORIZATION_ID,
+                sender_participant_id=OWNER_PARTICIPANT_ID,
+                conversation_id=conversation_id,
+                body_text=body_text,
+                audience_kind="room",
+                audience_value="*",
+                mentions=mentions,
+                links=links,
+                wake_all_agents=wake_all_agents,
+                reply_to=reply_to,
+                _owner_ui=True,
+                _staged_attachments=staged,
+            )
+        except Exception:
+            self._discard_staged_message_attachments(staged, include_final=True)
+            raise
+        self._discard_staged_message_attachments(staged, include_final=False)
+        return result
 
     def send_web_message(
         self,
@@ -675,21 +761,31 @@ class MessageComposerMixin:
         mentions: Sequence[str] | None = None,
         wake_all_agents: bool = False,
         reply_to: str | None = None,
+        links: Sequence[str] | None = None,
+        attachments: Sequence[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Send one authenticated web user's room message under its own identity."""
-
-        return self.send(
-            authorized_session_id=authorized_session_id,
-            sender_participant_id=participant_id,
-            conversation_id=conversation_id,
-            body_text=body_text,
-            audience_kind="room",
-            audience_value="*",
-            mentions=mentions,
-            wake_all_agents=wake_all_agents,
-            reply_to=reply_to,
-            _web_user=True,
-        )
+        staged = self._stage_message_attachments(attachments)
+        try:
+            result = self.send(
+                authorized_session_id=authorized_session_id,
+                sender_participant_id=participant_id,
+                conversation_id=conversation_id,
+                body_text=body_text,
+                audience_kind="room",
+                audience_value="*",
+                mentions=mentions,
+                links=links,
+                wake_all_agents=wake_all_agents,
+                reply_to=reply_to,
+                _web_user=True,
+                _staged_attachments=staged,
+            )
+        except Exception:
+            self._discard_staged_message_attachments(staged, include_final=True)
+            raise
+        self._discard_staged_message_attachments(staged, include_final=False)
+        return result
 
     @staticmethod
     def _room_wake_policy_payload(
@@ -894,6 +990,21 @@ class MessageComposerMixin:
             ).fetchone()
             if source is None:
                 raise NotFoundError(f"unknown source message: {source_id}")
+            if conn.execute(
+                "SELECT 1 FROM message_restrictions WHERE message_id = ?",
+                (source_id,),
+            ).fetchone() is not None:
+                raise AuthorizationError(
+                    "包含文件或图片的定向消息不能跨聊天室转发"
+                )
+            source_links = [
+                str(row["url"])
+                for row in conn.execute(
+                    "SELECT url FROM message_links WHERE message_id = ? "
+                    "ORDER BY position",
+                    (source_id,),
+                ).fetchall()
+            ]
             if str(source["message_kind"]) == "forward":
                 raise ConflictError(
                     "forward chains are not allowed; forward the original message"
@@ -930,4 +1041,5 @@ class MessageComposerMixin:
             _forwarded_from_message_id=source_id,
             _suppress_chat_authorization=True,
             _suppress_mention_inference=True,
+            links=source_links,
         )

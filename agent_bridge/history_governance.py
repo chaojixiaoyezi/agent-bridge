@@ -688,6 +688,10 @@ class HistoryGovernanceMixin:
                 """,
                 (conversation,),
             ).fetchall()
+            message_assets = self._message_asset_projection_locked(
+                conn,
+                [str(row["message_id"]) for row in message_rows],
+            )
             marker_rows = conn.execute(
                 "SELECT * FROM room_message_markers WHERE conversation_id = ? "
                 "ORDER BY updated_at, message_id, marker_kind",
@@ -785,6 +789,7 @@ class HistoryGovernanceMixin:
                         else None
                     ),
                     "redaction_reason": str(row["redaction_reason"] or ""),
+                    **message_assets[str(row["message_id"])],
                     "created_at": float(row["created_at"]),
                     "updated_at": float(row["updated_at"]),
                 }

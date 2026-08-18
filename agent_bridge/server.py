@@ -30,8 +30,11 @@ MCP = MCPServer(
         "launcher or registration authority. After joining, use ordinary chat "
         "messages. Messages have no question/answer/info labels. A quoted reply "
         "cannot itself be quoted again; continue with a new top-level message. "
-        "Every room member can read the complete room history. participant "
-        "audiences and mentions are public @ notifications, never private messages. "
+        "Every room member can read ordinary room history. A Web message that "
+        "contains a file or image is the only exception: its text, links, and "
+        "attachment metadata are visible only to the structured Agent recipients "
+        "fixed at send time. participant audiences and ordinary mentions remain "
+        "public @ notifications, never private messages. "
         "Choose notification_mode=ordinary for backlog chat or mention for an "
         "immediate notification with an explicit target. "
         "Pass participant IDs in mentions whenever possible. Exact visible "
@@ -381,11 +384,14 @@ def agent_send(
     reply_to: str | None = None,
     refs: list[dict[str, Any]] | None = None,
     mentions: list[str] | None = None,
+    links: list[str] | None = None,
     notification_mode: Literal["ordinary", "mention"] | None = None,
 ) -> dict[str, Any]:
     """Send one ordinary chat message through the authenticated session.
 
-    refs remain metadata only. The bridge never reads files or executes text.
+    refs remain metadata only. links are first-class HTTP(S) link cards and the
+    Bridge never fetches their remote content. The bridge never reads referenced
+    local files or executes text.
     reply_to may quote a top-level message once; longer discussion continues as
     a new ordinary message. Every member can see the message. Choose
     notification_mode=ordinary for normal backlog chat, or mention for
@@ -416,6 +422,7 @@ def agent_send(
             "reply_to": reply_to,
             "refs": refs,
             "mentions": mentions,
+            "links": links,
             "notification_mode": notification_mode,
         },
     )
@@ -581,6 +588,28 @@ def agent_search_history(
             "created_before": created_before,
             "limit": limit,
         },
+    )
+
+
+@MCP.tool()
+def agent_download_attachment(
+    attachment_id: str,
+    destination_path: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Save one attachment that was explicitly addressed to this Agent.
+
+    Use the attachment_id returned by agent_wait or agent_history. The Bridge
+    rechecks the current authenticated room session and the immutable recipient
+    ACL, verifies size and SHA-256 while downloading, and writes atomically to
+    destination_path. A directory destination keeps the original safe filename.
+    Local TUI and operating-system permissions remain the final boundary.
+    """
+
+    return get_client().download_attachment(
+        attachment_id=attachment_id,
+        destination_path=destination_path,
+        overwrite=overwrite,
     )
 
 

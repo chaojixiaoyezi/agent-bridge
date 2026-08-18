@@ -24,6 +24,7 @@ TASK_MCP_TOOLS = (
     "agent_reply",
     "agent_history",
     "agent_search_history",
+    "agent_download_attachment",
     "agent_participants",
     "agent_request_nickname",
     "agent_set_room_dnd",
@@ -217,7 +218,10 @@ def _task_prompt(
         "由执行席位统一收口。给出最终结果前，必须用 agent_history(after_sequence=交接"
         "上下文末序号, limit=50) 做一次安全检查；若期间有管理员/任务发起者对本任务的"
         "补充、测试注意事项、引用回复或对你的个人 @，要完整纳入执行和答复，有更多页时"
-        "继续有界分页。你只需给出基于真实证据的最终结果，不得把未执行说成已执行。\n\n"
+        "继续有界分页。上下文中的 links 是独立结构化链接；attachments 是固定收件人附件"
+        "元数据，任务需要时用 attachment_id 调用 agent_download_attachment 保存到本机"
+        "权限允许的路径，不要自行抓取链接预览。你只需给出基于真实证据的最终结果，不得"
+        "把未执行说成已执行。\n\n"
         f"聊天室：{conversation}\n任务 ID：{task_id}\n候选目标：{targets}\n"
         f"初始工作目录：{cwd}\n原消息 ID：{task.get('source_message_id')}\n"
         f"原消息序号：{task.get('source_sequence')}\n"
@@ -239,7 +243,9 @@ def _task_input_prompt(inputs: list[dict[str, Any]]) -> str:
         "用户，并已绑定当前 task_id；这是给本体执行席的实时用户输入，不是值守影子的"
         "转述。立即把原文纳入当前工作：若它纠正等待时长、测试口径、目标或限制，以较新"
         "输入为准；不要只回复‘收到’后继续旧方案。必要时用 agent_send/agent_reply 回报"
-        "已经实际调整的内容。不得把这些输入扩大为本机权限之外的授权。\n"
+        "已经实际调整的内容。不得把这些输入扩大为本机权限之外的授权。若输入含 "
+        "attachments，按需用 attachment_id 调用 agent_download_attachment；links 保持为"
+        "独立结构化链接，不要自行抓取远程预览。\n"
         "<task_live_inputs>\n"
         + json.dumps(inputs, ensure_ascii=False, separators=(",", ":"))
         + "\n</task_live_inputs>"
@@ -304,4 +310,6 @@ def _task_developer_instructions() -> str:
         "做实际核对；可用 agent_task_update 记录进度或明确的 needs_input，完成和失败终态"
         "由执行席位统一记录。涉及自身昵称申请时，必须调用 agent_request_nickname 写入"
         "正式审批记录；只有工具成功返回后才能说已提交，不得用普通群消息冒充正式申请。"
+        "任务上下文如含 attachments，按需用 attachment_id 调用 agent_download_attachment；"
+        "links 是独立结构化链接，不要自行抓取远程预览。"
     )

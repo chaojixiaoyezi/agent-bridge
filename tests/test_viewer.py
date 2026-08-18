@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import concurrent.futures
+import base64
 import hashlib
+import json
 import sqlite3
 import threading
 import time
@@ -59,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.24"
+    assert _runtime_software_version() == "0.43.0"
 
 
 class FakeEmailDelivery:
@@ -2206,12 +2208,102 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260818-05")
+        index_html.index(f"{filename}?v=20260818-06")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
+
+
+def test_web_composite_attachment_message_and_agent_download_acl(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    _store, sender, receiver = seed(database)
+    client = TestClient(make_app(database))
+    login_admin(client)
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "/w8AAusB9Y9Z4L8AAAAASUVORK5CYII="
+    )
+
+    sent = client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(client, "send-message"),
+        data={
+            "body": "请检查图片和说明链接。",
+            "mentions": json.dumps([receiver["participant_id"]]),
+            "links": json.dumps(["https://example.com/spec"]),
+            "reply_to": "",
+            "wake_all_agents": "false",
+        },
+        files=[("files", ("evidence.png", png, "image/png"))],
+    )
+    assert sent.status_code == 201, sent.text
+    message = sent.json()["message"]
+    assert message["body"] == "请检查图片和说明链接。"
+    assert message["visibility"]["kind"] == "restricted"
+    assert message["attachments"][0]["filename"] == "evidence.png"
+    assert message["links"][0]["host"] == "example.com"
+
+    attachment_id = message["attachments"][0]["attachment_id"]
+    web_download = client.get(
+        f"/api/rooms/room-one/attachments/{attachment_id}"
+    )
+    assert web_download.status_code == 200
+    assert web_download.content == png
+    assert web_download.headers["content-type"] == "image/png"
+    assert client.get(
+        f"/api/rooms/room-two/attachments/{attachment_id}"
+    ).status_code == 404
+
+    target_download = client.post(
+        "/agent/attachments/download",
+        headers={"Authorization": f"Bearer {receiver['access_token']}"},
+        json={"attachment_id": attachment_id},
+    )
+    assert target_download.status_code == 200
+    assert target_download.content == png
+    denied = client.post(
+        "/agent/attachments/download",
+        headers={"Authorization": f"Bearer {sender['access_token']}"},
+        json={"attachment_id": attachment_id},
+    )
+    assert denied.status_code == 403
+
+    no_target = client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(client, "send-message"),
+        data={
+            "body": "不能公开发附件。",
+            "mentions": "[]",
+            "links": "[]",
+            "wake_all_agents": "false",
+        },
+        files=[("files", ("blocked.png", png, "image/png"))],
+    )
+    assert no_target.status_code == 400
+
+    link_only = client.post(
+        "/api/rooms/room-one/messages",
+        headers=intent_headers(client, "send-message"),
+        json={"body": "", "links": ["https://example.org/guide"]},
+    )
+    assert link_only.status_code == 201
+    link_message = link_only.json()["message"]
+    assert link_message["visibility"] == {"kind": "room"}
+    assert link_message["links"][0]["url"] == "https://example.org/guide"
+
+    projected = client.get("/api/rooms/room-one/messages").json()["messages"]
+    composite = next(item for item in projected if item["message_id"] == message["message_id"])
+    assert composite["attachments"][0]["attachment_id"] == attachment_id
+    assert composite["links"][0]["host"] == "example.com"
+    javascript = dashboard_javascript()
+    index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
+    assert "FormData" in javascript
+    assert "message-link-card" in javascript
+    assert "不会抓取远程预览" in javascript
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260818-05")
+        index_html.index(f"{filename}?v=20260818-06")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
