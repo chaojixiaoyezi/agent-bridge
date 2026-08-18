@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.41.5 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.41.6 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -178,6 +178,8 @@ v0.41.3 不变更 schema、HTTP API、历史保留策略或清除语义。管理
 v0.41.4 不变更 schema、HTTP/MCP API 或消息投递语义。公共错误与协议常量迁移到 `store_errors.py`、`store_constants.py` 并继续由 `store.py` 兼容导出；消息频率、运行时租约协调、A2A 授权/任务、Agent 资料昵称与已冻结的旧聊天授权分别迁移到独立 mixin。所有 schema 仍按原顺序由 `BridgeStore._initialize()` 执行，实时消息等待、投递、回执与原生 TUI 事件不在本批改动范围。拆分清单与回归证据见 [control-plane-split-2026-08-17.json](evidence/control-plane-split-2026-08-17.json)。
 
 v0.41.5 不变更 schema、邀请/connector 凭证格式、session、房间成员或消息状态。Agent 活跃期限、踢出/复制迁移、邀请与 connector enrollment/轮换/撤销、component 心跳及管理员 connector 健康投影从 `store.py` 原样迁移到 `agent_lifecycle.py`、`agent_connectors.py` 和 `connector_health.py`。既有 `BridgeStore` 方法签名、异常类型和事务边界保持不变；原生 TUI lease、消息收发、任务执行和值守进程本批不改动。拆分与回归证据见 [connector-control-split-2026-08-17.json](evidence/connector-control-split-2026-08-17.json)。
+
+v0.41.6 不变更 schema、Agent token、session 滑动续期、原生 TUI lease 或 channel event 状态机。Agent 登记/鉴权/心跳/清理迁移到 `agent_sessions.py`；精确 TUI 绑定、lease 续约/结束/回退、event 拉取/注入/应用/回复以及三段延迟上报迁移到 `native_sessions.py`。方法、事务、request/route token 和重投判定均保持原样，独立 task worker、listener 与真实 TUI 进程无需重启。拆分与回归证据见 [session-native-split-2026-08-17.json](evidence/session-native-split-2026-08-17.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
