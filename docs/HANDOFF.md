@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.41.7 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.41.8 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -182,6 +182,8 @@ v0.41.5 不变更 schema、邀请/connector 凭证格式、session、房间成�
 v0.41.6 不变更 schema、Agent token、session 滑动续期、原生 TUI lease 或 channel event 状态机。Agent 登记/鉴权/心跳/清理迁移到 `agent_sessions.py`；精确 TUI 绑定、lease 续约/结束/回退、event 拉取/注入/应用/回复以及三段延迟上报迁移到 `native_sessions.py`。方法、事务、request/route token 和重投判定均保持原样，独立 task worker、listener 与真实 TUI 进程无需重启。拆分与回归证据见 [session-native-split-2026-08-17.json](evidence/session-native-split-2026-08-17.json)。
 
 v0.41.7 不变更 schema、HTTP/MCP API、房间 ACL、成员关系或消息状态。房间创建与登记、Web 成员权限、房间改名、置顶/决策标记、成员与活动房间校验从 `store.py` 原样迁移到 `room_governance.py`；`BridgeStore` 继续暴露相同方法与公共常量。发送、通知、任务、回执和 Agent 进程均不在本批改动范围，线上仍只需 Viewer 滚动发布。拆分与回归证据见 [room-governance-split-2026-08-17.json](evidence/room-governance-split-2026-08-17.json)。
+
+v0.41.8 不变更 schema、HTTP/MCP API、任务权限、领取租约、任务输入重投或消息路由语义。Web 任务创建与普通消息转任务、执行席定向路由、房间任务策略/授权、领取/等待、补充输入、状态更新和子任务委派从 `store.py` 原样迁移到 `room_tasks.py`；发送与实时投递仍通过原 `BridgeStore` 方法协作，原任务 worker、TUI 与 connector 无需重启。拆分与回归证据见 [room-task-split-2026-08-17.json](evidence/room-task-split-2026-08-17.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
