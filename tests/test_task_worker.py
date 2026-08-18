@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import agent_bridge.task_worker as task_worker
+import agent_bridge.task_worker_codex as task_worker_codex
 from agent_bridge.http_client import BridgeRemoteError
 from agent_bridge.task_worker import (
     TASK_MCP_TOOLS,
@@ -46,9 +47,9 @@ def test_codex_task_host_forks_inviting_tui_without_overriding_permissions(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(task_worker, "JsonRpcProcess", FakeRpc)
+    monkeypatch.setattr(task_worker_codex, "JsonRpcProcess", FakeRpc)
     monkeypatch.setattr(
-        task_worker,
+        task_worker_codex,
         "resolve_executable_path",
         lambda _name: "/usr/bin/true",
     )

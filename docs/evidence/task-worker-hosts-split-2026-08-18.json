@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T00:51:31-07:00",
+  "baseline_commit": "a4e7cae348a1d04a00478497ce950a8fa2c43b9f",
+  "agent_bridge": {
+    "version": "0.42.12",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/task_worker.py",
+    "source_lines_before": 1150,
+    "source_lines_after": 434,
+    "targets": [
+      "agent_bridge/task_worker_common.py",
+      "agent_bridge/task_worker_codex.py",
+      "agent_bridge/task_worker_claude.py"
+    ],
+    "definitions_moved_or_retained": 20,
+    "definition_ast_equal": 20,
+    "module_assignments_moved": 3,
+    "module_assignment_ast_equal": 3,
+    "public_import_surface_changed": false,
+    "schema_changed": false,
+    "task_lease_semantics_changed": false,
+    "task_prompt_semantics_changed": false,
+    "codex_host_semantics_changed": false,
+    "claude_host_semantics_changed": false,
+    "native_tui_task_semantics_changed": false
+  },
+  "verification": {
+    "focused_task_worker_passed": 53,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 107.73,
+    "authenticated_ready_ms": 315.21,
+    "room_switch_ms": 51.7,
+    "resource_transfer_bytes": 592695,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

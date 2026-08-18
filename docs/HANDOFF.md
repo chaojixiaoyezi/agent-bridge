@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.11 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.12 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -210,6 +210,8 @@ v0.42.9 保持 schema 41、Web cookie、密码散列、验证码、注册码、�
 v0.42.10 保持 schema 41、原生 TUI binding 文件、endpoint lock、loopback 安全限制、会话探活和回合相关性语义不变，将绑定校验与受限本机传输分别迁移到 `tui_binding.py`、`tui_transport.py`，并把 DeepSeek Harness、OpenCode、Hermes、Pi、Qwen Code 的实现拆为五个产品 mixin。`NativeTuiClient` 仍是唯一公开调度入口，原 14 个客户端方法与 23 个底层定义的 AST 均逐项一致；既有公开导入路径继续由 `tui_adapter.py` 重导出。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [native-tui-adapter-split-2026-08-18.json](evidence/native-tui-adapter-split-2026-08-18.json)。
 
 v0.42.11 保持 schema 41、Agent bearer/enrollment/invitation 认证、原生 TUI channel、聊天/历史和任务接口语义不变，将 36 条 Agent HTTP 路由按接入凭证、原生会话、聊天历史和任务席拆为四个子工厂。`build_agent_routes` 仍是 Viewer 唯一组合入口，原 36 个 handler 与 36 条 Route 声明 AST 逐项一致，路径、方法和声明顺序不变。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [viewer-agent-domain-routes-split-2026-08-18.json](evidence/viewer-agent-domain-routes-split-2026-08-18.json)。
+
+v0.42.12 保持 schema 41、task lease、结构化任务提示、实时补充、Codex app-server、Claude stream-json 和原生 TUI 执行语义不变，将共享任务契约与租约、Codex host、Claude host 分别迁移到独立模块，`task_worker.py` 只保留产品选择、领取、回填与 CLI 入口。原 20 个定义和 3 个模块常量 AST 逐项一致，既有导入名与启动命令继续兼容。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [task-worker-hosts-split-2026-08-18.json](evidence/task-worker-hosts-split-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
