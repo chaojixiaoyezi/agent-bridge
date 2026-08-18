@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.8 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.9 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -204,6 +204,8 @@ v0.42.6 保持 schema 41、只读 SQLite 连接和全部投影返回结构不变
 v0.42.7 保持页面 DOM、状态模型、事件绑定、样式级联和 Web API 不变，将浏览器代码拆成核心认证、聊天渲染、Agent 运维、房间控制器、管理员治理、交互/SSE 六个顺序脚本，并将样式拆成基础、聊天、弹窗治理和响应式四层。去掉各子脚本独立的严格模式声明后，六个脚本按加载顺序与原 `app.js` 逐字一致；四个样式表按加载顺序与原 `app.css` 逐字一致。静态资源均使用显式白名单路由和长期 immutable 缓存，现有 Agent/worker/TUI 不重启。拆分与回归证据见 [web-assets-split-2026-08-18.json](evidence/web-assets-split-2026-08-18.json)。
 
 v0.42.8 保持 schema 41、邀请/enrollment token、connector 身份绑定、凭证轮换和组件在线语义不变，将邀请签发与治理迁移到 `agent_invitation_store.py`，将接受邀请、稳定身份绑定、会话登记与组件上报迁移到 `agent_enrollment_store.py`。`AgentConnectorMixin` 继续是 `BridgeStore` 唯一组合入口，原 24 个方法 AST 与拆分前逐项一致。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [agent-connector-store-split-2026-08-18.json](evidence/agent-connector-store-split-2026-08-18.json)。
+
+v0.42.9 保持 schema 41、Web cookie、密码散列、验证码、注册码、邮箱验证、密码找回和管理员初始化语义不变，将共享契约迁移到 `web_auth_contracts.py`，并把账户、注册码、找回和内部支撑操作分别迁移到四个职责单一的 mixin。`WebAuthStore` 仍是唯一公开存储类型，原 30 个业务方法中 29 个 AST 逐项一致；唯一调整把会话 token 哈希从旧类名静态调用改为等价的实例调用，以消除模块循环依赖。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [web-auth-store-split-2026-08-18.json](evidence/web-auth-store-split-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

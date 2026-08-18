@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T00:23:44-07:00",
+  "baseline_commit": "8c267d6fbc8a0586652069cf96b87157a9af2b93",
+  "agent_bridge": {
+    "version": "0.42.9",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/web_auth.py",
+    "source_lines_before": 1717,
+    "source_lines_after": 262,
+    "targets": [
+      "agent_bridge/web_auth_contracts.py",
+      "agent_bridge/web_auth_account_store.py",
+      "agent_bridge/web_auth_registration_store.py",
+      "agent_bridge/web_auth_recovery_store.py",
+      "agent_bridge/web_auth_support_store.py"
+    ],
+    "contract_definitions_moved": 11,
+    "contract_definition_ast_equal": 11,
+    "methods_moved": 30,
+    "method_ast_equal": 29,
+    "equivalent_instance_reference_changes": [
+      "_create_session_locked: WebAuthStore._secret_hash -> self._secret_hash"
+    ],
+    "public_store_surface_changed": false,
+    "schema_changed": false,
+    "cookie_semantics_changed": false,
+    "password_semantics_changed": false,
+    "captcha_semantics_changed": false,
+    "registration_semantics_changed": false,
+    "recovery_semantics_changed": false
+  },
+  "verification": {
+    "focused_web_auth_passed": 172,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 151.33,
+    "authenticated_ready_ms": 396.69,
+    "room_switch_ms": 56.65,
+    "resource_transfer_bytes": 592711,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
