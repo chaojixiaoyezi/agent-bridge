@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T01:22:23-07:00",
+  "baseline_commit": "9ffd04e26645a28a02dcdd7302b1278367c3ffe3",
+  "agent_bridge": {
+    "version": "0.42.15",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/viewer_admin_routes.py",
+    "source_lines_before": 1005,
+    "source_lines_after": 71,
+    "targets": [
+      "agent_bridge/viewer_admin_access_routes.py",
+      "agent_bridge/viewer_admin_observability_routes.py",
+      "agent_bridge/viewer_admin_operation_routes.py",
+      "agent_bridge/viewer_admin_rate_session_routes.py"
+    ],
+    "handlers_moved": 35,
+    "handler_ast_equal": 35,
+    "routes_moved": 36,
+    "route_ast_equal": 36,
+    "route_order_changed": false,
+    "public_composition_entry_changed": false,
+    "schema_changed": false,
+    "authorization_semantics_changed": false,
+    "response_semantics_changed": false
+  },
+  "verification": {
+    "focused_viewer_passed": 42,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 166.95,
+    "authenticated_ready_ms": 426.78,
+    "room_switch_ms": 62.8,
+    "resource_transfer_bytes": 592725,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
