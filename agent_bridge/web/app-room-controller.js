@@ -173,7 +173,7 @@ function renderActiveRoomHeader(roomId = state.selectedRoom) {
   elements.roomMessageSearchAdvanced.classList.toggle("disabled", !searchable);
   elements.roomTitle.textContent = roomId || "未选择聊天室";
   const abandoned = activeRoom?.status === "abandoned";
-  elements.roomRoute.textContent = abandoned ? "ABANDONED · HISTORY ONLY" : "ROOM · EVENT LIVE VIEW";
+  elements.roomRoute.textContent = abandoned ? "已废弃 · 仅浏览历史" : "当前聊天室 · 实时消息";
   elements.roomSummary.textContent = activeRoom
     ? abandoned
       ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`

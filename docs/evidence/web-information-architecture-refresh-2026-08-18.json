@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T02:28:42-07:00",
+  "baseline_commit": "89d50f2097f05eb35c8506d9fe6b7f33f40c4d4b",
+  "agent_bridge": {
+    "version": "0.42.20",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "information_architecture": {
+    "global_scope_label": "系统管理",
+    "room_scope_label": "房间管理",
+    "room_search_label": "搜消息",
+    "global_groups": [
+      "显示与提醒",
+      "Agent 接入",
+      "全局策略",
+      "安全与数据"
+    ],
+    "room_groups": [
+      "成员协作",
+      "房间规则",
+      "内容整理"
+    ],
+    "existing_control_ids_preserved": true,
+    "permission_visibility_contract_changed": false,
+    "message_or_room_protocol_changed": false
+  },
+  "layout_regression": {
+    "rooms_title_create_overlap": false,
+    "rooms_create_collapse_overlap": false,
+    "participant_name_minimum_verified_px": 100,
+    "mobile_viewport_width_px": 390,
+    "mobile_horizontal_overflow": false,
+    "light_theme_verified": true,
+    "dark_theme_verified": true,
+    "collapsed_panels_verified": true
+  },
+  "verification": {
+    "focused_viewer": "passed",
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 127.78,
+    "authenticated_ready_ms": 349.39,
+    "room_switch_ms": 44.04,
+    "resource_transfer_bytes": 595524,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

@@ -6,16 +6,16 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260817-01">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260817-01">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260817-01">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260817-01">
-    <script src="/assets/app.js?v=20260817-01" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260817-01" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260817-01" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260817-01" defer></script>
-    <script src="/assets/app-governance.js?v=20260817-01" defer></script>
-    <script src="/assets/app-interactions.js?v=20260817-01" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260818-01">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-01">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-01">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-01">
+    <script src="/assets/app.js?v=20260818-01" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260818-01" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260818-01" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260818-01" defer></script>
+    <script src="/assets/app-governance.js?v=20260818-01" defer></script>
+    <script src="/assets/app-interactions.js?v=20260818-01" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -38,39 +38,75 @@
             待回复
             <span id="pending-center-badge" hidden>0</span>
           </button>
-          <details class="tool-menu global-tools-menu" id="global-tools-menu">
-            <summary aria-label="展开全局工具">
-              <span>工具</span>
+          <details class="tool-menu global-tools-menu" id="global-tools-menu" data-tool-scope="global">
+            <summary aria-label="展开系统管理">
+              <svg class="tool-menu-icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M4 5h12M7 10h9M4 15h12M7 3v4M13 8v4M8 13v4"></path>
+              </svg>
+              <span class="tool-menu-label">系统管理</span>
               <span class="tool-menu-chevron" aria-hidden="true">⌄</span>
             </summary>
             <div class="tool-popover global-tool-popover">
               <div class="tool-popover-heading">
-                <strong>全局工具</strong>
-                <span>外观、接入与管理</span>
+                <div class="tool-popover-title">
+                  <span class="tool-scope-pill">全局</span>
+                  <strong>系统管理</strong>
+                </div>
+                <span>作用于所有聊天室</span>
               </div>
-              <label class="theme-picker" title="选择页面颜色风格">
-                <span>页面配色</span>
-                <select id="theme-select" aria-label="页面颜色风格">
-                  <option value="paper">明亮白</option>
-                  <option value="mist">浅雾蓝</option>
-                  <option value="aurora">青岚</option>
-                  <option value="ocean">海蓝</option>
-                  <option value="violet">紫夜</option>
-                  <option value="ember">暖砂</option>
-                </select>
-              </label>
-              <div class="tool-button-grid">
-                <button class="access-button" id="enable-notifications" type="button">开启通知</button>
-                <button class="access-button" id="open-agent-access" type="button">
-                  Agent 接入
-                  <span class="monitoring-alert-badge" id="monitoring-alert-badge" hidden>0</span>
-                </button>
-                <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
-                <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
-                <button class="access-button" id="open-registration-codes" type="button" hidden>注册码</button>
-                <button class="access-button" id="open-admin-audit" type="button" hidden>审计中心</button>
-                <button class="access-button" id="open-history-governance" type="button" hidden>历史治理</button>
-              </div>
+              <section class="tool-section appearance-tool-section">
+                <div class="tool-section-heading">
+                  <strong>显示与提醒</strong>
+                  <span>只影响当前浏览器</span>
+                </div>
+                <label class="theme-picker" title="选择页面颜色风格">
+                  <span>页面配色</span>
+                  <select id="theme-select" aria-label="页面颜色风格">
+                    <option value="paper">明亮白</option>
+                    <option value="mist">浅雾蓝</option>
+                    <option value="aurora">青岚</option>
+                    <option value="ocean">海蓝</option>
+                    <option value="violet">紫夜</option>
+                    <option value="ember">暖砂</option>
+                  </select>
+                </label>
+                <div class="tool-button-grid single-column-tool-grid">
+                  <button class="access-button" id="enable-notifications" type="button">开启通知</button>
+                </div>
+              </section>
+              <section class="tool-section">
+                <div class="tool-section-heading">
+                  <strong>Agent 接入</strong>
+                  <span>连接、设备与值守状态</span>
+                </div>
+                <div class="tool-button-grid single-column-tool-grid">
+                  <button class="access-button" id="open-agent-access" type="button">
+                    接入与运行状态
+                    <span class="monitoring-alert-badge" id="monitoring-alert-badge" hidden>0</span>
+                  </button>
+                </div>
+              </section>
+              <section class="tool-section">
+                <div class="tool-section-heading">
+                  <strong>全局策略</strong>
+                  <span>跨聊天室统一生效</span>
+                </div>
+                <div class="tool-button-grid">
+                  <button class="access-button" id="open-message-rates" type="button" hidden>发言频率</button>
+                  <button class="access-button" id="open-room-permissions" type="button" hidden>建房权限</button>
+                  <button class="access-button" id="open-registration-codes" type="button" hidden>用户注册码</button>
+                </div>
+              </section>
+              <section class="tool-section">
+                <div class="tool-section-heading">
+                  <strong>安全与数据</strong>
+                  <span>审计和历史治理</span>
+                </div>
+                <div class="tool-button-grid">
+                  <button class="access-button" id="open-admin-audit" type="button" hidden>审计中心</button>
+                  <button class="access-button" id="open-history-governance" type="button" hidden>历史治理</button>
+                </div>
+              </section>
               <span class="readonly-pill" id="rate-limit-pill">登录后显示发言规则</span>
             </div>
           </details>
@@ -87,13 +123,15 @@
           </button>
           <div class="panel-inner" id="rooms-panel-content">
             <div class="panel-heading">
-              <div>
-                <p class="section-kicker">CONVERSATIONS</p>
-                <h2>聊天室</h2>
+              <div class="panel-heading-copy">
+                <div class="panel-title-line">
+                  <h2>聊天室</h2>
+                  <span class="count-badge" id="room-count">0</span>
+                </div>
+                <p class="panel-subtitle">选择一个空间开始协作</p>
               </div>
               <div class="heading-actions">
-                <span class="count-badge" id="room-count">0</span>
-                <button class="create-room-button" id="open-create-room" type="button" aria-label="创建聊天室" title="创建聊天室">＋</button>
+                <button class="create-room-button" id="open-create-room" type="button" aria-label="新建聊天室" title="新建聊天室">＋</button>
               </div>
             </div>
             <label class="search-box">
@@ -120,7 +158,11 @@
               </div>
               <details class="tool-menu room-search-menu" id="room-search-menu">
                 <summary aria-label="展开聊天室搜索">
-                  <span>查找</span>
+                  <svg class="tool-menu-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <circle cx="8.5" cy="8.5" r="4.75"></circle>
+                    <path d="m12 12 4 4"></path>
+                  </svg>
+                  <span class="tool-menu-label">搜消息</span>
                   <span class="tool-menu-chevron" aria-hidden="true">⌄</span>
                 </summary>
                 <div class="room-message-search-shell">
@@ -193,25 +235,54 @@
                   <div class="room-message-search-results" id="room-message-search-results" hidden></div>
                 </div>
               </details>
-              <details class="tool-menu room-tools-menu" id="room-tools-menu" hidden>
-                <summary aria-label="展开房间工具">
-                  <span>房间工具</span>
+              <details class="tool-menu room-tools-menu" id="room-tools-menu" data-tool-scope="room" hidden>
+                <summary aria-label="展开当前聊天室管理">
+                  <svg class="tool-menu-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M10 2.8 12 4l2.35-.12.88 2.18 1.88 1.42-.57 2.28.57 2.28-1.88 1.42-.88 2.18L12 15.32l-2 1.2-2-1.2-2.35.12-.88-2.18-1.88-1.42.57-2.28-.57-2.28 1.88-1.42.88-2.18L8 4l2-1.2Z"></path>
+                    <circle cx="10" cy="9.66" r="2.35"></circle>
+                  </svg>
+                  <span class="tool-menu-label">房间管理</span>
                   <span class="tool-menu-chevron" aria-hidden="true">⌄</span>
                 </summary>
                 <div class="tool-popover room-tool-popover">
                   <div class="tool-popover-heading">
-                    <strong>当前房间</strong>
-                    <span>成员、值守与房间设置</span>
+                    <div class="tool-popover-title">
+                      <span class="tool-scope-pill">当前房间</span>
+                      <strong>房间管理</strong>
+                    </div>
+                    <span>只影响所选聊天室</span>
                   </div>
-                  <div class="tool-button-grid room-tool-grid">
-                    <button class="secondary-button compact-button" id="invite-agent" type="button" hidden>邀请 Agent</button>
-                    <button class="secondary-button compact-button" id="manage-members" type="button" hidden>成员管理</button>
-                    <button class="secondary-button compact-button" id="repair-residents" type="button" hidden>修复值守</button>
-                    <button class="secondary-button compact-button" id="manage-wake-policy" type="button" hidden>唤醒策略</button>
-                    <button class="secondary-button compact-button" id="manage-task-permissions" type="button" hidden>任务权限</button>
-                    <button class="secondary-button compact-button" id="open-room-highlights" type="button" hidden>房间要点</button>
-                    <button class="secondary-button compact-button" id="rename-room" type="button" hidden>重命名</button>
-                  </div>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>成员协作</strong>
+                      <span>接入、成员与值守</span>
+                    </div>
+                    <div class="tool-button-grid room-tool-grid">
+                      <button class="secondary-button compact-button" id="invite-agent" type="button" hidden>邀请 Agent</button>
+                      <button class="secondary-button compact-button" id="manage-members" type="button" hidden>成员权限</button>
+                      <button class="secondary-button compact-button" id="repair-residents" type="button" hidden>修复值守</button>
+                    </div>
+                  </section>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>房间规则</strong>
+                      <span>唤醒与任务权限</span>
+                    </div>
+                    <div class="tool-button-grid room-tool-grid">
+                      <button class="secondary-button compact-button" id="manage-wake-policy" type="button" hidden>唤醒策略</button>
+                      <button class="secondary-button compact-button" id="manage-task-permissions" type="button" hidden>任务权限</button>
+                    </div>
+                  </section>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>内容整理</strong>
+                      <span>要点与房间名称</span>
+                    </div>
+                    <div class="tool-button-grid room-tool-grid">
+                      <button class="secondary-button compact-button" id="open-room-highlights" type="button" hidden>房间要点</button>
+                      <button class="secondary-button compact-button" id="rename-room" type="button" hidden>修改名称</button>
+                    </div>
+                  </section>
                 </div>
               </details>
             </div>
@@ -271,11 +342,13 @@
           </button>
           <div class="panel-inner" id="people-panel-content">
             <div class="panel-heading">
-              <div>
-                <p class="section-kicker">PARTICIPANTS</p>
-                <h2>会话成员</h2>
+              <div class="panel-heading-copy">
+                <div class="panel-title-line">
+                  <h2>房间成员</h2>
+                  <span class="count-badge" id="participant-count">0</span>
+                </div>
+                <p class="panel-subtitle">接入状态与快捷操作</p>
               </div>
-              <span class="count-badge" id="participant-count">0</span>
             </div>
             <label class="participant-search" for="participant-search">
               <span aria-hidden="true">⌕</span>

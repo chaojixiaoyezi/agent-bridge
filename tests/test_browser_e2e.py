@@ -184,7 +184,27 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert timeline.bounding_box()["width"] > rooms.bounding_box()["width"] * 2
             assert page.locator("#global-tools-menu").get_attribute("open") is None
             assert page.locator("#room-tools-menu").get_attribute("open") is None
+            playwright_api.expect(
+                page.locator("#global-tools-menu > summary")
+            ).to_contain_text("系统管理")
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            panel_controls = page.evaluate(
+                """() => {
+                  const title = document.querySelector('.rooms-panel .panel-title-line').getBoundingClientRect();
+                  const create = document.querySelector('#open-create-room').getBoundingClientRect();
+                  const collapse = document.querySelector('#toggle-rooms-panel').getBoundingClientRect();
+                  const overlaps = (a, b) => !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
+                  return {
+                    titleCreateOverlap: overlaps(title, create),
+                    createCollapseOverlap: overlaps(create, collapse),
+                  };
+                }"""
+            )
+            assert panel_controls == {
+                "titleCreateOverlap": False,
+                "createCollapseOverlap": False,
+            }
 
             page.locator(".room-card", has_text="browser-room-one").click()
             playwright_api.expect(page.locator("#active-room-title")).to_have_text(
@@ -194,6 +214,9 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 page.locator("#timeline article[data-message-id]")
             ).to_have_count(60)
             assert page.locator(".load-earlier-button").is_visible()
+            playwright_api.expect(
+                page.locator("#room-tools-menu > summary")
+            ).to_contain_text("房间管理")
 
             timeline_locator = page.locator("#timeline")
             page.wait_for_function(
@@ -230,8 +253,16 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert "rooms-collapsed" in (workspace.get_attribute("class") or "")
             page.locator("#toggle-people-panel").click()
             assert "people-collapsed" not in (workspace.get_attribute("class") or "")
+            playwright_api.expect(page.locator(".person-actions").first).to_be_visible()
+            assert page.locator(".person-name").first.bounding_box()["width"] > 100
 
             page.locator("#global-tools-menu").click()
+            playwright_api.expect(
+                page.locator("#global-tools-menu .tool-scope-pill")
+            ).to_have_text("全局")
+            playwright_api.expect(
+                page.locator("#global-tools-menu .tool-popover-heading")
+            ).to_contain_text("作用于所有聊天室")
             page.locator("#theme-select").select_option("violet")
             assert page.locator("html").get_attribute("data-theme") == "violet"
             assert page.evaluate(
@@ -274,6 +305,7 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             page.wait_for_timeout(100)
             assert page.locator("#owner-message-form").is_visible()
             assert page.locator("#active-room-title").is_visible()
+            assert page.locator("#global-tools-menu > summary").bounding_box()["width"] == 32
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
             resource_bytes = page.evaluate(

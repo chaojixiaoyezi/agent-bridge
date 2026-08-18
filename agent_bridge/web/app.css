@@ -203,7 +203,13 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
   font-size: 12px;
 }
 
-.connection-status { display: inline-flex; align-items: center; gap: 8px; }
+.connection-status {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
 
 .theme-picker {
   min-height: 34px;
@@ -317,8 +323,8 @@ select option {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .workspace {
-  --rooms-column: 230px;
-  --people-column: 230px;
+  --rooms-column: 236px;
+  --people-column: 260px;
   position: relative;
   height: calc(100vh - 82px);
   display: grid;
@@ -342,11 +348,15 @@ select option {
 
 .rooms-panel, .people-panel { position: relative; padding: 0; }
 .panel-inner { height: 100%; display: flex; flex-direction: column; padding: 16px 12px 12px; transition: opacity 120ms ease; }
-.panel-heading { justify-content: space-between; padding: 0 39px 13px 5px; }
+.panel-heading { min-height: 46px; justify-content: space-between; gap: 8px; padding: 0 39px 13px 5px; }
+.panel-heading-copy { min-width: 0; }
+.panel-title-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.panel-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel-subtitle { margin: 5px 0 0; overflow: hidden; color: var(--muted); font-size: 9px; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
 
 .panel-collapse-toggle {
   position: absolute;
-  top: 12px;
+  top: 14px;
   right: 10px;
   z-index: 4;
   width: 30px;
@@ -354,14 +364,14 @@ select option {
   display: grid;
   place-items: center;
   padding: 0;
-  border: 1px solid var(--line);
+  border: 1px solid transparent;
   border-radius: 9px;
   color: var(--muted-strong);
-  background: var(--surface-soft);
+  background: color-mix(in srgb, var(--surface-soft) 72%, transparent);
   cursor: pointer;
   transition: 150ms ease;
 }
-.panel-collapse-toggle:hover { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--line)); }
+.panel-collapse-toggle:hover { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--line)); background: var(--cyan-soft); }
 .panel-toggle-icon { font-size: 18px; line-height: 1; }
 .panel-toggle-label { display: none; }
 .workspace.rooms-collapsed .rooms-panel .panel-inner,
@@ -391,29 +401,31 @@ select option {
   writing-mode: vertical-rl;
 }
 
-.heading-actions { display: flex; align-items: center; gap: 7px; }
+.heading-actions { flex: none; display: flex; align-items: center; gap: 7px; }
 
 .count-badge {
-  min-width: 25px;
-  height: 25px;
-  display: grid;
+  min-width: 20px;
+  height: 20px;
+  display: inline-grid;
   place-items: center;
-  padding: 0 7px;
-  border-radius: 9px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
   color: var(--muted-strong);
-  background: rgba(255,255,255,0.045);
-  font-size: 11px;
+  background: color-mix(in srgb, var(--surface-soft) 72%, transparent);
+  font-size: 9px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 
 .create-room-button {
-  width: 27px;
-  height: 27px;
+  width: 30px;
+  height: 30px;
   display: grid;
   place-items: center;
   padding: 0 0 2px;
   border: 1px solid rgba(85, 214, 199, 0.22);
-  border-radius: 9px;
+  border-radius: 10px;
   color: var(--cyan);
   background: var(--cyan-soft);
   cursor: pointer;
@@ -432,7 +444,7 @@ select option {
   border: 1px solid var(--line);
   border-radius: 12px;
   color: var(--muted);
-  background: rgba(4, 6, 10, 0.35);
+  background: color-mix(in srgb, var(--surface-soft) 76%, transparent);
 }
 
 .search-box:focus-within { border-color: rgba(85, 214, 199, 0.34); box-shadow: 0 0 0 3px rgba(85, 214, 199, 0.06); }

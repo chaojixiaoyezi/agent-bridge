@@ -620,28 +620,32 @@ function createParticipantCard(person) {
   head.append(name);
   head.append(makeElement("span", `presence-dot ${person.status}`));
   const isWebUser = isWebParticipant(person);
+  const actions = makeElement("div", "person-actions");
   if (!isWebUser && !archived) {
-    const mention = makeElement("button", "mention-button", "@");
+    const mention = makeElement("button", "mention-button", "@ 通知");
     mention.type = "button";
     mention.title = `特别通知 ${person.display_name || person.client_type}`;
+    mention.setAttribute("aria-label", `特别通知 ${person.display_name || person.client_type}`);
     mention.addEventListener("click", () => addComposerMention(person));
-    head.append(mention);
+    actions.append(mention);
     const activeRoom = state.rooms.find(
       (room) => room.conversation_id === state.selectedRoom,
     );
     if (activeRoom?.can_kick_agents && state.selectedRoom) {
-      const kick = makeElement("button", "person-kick-button", "踢");
+      const kick = makeElement("button", "person-kick-button", "移出");
       kick.type = "button";
       kick.title = `将 ${person.display_name || person.client_type} 踢出当前聊天室`;
+      kick.setAttribute("aria-label", `将 ${person.display_name || person.client_type} 移出当前聊天室`);
       kick.addEventListener("click", () => kickAgentFromRoom(
         state.selectedRoom,
         person,
         kick,
       ));
-      head.append(kick);
+      actions.append(kick);
     }
   }
   card.append(head);
+  if (actions.childElementCount) card.append(actions);
   if (person.roles.length) {
     const roles = makeElement("div", "roles");
     for (const role of person.roles) roles.append(makeElement("span", "role-chip", role));

@@ -13,7 +13,7 @@
     right: 0;
     bottom: 0;
     z-index: 22;
-    width: 230px;
+    width: 260px;
     box-shadow: -12px 0 40px rgba(0,0,0,.16);
   }
   .workspace.people-collapsed .people-panel { width: 48px; box-shadow: none; }
@@ -106,13 +106,13 @@
   .topbar-status { min-width: 0; gap: 5px; }
   .account-button { max-width: 62px; padding: 0 8px; }
   .pending-center-button { min-width: 0; padding: 0 8px; font-size: 9px; }
-  .global-tools-menu > summary > span:first-child { font-size: 0; }
-  .global-tools-menu > summary > span:first-child::after { content: "•••"; font-size: 10px; letter-spacing: 1px; }
+  .global-tools-menu .tool-menu-label { display: none; }
   .room-title-wrap { max-width: calc(100% - 116px); }
-  .room-search-menu > summary > span:first-child { font-size: 0; }
-  .room-search-menu > summary > span:first-child::after { content: "⌕"; font-size: 13px; }
-  .room-tools-menu > summary > span:first-child { font-size: 0; }
-  .room-tools-menu > summary > span:first-child::after { content: "工具"; font-size: 9px; }
+  .room-search-menu .tool-menu-label,
+  .room-tools-menu .tool-menu-label { display: none; }
+  .global-tools-menu > summary,
+  .room-search-menu > summary,
+  .room-tools-menu > summary { width: 32px; justify-content: center; padding: 0; }
   .tool-menu-chevron { display: none; }
   .room-message-search { grid-template-columns: 1fr auto; }
   .room-message-search select { grid-column: 1 / -1; }

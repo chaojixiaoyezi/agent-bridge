@@ -59,7 +59,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.19"
+    assert _runtime_software_version() == "0.42.20"
 
 
 class FakeEmailDelivery:
@@ -2206,22 +2206,32 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260817-01")
+        index_html.index(f"{filename}?v=20260818-01")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260817-01")
+        index_html.index(f"{filename}?v=20260818-01")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html
+    assert 'data-tool-scope="global"' in index_html
+    assert 'data-tool-scope="room"' in index_html
+    assert "系统管理" in index_html
+    assert "房间管理" in index_html
+    assert "作用于所有聊天室" in index_html
+    assert "只影响所选聊天室" in index_html
+    assert "成员协作" in index_html
+    assert "房间规则" in index_html
+    assert "内容整理" in index_html
     assert 'id="toggle-rooms-panel"' in index_html
     assert 'id="toggle-people-panel"' in index_html
     assert "function applyWorkspaceLayout" in javascript
     assert '"agentBridgeRoomsPanel"' in javascript
+    assert 'makeElement("div", "person-actions")' in javascript
     assert 'id="open-registration-codes"' in index_html
     assert 'id="registration-code-dialog"' in index_html
     assert "requestAnimationFrame" in javascript
