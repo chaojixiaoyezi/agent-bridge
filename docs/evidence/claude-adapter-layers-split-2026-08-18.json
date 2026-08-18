@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T01:42:28-07:00",
+  "baseline_commit": "45e6fe9cbccac977e03e269c499c8563f26787ad",
+  "agent_bridge": {
+    "version": "0.42.18",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/claude_adapter.py",
+    "source_lines_before": 744,
+    "source_lines_after": 294,
+    "targets": [
+      "agent_bridge/claude_adapter_contracts.py",
+      "agent_bridge/claude_adapter_evidence.py",
+      "agent_bridge/claude_adapter_fallback.py"
+    ],
+    "definitions_or_assignments_retained": 23,
+    "definition_or_assignment_ast_equal": 23,
+    "public_import_surface_changed": false,
+    "worker_entry_changed": false,
+    "schema_changed": false,
+    "prefetch_semantics_changed": false,
+    "tool_evidence_semantics_changed": false,
+    "required_reply_fallback_semantics_changed": false
+  },
+  "verification": {
+    "focused_connector_supervisor_passed": 38,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 106.01,
+    "authenticated_ready_ms": 324.86,
+    "room_switch_ms": 42.92,
+    "resource_transfer_bytes": 592637,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
