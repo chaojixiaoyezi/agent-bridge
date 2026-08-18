@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T18:26:45-07:00",
+  "agent_bridge": {
+    "version": "0.40.11",
+    "schema": 40
+  },
+  "environment": {
+    "os": "macOS",
+    "codex_version": "codex-cli 0.147.0-alpha.6.5",
+    "requested_binary": "/opt/homebrew/bin/codex",
+    "resolved_binary": "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "authentication": "ChatGPT login present",
+    "network": "random loopback Bridge endpoint"
+  },
+  "test": {
+    "kind": "real-listener-supervisor-codex-app-server-mcp",
+    "executions": 2,
+    "rounds_per_execution": 2,
+    "worker_durations_seconds": [
+      [135.238, 128.078],
+      [132.525, 135.242]
+    ],
+    "listener_restart": "passed",
+    "participant_identity_reused": "passed",
+    "codex_thread_reused": "passed",
+    "mention_at_end": "passed",
+    "mention_in_middle": "passed",
+    "exact_reply_to": "passed",
+    "delivery_ack": "passed",
+    "queue_handled_per_execution": 2,
+    "queue_active_after_test": 0,
+    "control_room_isolation": "passed"
+  },
+  "observations": {
+    "first_round_transport": "stream sampling timed out and Codex fell back to HTTP",
+    "latency_gate": "informational only"
+  },
+  "production_isolation": {
+    "central_database_opened": false,
+    "production_agent_processes_restarted": 0,
+    "production_room_messages_written": 0,
+    "production_connectors_reused": 0
+  },
+  "cleanup": {
+    "test_codex_thread_archived": true,
+    "temporary_registration_secret_removed": true,
+    "temporary_bridge_processes_remaining": 0
+  }
+}

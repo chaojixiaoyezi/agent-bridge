@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.10 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.11 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -50,7 +50,7 @@
 | connector installer | `agent_bridge/connector.py` | 接受邀请后写私有状态和当前用户级 launchd/systemd 服务 |
 | body/task executor | `bin/agent-bridge-task-worker` | 本体优先地原子领取结构化任务；Codex 用 `turn/steer`、Claude 用同 session 实时 `stream-json`，Native TUI 用产品原生 queue/steer 接收活动任务补充 |
 
-不要同时让旧 `agent-bridge-codex-wake` 和新 Codex worker消费同一个队列。旧入口只用于迁移兼容。
+Codex 只使用常驻 `agent-bridge-codex-worker`；旧同步 `agent-bridge-codex-wake` 已在迁移完成后移除。通用 supervisor 仍供 Claude 兼容回退和其他同步 adapter 使用。
 
 ## 3. “唤醒本机任意可达 Agent”的契约
 
@@ -164,6 +164,8 @@ v0.40.8 不变更 schema。Agent 个人 @ 的必须回复合同只读取结构�
 v0.40.9 不变更 schema、participant、connector、session 或消息结构。全局加载 Agent Bridge MCP 的普通 Codex/TUI 任务不再能调用 `agent_register` 自行入群；只有固定常驻启动器、connector enrollment、登记密钥或显式兼容开关拥有直接登记权限，新 Agent 继续通过管理员邀请调用 `agent_accept_invitation`。生产 viewer 同时配置独立登记密钥，阻止绕过 MCP 的裸 HTTP 登记。升级只需滚动重启 viewer；既有 Agent session 不撤销，受管旧常驻进程在自然续登或受控重启时继承密钥。
 
 v0.40.10 不变更 schema、队列或线程状态。Codex CLI 可能由 `/opt/homebrew/bin/codex` 等符号链接指向 ChatGPT/Codex 应用包；新版本在聊天值守、任务执行和旧同步 adapter 三条路径统一解析真实可执行文件后再启动，从而让 Codex 在真实二进制同目录找到 `codex-code-mode-host`。此前因宿主缺失而完成但没有 Bridge 工具证据的批次仍保持 pending，升级重启 worker 后由原持久队列和原 thread id 自动重放，不伪造 ack 或回复。
+
+v0.40.11 不变更 schema、队列、participant、connector、session 或 thread 状态。经 launchd、进程、connector 配置和应用状态目录四处核对后，旧同步 `agent-bridge-codex-wake` 已无部署引用并删除；Codex 只保留常驻 `agent-bridge-codex-worker`，仍被在线 Claude connector 使用的 `agent-bridge-claude-wake` 与通用 supervisor 保留。新增默认跳过的真实 Codex 隔离测试，使用临时中央库、本机队列、随机 loopback 端口和两个控制房间，验证 listener 重启、同一 participant/thread 恢复、正文中间/末尾精确 @、逐条引用回复、ack、队列收口及零跨房投递；测试 task 最后归档。发布仍可只滚动 viewer，不需要重启现有 Agent。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

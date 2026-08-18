@@ -1,6 +1,6 @@
 [project]
 name = "agent-bridge"
-version = "0.40.10"
+version = "0.40.11"
 description = "Durable multi-agent rooms with chat, structured tasks, and resident execution"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -23,4 +23,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
     "browser: real Chromium end-to-end coverage (requires AGENT_BRIDGE_RUN_BROWSER_TESTS=1)",
+    "live_codex: isolated real Codex and Agent Bridge end-to-end coverage (requires AGENT_BRIDGE_RUN_LIVE_CODEX_TESTS=1)",
 ]

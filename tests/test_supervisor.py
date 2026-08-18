@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-import agent_bridge.codex_adapter as codex_adapter
 import agent_bridge.supervisor as supervisor
 from agent_bridge.claude_adapter import _tool_evidence
-from agent_bridge.codex_adapter import _prompt_for_batch, _validated_batch, run_codex
 from agent_bridge.codex_worker import (
     CodexRpcError,
     CodexThreadHost,
@@ -257,78 +254,6 @@ def test_supervisor_recovers_inflight_events_after_owner_restart(
     status = queue_status(database)
     assert status["counts"]["pending"] == 1
     assert status["counts"]["inflight"] == 0
-
-
-def test_codex_adapter_uses_metadata_wake_and_freezes_chat_authority_prompt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    batch = _validated_batch(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "source": "agent-bridge-supervisor",
-                "event": "wake_batch",
-                "batch_id": "batch-id",
-                "event_count": 3,
-                "event_ids": [70, 71, 72],
-                "first_event_id": 70,
-                "last_event_id": 72,
-                "participant_ids": ["participant_receiver"],
-                "wake_priority": "mention",
-                "priority_counts": {
-                    "normal": 1,
-                    "important": 0,
-                    "mention": 2,
-                },
-            }
-        ).encode("utf-8")
-    )
-    captured: dict = {}
-
-    def fake_run(command, **kwargs):
-        captured["command"] = command
-        captured.update(kwargs)
-        return SimpleNamespace(returncode=0)
-
-    monkeypatch.setattr(
-        codex_adapter,
-        "resolve_executable_path",
-        lambda _binary: "/opt/bin/codex",
-    )
-    monkeypatch.setattr(codex_adapter.subprocess, "run", fake_run)
-    monkeypatch.setenv("AGENT_BRIDGE_TOKEN", "must-not-reach-codex")
-    monkeypatch.setenv("AGENT_TOKEN", "must-not-reach-codex-either")
-
-    assert (
-        run_codex(
-            batch,
-            thread_id="019f0000-0000-7000-8000-000000000000",
-            cwd=tmp_path,
-            codex_binary="codex",
-        )
-        == 0
-    )
-    prompt = captured["input"]
-    assert "唤醒信号" in prompt
-    assert "message.authorization" in prompt
-    assert "授权功能已冻结" in prompt
-    assert "结构化任务执行席位" in prompt
-    assert "本批事件数=3" in prompt
-    assert "最新事件序号=72" in prompt
-    assert "body" not in prompt
-    assert captured["shell"] is False
-    assert "AGENT_BRIDGE_TOKEN" not in captured["env"]
-    assert "AGENT_TOKEN" not in captured["env"]
-    assert captured["command"] == [
-        "/opt/bin/codex",
-        "exec",
-        "resume",
-        "--skip-git-repo-check",
-        "019f0000-0000-7000-8000-000000000000",
-        "-",
-    ]
-    assert _prompt_for_batch(batch) == prompt
 
 
 def test_resident_codex_worker_requires_and_observes_exact_mention_reply(

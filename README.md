@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.40.10。
+当前版本：v0.40.11。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -138,7 +138,7 @@ Claude 接受自动值守邀请后会返回 `resident_setup.launch_command`。�
 
 Pi 首次接入会把 extension 安装到 `~/.pi/agent/extensions/agent-bridge.ts`。若当前 Pi 尚未加载它，执行一次 `/reload`；extension 会按当前 session 自动匹配唯一 endpoint。刚创建且尚未发送过消息的当前 session 虽然还没有 JSONL 文件，也可以直接接收首条 Bridge 消息；不存在且并非当前 session 的路径仍会拒绝。要让同一 Pi TUI 在多个已绑定房间之间自动切换，再执行一次 `/agent-bridge-bind <resident_setup.state_directory>/tui-binding.json`，获得 Pi 明确授予的 session-switch command context。后续给同一 endpoint 增加房间会自动发现；如果本机存在多个 endpoint 且无法由当前 session 唯一判断，必须传具体 binding 路径，不能全局认领。
 
-Codex 使用专用常驻聊天 worker 作为无本机实施权的影子兜底，同时由 `agent-bridge-task-worker` 保持一个持久本体执行席。普通群聊仍由影子讨论；有任务权限的 Web 用户结构化个人 `@` 会在本体组件就绪时直接进入本体，目标正在工作则通过 `turn/steer` 合入同一回合，空闲则立即创建本体任务。这样不会同时让影子抢答同一条本体请求。Agent Bridge MCP 进程按连接器固定身份自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。worker 在启动 Codex 前会把 PATH 或配置给出的符号链接解析到真实可执行文件，使 Codex 能在应用包内找到同目录的 `codex-code-mode-host`；聊天值守、任务席和旧兼容 adapter 使用同一规则。session token 只保存在 MCP 内存中；状态文件只保存专用 task/thread id，不保存 Bridge token：
+Codex 使用专用常驻聊天 worker 作为无本机实施权的影子兜底，同时由 `agent-bridge-task-worker` 保持一个持久本体执行席。普通群聊仍由影子讨论；有任务权限的 Web 用户结构化个人 `@` 会在本体组件就绪时直接进入本体，目标正在工作则通过 `turn/steer` 合入同一回合，空闲则立即创建本体任务。这样不会同时让影子抢答同一条本体请求。Agent Bridge MCP 进程按连接器固定身份自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。worker 在启动 Codex 前会把 PATH 或配置给出的符号链接解析到真实可执行文件，使 Codex 能在应用包内找到同目录的 `codex-code-mode-host`；聊天值守和任务席使用同一规则。session token 只保存在 MCP 内存中；状态文件只保存专用 task/thread id，不保存 Bridge token：
 
 ```bash
 export AGENT_BRIDGE_CODEX_THREAD_STATE_FILE=/absolute/path/codex-worker-thread
@@ -160,7 +160,7 @@ worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令�
 
 常驻 Codex worker 仅预批准一个显式的 Agent Bridge MCP 工具白名单，不会放开 shell、文件修改或其他 MCP。它不会仅凭 Codex turn 状态为 `completed` 就确认本地队列：每批必须观察到成功的 `agent_wait`；含个人 @ 的批次还必须观察到每个 `agent_reply.message_id` 与 `agent_wait` 返回且投递原因含 `mention` 的消息一致。引用唤醒与 `@全员` 不要求回复。工具被拒绝、模型回合中断或证据不完整时，批次回到 `pending` 并退避重试。
 
-v0.4 的 `agent-bridge-supervisor` + `agent-bridge-codex-wake` 同步 adapter 接口继续保留一个兼容版本，供已有非 Codex adapter 迁移；新 Codex 部署应使用常驻 worker。同步 adapter 会等待整个产品回合结束，不具备同回合 steering，因此不应再指向用户正在操作的 Codex task。
+旧同步 `agent-bridge-codex-wake` 已在常驻 worker 完成迁移后移除。Codex 部署统一使用 `agent-bridge-codex-worker`；通用 supervisor 继续服务仍在使用同步兼容入口的 Claude 与其他产品。
 
 本地 webhook 必须返回 2xx、enqueue 命令必须返回 0，表示事件已经**持久进入本机 supervisor 队列**。监听器只在所有已配置 sink 确认后写 cursor；sink 失败会重连并重投同一元数据事件。内置 supervisor 用 `participant_id + event + event_id` 幂等去重，因为前一个 sink 成功而后一个 sink 失败时，重连会再次投递同一事件。cursor 文件只包含最后序号，不包含令牌。兼容旧部署时仍可安全注入 `AGENT_BRIDGE_TOKEN`；不要把 token 放进参数、日志、URL 或 cursor 文件。
 
@@ -335,7 +335,7 @@ bin/agent-bridge-maintain --database "$PWD/bridge.db" release-viewer \
 
 ## 测试
 
-五类原生 TUI 的真产品双会话证据、版本边界和清理记录见 [docs/REAL_PRODUCT_E2E.md](docs/REAL_PRODUCT_E2E.md)。
+完整测试分层、隔离边界与运行命令见 [docs/TESTING.md](docs/TESTING.md)。五类原生 TUI 的真产品双会话证据、版本边界和清理记录见 [docs/REAL_PRODUCT_E2E.md](docs/REAL_PRODUCT_E2E.md)。
 
 ```bash
 .venv/bin/pytest -q
@@ -354,6 +354,15 @@ AGENT_BRIDGE_BROWSER_CHANNEL=chrome \
 uv run pytest tests/test_browser_e2e.py -s
 ```
 
+本机已登录 Codex 时，可运行隔离的真实 listener → supervisor → Codex
+app-server → MCP → 引用回复链路。它只使用临时数据库、随机 loopback 端口和
+独立聊天室，完成后归档测试 Codex task；默认 CI 不消耗真实模型：
+
+```bash
+AGENT_BRIDGE_RUN_LIVE_CODEX_TESTS=1 \
+uv run pytest tests/test_live_codex_e2e.py -s
+```
+
 覆盖范围包括：
 
 - 真实独立 stdio MCP 进程的手动登记、常驻自动登记、单次/多人复用邀请接受、消息、公开 `@`、回复与等待；
@@ -365,6 +374,8 @@ uv run pytest tests/test_browser_e2e.py -s
 - 页面增量刷新、滚动锚点、纯文本渲染、任意正文位置的 `@`、限频管理与审批界面；
 - 五类真实 TUI binding 校验、同端点多房间 session 隔离、原生 turn 相关性、Pi extension 严格 TypeScript 检查与在线探活；
 - 正文、路径和 refs 永不执行或读取。
+- 真实 Codex 在 listener 重启后复用同一 participant 与 thread，正文中间/末尾的
+  精确 `@` 均完成 `agent_wait`、逐条 `agent_reply`、ack 和房间隔离核对。
 
 ## 明确边界
 
