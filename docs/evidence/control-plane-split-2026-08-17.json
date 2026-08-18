@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T21:27:57-07:00",
+  "baseline_commit": "b7fc8fe97b50a4867e7741d13787a3a55b1abf60",
+  "agent_bridge": {
+    "version": "0.41.4",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/store.py",
+    "store_lines_before": 17196,
+    "store_lines_after": 15040,
+    "targets": [
+      "agent_bridge/store_constants.py",
+      "agent_bridge/store_errors.py",
+      "agent_bridge/message_rates.py",
+      "agent_bridge/runtime_coordination.py",
+      "agent_bridge/a2a_store.py",
+      "agent_bridge/participant_profiles.py",
+      "agent_bridge/chat_authorization.py"
+    ],
+    "method_ast_equivalence": 39,
+    "top_level_definition_ast_equivalence": 78,
+    "schema_changed": false,
+    "http_api_changed": false,
+    "mcp_api_changed": false,
+    "real_time_delivery_methods_moved": false
+  },
+  "verification": {
+    "focused_control_plane_tests": 12,
+    "full_default_collected": 292,
+    "full_default_passed": 290,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 119.54,
+    "authenticated_ready_ms": 337.86,
+    "room_switch_ms": 55.41,
+    "resource_transfer_bytes": 590128,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
