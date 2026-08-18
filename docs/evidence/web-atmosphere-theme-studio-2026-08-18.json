@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T02:48:10-07:00",
+  "baseline_commit": "5a4c8f14df9b8a72f6dc653f87102bc7f5082626",
+  "agent_bridge": {
+    "version": "0.42.21",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "sidebar_alignment": {
+    "shared_control_rail_px": 82,
+    "button_size_px": 34,
+    "create_button_top_px": 85,
+    "collapse_button_top_px": 85,
+    "top_delta_px": 0,
+    "height_delta_px": 0,
+    "button_gap_px": 6
+  },
+  "theme_studio": {
+    "theme_count": 6,
+    "themes": [
+      "paper",
+      "mist",
+      "aurora",
+      "ocean",
+      "violet",
+      "ember"
+    ],
+    "live_preview": true,
+    "light_dark_badge": true,
+    "mood_labels": true,
+    "keyboard_navigation": true,
+    "native_select_compatibility": true,
+    "aurora_has_distinct_tokens": true,
+    "ambient_grid_and_glow": true
+  },
+  "verification": {
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "browser_e2e_passed": 1,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 106.24,
+    "authenticated_ready_ms": 331.18,
+    "room_switch_ms": 42.5,
+    "resource_transfer_bytes": 605796,
+    "result": "passed"
+  },
+  "visual_review": {
+    "paper_theme": "passed",
+    "aurora_theme": "passed",
+    "popover_overlap": false,
+    "chat_or_member_panel_obscured_after_close": false
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

@@ -6,16 +6,16 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260818-01">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-01">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-01">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-01">
-    <script src="/assets/app.js?v=20260818-01" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260818-01" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260818-01" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260818-01" defer></script>
-    <script src="/assets/app-governance.js?v=20260818-01" defer></script>
-    <script src="/assets/app-interactions.js?v=20260818-01" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260818-02">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-02">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-02">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-02">
+    <script src="/assets/app.js?v=20260818-02" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260818-02" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260818-02" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260818-02" defer></script>
+    <script src="/assets/app-governance.js?v=20260818-02" defer></script>
+    <script src="/assets/app-interactions.js?v=20260818-02" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -59,9 +59,48 @@
                   <strong>显示与提醒</strong>
                   <span>只影响当前浏览器</span>
                 </div>
-                <label class="theme-picker" title="选择页面颜色风格">
-                  <span>页面配色</span>
-                  <select id="theme-select" aria-label="页面颜色风格">
+                <div class="theme-studio">
+                  <div class="theme-studio-intro">
+                    <span class="theme-studio-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+                    <div>
+                      <strong>空间氛围</strong>
+                      <span>背景、光晕与面板质感会一起变化</span>
+                    </div>
+                    <span class="theme-current-mode" id="theme-current-mode">浅色</span>
+                  </div>
+                  <div class="theme-choice-grid" role="radiogroup" aria-label="页面颜色风格">
+                    <button class="theme-choice" data-theme-value="paper" data-theme-mode="浅色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>明亮白</strong><small>通透 · 清晰</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="theme-choice" data-theme-value="mist" data-theme-mode="浅色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>浅雾蓝</strong><small>安静 · 柔和</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="theme-choice" data-theme-value="aurora" data-theme-mode="深色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>青岚</strong><small>清新 · 灵动</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="theme-choice" data-theme-value="ocean" data-theme-mode="深色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>海蓝</strong><small>深邃 · 专注</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="theme-choice" data-theme-value="violet" data-theme-mode="深色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>紫夜</strong><small>沉浸 · 神秘</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                    <button class="theme-choice" data-theme-value="ember" data-theme-mode="深色" type="button" role="radio" aria-checked="false">
+                      <span class="theme-choice-preview" aria-hidden="true"></span>
+                      <span class="theme-choice-copy"><strong>暖砂</strong><small>温暖 · 松弛</small></span>
+                      <span class="theme-choice-check" aria-hidden="true">✓</span>
+                    </button>
+                  </div>
+                  <select class="visually-hidden" id="theme-select" aria-label="页面颜色风格" tabindex="-1">
                     <option value="paper">明亮白</option>
                     <option value="mist">浅雾蓝</option>
                     <option value="aurora">青岚</option>
@@ -69,7 +108,7 @@
                     <option value="violet">紫夜</option>
                     <option value="ember">暖砂</option>
                   </select>
-                </label>
+                </div>
                 <div class="tool-button-grid single-column-tool-grid">
                   <button class="access-button" id="enable-notifications" type="button">开启通知</button>
                 </div>
@@ -118,7 +157,9 @@
       <section class="workspace people-collapsed" id="workspace">
         <aside class="rooms-panel panel">
           <button class="panel-collapse-toggle" id="toggle-rooms-panel" type="button" aria-controls="rooms-panel-content" aria-expanded="true" title="收起聊天室列表">
-            <span class="panel-toggle-icon" aria-hidden="true">‹</span>
+            <span class="panel-toggle-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20"><path d="m12.5 4.5-5 5.5 5 5.5"></path></svg>
+            </span>
             <span class="panel-toggle-label">聊天室</span>
           </button>
           <div class="panel-inner" id="rooms-panel-content">
@@ -337,7 +378,9 @@
 
         <aside class="people-panel panel">
           <button class="panel-collapse-toggle" id="toggle-people-panel" type="button" aria-controls="people-panel-content" aria-expanded="false" title="展开成员面板">
-            <span class="panel-toggle-icon" aria-hidden="true">‹</span>
+            <span class="panel-toggle-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20"><path d="m12.5 4.5-5 5.5 5 5.5"></path></svg>
+            </span>
             <span class="panel-toggle-label">成员</span>
           </button>
           <div class="panel-inner" id="people-panel-content">

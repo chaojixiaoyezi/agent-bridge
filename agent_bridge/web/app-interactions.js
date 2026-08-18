@@ -1286,6 +1286,18 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pagehide", () => state.ownerEvents?.close());
 
 elements.themeSelect.addEventListener("change", () => applyTheme(elements.themeSelect.value));
+for (const [index, choice] of elements.themeChoices.entries()) {
+  choice.addEventListener("click", () => applyTheme(choice.dataset.themeValue));
+  choice.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const step = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
+    const targetIndex = (index + step + elements.themeChoices.length) % elements.themeChoices.length;
+    const target = elements.themeChoices[targetIndex];
+    applyTheme(target.dataset.themeValue);
+    target.focus();
+  });
+}
 elements.toggleRoomsPanel.addEventListener("click", () => {
   state.roomsPanelCollapsed = !state.roomsPanelCollapsed;
   applyWorkspaceLayout({ persist: true });
@@ -1311,6 +1323,7 @@ for (const menu of expandableToolMenus) {
 for (const menu of [elements.globalToolsMenu, elements.roomToolsMenu]) {
   for (const button of menu.querySelectorAll("button")) {
     button.addEventListener("click", () => {
+      if (button.matches(".theme-choice")) return;
       menu.open = false;
     });
   }

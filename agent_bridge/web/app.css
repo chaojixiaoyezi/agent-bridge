@@ -18,6 +18,9 @@
   --shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
   --ambient-one: rgba(85, 214, 199, 0.075);
   --ambient-two: rgba(155, 140, 255, 0.07);
+  --ambient-opacity: 0.24;
+  --pattern-line: rgba(255, 255, 255, 0.026);
+  --panel-sheen: rgba(255, 255, 255, 0.028);
   --panel-tint: rgba(18, 21, 29, 0.88);
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
@@ -33,6 +36,9 @@
   --amber: #ffc66d;
   --ambient-one: rgba(87, 184, 255, 0.1);
   --ambient-two: rgba(112, 225, 209, 0.08);
+  --ambient-opacity: 0.32;
+  --pattern-line: rgba(87, 184, 255, 0.035);
+  --panel-sheen: rgba(87, 184, 255, 0.04);
 }
 
 :root[data-theme="violet"] {
@@ -46,6 +52,9 @@
   --amber: #ffd06a;
   --ambient-one: rgba(187, 140, 255, 0.1);
   --ambient-two: rgba(255, 143, 199, 0.075);
+  --ambient-opacity: 0.34;
+  --pattern-line: rgba(187, 140, 255, 0.037);
+  --panel-sheen: rgba(255, 143, 199, 0.035);
 }
 
 :root[data-theme="ember"] {
@@ -59,6 +68,33 @@
   --amber: #ffcd7e;
   --ambient-one: rgba(242, 170, 107, 0.09);
   --ambient-two: rgba(233, 196, 106, 0.07);
+  --ambient-opacity: 0.32;
+  --pattern-line: rgba(242, 170, 107, 0.034);
+  --panel-sheen: rgba(255, 205, 126, 0.035);
+}
+
+:root[data-theme="aurora"] {
+  --bg: #071311;
+  --surface: rgba(13, 29, 27, 0.9);
+  --surface-strong: #102522;
+  --surface-soft: #0b1c1a;
+  --line: rgba(123, 235, 213, 0.09);
+  --line-strong: rgba(123, 235, 213, 0.16);
+  --text: #effaf7;
+  --muted: #85a49e;
+  --muted-strong: #b8d0cb;
+  --cyan: #65e0c8;
+  --cyan-soft: rgba(101, 224, 200, 0.13);
+  --amber: #f3c875;
+  --purple: #8fb8ff;
+  --danger: #ff7e96;
+  --shadow: 0 24px 80px rgba(0, 13, 11, 0.38);
+  --ambient-one: rgba(101, 224, 200, 0.12);
+  --ambient-two: rgba(88, 137, 255, 0.09);
+  --ambient-opacity: 0.36;
+  --pattern-line: rgba(101, 224, 200, 0.038);
+  --panel-sheen: rgba(101, 224, 200, 0.04);
+  --panel-tint: rgba(13, 29, 27, 0.9);
 }
 
 :root[data-theme="paper"] {
@@ -80,6 +116,9 @@
   --shadow: 0 22px 70px rgba(45, 65, 90, 0.12);
   --ambient-one: rgba(55, 180, 171, 0.14);
   --ambient-two: rgba(124, 108, 220, 0.11);
+  --ambient-opacity: 0.22;
+  --pattern-line: rgba(35, 52, 72, 0.03);
+  --panel-sheen: rgba(255, 255, 255, 0.58);
   --panel-tint: rgba(255, 255, 255, 0.92);
 }
 
@@ -102,6 +141,9 @@
   --shadow: 0 22px 70px rgba(37, 67, 95, 0.13);
   --ambient-one: rgba(74, 169, 207, 0.15);
   --ambient-two: rgba(102, 122, 205, 0.12);
+  --ambient-opacity: 0.24;
+  --pattern-line: rgba(36, 65, 91, 0.032);
+  --panel-sheen: rgba(255, 255, 255, 0.5);
   --panel-tint: rgba(247, 251, 255, 0.92);
 }
 
@@ -111,6 +153,8 @@
 html, body { min-height: 100%; }
 
 body {
+  position: relative;
+  isolation: isolate;
   margin: 0;
   color: var(--text);
   background:
@@ -118,11 +162,38 @@ body {
     radial-gradient(circle at 90% 85%, var(--ambient-two), transparent 30rem),
     var(--bg);
   overflow: hidden;
+  transition: color 180ms ease, background-color 220ms ease;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-image:
+    linear-gradient(var(--pattern-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--pattern-line) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, rgba(0,0,0,.64), transparent 76%);
+  pointer-events: none;
+  opacity: .72;
 }
 
 button, input, select, textarea { font: inherit; }
 
 button { color: inherit; }
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
 
 .ambient {
   position: fixed;
@@ -131,7 +202,9 @@ button { color: inherit; }
   border-radius: 50%;
   filter: blur(90px);
   pointer-events: none;
-  opacity: 0.12;
+  z-index: 0;
+  opacity: var(--ambient-opacity);
+  transition: background-color 220ms ease, opacity 220ms ease;
 }
 
 .ambient-one { top: -12rem; right: 18%; background: var(--cyan); }
@@ -139,6 +212,7 @@ button { color: inherit; }
 
 .shell {
   position: relative;
+  z-index: 1;
   width: min(1760px, 100%);
   min-height: 100vh;
   margin: 0 auto;
@@ -209,30 +283,6 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -0.015em; }
   align-items: center;
   gap: 8px;
   padding: 0 4px;
-}
-
-.theme-picker {
-  min-height: 34px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 7px 0 10px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  color: var(--muted);
-  background: rgba(255,255,255,.025);
-  font-size: 9px;
-}
-.theme-picker select {
-  min-width: 106px;
-  height: 24px;
-  border: 0;
-  outline: 0;
-  color: var(--text);
-  background: transparent;
-  cursor: pointer;
-  font-size: 10px;
 }
 
 /* Native select popovers may otherwise use a light system background while
@@ -340,15 +390,31 @@ select option {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--surface);
+  background:
+    linear-gradient(145deg, var(--panel-sheen), transparent 42%),
+    var(--surface);
   box-shadow: var(--shadow), inset 0 1px 0 rgba(255,255,255,0.025);
   backdrop-filter: blur(24px);
   overflow: hidden;
 }
 
 .rooms-panel, .people-panel { position: relative; padding: 0; }
+.rooms-panel::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  right: 8px;
+  z-index: 3;
+  width: 82px;
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--surface-soft) 72%, transparent);
+  box-shadow: inset 0 1px 0 var(--panel-sheen);
+}
 .panel-inner { height: 100%; display: flex; flex-direction: column; padding: 16px 12px 12px; transition: opacity 120ms ease; }
 .panel-heading { min-height: 46px; justify-content: space-between; gap: 8px; padding: 0 39px 13px 5px; }
+.rooms-panel .panel-heading { padding-right: 82px; }
 .panel-heading-copy { min-width: 0; }
 .panel-title-line { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .panel-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -357,22 +423,26 @@ select option {
 .panel-collapse-toggle {
   position: absolute;
   top: 14px;
-  right: 10px;
+  right: 12px;
   z-index: 4;
-  width: 30px;
-  height: 30px;
+  width: 34px;
+  height: 34px;
   display: grid;
   place-items: center;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 9px;
+  border-radius: 10px;
   color: var(--muted-strong);
-  background: color-mix(in srgb, var(--surface-soft) 72%, transparent);
+  background: transparent;
   cursor: pointer;
   transition: 150ms ease;
 }
 .panel-collapse-toggle:hover { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--line)); background: var(--cyan-soft); }
-.panel-toggle-icon { font-size: 18px; line-height: 1; }
+.panel-toggle-icon { width: 18px; height: 18px; display: grid; place-items: center; transition: transform 150ms ease; }
+.panel-toggle-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.people-panel .panel-toggle-icon { transform: rotate(180deg); }
+.workspace.rooms-collapsed .rooms-panel .panel-toggle-icon { transform: rotate(180deg); }
+.workspace.people-collapsed .people-panel .panel-toggle-icon { transform: rotate(0deg); }
 .panel-toggle-label { display: none; }
 .workspace.rooms-collapsed .rooms-panel .panel-inner,
 .workspace.people-collapsed .people-panel .panel-inner { visibility: hidden; opacity: 0; pointer-events: none; }
@@ -391,6 +461,7 @@ select option {
   border-color: transparent;
   background: transparent;
 }
+.workspace.rooms-collapsed .rooms-panel::before { display: none; }
 .workspace.rooms-collapsed .rooms-panel .panel-toggle-label,
 .workspace.people-collapsed .people-panel .panel-toggle-label {
   display: block;
@@ -402,6 +473,12 @@ select option {
 }
 
 .heading-actions { flex: none; display: flex; align-items: center; gap: 7px; }
+.rooms-panel .heading-actions {
+  position: absolute;
+  top: 14px;
+  right: 52px;
+  z-index: 4;
+}
 
 .count-badge {
   min-width: 20px;
@@ -419,15 +496,17 @@ select option {
 }
 
 .create-room-button {
-  width: 30px;
-  height: 30px;
+  width: 34px;
+  height: 34px;
   display: grid;
   place-items: center;
-  padding: 0 0 2px;
+  padding: 0;
   border: 1px solid rgba(85, 214, 199, 0.22);
   border-radius: 10px;
   color: var(--cyan);
   background: var(--cyan-soft);
+  font-size: 19px;
+  line-height: 1;
   cursor: pointer;
   transition: 150ms ease;
 }

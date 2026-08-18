@@ -198,13 +198,15 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                   return {
                     titleCreateOverlap: overlaps(title, create),
                     createCollapseOverlap: overlaps(create, collapse),
+                    createCollapseTopDelta: Math.abs(create.top - collapse.top),
+                    createCollapseHeightDelta: Math.abs(create.height - collapse.height),
                   };
                 }"""
             )
-            assert panel_controls == {
-                "titleCreateOverlap": False,
-                "createCollapseOverlap": False,
-            }
+            assert panel_controls["titleCreateOverlap"] is False
+            assert panel_controls["createCollapseOverlap"] is False
+            assert panel_controls["createCollapseTopDelta"] < 0.5
+            assert panel_controls["createCollapseHeightDelta"] < 0.5
 
             page.locator(".room-card", has_text="browser-room-one").click()
             playwright_api.expect(page.locator("#active-room-title")).to_have_text(
@@ -263,8 +265,29 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             playwright_api.expect(
                 page.locator("#global-tools-menu .tool-popover-heading")
             ).to_contain_text("作用于所有聊天室")
-            page.locator("#theme-select").select_option("violet")
+            playwright_api.expect(page.locator(".theme-choice")).to_have_count(6)
+            theme_backgrounds = {}
+            for theme in ("paper", "mist", "aurora", "ocean", "violet", "ember"):
+                theme_choice = page.locator(
+                    f'.theme-choice[data-theme-value="{theme}"]'
+                )
+                theme_choice.click()
+                assert page.locator("html").get_attribute("data-theme") == theme
+                assert theme_choice.get_attribute("aria-checked") == "true"
+                theme_backgrounds[theme] = page.evaluate(
+                    "getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()"
+                )
+            assert len(set(theme_backgrounds.values())) == 6
+
+            page.locator('.theme-choice[data-theme-value="violet"]').click()
             assert page.locator("html").get_attribute("data-theme") == "violet"
+            assert page.locator("#global-tools-menu").get_attribute("open") == ""
+            assert page.locator(
+                '.theme-choice[data-theme-value="violet"]'
+            ).get_attribute("aria-checked") == "true"
+            playwright_api.expect(page.locator("#theme-current-mode")).to_have_text(
+                "深色"
+            )
             assert page.evaluate(
                 "getComputedStyle(document.documentElement).getPropertyValue('--surface-strong').trim() !== ''"
             )

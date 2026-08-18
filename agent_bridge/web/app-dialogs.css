@@ -205,8 +205,6 @@
 :root[data-theme="mist"] .panel { backdrop-filter: blur(18px); }
 :root[data-theme="paper"] .brand-mark,
 :root[data-theme="mist"] .brand-mark,
-:root[data-theme="paper"] .theme-picker,
-:root[data-theme="mist"] .theme-picker,
 :root[data-theme="paper"] .message-reply-button,
 :root[data-theme="mist"] .message-reply-button,
 :root[data-theme="paper"] .rate-result-card,

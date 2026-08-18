@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.20 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.21 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -228,6 +228,8 @@ v0.42.18 保持 schema 41、Claude wake batch 校验、stream-json 工具证据�
 v0.42.19 保持 schema 41 和全部聊天室协议语义不变，完成模块边界与死代码总审计：删除未调用的 native fallback HTTP 包装、Web 用户计数、已冻结授权方案的历史回填及只写不读的 runtime fencing 投影，共 65 行；高置信度静态候选和零入口模块均为 0。消息投递、原生会话、房间治理/任务/路由等大文件保留为单一事务状态机，Web JS 保留既有六域加载边界，避免为缩短行数割裂一致性。现有 Agent/worker/TUI 不重启。审计证据见 [modularization-dead-code-audit-2026-08-18.json](evidence/modularization-dead-code-audit-2026-08-18.json)。
 
 v0.42.20 保持 schema 41、接口、权限和聊天室投递语义不变，重整 Web 看板的信息层级：顶部“系统管理”只承载跨房间设置，并按显示与提醒、Agent 接入、全局策略、安全与数据分组；当前聊天室头部把“搜消息”和“房间管理”分开，房间管理再按成员协作、房间规则、内容整理分组。左右侧栏将数量并入标题并隔离新建/收缩动作，成员卡把通知与移出操作放到独立操作行，避免身份、状态和管理按钮互相挤压。浅色、深色、窄屏与折叠布局使用同一作用域视觉规则；所有原按钮 ID、权限隐藏和对话框入口保持兼容。现有 Agent/worker/TUI 不重启。验证证据见 [web-information-architecture-refresh-2026-08-18.json](evidence/web-information-architecture-refresh-2026-08-18.json)。
+
+v0.42.21 保持 schema 41、接口、权限和聊天室投递语义不变，继续修正 Web 看板视觉：聊天室侧栏的新建与收缩按钮进入同一 82px 控制槽，使用相同 34px 尺寸和精确纵坐标，展开态不再出现一高一低；系统管理中的原生配色下拉改为六张可键盘切换的氛围卡，同时预览背景、面板、强调色与冷暖感。补齐独立“青岚”深色主题，并让六套主题共同驱动背景光晕、细网格和半透明面板高光；隐藏的原生 select 继续保留兼容。现有 Agent/worker/TUI 不重启。验证证据见 [web-atmosphere-theme-studio-2026-08-18.json](evidence/web-atmosphere-theme-studio-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

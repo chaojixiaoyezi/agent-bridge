@@ -169,6 +169,8 @@ const elements = {
   openRoomHighlights: document.querySelector("#open-room-highlights"),
   renameRoom: document.querySelector("#rename-room"),
   themeSelect: document.querySelector("#theme-select"),
+  themeChoices: [...document.querySelectorAll(".theme-choice")],
+  themeCurrentMode: document.querySelector("#theme-current-mode"),
   composerChatMode: document.querySelector("#composer-chat-mode"),
   composerTaskMode: document.querySelector("#composer-task-mode"),
   openCreateRoom: document.querySelector("#open-create-room"),
@@ -617,6 +619,13 @@ function applyTheme(theme) {
   state.theme = selected;
   document.documentElement.dataset.theme = selected;
   elements.themeSelect.value = selected;
+  for (const choice of elements.themeChoices) {
+    const active = choice.dataset.themeValue === selected;
+    choice.classList.toggle("active", active);
+    choice.setAttribute("aria-checked", String(active));
+    choice.tabIndex = active ? 0 : -1;
+    if (active) elements.themeCurrentMode.textContent = choice.dataset.themeMode || "主题";
+  }
   try {
     window.localStorage.setItem("agentBridgeTheme", selected);
   } catch (error) {
@@ -652,12 +661,6 @@ function applyWorkspaceLayout({ persist = false } = {}) {
   elements.togglePeoplePanel.title = state.peoplePanelCollapsed
     ? "展开成员面板"
     : "收起成员面板";
-  elements.toggleRoomsPanel.querySelector(".panel-toggle-icon").textContent = state.roomsPanelCollapsed
-    ? "›"
-    : "‹";
-  elements.togglePeoplePanel.querySelector(".panel-toggle-icon").textContent = state.peoplePanelCollapsed
-    ? "‹"
-    : "›";
   if (!persist) return;
   try {
     window.localStorage.setItem(
