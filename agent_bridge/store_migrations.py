@@ -753,47 +753,6 @@ class StoreMigrationMixin:
             (OWNER_PARTICIPANT_ID,),
         )
 
-    @classmethod
-    def _backfill_admin_chat_authorization_grants(
-        cls,
-        conn: sqlite3.Connection,
-    ) -> None:
-        """Snapshot historical authenticated admin messages as authority sources.
-
-        The snapshot records who was an active administrator when the message was
-        written. Later role or session changes cannot manufacture authority for
-        ordinary messages, and revocation remains a separate durable state.
-        """
-
-        rows = conn.execute(
-            """
-            SELECT message.*, web_user.user_id AS issuer_web_user_id,
-                   web_user.username AS issuer_username,
-                   web_user.role AS issuer_role
-            FROM messages AS message
-            JOIN web_sessions AS web_session
-              ON web_session.session_id = message.authorized_session_id
-            JOIN web_users AS web_user
-              ON web_user.user_id = web_session.user_id
-             AND web_user.participant_id = message.sender_participant_id
-            WHERE web_user.role = 'admin'
-              AND message.message_kind = 'message'
-              AND NOT EXISTS (
-                  SELECT 1 FROM chat_authorization_grants AS grant_record
-                  WHERE grant_record.source_message_id = message.message_id
-              )
-            ORDER BY message.sequence
-            """
-        ).fetchall()
-        for row in rows:
-            cls._insert_admin_chat_authorization_grant_locked(
-                conn,
-                message=row,
-                issuer_web_user_id=str(row["issuer_web_user_id"]),
-                issuer_username=str(row["issuer_username"]),
-                issuer_role=str(row["issuer_role"]),
-            )
-
     @staticmethod
     def _freeze_legacy_chat_authorizations(conn: sqlite3.Connection) -> None:
         """Keep the old ledger for audit while removing all chat authority.

@@ -289,22 +289,6 @@ class BridgeHttpClient:
             },
         )
 
-    def fallback_native_session(
-        self,
-        *,
-        connector_id: str,
-        lease_id: str,
-        process_epoch: str,
-    ) -> dict[str, Any]:
-        return self.post(
-            "/agent/native/session/fallback",
-            {
-                "connector_id": connector_id,
-                "lease_id": lease_id,
-                "process_epoch": process_epoch,
-            },
-        )
-
     def wait_native_channel_event(
         self,
         *,

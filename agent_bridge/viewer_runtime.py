@@ -44,7 +44,6 @@ def build_viewer_runtime(
         else:
             runtime_leader.clear()
         application.state.runtime_leader = is_leader
-        application.state.runtime_fencing_token = int(state["fencing_token"])
         return is_leader
 
     async def runtime_leadership_confirmed(application: Starlette) -> bool:

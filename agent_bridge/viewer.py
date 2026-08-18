@@ -244,7 +244,6 @@ def create_app(
     )
     app.state.runtime_instance_id = runtime_instance_id
     app.state.runtime_leader = False
-    app.state.runtime_fencing_token = 0
     if policy.public_mode:
         app.add_middleware(
             TrustedHostMiddleware,

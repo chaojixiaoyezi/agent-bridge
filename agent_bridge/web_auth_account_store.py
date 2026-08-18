@@ -418,12 +418,6 @@ class WebAuthAccountMixin:
             raise WebConflictError("昵称已被使用") from exc
         return self._user_payload(updated)
 
-    def user_count(self) -> int:
-        with self._connection() as connection:
-            return int(
-                connection.execute("SELECT COUNT(*) FROM web_users").fetchone()[0]
-            )
-
     def bootstrap_admin_ready(self) -> bool:
         """Return true only after the active bootstrap admin changed its password."""
 

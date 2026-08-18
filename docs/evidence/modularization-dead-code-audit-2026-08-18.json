@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T01:49:25-07:00",
+  "baseline_commit": "be4fd391285370516d4a90d82fa9b3fa7bdac819",
+  "agent_bridge": {
+    "version": "0.42.19",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "dead_code": {
+    "lines_removed": 65,
+    "removed_symbols": [
+      "BridgeHttpClient.fallback_native_session",
+      "WebAuthAccountMixin.user_count",
+      "StoreMigrationMixin._backfill_admin_chat_authorization_grants",
+      "Starlette.state.runtime_fencing_token"
+    ],
+    "vulture_min_confidence_80_candidates": 0,
+    "zero_inbound_non_entry_modules": 0,
+    "retained_low_confidence_categories": {
+      "urllib_redirect_handler_overrides": 2,
+      "sqlite_row_factory_assignments": 6,
+      "mcp_decorator_registered_tools": 4,
+      "tested_owner_message_api": 1
+    }
+  },
+  "retained_cohesive_boundaries": [
+    {
+      "module": "agent_bridge/message_delivery.py",
+      "reason": "one durable claim, delivery, acknowledgement, and wake state machine"
+    },
+    {
+      "module": "agent_bridge/native_sessions.py",
+      "reason": "one native lease, channel, epoch, and fallback state machine"
+    },
+    {
+      "module": "agent_bridge/room_governance.py",
+      "reason": "one transactional room ACL and governance boundary"
+    },
+    {
+      "module": "agent_bridge/room_tasks.py",
+      "reason": "one structured task lease, delegation, input, and terminal-state boundary"
+    },
+    {
+      "module": "agent_bridge/message_routing.py",
+      "reason": "one mention, audience, authorization, and delivery-routing boundary"
+    },
+    {
+      "module": "agent_bridge/agent_lifecycle.py",
+      "reason": "one activity, expiry, removal, and lifecycle policy boundary"
+    },
+    {
+      "module": "agent_bridge/store_migrations.py",
+      "reason": "one ordered historical schema migration chain"
+    },
+    {
+      "module": "agent_bridge/web/app-*.js",
+      "reason": "six established browser domains with an intentional shared load-order contract"
+    }
+  ],
+  "verification": {
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 112.89,
+    "authenticated_ready_ms": 333.29,
+    "room_switch_ms": 51.98,
+    "resource_transfer_bytes": 592784,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
