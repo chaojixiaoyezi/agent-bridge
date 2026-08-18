@@ -1,19 +1,41 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import platform
-import plistlib
 import secrets
-import shlex
 import shutil
-import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
+from .connector_claude_setup import (
+    _claude_channel_configuration as _claude_channel_configuration,
+    _write_claude_channel_plugin as _write_claude_channel_plugin,
+    configure_claude_channel_artifacts as configure_claude_channel_artifacts,
+)
+from .connector_contracts import (
+    PROJECT_ROOT as PROJECT_ROOT,
+    SUPPORTED_NATIVE_TUI_ADAPTERS as SUPPORTED_NATIVE_TUI_ADAPTERS,
+    SUPPORTED_RESIDENT_ADAPTERS as SUPPORTED_RESIDENT_ADAPTERS,
+    ConnectorSetupError as ConnectorSetupError,
+    ConnectorSetupResult as ConnectorSetupResult,
+    _atomic_private_write as _atomic_private_write,
+    _common_environment as _common_environment,
+    _service_suffix as _service_suffix,
+    _state_root as _state_root,
+    _validated_bridge_url as _validated_bridge_url,
+    adapter_kind_for_product as adapter_kind_for_product,
+    tui_adapter_kind_for_product as tui_adapter_kind_for_product,
+    validate_connector_preflight as validate_connector_preflight,
+)
+from .connector_services import (
+    _activate_launchd as _activate_launchd,
+    _activate_systemd as _activate_systemd,
+    _launchd_plist as _launchd_plist,
+    _run_checked as _run_checked,
+    _systemd_quote as _systemd_quote,
+    _systemd_unit as _systemd_unit,
+)
 from .validation import (
     agent_username,
     alias,
@@ -28,438 +50,6 @@ from .tui_adapter import (
     endpoint_lock_path,
     validate_native_tui_binding,
 )
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SUPPORTED_RESIDENT_ADAPTERS = {
-    "codex": "codex",
-    "claude-code": "claude-code",
-}
-SUPPORTED_NATIVE_TUI_ADAPTERS = {
-    "deepseek": "deepseek-harness",
-    "deepseek-harness": "deepseek-harness",
-    "dsh": "deepseek-harness",
-    "opencode": "opencode",
-    "hermes": "hermes",
-    "hermes-agent": "hermes",
-    "pi": "pi",
-    "pi-agent": "pi",
-    "qcode": "qwen-code",
-    "qwen": "qwen-code",
-    "qwen-code": "qwen-code",
-}
-
-
-class ConnectorSetupError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True)
-class ConnectorSetupResult:
-    status: str
-    platform: str
-    adapter_kind: str
-    connector_id: str
-    state_directory: str
-    listener_service: str | None
-    worker_service: str | None
-    task_service: str | None
-    detail: str
-    launch_command: tuple[str, ...] | None = None
-
-    def public_payload(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "platform": self.platform,
-            "adapter_kind": self.adapter_kind,
-            "connector_id": self.connector_id,
-            "state_directory": self.state_directory,
-            "listener_service": self.listener_service,
-            "worker_service": self.worker_service,
-            "task_service": self.task_service,
-            "detail": self.detail,
-            "launch_command": (
-                list(self.launch_command) if self.launch_command else None
-            ),
-        }
-
-
-def adapter_kind_for_product(product: str) -> str:
-    normalized = token(product, field="product_name").casefold()
-    return SUPPORTED_RESIDENT_ADAPTERS.get(normalized, "manual")
-
-
-def tui_adapter_kind_for_product(product: str) -> str | None:
-    normalized = token(product, field="product_name").casefold()
-    return SUPPORTED_NATIVE_TUI_ADAPTERS.get(normalized)
-
-
-def _validated_bridge_url(value: str) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ConnectorSetupError("Bridge URL must be an http(s) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ConnectorSetupError("Bridge URL cannot contain credentials or query data")
-    if parsed.scheme == "http" and parsed.hostname not in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }:
-        raise ConnectorSetupError("remote resident connectors require HTTPS")
-    return normalized
-
-
-def _state_root(home: Path, system_name: str) -> Path:
-    override = os.environ.get("AGENT_BRIDGE_CONNECTOR_HOME", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    if system_name == "Darwin":
-        return home / "Library" / "Application Support" / "AgentBridge" / "connectors"
-    return home / ".local" / "state" / "agent-bridge" / "connectors"
-
-
-def validate_connector_preflight(
-    *,
-    bridge_url: str,
-    workspace_path: str | None,
-) -> tuple[str, Path]:
-    """Validate local inputs before this Agent accepts an invitation."""
-
-    normalized_url = _validated_bridge_url(bridge_url)
-    workspace = (
-        Path(workspace_path).expanduser().resolve()
-        if str(workspace_path or "").strip()
-        else Path.cwd().resolve()
-    )
-    if not workspace.is_dir():
-        raise ConnectorSetupError("Agent workspace does not exist")
-    return normalized_url, workspace
-
-
-def _atomic_private_write(path: Path, data: bytes, *, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        temporary.write_bytes(data)
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def _service_suffix(connector_id: str) -> str:
-    digest = hashlib.sha256(connector_id.encode("utf-8")).hexdigest()[:16]
-    return f"c{digest}"
-
-
-def _common_environment(
-    *,
-    bridge_url: str,
-    product: str,
-    username: str,
-    signature: str,
-    conversation_id: str,
-    roles: tuple[str, ...],
-    capabilities: tuple[str, ...],
-    enrollment_file: Path,
-    connector_id: str,
-) -> dict[str, str]:
-    return {
-        "PYTHONUNBUFFERED": "1",
-        "AGENT_BRIDGE_AUTO_REGISTER": "1",
-        "AGENT_BRIDGE_URL": bridge_url,
-        "AGENT_BRIDGE_PRODUCT": product,
-        "AGENT_BRIDGE_CLIENT_TYPE": product,
-        "AGENT_BRIDGE_USERNAME": username,
-        "AGENT_BRIDGE_SIGNATURE": signature,
-        "AGENT_BRIDGE_CONVERSATION_ID": conversation_id,
-        "AGENT_BRIDGE_ROLES": ",".join(roles),
-        "AGENT_BRIDGE_CAPABILITIES": ",".join(capabilities),
-        "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
-        "AGENT_BRIDGE_CONNECTOR_ID": connector_id,
-    }
-
-
-def _launchd_plist(
-    *,
-    label: str,
-    program_arguments: list[str],
-    environment: dict[str, str],
-    stdout_path: Path,
-    stderr_path: Path,
-) -> bytes:
-    return plistlib.dumps(
-        {
-            "Label": label,
-            "ProgramArguments": program_arguments,
-            "EnvironmentVariables": environment,
-            "RunAtLoad": True,
-            "KeepAlive": True,
-            "ProcessType": "Background",
-            "StandardOutPath": str(stdout_path),
-            "StandardErrorPath": str(stderr_path),
-        },
-        fmt=plistlib.FMT_XML,
-        sort_keys=False,
-    )
-
-
-def _run_checked(command: list[str], *, description: str) -> None:
-    try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False,
-            check=False,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ConnectorSetupError(f"{description} failed") from exc
-    if completed.returncode != 0:
-        raise ConnectorSetupError(f"{description} failed")
-
-
-def _activate_launchd(services: list[tuple[str, Path]]) -> None:
-    domain = f"gui/{os.getuid()}"
-    for label, plist_path in services:
-        try:
-            existing = subprocess.run(
-                ["launchctl", "print", f"{domain}/{label}"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=False,
-                check=False,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ConnectorSetupError(
-                f"checking existing connector service {label} failed"
-            ) from exc
-        if existing.returncode == 0:
-            _run_checked(
-                ["launchctl", "bootout", f"{domain}/{label}"],
-                description=f"stopping existing connector service {label}",
-            )
-        _run_checked(
-            ["launchctl", "bootstrap", domain, str(plist_path)],
-            description=f"starting connector service {label}",
-        )
-
-
-def _systemd_quote(value: str) -> str:
-    escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
-    return '"' + escaped + '"'
-
-
-def _systemd_unit(
-    *,
-    description: str,
-    program_arguments: list[str],
-    environment: dict[str, str],
-) -> bytes:
-    environment_lines = "\n".join(
-        f"Environment={_systemd_quote(f'{key}={value}')}"
-        for key, value in sorted(environment.items())
-    )
-    command = " ".join(_systemd_quote(argument) for argument in program_arguments)
-    content = (
-        "[Unit]\n"
-        f"Description={description}\n"
-        "After=network-online.target\n\n"
-        "[Service]\n"
-        "Type=simple\n"
-        f"{environment_lines}\n"
-        f"ExecStart={command}\n"
-        "Restart=always\n"
-        "RestartSec=2\n\n"
-        "[Install]\n"
-        "WantedBy=default.target\n"
-    )
-    return content.encode("utf-8")
-
-
-def _activate_systemd(units: list[Path]) -> None:
-    _run_checked(["systemctl", "--user", "daemon-reload"], description="systemd reload")
-    _run_checked(
-        ["systemctl", "--user", "enable", "--now", *[unit.name for unit in units]],
-        description="starting connector services",
-    )
-
-
-def _claude_channel_configuration(
-    *,
-    connector_id: str,
-    state_directory: Path,
-) -> dict[str, Any]:
-    suffix = _service_suffix(connector_id)
-    plugin_name = f"agent-bridge-{suffix}"
-    server_name = f"agent-bridge-{suffix}"
-    plugin_root = state_directory / "claude-plugin"
-    mcp_config_file = state_directory / "claude-channel.mcp.json"
-    launcher = PROJECT_ROOT / "bin" / "agent-bridge-claude"
-    return {
-        "plugin_name": plugin_name,
-        "plugin_root": str(plugin_root),
-        "server_name": server_name,
-        "selector": f"server:{server_name}",
-        "mcp_config_file": str(mcp_config_file),
-        "tui_endpoint_id": f"claude-{suffix}",
-        "state_directory": str(state_directory),
-        "launch_command": [
-            str(launcher),
-            "--state-directory",
-            str(state_directory),
-        ],
-    }
-
-
-def _write_claude_channel_plugin(
-    *,
-    configuration: dict[str, Any],
-) -> None:
-    """Install connector-local hooks plus a direct, uniquely named channel."""
-
-    plugin_root = Path(str(configuration["plugin_root"]))
-    plugin_root.mkdir(parents=True, exist_ok=True)
-    os.chmod(plugin_root, 0o700)
-    (plugin_root / ".claude-plugin").mkdir(parents=True, exist_ok=True)
-    (plugin_root / "hooks").mkdir(parents=True, exist_ok=True)
-    for directory in (plugin_root / ".claude-plugin", plugin_root / "hooks"):
-        os.chmod(directory, 0o700)
-    plugin_name = str(configuration["plugin_name"])
-    server_name = str(configuration["server_name"])
-    state_directory = str(configuration["state_directory"])
-    channel_command = str(PROJECT_ROOT / "bin" / "agent-bridge-claude-channel")
-    hook_command = str(
-        PROJECT_ROOT / "bin" / "agent-bridge-claude-session-hook"
-    )
-    _atomic_private_write(
-        plugin_root / ".claude-plugin" / "plugin.json",
-        (
-            json.dumps(
-                {
-                    "name": plugin_name,
-                    "version": "0.40.5",
-                    "author": {"name": "Agent Bridge"},
-                    "description": (
-                        "Route authenticated Agent Bridge room notifications "
-                        "into the exact live Claude Code session."
-                    ),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n"
-        ).encode("utf-8"),
-    )
-    _atomic_private_write(
-        Path(str(configuration["mcp_config_file"])),
-        (
-            json.dumps(
-                {
-                    "mcpServers": {
-                        server_name: {
-                            "command": channel_command,
-                            "args": [
-                                "--state-directory",
-                                state_directory,
-                            ],
-                        }
-                    }
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n"
-        ).encode("utf-8"),
-    )
-    quoted_hook = " ".join(
-        [
-            shlex.quote(hook_command),
-            "--state-directory",
-            shlex.quote(state_directory),
-        ]
-    )
-    _atomic_private_write(
-        plugin_root / "hooks" / "hooks.json",
-        (
-            json.dumps(
-                {
-                    "description": (
-                        "Bind and end the exact Agent Bridge Claude session lease."
-                    ),
-                    "hooks": {
-                        "SessionStart": [
-                            {
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": quoted_hook,
-                                        "timeout": 10,
-                                    }
-                                ]
-                            }
-                        ],
-                        "SessionEnd": [
-                            {
-                                "hooks": [
-                                    {
-                                        "type": "command",
-                                        "command": quoted_hook,
-                                        "timeout": 10,
-                                    }
-                                ]
-                            }
-                        ],
-                    },
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n"
-        ).encode("utf-8"),
-    )
-
-
-def configure_claude_channel_artifacts(
-    state_directory: str | Path,
-    *,
-    home: Path | None = None,
-) -> dict[str, Any]:
-    """Upgrade Claude channel files without touching any resident service."""
-
-    state = Path(state_directory).expanduser().resolve()
-    manifest_file = state / "connector.json"
-    try:
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-    except (OSError, TypeError, json.JSONDecodeError) as exc:
-        raise ConnectorSetupError("Claude connector manifest is invalid") from exc
-    if str(manifest.get("adapter_kind") or "") != "claude-code":
-        raise ConnectorSetupError("connector is not a Claude Code connector")
-    connector_id = opaque_id(
-        str(manifest.get("connector_id") or ""),
-        field="connector_id",
-    )
-    del home
-    configuration = _claude_channel_configuration(
-        connector_id=connector_id,
-        state_directory=state,
-    )
-    manifest["schema_version"] = max(int(manifest.get("schema_version") or 0), 4)
-    manifest["claude_channel"] = configuration
-    _atomic_private_write(
-        manifest_file,
-        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
-    )
-    _write_claude_channel_plugin(configuration=configuration)
-    return configuration
 
 
 def configure_resident_connector(
