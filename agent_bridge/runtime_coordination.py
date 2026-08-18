@@ -110,6 +110,11 @@ class RuntimeCoordinationMixin:
                     software_version = excluded.software_version,
                     last_seen_at = excluded.last_seen_at,
                     stopped_at = NULL
+                WHERE excluded.last_seen_at >= bridge_runtime_instances.last_seen_at
+                  AND (
+                      bridge_runtime_instances.stopped_at IS NULL
+                      OR excluded.last_seen_at > bridge_runtime_instances.stopped_at
+                  )
                 """,
                 (
                     normalized_instance_id,
@@ -125,8 +130,16 @@ class RuntimeCoordinationMixin:
                 "SELECT * FROM bridge_runtime_leases WHERE lease_name = ?",
                 (normalized_lease_name,),
             ).fetchone()
+            instance = conn.execute(
+                "SELECT stopped_at FROM bridge_runtime_instances "
+                "WHERE instance_id = ?",
+                (normalized_instance_id,),
+            ).fetchone()
+            heartbeat_accepted = bool(
+                instance is not None and instance["stopped_at"] is None
+            )
             leader = False
-            if lease is None:
+            if heartbeat_accepted and lease is None:
                 conn.execute(
                     """
                     INSERT INTO bridge_runtime_leases (
@@ -143,7 +156,7 @@ class RuntimeCoordinationMixin:
                     ),
                 )
                 leader = True
-            else:
+            elif heartbeat_accepted:
                 holder = (
                     str(lease["holder_instance_id"])
                     if lease["holder_instance_id"] is not None
@@ -161,7 +174,8 @@ class RuntimeCoordinationMixin:
                     conn.execute(
                         """
                         UPDATE bridge_runtime_leases
-                        SET renewed_at = ?, expires_at = ?
+                        SET renewed_at = MAX(renewed_at, ?),
+                            expires_at = MAX(expires_at, ?)
                         WHERE lease_name = ? AND holder_instance_id = ?
                         """,
                         (

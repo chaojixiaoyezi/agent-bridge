@@ -586,6 +586,53 @@ def test_runtime_coordination_has_one_leader_and_fenced_failover(
     assert status["lease"]["holder_instance_id"] == "viewer-one"
 
 
+def test_stale_runtime_heartbeat_cannot_resurrect_stopped_instance(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    started = store.coordinate_runtime_instance(
+        instance_id="viewer-stale",
+        node_name="test-node",
+        process_id=201,
+        software_version="test",
+        now=100.0,
+    )
+    assert started["leader"] is True
+
+    store.stop_runtime_instance(instance_id="viewer-stale", now=110.0)
+    stale = store.coordinate_runtime_instance(
+        instance_id="viewer-stale",
+        node_name="test-node",
+        process_id=201,
+        software_version="test",
+        now=105.0,
+    )
+    assert stale["leader"] is False
+    stopped = store.runtime_coordination_status(
+        current_instance_id="viewer-stale",
+        now=111.0,
+    )
+    assert stopped["active_instance_count"] == 0
+    assert stopped["instances"][0]["active"] is False
+    assert stopped["instances"][0]["stopped_at"] == 110.0
+    assert stopped["lease"]["holder_instance_id"] is None
+
+    restarted = store.coordinate_runtime_instance(
+        instance_id="viewer-stale",
+        node_name="test-node",
+        process_id=201,
+        software_version="test",
+        now=112.0,
+    )
+    assert restarted["leader"] is True
+    active = store.runtime_coordination_status(
+        current_instance_id="viewer-stale",
+        now=113.0,
+    )
+    assert active["active_instance_count"] == 1
+    assert active["current_role"] == "leader"
+
+
 def test_admin_audit_ledger_is_append_only_filterable_and_admin_only(
     tmp_path: Path,
 ) -> None:
