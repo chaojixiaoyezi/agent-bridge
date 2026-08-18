@@ -9,6 +9,9 @@ from pathlib import Path
 import pytest
 
 import agent_bridge.tui_adapter as tui_adapter
+import agent_bridge.tui_opencode_adapter as tui_opencode_adapter
+import agent_bridge.tui_qwen_adapter as tui_qwen_adapter
+import agent_bridge.tui_transport as tui_transport
 from agent_bridge.tui_adapter import (
     NativeTuiClient,
     NativeTuiError,
@@ -233,7 +236,7 @@ def test_native_tui_http_response_has_a_safety_limit(
         def read(limit: int) -> bytes:
             return b"x" * limit
 
-    monkeypatch.setattr(tui_adapter, "_open_local", lambda *_a, **_k: OversizedResponse())
+    monkeypatch.setattr(tui_transport, "_open_local", lambda *_a, **_k: OversizedResponse())
     with pytest.raises(NativeTuiError, match="safety limit"):
         tui_adapter._json_http_get("http://127.0.0.1:9201/probe", timeout=1)
 
@@ -409,7 +412,7 @@ def test_opencode_uses_the_bound_session(
         calls.append((url, payload))
         return {"parts": [{"type": "text", "text": "本体结果"}]}
 
-    monkeypatch.setattr(tui_adapter, "_json_request", request)
+    monkeypatch.setattr(tui_opencode_adapter, "_json_request", request)
     client = NativeTuiClient(
         binding(
             tmp_path,
@@ -472,8 +475,8 @@ def test_qwen_daemon_correlates_prompt_sse_and_uses_private_auth(
             "data": {"promptId": "prompt-7", "stopReason": "end_turn"},
         }
 
-    monkeypatch.setattr(tui_adapter, "_json_http_request", request)
-    monkeypatch.setattr(tui_adapter, "_sse_json_events", events)
+    monkeypatch.setattr(tui_qwen_adapter, "_json_http_request", request)
+    monkeypatch.setattr(tui_qwen_adapter, "_sse_json_events", events)
     client = NativeTuiClient(
         binding(
             tmp_path,
@@ -536,8 +539,8 @@ def test_qwen_daemon_reads_nested_acp_updates_from_current_daemon(
             },
         }
 
-    monkeypatch.setattr(tui_adapter, "_json_http_request", request)
-    monkeypatch.setattr(tui_adapter, "_sse_json_events", events)
+    monkeypatch.setattr(tui_qwen_adapter, "_json_http_request", request)
+    monkeypatch.setattr(tui_qwen_adapter, "_sse_json_events", events)
     client = NativeTuiClient(
         binding(
             tmp_path,

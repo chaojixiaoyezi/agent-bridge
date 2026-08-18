@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T00:33:59-07:00",
+  "baseline_commit": "55558edaa9082a0b9617ae7c60b9c6708ebeffe1",
+  "agent_bridge": {
+    "version": "0.42.10",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/tui_adapter.py",
+    "source_lines_before": 1523,
+    "source_lines_after": 173,
+    "targets": [
+      "agent_bridge/tui_binding.py",
+      "agent_bridge/tui_transport.py",
+      "agent_bridge/tui_deepseek_adapter.py",
+      "agent_bridge/tui_opencode_adapter.py",
+      "agent_bridge/tui_hermes_adapter.py",
+      "agent_bridge/tui_pi_adapter.py",
+      "agent_bridge/tui_qwen_adapter.py"
+    ],
+    "client_methods_moved_or_retained": 14,
+    "client_method_ast_equal": 14,
+    "top_level_definitions_moved": 23,
+    "top_level_definition_ast_equal": 23,
+    "public_import_surface_changed": false,
+    "schema_changed": false,
+    "binding_schema_changed": false,
+    "loopback_policy_changed": false,
+    "session_correlation_changed": false,
+    "product_protocols_changed": false
+  },
+  "verification": {
+    "focused_native_tui_passed": 61,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 119.64,
+    "authenticated_ready_ms": 335.76,
+    "room_switch_ms": 45.88,
+    "resource_transfer_bytes": 592706,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

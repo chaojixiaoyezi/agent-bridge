@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.9 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.10 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -206,6 +206,8 @@ v0.42.7 保持页面 DOM、状态模型、事件绑定、样式级联和 Web API
 v0.42.8 保持 schema 41、邀请/enrollment token、connector 身份绑定、凭证轮换和组件在线语义不变，将邀请签发与治理迁移到 `agent_invitation_store.py`，将接受邀请、稳定身份绑定、会话登记与组件上报迁移到 `agent_enrollment_store.py`。`AgentConnectorMixin` 继续是 `BridgeStore` 唯一组合入口，原 24 个方法 AST 与拆分前逐项一致。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [agent-connector-store-split-2026-08-18.json](evidence/agent-connector-store-split-2026-08-18.json)。
 
 v0.42.9 保持 schema 41、Web cookie、密码散列、验证码、注册码、邮箱验证、密码找回和管理员初始化语义不变，将共享契约迁移到 `web_auth_contracts.py`，并把账户、注册码、找回和内部支撑操作分别迁移到四个职责单一的 mixin。`WebAuthStore` 仍是唯一公开存储类型，原 30 个业务方法中 29 个 AST 逐项一致；唯一调整把会话 token 哈希从旧类名静态调用改为等价的实例调用，以消除模块循环依赖。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [web-auth-store-split-2026-08-18.json](evidence/web-auth-store-split-2026-08-18.json)。
+
+v0.42.10 保持 schema 41、原生 TUI binding 文件、endpoint lock、loopback 安全限制、会话探活和回合相关性语义不变，将绑定校验与受限本机传输分别迁移到 `tui_binding.py`、`tui_transport.py`，并把 DeepSeek Harness、OpenCode、Hermes、Pi、Qwen Code 的实现拆为五个产品 mixin。`NativeTuiClient` 仍是唯一公开调度入口，原 14 个客户端方法与 23 个底层定义的 AST 均逐项一致；既有公开导入路径继续由 `tui_adapter.py` 重导出。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [native-tui-adapter-split-2026-08-18.json](evidence/native-tui-adapter-split-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
