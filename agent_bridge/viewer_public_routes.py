@@ -36,6 +36,22 @@ from .viewer_store import ViewerRepository
 from .web_auth import WebAuthenticationError, WebAuthStore
 
 
+WEB_JAVASCRIPT_ASSETS = (
+    "app.js",
+    "app-chat-render.js",
+    "app-agent-operations.js",
+    "app-room-controller.js",
+    "app-governance.js",
+    "app-interactions.js",
+)
+WEB_STYLESHEET_ASSETS = (
+    "app.css",
+    "app-chat.css",
+    "app-dialogs.css",
+    "app-responsive.css",
+)
+
+
 def build_public_routes(
     *,
     web_root: Path,
@@ -57,14 +73,20 @@ def build_public_routes(
     async def index(_: Request) -> Response:
         return FileResponse(WEB_ROOT / "index.html", media_type="text/html")
 
-    async def stylesheet(_: Request) -> Response:
-        return FileResponse(WEB_ROOT / "app.css", media_type="text/css")
+    def stylesheet_asset(filename: str):
+        async def serve(_: Request) -> Response:
+            return FileResponse(WEB_ROOT / filename, media_type="text/css")
 
-    async def javascript(_: Request) -> Response:
-        return FileResponse(
-            WEB_ROOT / "app.js",
-            media_type="application/javascript",
-        )
+        return serve
+
+    def javascript_asset(filename: str):
+        async def serve(_: Request) -> Response:
+            return FileResponse(
+                WEB_ROOT / filename,
+                media_type="application/javascript",
+            )
+
+        return serve
 
     async def avatar_asset(request: Request) -> Response:
         path = avatar_asset_path(
@@ -260,8 +282,22 @@ def build_public_routes(
 
     return [
             Route("/", index, methods=["GET"]),
-            Route("/assets/app.css", stylesheet, methods=["GET"]),
-            Route("/assets/app.js", javascript, methods=["GET"]),
+            *[
+                Route(
+                    f"/assets/{filename}",
+                    stylesheet_asset(filename),
+                    methods=["GET"],
+                )
+                for filename in WEB_STYLESHEET_ASSETS
+            ],
+            *[
+                Route(
+                    f"/assets/{filename}",
+                    javascript_asset(filename),
+                    methods=["GET"],
+                )
+                for filename in WEB_JAVASCRIPT_ASSETS
+            ],
             Route(
                 "/assets/avatars/{vendor:str}/{filename:str}",
                 avatar_asset,

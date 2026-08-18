@@ -1,0 +1,120 @@
+
+@media (max-width: 1100px) {
+  .audit-filter-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .audit-filter-form #admin-audit-room { grid-column: span 1; }
+  .history-search-form { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .history-search-form #history-search-query { grid-column: span 2; }
+  .history-governance-grid { grid-template-columns: 1fr; gap: 0; }
+  .workspace { grid-template-columns: var(--rooms-column) minmax(0, 1fr); }
+  .timeline-panel { grid-column: 2; }
+  .people-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 22;
+    width: 230px;
+    box-shadow: -12px 0 40px rgba(0,0,0,.16);
+  }
+  .workspace.people-collapsed .people-panel { width: 48px; box-shadow: none; }
+}
+
+@media (max-width: 760px) {
+  .audit-dialog-shell { padding: 16px; }
+  .audit-filter-form { grid-template-columns: 1fr 1fr; }
+  .audit-filter-form #admin-audit-query,
+  .audit-filter-form #admin-audit-room { grid-column: 1 / -1; }
+  .audit-event-meta { display: grid; }
+  .audit-event-target { text-align: left; }
+  .history-dialog-shell { padding: 14px; }
+  .history-search-form,
+  .history-redaction-form,
+  .history-retention-form { grid-template-columns: 1fr; }
+  .history-search-form #history-search-query { grid-column: auto; }
+  .history-inline-controls { grid-template-columns: 1fr; }
+  .history-result-heading,
+  .history-result-meta { display: grid; }
+  body { overflow: hidden; }
+  .shell { min-height: 100dvh; padding: 8px; }
+  .topbar { height: 56px; }
+  .connection-status { display: none; }
+  .account-button { max-width: 86px; }
+  .workspace { height: calc(100dvh - 72px); min-height: 0; grid-template-columns: 1fr; }
+  .timeline-panel { grid-column: 1; grid-row: 1; min-height: 0; }
+  .rooms-panel,
+  .people-panel {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 24;
+    width: min(300px, calc(100% - 52px));
+    box-shadow: 12px 0 40px rgba(0,0,0,.2);
+  }
+  .rooms-panel { left: 0; }
+  .people-panel { right: 0; box-shadow: -12px 0 40px rgba(0,0,0,.2); }
+  .workspace.rooms-collapsed .rooms-panel,
+  .workspace.people-collapsed .people-panel { width: 44px; box-shadow: none; }
+  .timeline { padding: 18px 17px 48px; }
+  .timeline-heading { min-height: 66px; padding: 11px 13px; }
+  .room-title-wrap { max-width: calc(100% - 135px); }
+  .room-title-wrap h2 { font-size: 14px; }
+  .room-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
+  .sync-time { display: none; }
+  .timeline-heading-tools { gap: 5px; }
+  .tool-menu > summary { height: 30px; padding: 0 8px; font-size: 9px; }
+  .room-message-search-shell { width: min(560px, calc(100vw - 34px)); }
+  .room-message-search { grid-template-columns: minmax(100px, .45fr) minmax(120px, 1fr) auto; }
+  .room-message-search #clear-room-message-search { grid-column: 1 / -1; justify-self: end; }
+  .active-room-line { align-items: flex-start; }
+  .captcha-row { align-items: flex-start; flex-direction: column; }
+  .account-actions { align-items: stretch; flex-direction: column; }
+  .account-actions .primary-button { width: 100%; margin-left: 0; }
+  .rate-global-grid, .rate-search-form { grid-template-columns: 1fr; }
+  .rate-global-card { align-items: flex-start; flex-direction: column; }
+  .rate-result-controls { align-items: stretch; flex-direction: column; }
+  .rate-override-wrap { margin-right: 0; }
+  .rate-override-input { width: 100% !important; }
+  .lifecycle-form, .member-room-list, .wake-policy-digest { grid-template-columns: 1fr; }
+  .pending-center-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .connector-health-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .connector-health-room-card { align-items: flex-start; flex-direction: column; }
+  .connector-health-room-card span { text-align: left; }
+  .monitoring-heading { align-items: flex-start; flex-direction: column; }
+  .monitoring-controls { width: 100%; }
+  .monitoring-controls select { min-width: 0; flex: 1 1 auto; }
+  .monitoring-trends { grid-template-columns: 1fr; }
+  .lifecycle-form .form-actions { margin-top: 10px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar { gap: 8px; padding-right: 3px; }
+  .brand-block { min-width: 0; gap: 8px; }
+  .brand-mark { width: 32px; height: 32px; border-radius: 10px; }
+  .brand-block .eyebrow, #refresh-button {
+    display: none;
+  }
+  h1 { font-size: 16px; white-space: nowrap; }
+  .topbar-status { min-width: 0; gap: 5px; }
+  .account-button { max-width: 62px; padding: 0 8px; }
+  .pending-center-button { min-width: 0; padding: 0 8px; font-size: 9px; }
+  .global-tools-menu > summary > span:first-child { font-size: 0; }
+  .global-tools-menu > summary > span:first-child::after { content: "•••"; font-size: 10px; letter-spacing: 1px; }
+  .room-title-wrap { max-width: calc(100% - 116px); }
+  .room-search-menu > summary > span:first-child { font-size: 0; }
+  .room-search-menu > summary > span:first-child::after { content: "⌕"; font-size: 13px; }
+  .room-tools-menu > summary > span:first-child { font-size: 0; }
+  .room-tools-menu > summary > span:first-child::after { content: "工具"; font-size: 9px; }
+  .tool-menu-chevron { display: none; }
+  .room-message-search { grid-template-columns: 1fr auto; }
+  .room-message-search select { grid-column: 1 / -1; }
+  .room-message-search #clear-room-message-search { grid-column: 1 / -1; }
+}

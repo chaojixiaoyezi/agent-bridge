@@ -45,7 +45,10 @@ jobs:
           uv run python -m compileall -q agent_bridge tests
 
       - name: Check browser JavaScript syntax
-        run: node --check agent_bridge/web/app.js
+        run: |
+          for script in agent_bridge/web/*.js; do
+            node --check "$script"
+          done
 
       - name: Validate bundled Pi extension
         run: |

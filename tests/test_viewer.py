@@ -30,6 +30,10 @@ from agent_bridge.viewer import (
     create_app,
 )
 from agent_bridge.viewer_store import ViewerRepository
+from agent_bridge.viewer_public_routes import (
+    WEB_JAVASCRIPT_ASSETS,
+    WEB_STYLESHEET_ASSETS,
+)
 from agent_bridge.web_auth import WebAuthStore
 
 
@@ -38,8 +42,22 @@ ADMIN_PASSWORD = "AdminSecure1!"
 USER_PASSWORD = "MemberSecure1!"
 
 
+def dashboard_javascript() -> str:
+    return "\n".join(
+        (WEB_ROOT / filename).read_text(encoding="utf-8")
+        for filename in WEB_JAVASCRIPT_ASSETS
+    )
+
+
+def dashboard_stylesheet() -> str:
+    return "".join(
+        (WEB_ROOT / filename).read_text(encoding="utf-8")
+        for filename in WEB_STYLESHEET_ASSETS
+    )
+
+
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.6"
+    assert _runtime_software_version() == "0.42.7"
 
 
 class FakeEmailDelivery:
@@ -2171,7 +2189,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         }
     ]
     assert malicious not in str(event_snapshot)
-    javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    javascript = dashboard_javascript()
     assert "innerHTML" not in javascript
     assert ".textContent" in javascript
     assert "setInterval" not in javascript
@@ -2185,8 +2203,16 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         encoding="utf-8"
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
-    assert "app.js?v=20260815-05" in index_html
-    assert "app.css?v=20260815-05" in index_html
+    script_positions = [
+        index_html.index(f"{filename}?v=20260817-01")
+        for filename in WEB_JAVASCRIPT_ASSETS
+    ]
+    assert script_positions == sorted(script_positions)
+    stylesheet_positions = [
+        index_html.index(f"{filename}?v=20260817-01")
+        for filename in WEB_STYLESHEET_ASSETS
+    ]
+    assert stylesheet_positions == sorted(stylesheet_positions)
     assert 'id="global-tools-menu"' in index_html
     assert 'id="room-tools-menu"' in index_html
     assert 'id="room-search-menu"' in index_html
@@ -2252,10 +2278,18 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     participant_search = javascript.index("function participantMatchesQuery")
     assert participant_search < card_mention < mention_menu_start
 
-    stylesheet_response = client.get("/assets/app.css")
-    assert stylesheet_response.headers["cache-control"] == (
-        "public, max-age=31536000, immutable"
-    )
+    for filename in WEB_STYLESHEET_ASSETS:
+        stylesheet_response = client.get(f"/assets/{filename}")
+        assert stylesheet_response.status_code == 200
+        assert stylesheet_response.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
+    for filename in WEB_JAVASCRIPT_ASSETS:
+        javascript_response = client.get(f"/assets/{filename}")
+        assert javascript_response.status_code == 200
+        assert javascript_response.headers["cache-control"] == (
+            "public, max-age=31536000, immutable"
+        )
 
 
 def test_admin_can_repair_known_room_residents_without_changing_chat_state(
@@ -2843,7 +2877,7 @@ def test_dashboard_separates_abandoned_rooms_and_retains_history(
     assert all(person["membership_active"] is False for person in participants)
 
     html = client.get("/").text
-    javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
+    javascript = dashboard_javascript()
     assert "创建聊天室" in html
     assert "废弃聊天室" in javascript
 
@@ -4110,8 +4144,8 @@ def test_admin_agent_lifecycle_kick_migration_and_jump_button_ui(
     }.issuperset({agents[0]["participant_id"], agents[1]["participant_id"]})
 
     html = admin_client.get("/").text
-    javascript = (WEB_ROOT / "app.js").read_text(encoding="utf-8")
-    stylesheet = (WEB_ROOT / "app.css").read_text(encoding="utf-8")
+    javascript = dashboard_javascript()
+    stylesheet = dashboard_stylesheet()
     assert 'id="new-message-indicator"' in html
     assert 'd="M12 4v14m-6-6 6 6 6-6"' in html
     assert 'id="member-management-dialog"' in html
