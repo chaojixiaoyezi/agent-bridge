@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.16 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.17 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -220,6 +220,8 @@ v0.42.14 保持 schema 41、Codex app-server JSON-RPC、thread resume/fork、值
 v0.42.15 保持 schema 41、Web 认证/授权、同源意图校验、全部管理 API 路径/方法/顺序和响应语义不变，将管理员路由按房间与账号、监控与历史、连接器与成员操作、频率与会话四个业务域拆开。`build_admin_routes` 继续是 Viewer 唯一组合入口，原 35 个 handler 与 36 条 Route 声明的 AST 逐项一致。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [viewer-admin-domain-routes-split-2026-08-18.json](evidence/viewer-admin-domain-routes-split-2026-08-18.json)。
 
 v0.42.16 保持 schema 41、邀请令牌、产品接入说明、本机值守修复、昵称审批和 Viewer 路由装配顺序不变，将 Web 侧 Agent 邀请接入与值守/昵称管理拆成两个独立路由域。`build_resident_routes` 仍返回原先的 invitation/management 两组路由，原 6 个 handler 与 6 条 Route 声明的 AST 逐项一致。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [viewer-resident-domain-routes-split-2026-08-18.json](evidence/viewer-resident-domain-routes-split-2026-08-18.json)。
+
+v0.42.17 保持 schema 41、SQLite 在线备份、制品校验、恢复演练、launchd 进程保护和 Viewer-only 滚动发布语义不变，将共享数据库安全门、快照/恢复、部署检查拆成独立模块，`maintenance.py` 只保留组合发布与 CLI 入口。原 34 个定义和模块常量的 AST 逐项一致，既有 `agent_bridge.maintenance` 导入及 `bin/agent-bridge-maintain` 命令继续兼容。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [maintenance-layers-split-2026-08-18.json](evidence/maintenance-layers-split-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

@@ -59,7 +59,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.16"
+    assert _runtime_software_version() == "0.42.17"
 
 
 class FakeEmailDelivery:
