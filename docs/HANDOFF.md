@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.41.1 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.41.2 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -170,6 +170,8 @@ v0.40.11 不变更 schema、队列、participant、connector、session 或 threa
 v0.41.0 的 schema 41 只为既有 `operational_metric_samples` 增量增加原生投递三段耗时列，不重建消息、投递、session、connector 或监控历史。五类原生 TUI adapter 在调用真实模型前后分别上报 `injected`/`applied`，成功引用回复由服务端结构化标记 `replied`；上报仅允许 connector 精确绑定的 `mcp` session、endpoint、native session 和同房间 message id，不能 ack、改变必回状态或授予权限。旧 viewer 暂时返回 404 时 adapter 忽略纯遥测失败并继续正常聊天，因此可先滚动 viewer、无需重启现有 Agent。默认测试同时加入 24 轮重连长稳、100 房/100 Agent/10 万消息读性能门禁和五产品完整编排回归。
 
 v0.41.1 不变更 schema、HTTP/MCP API、消息路由或告警规则。`operational_metric_samples` schema、schema 40→41 增量列、采样计算、告警状态机、看板投影与确认逻辑从超大的 `store.py` 抽到 `operational_monitoring.py`；`BridgeStore` 保留原方法签名并只委托数据库连接、事务、管理员鉴权和 connector 健康权威。线上仍只需 viewer-only 滚动发布，不重启 Agent、listener、task worker 或原生 TUI。拆分前后行数、全量回归和浏览器门禁见 [operational-monitoring-split-2026-08-17.json](evidence/operational-monitoring-split-2026-08-17.json)。
+
+v0.41.2 不变更 schema、HTTP API、审计字段或 append-only 触发器。管理员治理审计 schema、事件规范化、写入和筛选投影从 `store.py` 原样迁移到 `admin_audit.py`，`BridgeStore` 通过 mixin 继续暴露相同方法；审计仍在治理响应完成后隔离写入，失败不会改变聊天室消息、Agent session 或原操作结果。拆分与回归证据见 [admin-audit-split-2026-08-17.json](evidence/admin-audit-split-2026-08-17.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T20:28:36-07:00",
+  "baseline_commit": "2d88e992cd728cae0c324465abaa56edb951ae9d",
+  "agent_bridge": {
+    "version": "0.41.2",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/store.py",
+    "target": "agent_bridge/admin_audit.py",
+    "store_lines_before": 18352,
+    "store_lines_after": 17980,
+    "target_lines": 395,
+    "public_methods_preserved": [
+      "record_admin_audit_event",
+      "admin_audit_events"
+    ],
+    "append_only_triggers_preserved": true,
+    "schema_changed": false,
+    "http_api_changed": false
+  },
+  "verification": {
+    "focused_audit_tests": 3,
+    "full_default_collected": 292,
+    "full_default_passed": 290,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 168.2,
+    "authenticated_ready_ms": 388.53,
+    "room_switch_ms": 58.34,
+    "resource_transfer_bytes": 590225,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
