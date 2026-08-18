@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T00:43:01-07:00",
+  "baseline_commit": "3b6991adb04fbaf0573e92c8824afd3ef491ef89",
+  "agent_bridge": {
+    "version": "0.42.11",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/viewer_agent_routes.py",
+    "source_lines_before": 1130,
+    "source_lines_after": 34,
+    "targets": [
+      "agent_bridge/viewer_agent_enrollment_routes.py",
+      "agent_bridge/viewer_agent_native_routes.py",
+      "agent_bridge/viewer_agent_chat_routes.py",
+      "agent_bridge/viewer_agent_task_routes.py"
+    ],
+    "handlers_moved": 36,
+    "handler_ast_equal": 36,
+    "route_declarations_moved": 36,
+    "route_declaration_ast_equal": 36,
+    "route_path_method_order_equal": true,
+    "schema_changed": false,
+    "authentication_semantics_changed": false,
+    "native_channel_semantics_changed": false,
+    "chat_history_semantics_changed": false,
+    "task_semantics_changed": false
+  },
+  "verification": {
+    "focused_agent_http_passed": 54,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 111.39,
+    "authenticated_ready_ms": 322.62,
+    "room_switch_ms": 50.87,
+    "resource_transfer_bytes": 592660,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
