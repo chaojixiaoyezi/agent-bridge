@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T23:44:47-07:00",
+  "baseline_commit": "c041894ef2b4851af07d3016d0894cd3406e697e",
+  "agent_bridge": {
+    "version": "0.42.6",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/viewer_store.py",
+    "source_lines_before": 2334,
+    "source_lines_after": 446,
+    "targets": [
+      "agent_bridge/viewer_message_queries.py",
+      "agent_bridge/viewer_activity_queries.py"
+    ],
+    "methods_moved": 13,
+    "method_ast_equal": true,
+    "public_repository_type_changed": false,
+    "database_open_mode_changed": false,
+    "schema_changed": false,
+    "query_contract_changed": false
+  },
+  "verification": {
+    "focused_repository_passed": 162,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 229.53,
+    "authenticated_ready_ms": 529.75,
+    "room_switch_ms": 65.94,
+    "resource_transfer_bytes": 590211,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
