@@ -1,0 +1,50 @@
+{
+  "artifact": "web-topbar-density",
+  "version": "0.42.23",
+  "date": "2026-08-18",
+  "baseline_commit": "83a125c15e584ec2461cfb1666e2e9c7ba340cb3",
+  "schema_version": 41,
+  "scope": {
+    "topbar": "The global Agent Bridge and system-management bar collapses upward from a 34px control centered on the boundary above the room workspace.",
+    "density": [
+      "simple: avatar, sender name, message body, reply action",
+      "standard: previous compact presentation",
+      "detailed: complete message and participant projection"
+    ],
+    "storage": "Browser-local layout state only; legacy compact density normalizes to standard.",
+    "protocol_or_database_change": false
+  },
+  "isolated_browser_inspection": {
+    "topbar_expanded_timeline_height_px": 638,
+    "topbar_collapsed_timeline_height_px": 684,
+    "recovered_timeline_height_px": 46,
+    "simple_message_visible_direct_children": [
+      "message-head",
+      "message-body",
+      "message-reply-button message-direct-reply"
+    ],
+    "simple_sender_visible_children": [
+      "avatar message-avatar",
+      "STRONG"
+    ]
+  },
+  "verification": {
+    "pytest": "291 passed, 2 skipped",
+    "browser_e2e": "1 passed",
+    "additional_gates": [
+      "uv lock --check",
+      "ruff check",
+      "python compileall",
+      "node --check for every Web JavaScript asset",
+      "sh -n for every bin entrypoint",
+      "plutil -lint for macOS launchd templates",
+      "git diff --check"
+    ],
+    "browser_metrics": {
+      "dom_ready_ms": 136.0,
+      "authenticated_ready_ms": 365.28,
+      "room_switch_ms": 36.96,
+      "resource_transfer_bytes": 631691
+    }
+  }
+}

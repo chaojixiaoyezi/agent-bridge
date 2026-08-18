@@ -211,20 +211,34 @@ button { color: inherit; }
 .ambient-two { bottom: -14rem; left: 32%; background: var(--purple); }
 
 .shell {
+  --shell-gutter: 12px;
+  --topbar-height: 58px;
   position: relative;
   z-index: 1;
   width: min(1760px, 100%);
   min-height: 100vh;
   margin: 0 auto;
-  padding: 12px;
+  padding: var(--shell-gutter);
 }
+.shell.topbar-collapsed { --topbar-height: 12px; }
 
 .topbar {
-  height: 58px;
+  position: relative;
+  z-index: 25;
+  height: var(--topbar-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 12px 0 8px;
+  opacity: 1;
+  transform: translateY(0);
+  transition: height 180ms ease, opacity 120ms ease, transform 180ms ease;
+}
+.shell.topbar-collapsed .topbar {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-10px);
 }
 
 .brand-block, .topbar-status, .panel-heading, .timeline-heading, .room-meta, .message-head, .person-head {
@@ -379,7 +393,7 @@ select option {
   --people-column: var(--people-expanded-column);
   --composer-input-height: 58px;
   position: relative;
-  height: calc(100vh - 82px);
+  height: calc(100vh - var(--shell-gutter) - var(--shell-gutter) - var(--topbar-height));
   display: grid;
   grid-template-columns: var(--rooms-column) minmax(0, 1fr) var(--people-column);
   gap: 12px;
@@ -490,6 +504,24 @@ body.layout-resizing-rows { cursor: row-resize; }
   transition: 150ms ease;
 }
 .panel-collapse-toggle:hover { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 28%, var(--line)); background: var(--cyan-soft); }
+.topbar-collapse-toggle {
+  top: calc(var(--shell-gutter) + var(--topbar-height) - 17px);
+  right: auto;
+  left: 50%;
+  z-index: 24;
+  transform: translateX(-50%);
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--surface-strong) 94%, transparent);
+  box-shadow: 0 7px 20px color-mix(in srgb, #000 18%, transparent), inset 0 1px 0 var(--panel-sheen);
+  transition: top 180ms ease, color 150ms ease, border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+}
+.topbar-collapse-toggle:hover {
+  color: var(--cyan);
+  border-color: color-mix(in srgb, var(--cyan) 34%, var(--line));
+  background: color-mix(in srgb, var(--surface-strong) 82%, var(--cyan-soft));
+  box-shadow: 0 9px 24px color-mix(in srgb, #000 22%, transparent), 0 0 0 4px color-mix(in srgb, var(--cyan) 7%, transparent);
+}
+.shell.topbar-collapsed .topbar-collapse-toggle .panel-toggle-icon { transform: rotate(180deg); }
 .panel-toggle-icon { width: 18px; height: 18px; display: grid; place-items: center; transition: transform 150ms ease; }
 .panel-toggle-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .people-panel .panel-toggle-icon { transform: rotate(180deg); }

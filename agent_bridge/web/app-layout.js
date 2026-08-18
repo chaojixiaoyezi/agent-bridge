@@ -4,6 +4,7 @@ const WORKSPACE_LAYOUT_DEFAULTS = Object.freeze({
   roomsWidth: 236,
   peopleWidth: 260,
   composerHeight: 58,
+  topbarCollapsed: false,
   density: "detailed",
 });
 const WORKSPACE_LAYOUT_LIMITS = Object.freeze({
@@ -21,6 +22,7 @@ const WORKSPACE_LAYOUT_STORAGE = Object.freeze({
   peopleWidth: "agentBridgePeopleWidth",
   composerHeight: "agentBridgeComposerHeight",
   composerCollapsed: "agentBridgeComposerPanel",
+  topbarCollapsed: "agentBridgeTopbarPanel",
   density: "agentBridgeWorkspaceDensity",
   focusMode: "agentBridgeWorkspaceFocus",
 });
@@ -54,6 +56,20 @@ function readLayoutNumber(key, fallback, minimum, maximum) {
   return Number.isFinite(stored)
     ? clampLayoutValue(stored, minimum, maximum)
     : fallback;
+}
+
+function normalizeWorkspaceDensity(value) {
+  if (value === "simple") return "simple";
+  if (value === "standard" || value === "compact") return "standard";
+  return "detailed";
+}
+
+function workspaceDensityChoices() {
+  return [
+    elements.layoutDensitySimple,
+    elements.layoutDensityStandard,
+    elements.layoutDensityDetailed,
+  ];
 }
 
 function composerHeightMaximum() {
@@ -108,6 +124,10 @@ function persistWorkspaceLayout() {
     window.localStorage.setItem(
       WORKSPACE_LAYOUT_STORAGE.composerCollapsed,
       state.composerPanelCollapsed ? "collapsed" : "expanded",
+    );
+    window.localStorage.setItem(
+      WORKSPACE_LAYOUT_STORAGE.topbarCollapsed,
+      state.topbarPanelCollapsed ? "collapsed" : "expanded",
     );
     window.localStorage.setItem(
       WORKSPACE_LAYOUT_STORAGE.density,
@@ -188,9 +208,14 @@ function applyWorkspaceLayout({ persist = false } = {}) {
   elements.workspace.classList.toggle("rooms-collapsed", state.roomsPanelCollapsed);
   elements.workspace.classList.toggle("people-collapsed", state.peoplePanelCollapsed);
   elements.workspace.classList.toggle("focus-mode", state.workspaceFocusMode);
+  elements.appShell.classList.toggle("topbar-collapsed", state.topbarPanelCollapsed);
   elements.workspace.classList.toggle(
-    "compact-view",
-    state.workspaceDensity === "compact",
+    "simple-view",
+    state.workspaceDensity === "simple",
+  );
+  elements.workspace.classList.toggle(
+    "standard-view",
+    state.workspaceDensity === "standard",
   );
   elements.workspace.classList.toggle(
     "composer-collapsed",
@@ -211,12 +236,30 @@ function applyWorkspaceLayout({ persist = false } = {}) {
   elements.togglePeoplePanel.title = state.peoplePanelCollapsed
     ? "展开成员面板"
     : "收起成员面板";
+  elements.toggleTopbarPanel.setAttribute(
+    "aria-expanded",
+    String(!state.topbarPanelCollapsed),
+  );
+  elements.toggleTopbarPanel.title = state.topbarPanelCollapsed
+    ? "展开顶部工具栏"
+    : "收起顶部工具栏";
+  elements.layoutToggleTopbar.classList.toggle(
+    "active",
+    state.topbarPanelCollapsed,
+  );
+  elements.layoutToggleTopbar.setAttribute(
+    "aria-pressed",
+    String(state.topbarPanelCollapsed),
+  );
+  elements.layoutTopbarStatus.textContent = state.topbarPanelCollapsed
+    ? "已收起"
+    : "展开";
 
   elements.toggleFocusMode.classList.toggle("active", state.workspaceFocusMode);
   elements.toggleFocusMode.setAttribute("aria-pressed", String(state.workspaceFocusMode));
   elements.layoutFocusStatus.textContent = state.workspaceFocusMode ? "退出" : "开启";
 
-  for (const choice of [elements.layoutDensityCompact, elements.layoutDensityDetailed]) {
+  for (const choice of workspaceDensityChoices()) {
     const active = choice.dataset.density === state.workspaceDensity;
     choice.classList.toggle("active", active);
     choice.setAttribute("aria-checked", String(active));
@@ -365,8 +408,14 @@ function bindWorkspaceResizer(element, kind, defaultValue) {
 }
 
 function setWorkspaceDensity(density, { persist = true } = {}) {
-  state.workspaceDensity = density === "compact" ? "compact" : "detailed";
+  state.workspaceDensity = normalizeWorkspaceDensity(density);
   applyWorkspaceLayout({ persist });
+}
+
+function toggleTopbarPanel() {
+  state.topbarPanelCollapsed = !state.topbarPanelCollapsed;
+  if (state.topbarPanelCollapsed) elements.globalToolsMenu.open = false;
+  applyWorkspaceLayout({ persist: true });
 }
 
 function toggleComposerPanel() {
@@ -384,6 +433,7 @@ function ensureComposerPanelExpanded() {
 function resetWorkspaceLayout() {
   state.roomsPanelCollapsed = false;
   state.peoplePanelCollapsed = true;
+  state.topbarPanelCollapsed = WORKSPACE_LAYOUT_DEFAULTS.topbarCollapsed;
   state.workspaceDensity = WORKSPACE_LAYOUT_DEFAULTS.density;
   state.workspaceFocusMode = false;
   state.roomsPanelWidth = WORKSPACE_LAYOUT_DEFAULTS.roomsWidth;
@@ -423,14 +473,18 @@ state.composerPanelCollapsed = readLayoutPreference(
   WORKSPACE_LAYOUT_STORAGE.composerCollapsed,
   false,
 );
+state.topbarPanelCollapsed = readLayoutPreference(
+  WORKSPACE_LAYOUT_STORAGE.topbarCollapsed,
+  WORKSPACE_LAYOUT_DEFAULTS.topbarCollapsed,
+);
 state.workspaceFocusMode = readLayoutPreference(
   WORKSPACE_LAYOUT_STORAGE.focusMode,
   false,
 );
-state.workspaceDensity = readLayoutValue(
+state.workspaceDensity = normalizeWorkspaceDensity(readLayoutValue(
   WORKSPACE_LAYOUT_STORAGE.density,
   WORKSPACE_LAYOUT_DEFAULTS.density,
-) === "compact" ? "compact" : "detailed";
+));
 
 bindWorkspaceResizer(elements.roomsResizer, "rooms", WORKSPACE_LAYOUT_DEFAULTS.roomsWidth);
 bindWorkspaceResizer(elements.peopleResizer, "people", WORKSPACE_LAYOUT_DEFAULTS.peopleWidth);
@@ -444,20 +498,20 @@ elements.togglePeoplePanel.addEventListener("click", () => {
   state.peoplePanelCollapsed = !state.peoplePanelCollapsed;
   applyWorkspaceLayout({ persist: true });
 });
+elements.toggleTopbarPanel.addEventListener("click", toggleTopbarPanel);
+elements.layoutToggleTopbar.addEventListener("click", toggleTopbarPanel);
 elements.toggleFocusMode.addEventListener("click", () => {
   state.workspaceFocusMode = !state.workspaceFocusMode;
   applyWorkspaceLayout({ persist: true });
 });
-elements.layoutDensityCompact.addEventListener("click", () => setWorkspaceDensity("compact"));
+elements.layoutDensitySimple.addEventListener("click", () => setWorkspaceDensity("simple"));
+elements.layoutDensityStandard.addEventListener("click", () => setWorkspaceDensity("standard"));
 elements.layoutDensityDetailed.addEventListener("click", () => setWorkspaceDensity("detailed"));
-for (const [index, choice] of [
-  elements.layoutDensityCompact,
-  elements.layoutDensityDetailed,
-].entries()) {
+for (const [index, choice] of workspaceDensityChoices().entries()) {
   choice.addEventListener("keydown", (event) => {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
     event.preventDefault();
-    const choices = [elements.layoutDensityCompact, elements.layoutDensityDetailed];
+    const choices = workspaceDensityChoices();
     const step = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
     const target = choices[(index + step + choices.length) % choices.length];
     setWorkspaceDensity(target.dataset.density);

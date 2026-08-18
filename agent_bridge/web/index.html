@@ -6,23 +6,23 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260818-03">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-03">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-03">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-03">
-    <script src="/assets/app.js?v=20260818-03" defer></script>
-    <script src="/assets/app-layout.js?v=20260818-03" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260818-03" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260818-03" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260818-03" defer></script>
-    <script src="/assets/app-governance.js?v=20260818-03" defer></script>
-    <script src="/assets/app-interactions.js?v=20260818-03" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260818-04">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-04">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-04">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-04">
+    <script src="/assets/app.js?v=20260818-04" defer></script>
+    <script src="/assets/app-layout.js?v=20260818-04" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260818-04" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260818-04" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260818-04" defer></script>
+    <script src="/assets/app-governance.js?v=20260818-04" defer></script>
+    <script src="/assets/app-interactions.js?v=20260818-04" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
     <div class="ambient ambient-two" aria-hidden="true"></div>
     <main class="shell" id="app-shell" hidden>
-      <header class="topbar">
+      <header class="topbar" id="topbar-content">
         <div class="brand-block">
           <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
           <div>
@@ -155,6 +155,12 @@
         </div>
       </header>
 
+      <button class="panel-collapse-toggle topbar-collapse-toggle" id="toggle-topbar-panel" type="button" aria-controls="topbar-content" aria-expanded="true" title="收起顶部工具栏">
+        <span class="panel-toggle-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><path d="m4.5 12.5 5.5-5 5.5 5"></path></svg>
+        </span>
+      </button>
+
       <section class="workspace people-collapsed" id="workspace">
         <aside class="rooms-panel panel">
           <button class="panel-collapse-toggle" id="toggle-rooms-panel" type="button" aria-controls="rooms-panel-content" aria-expanded="true" title="收起聊天室列表">
@@ -249,9 +255,13 @@
                       <span>左右栏与消息同步变化</span>
                     </div>
                     <div class="layout-density-control" role="radiogroup" aria-label="工作区信息密度">
-                      <button id="layout-density-compact" data-density="compact" type="button" role="radio" aria-checked="false">
+                      <button id="layout-density-simple" data-density="simple" type="button" role="radio" aria-checked="false">
                         <strong>简洁</strong>
-                        <small>更多内容，隐藏次要说明</small>
+                        <small>头像、名字、正文与回复</small>
+                      </button>
+                      <button id="layout-density-standard" data-density="standard" type="button" role="radio" aria-checked="false">
+                        <strong>标准</strong>
+                        <small>原简洁模式，保留常用状态</small>
                       </button>
                       <button id="layout-density-detailed" data-density="detailed" type="button" role="radio" aria-checked="true">
                         <strong>详细</strong>
@@ -265,6 +275,10 @@
                       <span>上下、左右均可调节</span>
                     </div>
                     <div class="layout-action-grid">
+                      <button id="layout-toggle-topbar" type="button" aria-pressed="false">
+                        <span>顶部栏</span>
+                        <strong id="layout-topbar-status">展开</strong>
+                      </button>
                       <button id="layout-toggle-composer" type="button" aria-pressed="false">
                         <span>输入区</span>
                         <strong id="layout-composer-status">展开</strong>
@@ -275,7 +289,7 @@
                       </button>
                     </div>
                   </section>
-                  <p class="layout-hint">拖动左右分隔线调整侧栏；拖动输入区上沿调整高度，双击任一分隔线可复位。</p>
+                  <p class="layout-hint">顶部中间按钮收起系统栏；拖动左右分隔线或输入区上沿调整尺寸，双击分隔线可复位。</p>
                 </div>
               </details>
               <details class="tool-menu room-search-menu" id="room-search-menu">

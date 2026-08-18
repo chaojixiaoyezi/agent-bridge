@@ -179,6 +179,8 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert measurements["authenticated_ready_ms"] < 8_000
 
             workspace = page.locator("#workspace")
+            shell = page.locator("#app-shell")
+            topbar = page.locator("#topbar-content")
             timeline = page.locator(".timeline-panel")
             rooms = page.locator(".rooms-panel")
             people = page.locator(".people-panel")
@@ -189,6 +191,35 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 page.locator("#global-tools-menu > summary")
             ).to_contain_text("系统管理")
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+            topbar_boundary = page.evaluate(
+                """() => {
+                  const topbar = document.querySelector('#topbar-content').getBoundingClientRect();
+                  const workspace = document.querySelector('#workspace').getBoundingClientRect();
+                  const topToggle = document.querySelector('#toggle-topbar-panel').getBoundingClientRect();
+                  const sideToggle = document.querySelector('#toggle-rooms-panel').getBoundingClientRect();
+                  return {
+                    boundaryDelta: Math.abs(topbar.bottom - workspace.top),
+                    toggleCenterDelta: Math.abs((topToggle.top + topToggle.height / 2) - workspace.top),
+                    widthDelta: Math.abs(topToggle.width - sideToggle.width),
+                    heightDelta: Math.abs(topToggle.height - sideToggle.height),
+                  };
+                }"""
+            )
+            assert topbar_boundary["boundaryDelta"] < 0.5
+            assert topbar_boundary["toggleCenterDelta"] < 0.5
+            assert topbar_boundary["widthDelta"] < 0.5
+            assert topbar_boundary["heightDelta"] < 0.5
+
+            timeline_height_before_topbar_collapse = timeline.bounding_box()["height"]
+            page.locator("#toggle-topbar-panel").click()
+            playwright_api.expect(topbar).to_be_hidden()
+            assert "topbar-collapsed" in (shell.get_attribute("class") or "")
+            assert page.evaluate("localStorage.agentBridgeTopbarPanel") == "collapsed"
+            assert timeline.bounding_box()["height"] > timeline_height_before_topbar_collapse + 35
+            page.locator("#toggle-topbar-panel").click()
+            playwright_api.expect(topbar).to_be_visible()
+            assert "topbar-collapsed" not in (shell.get_attribute("class") or "")
 
             panel_controls = page.evaluate(
                 """() => {
@@ -250,13 +281,26 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
 
             timeline_width_before_focus = timeline.bounding_box()["width"]
             page.locator("#layout-menu > summary").click()
-            page.locator("#layout-density-compact").click()
-            assert "compact-view" in (workspace.get_attribute("class") or "")
+            page.locator("#layout-density-standard").click()
+            assert "standard-view" in (workspace.get_attribute("class") or "")
             assert page.locator(".room-preview").first.evaluate(
                 "element => getComputedStyle(element).display"
             ) == "none"
+            assert page.locator(".route-badge").first.is_visible()
+            assert page.locator(".client-label").first.is_hidden()
+            assert page.locator(".receipt-label").first.is_hidden()
+            page.locator("#layout-density-simple").click()
+            assert "simple-view" in (workspace.get_attribute("class") or "")
+            first_message = page.locator("article.message").first
+            assert first_message.locator(".message-avatar").is_visible()
+            assert first_message.locator(".sender-line strong").is_visible()
+            assert first_message.locator(".message-body").is_visible()
+            assert first_message.locator(".message-direct-reply").is_visible()
+            assert first_message.locator(".route-badge").is_hidden()
+            assert first_message.locator(".message-time").is_hidden()
             page.locator("#layout-density-detailed").click()
-            assert "compact-view" not in (workspace.get_attribute("class") or "")
+            assert "simple-view" not in (workspace.get_attribute("class") or "")
+            assert "standard-view" not in (workspace.get_attribute("class") or "")
             page.locator("#toggle-focus-mode").click()
             assert "focus-mode" in (workspace.get_attribute("class") or "")
             playwright_api.expect(rooms).to_be_hidden()

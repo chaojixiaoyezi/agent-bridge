@@ -36,11 +36,11 @@
   .history-result-heading,
   .history-result-meta { display: grid; }
   body { overflow: hidden; }
-  .shell { min-height: 100dvh; padding: 8px; }
-  .topbar { height: 56px; }
+  .shell { --shell-gutter: 8px; --topbar-height: 56px; min-height: 100dvh; padding: var(--shell-gutter); }
+  .topbar { height: var(--topbar-height); }
   .connection-status { display: none; }
   .account-button { max-width: 86px; }
-  .workspace { height: calc(100dvh - 72px); min-height: 0; grid-template-columns: 1fr; }
+  .workspace { height: calc(100dvh - var(--shell-gutter) - var(--shell-gutter) - var(--topbar-height)); min-height: 0; grid-template-columns: 1fr; }
   .timeline-panel { grid-column: 1; grid-row: 1; min-height: 0; }
   .rooms-panel,
   .people-panel {

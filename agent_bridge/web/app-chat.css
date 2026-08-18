@@ -127,7 +127,7 @@
 .layout-focus-card strong { color: var(--text); font-size: 10px; }
 .layout-focus-card small { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .layout-focus-card b { padding: 4px 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--cyan); background: color-mix(in srgb, var(--surface-strong) 70%, transparent); font-size: 8px; }
-.layout-density-control { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.layout-density-control { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .layout-density-control button {
   min-width: 0;
   padding: 9px;
@@ -144,7 +144,7 @@
 .layout-density-control small { display: block; }
 .layout-density-control strong { color: var(--text); font-size: 9px; }
 .layout-density-control small { margin-top: 4px; color: var(--muted); font-size: 8px; line-height: 1.35; }
-.layout-action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.layout-action-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
 .layout-action-grid button {
   min-width: 0;
   min-height: 42px;
@@ -853,25 +853,50 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .empty-orbit { width: 48px; height: 48px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 50%; }
 .empty-orbit span { width: 8px; height: 8px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 16px rgba(85,214,199,.5); }
 
-.workspace.compact-view .timeline { padding: 14px 18px 42px; }
-.workspace.compact-view .message { padding-bottom: 14px; }
-.workspace.compact-view .message-head { margin-bottom: 4px; }
-.workspace.compact-view .message-body { font-size: 12px; line-height: 1.58; }
-.workspace.compact-view .client-label,
-.workspace.compact-view .receipt-label { display: none; }
-.workspace.compact-view .reply-label,
-.workspace.compact-view .claim-label,
-.workspace.compact-view .mention-label,
-.workspace.compact-view .authorization-label,
-.workspace.compact-view .forward-label { margin-top: 5px; }
-.workspace.compact-view .message-reply-button { margin-top: 5px; }
-.workspace.compact-view .day-divider { margin: 14px 0; }
-.workspace.compact-view .room-card { padding: 9px 10px; }
-.workspace.compact-view .room-card-title { margin-bottom: 3px; }
-.workspace.compact-view .room-preview { display: none; }
-.workspace.compact-view .person-card { padding: 9px 7px; }
-.workspace.compact-view .person-name span,
-.workspace.compact-view .roles,
-.workspace.compact-view .membership-label,
-.workspace.compact-view .safety-note { display: none; }
-.workspace.compact-view .person-actions { margin-top: 6px; margin-left: 36px; }
+.workspace:is(.simple-view, .standard-view) .timeline { padding: 14px 18px 42px; }
+.workspace:is(.simple-view, .standard-view) .message { padding-bottom: 14px; }
+.workspace:is(.simple-view, .standard-view) .message-head { margin-bottom: 4px; }
+.workspace:is(.simple-view, .standard-view) .message-body { font-size: 12px; line-height: 1.58; }
+.workspace:is(.simple-view, .standard-view) .client-label,
+.workspace:is(.simple-view, .standard-view) .receipt-label { display: none; }
+.workspace:is(.simple-view, .standard-view) .reply-label,
+.workspace:is(.simple-view, .standard-view) .claim-label,
+.workspace:is(.simple-view, .standard-view) .mention-label,
+.workspace:is(.simple-view, .standard-view) .authorization-label,
+.workspace:is(.simple-view, .standard-view) .forward-label { margin-top: 5px; }
+.workspace:is(.simple-view, .standard-view) .message-reply-button { margin-top: 5px; }
+.workspace:is(.simple-view, .standard-view) .day-divider { margin: 14px 0; }
+.workspace:is(.simple-view, .standard-view) .room-card { padding: 9px 10px; }
+.workspace:is(.simple-view, .standard-view) .room-card-title { margin-bottom: 3px; }
+.workspace:is(.simple-view, .standard-view) .room-preview { display: none; }
+.workspace:is(.simple-view, .standard-view) .person-card { padding: 9px 7px; }
+.workspace:is(.simple-view, .standard-view) .person-name span,
+.workspace:is(.simple-view, .standard-view) .roles,
+.workspace:is(.simple-view, .standard-view) .membership-label,
+.workspace:is(.simple-view, .standard-view) .safety-note { display: none; }
+.workspace:is(.simple-view, .standard-view) .person-actions { margin-top: 6px; margin-left: 36px; }
+
+.workspace.simple-view .message {
+  padding-left: 0;
+  border-left: 0;
+}
+.workspace.simple-view .message::before { display: none; }
+.workspace.simple-view .message.search-target { padding: 10px 10px 12px; }
+.workspace.simple-view .message-head { justify-content: flex-start; gap: 0; }
+.workspace.simple-view .sender-line { gap: 8px; }
+.workspace.simple-view .message-avatar { width: 32px; height: 32px; border-radius: 10px; }
+.workspace.simple-view .sender-line strong { font-size: 12px; }
+.workspace.simple-view .message-time,
+.workspace.simple-view .message-head .sender-line > :not(.message-avatar):not(strong),
+.workspace.simple-view .message > :not(.message-head):not(.message-body):not(.message-direct-reply) {
+  display: none !important;
+}
+.workspace.simple-view .message-body { margin-left: 40px; font-size: 13px; line-height: 1.58; }
+.workspace.simple-view .message-direct-reply {
+  margin: 5px 0 0 40px;
+  padding: 2px 0;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+}
+.workspace.simple-view .message-direct-reply:hover { color: var(--cyan); background: transparent; }

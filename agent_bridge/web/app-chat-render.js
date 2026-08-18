@@ -361,7 +361,7 @@ function createMessageElement(message) {
     article.append(promoteButton);
   }
   if (!message.reply_to && selectedRoom?.status === "active") {
-    const replyButton = makeElement("button", "message-reply-button", "回复");
+    const replyButton = makeElement("button", "message-reply-button message-direct-reply", "回复");
     replyButton.type = "button";
     replyButton.addEventListener("click", () => startComposerReply(message));
     article.append(replyButton);

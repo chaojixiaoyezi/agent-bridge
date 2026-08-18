@@ -59,7 +59,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.22"
+    assert _runtime_software_version() == "0.42.23"
 
 
 class FakeEmailDelivery:
@@ -2206,12 +2206,12 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260818-03")
+        index_html.index(f"{filename}?v=20260818-04")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260818-03")
+        index_html.index(f"{filename}?v=20260818-04")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
@@ -2233,10 +2233,13 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert 'role="radiogroup" aria-label="页面颜色风格"' in index_html
     assert 'id="toggle-rooms-panel"' in index_html
     assert 'id="toggle-people-panel"' in index_html
+    assert 'id="toggle-topbar-panel"' in index_html
     assert 'id="layout-menu"' in index_html
     assert 'id="toggle-focus-mode"' in index_html
-    assert 'id="layout-density-compact"' in index_html
+    assert 'id="layout-density-simple"' in index_html
+    assert 'id="layout-density-standard"' in index_html
     assert 'id="layout-density-detailed"' in index_html
+    assert 'id="layout-toggle-topbar"' in index_html
     assert 'id="rooms-resizer"' in index_html
     assert 'id="people-resizer"' in index_html
     assert 'id="composer-resizer"' in index_html
@@ -2244,11 +2247,15 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert "function applyWorkspaceLayout" in javascript
     assert "function beginWorkspaceResize" in javascript
     assert "function setWorkspaceDensity" in javascript
+    assert "function toggleTopbarPanel" in javascript
     assert "function resetWorkspaceLayout" in javascript
     assert '"agentBridgeRoomsPanel"' in javascript
     assert '"agentBridgeWorkspaceDensity"' in javascript
     assert '"agentBridgeWorkspaceFocus"' in javascript
+    assert '"agentBridgeTopbarPanel"' in javascript
     assert '"agentBridgeComposerHeight"' in javascript
+    assert 'value === "standard" || value === "compact"' in javascript
+    assert '"message-reply-button message-direct-reply"' in javascript
     assert 'makeElement("div", "person-actions")' in javascript
     assert 'choice.classList.toggle("active", active)' in javascript
     assert 'button.matches(".theme-choice")' in javascript
