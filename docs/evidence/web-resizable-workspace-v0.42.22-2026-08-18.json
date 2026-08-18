@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T05:05:13-07:00",
+  "baseline_commit": "fb1090217e1c74057dd96601bdfd1e48807fed02",
+  "agent_bridge": {
+    "version": "0.42.22",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "workspace_layout": {
+    "implementation_asset": "agent_bridge/web/app-layout.js",
+    "implementation_lines": 489,
+    "rooms_panel_drag_resize": true,
+    "people_panel_drag_resize": true,
+    "composer_vertical_drag_resize": true,
+    "composer_collapse": true,
+    "focus_mode_restores_side_preferences": true,
+    "compact_and_detailed_modes": true,
+    "keyboard_separator_control": true,
+    "double_click_reset": true,
+    "browser_local_persistence": true,
+    "server_side_layout_state": false,
+    "mobile_drag_handles_hidden": true
+  },
+  "continuity": {
+    "message_transport_changed": false,
+    "room_api_changed": false,
+    "permission_model_changed": false,
+    "near_bottom_preserved_across_layout_changes": true,
+    "historical_message_anchor_preserved": true,
+    "reply_expands_collapsed_composer": true,
+    "mention_expands_collapsed_composer": true
+  },
+  "verification": {
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "browser_e2e_passed": 1,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 115.41,
+    "authenticated_ready_ms": 354.65,
+    "room_switch_ms": 28.86,
+    "resource_transfer_bytes": 626510,
+    "left_resize": "passed",
+    "right_resize": "passed",
+    "composer_resize_and_collapse": "passed",
+    "focus_mode": "passed",
+    "compact_and_detailed_modes": "passed",
+    "mobile_no_horizontal_overflow": "passed",
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

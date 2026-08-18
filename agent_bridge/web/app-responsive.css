@@ -13,10 +13,11 @@
     right: 0;
     bottom: 0;
     z-index: 22;
-    width: 260px;
+    width: var(--people-column);
     box-shadow: -12px 0 40px rgba(0,0,0,.16);
   }
   .workspace.people-collapsed .people-panel { width: 48px; box-shadow: none; }
+  .people-resizer { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -54,6 +55,7 @@
   .people-panel { right: 0; box-shadow: -12px 0 40px rgba(0,0,0,.2); }
   .workspace.rooms-collapsed .rooms-panel,
   .workspace.people-collapsed .people-panel { width: 44px; box-shadow: none; }
+  .workspace-resizer { display: none; }
   .timeline { padding: 18px 17px 48px; }
   .timeline-heading { min-height: 66px; padding: 11px 13px; }
   .room-title-wrap { max-width: calc(100% - 135px); }
@@ -109,8 +111,10 @@
   .global-tools-menu .tool-menu-label { display: none; }
   .room-title-wrap { max-width: calc(100% - 116px); }
   .room-search-menu .tool-menu-label,
+  .layout-menu .tool-menu-label,
   .room-tools-menu .tool-menu-label { display: none; }
   .global-tools-menu > summary,
+  .layout-menu > summary,
   .room-search-menu > summary,
   .room-tools-menu > summary { width: 32px; justify-content: center; padding: 0; }
   .tool-menu-chevron { display: none; }

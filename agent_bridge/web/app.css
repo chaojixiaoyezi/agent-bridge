@@ -373,8 +373,11 @@ select option {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .workspace {
-  --rooms-column: 236px;
-  --people-column: 260px;
+  --rooms-expanded-column: 236px;
+  --people-expanded-column: 260px;
+  --rooms-column: var(--rooms-expanded-column);
+  --people-column: var(--people-expanded-column);
+  --composer-input-height: 58px;
   position: relative;
   height: calc(100vh - 82px);
   display: grid;
@@ -385,6 +388,55 @@ select option {
 
 .workspace.rooms-collapsed { --rooms-column: 48px; }
 .workspace.people-collapsed { --people-column: 48px; }
+.workspace.focus-mode {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+.workspace.focus-mode .timeline-panel { grid-column: 1; }
+.workspace.focus-mode .rooms-panel,
+.workspace.focus-mode .people-panel,
+.workspace.focus-mode .workspace-resizer { display: none; }
+
+.workspace-resizer {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  z-index: 21;
+  width: 12px;
+  border-radius: 999px;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+.workspace-resizer::before {
+  content: "";
+  position: absolute;
+  top: 44%;
+  bottom: 44%;
+  left: 5px;
+  width: 2px;
+  min-height: 34px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 22%, transparent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--cyan) 0%, transparent);
+  transition: top 150ms ease, bottom 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+}
+.workspace-resizer:hover::before,
+.workspace-resizer:focus-visible::before,
+body.layout-resizing-columns .workspace-resizer::before {
+  top: 39%;
+  bottom: 39%;
+  background: var(--cyan);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--cyan) 9%, transparent);
+}
+.rooms-resizer { left: var(--rooms-column); }
+.people-resizer { right: var(--people-column); }
+.workspace.rooms-collapsed .rooms-resizer,
+.workspace.people-collapsed .people-resizer { display: none; }
+body.layout-resizing { user-select: none; }
+body.layout-resizing .workspace { transition: none; }
+body.layout-resizing-columns { cursor: col-resize; }
+body.layout-resizing-rows { cursor: row-resize; }
 
 .panel {
   min-width: 0;

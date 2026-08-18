@@ -61,6 +61,7 @@ function updateComposerContext() {
 function setComposerMode(mode) {
   const room = state.rooms.find((item) => item.conversation_id === state.selectedRoom);
   if (mode === "task" && !room?.can_assign_tasks) return;
+  ensureComposerPanelExpanded();
   state.composerMode = mode === "task" ? "task" : "chat";
   state.composerWakeAll = false;
   updateComposer(room);
@@ -75,6 +76,7 @@ function clearComposerContext() {
 
 function startComposerReply(message) {
   if (!message || message.reply_to) return;
+  ensureComposerPanelExpanded();
   state.composerReplyTo = message.message_id;
   state.composerWakeAll = false;
   updateComposerContext();
@@ -132,6 +134,7 @@ function updateMentionMenu() {
 }
 
 function addComposerMention(person, range = null) {
+  ensureComposerPanelExpanded();
   const label = person.display_name || person.client_type;
   const token = `@${label}`;
   const textarea = elements.ownerMessageBody;

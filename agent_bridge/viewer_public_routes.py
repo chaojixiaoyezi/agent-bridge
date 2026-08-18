@@ -38,6 +38,7 @@ from .web_auth import WebAuthenticationError, WebAuthStore
 
 WEB_JAVASCRIPT_ASSETS = (
     "app.js",
+    "app-layout.js",
     "app-chat-render.js",
     "app-agent-operations.js",
     "app-room-controller.js",

@@ -181,6 +181,7 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             workspace = page.locator("#workspace")
             timeline = page.locator(".timeline-panel")
             rooms = page.locator(".rooms-panel")
+            people = page.locator(".people-panel")
             assert timeline.bounding_box()["width"] > rooms.bounding_box()["width"] * 2
             assert page.locator("#global-tools-menu").get_attribute("open") is None
             assert page.locator("#room-tools-menu").get_attribute("open") is None
@@ -208,6 +209,65 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert panel_controls["createCollapseTopDelta"] < 0.5
             assert panel_controls["createCollapseHeightDelta"] < 0.5
 
+            rooms_width_before = rooms.bounding_box()["width"]
+            rooms_resizer = page.locator("#rooms-resizer")
+            rooms_resizer_box = rooms_resizer.bounding_box()
+            page.mouse.move(
+                rooms_resizer_box["x"] + 3,
+                rooms_resizer_box["y"] + 80,
+            )
+            page.mouse.down()
+            page.mouse.move(
+                rooms_resizer_box["x"] + 47,
+                rooms_resizer_box["y"] + 80,
+            )
+            page.mouse.up()
+            assert rooms.bounding_box()["width"] > rooms_width_before + 30
+            assert int(page.evaluate("localStorage.agentBridgeRoomsWidth")) > 260
+
+            composer_textarea = page.locator("#owner-message-body")
+            composer_height_before = composer_textarea.bounding_box()["height"]
+            composer_resizer = page.locator("#composer-resizer")
+            composer_resizer_box = composer_resizer.bounding_box()
+            page.mouse.move(
+                composer_resizer_box["x"] + 30,
+                composer_resizer_box["y"] + 5,
+            )
+            page.mouse.down()
+            page.mouse.move(
+                composer_resizer_box["x"] + 30,
+                composer_resizer_box["y"] - 47,
+            )
+            page.mouse.up()
+            assert composer_textarea.bounding_box()["height"] > composer_height_before + 40
+            assert int(page.evaluate("localStorage.agentBridgeComposerHeight")) > 90
+
+            page.locator("#toggle-composer-panel").click()
+            playwright_api.expect(page.locator("#owner-message-form")).to_be_hidden()
+            assert "composer-collapsed" in (workspace.get_attribute("class") or "")
+            page.locator("#toggle-composer-panel").click()
+            playwright_api.expect(page.locator("#owner-message-form")).to_be_visible()
+
+            timeline_width_before_focus = timeline.bounding_box()["width"]
+            page.locator("#layout-menu > summary").click()
+            page.locator("#layout-density-compact").click()
+            assert "compact-view" in (workspace.get_attribute("class") or "")
+            assert page.locator(".room-preview").first.evaluate(
+                "element => getComputedStyle(element).display"
+            ) == "none"
+            page.locator("#layout-density-detailed").click()
+            assert "compact-view" not in (workspace.get_attribute("class") or "")
+            page.locator("#toggle-focus-mode").click()
+            assert "focus-mode" in (workspace.get_attribute("class") or "")
+            playwright_api.expect(rooms).to_be_hidden()
+            assert timeline.bounding_box()["width"] > timeline_width_before_focus + 150
+            page.locator("#toggle-focus-mode").click()
+            playwright_api.expect(rooms).to_be_visible()
+            page.locator("#reset-workspace-layout").click()
+            assert page.evaluate("localStorage.agentBridgeRoomsWidth") == "236"
+            assert page.evaluate("localStorage.agentBridgeComposerHeight") == "58"
+            page.locator("#layout-menu").evaluate("element => { element.open = false; }")
+
             page.locator(".room-card", has_text="browser-room-one").click()
             playwright_api.expect(page.locator("#active-room-title")).to_have_text(
                 "browser-room-one"
@@ -216,6 +276,12 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 page.locator("#timeline article[data-message-id]")
             ).to_have_count(60)
             assert page.locator(".load-earlier-button").is_visible()
+            page.locator("#toggle-composer-panel").click()
+            playwright_api.expect(page.locator("#owner-message-form")).to_be_hidden()
+            page.locator("button.message-reply-button", has_text="回复").last.click()
+            playwright_api.expect(page.locator("#owner-message-form")).to_be_visible()
+            playwright_api.expect(page.locator("#composer-context")).to_be_visible()
+            page.locator("#cancel-composer-context").click()
             playwright_api.expect(
                 page.locator("#room-tools-menu > summary")
             ).to_contain_text("房间管理")
@@ -255,8 +321,29 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert "rooms-collapsed" in (workspace.get_attribute("class") or "")
             page.locator("#toggle-people-panel").click()
             assert "people-collapsed" not in (workspace.get_attribute("class") or "")
+            page.wait_for_function(
+                "element => element.getBoundingClientRect().width > 200",
+                arg=people.element_handle(),
+            )
             playwright_api.expect(page.locator(".person-actions").first).to_be_visible()
             assert page.locator(".person-name").first.bounding_box()["width"] > 100
+            people_width_before = people.bounding_box()["width"]
+            people_resizer = page.locator("#people-resizer")
+            people_resizer_box = people_resizer.bounding_box()
+            page.mouse.move(
+                people_resizer_box["x"] + 8,
+                people_resizer_box["y"] + 80,
+            )
+            page.mouse.down()
+            page.mouse.move(
+                people_resizer_box["x"] - 34,
+                people_resizer_box["y"] + 80,
+            )
+            page.mouse.up()
+            assert people.bounding_box()["width"] > people_width_before + 30
+            assert int(page.evaluate("localStorage.agentBridgePeopleWidth")) > 290
+            people_resizer.dblclick()
+            assert page.evaluate("localStorage.agentBridgePeopleWidth") == "260"
 
             page.locator("#global-tools-menu").click()
             playwright_api.expect(
@@ -329,6 +416,9 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert page.locator("#owner-message-form").is_visible()
             assert page.locator("#active-room-title").is_visible()
             assert page.locator("#global-tools-menu > summary").bounding_box()["width"] == 32
+            assert page.locator("#layout-menu > summary").bounding_box()["width"] == 32
+            playwright_api.expect(page.locator("#rooms-resizer")).to_be_hidden()
+            playwright_api.expect(page.locator("#people-resizer")).to_be_hidden()
             assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
             resource_bytes = page.evaluate(

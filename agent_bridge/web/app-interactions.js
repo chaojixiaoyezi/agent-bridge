@@ -1298,17 +1298,9 @@ for (const [index, choice] of elements.themeChoices.entries()) {
     target.focus();
   });
 }
-elements.toggleRoomsPanel.addEventListener("click", () => {
-  state.roomsPanelCollapsed = !state.roomsPanelCollapsed;
-  applyWorkspaceLayout({ persist: true });
-});
-elements.togglePeoplePanel.addEventListener("click", () => {
-  state.peoplePanelCollapsed = !state.peoplePanelCollapsed;
-  applyWorkspaceLayout({ persist: true });
-});
-
 const expandableToolMenus = [
   elements.globalToolsMenu,
+  elements.layoutMenu,
   elements.roomSearchMenu,
   elements.roomToolsMenu,
 ];

@@ -6,16 +6,17 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260818-02">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-02">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-02">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-02">
-    <script src="/assets/app.js?v=20260818-02" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260818-02" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260818-02" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260818-02" defer></script>
-    <script src="/assets/app-governance.js?v=20260818-02" defer></script>
-    <script src="/assets/app-interactions.js?v=20260818-02" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260818-03">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-03">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-03">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-03">
+    <script src="/assets/app.js?v=20260818-03" defer></script>
+    <script src="/assets/app-layout.js?v=20260818-03" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260818-03" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260818-03" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260818-03" defer></script>
+    <script src="/assets/app-governance.js?v=20260818-03" defer></script>
+    <script src="/assets/app-interactions.js?v=20260818-03" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -183,6 +184,19 @@
           </div>
         </aside>
 
+        <div
+          class="workspace-resizer rooms-resizer"
+          id="rooms-resizer"
+          role="separator"
+          aria-label="调整聊天室列表宽度"
+          aria-orientation="vertical"
+          aria-valuemin="176"
+          aria-valuemax="420"
+          aria-valuenow="236"
+          tabindex="0"
+          title="左右拖动调整聊天室列表宽度；双击恢复默认"
+        ></div>
+
         <section class="timeline-panel panel">
           <div class="timeline-heading">
             <div class="room-title-wrap">
@@ -197,6 +211,73 @@
                 <span>最近同步</span>
                 <strong id="last-sync">—</strong>
               </div>
+              <details class="tool-menu layout-menu" id="layout-menu">
+                <summary aria-label="展开工作区布局设置">
+                  <svg class="tool-menu-icon" viewBox="0 0 20 20" aria-hidden="true">
+                    <path d="M3 7V3h4M13 3h4v4M17 13v4h-4M7 17H3v-4"></path>
+                  </svg>
+                  <span class="tool-menu-label">布局</span>
+                  <span class="tool-menu-chevron" aria-hidden="true">⌄</span>
+                </summary>
+                <div class="tool-popover layout-popover">
+                  <div class="tool-popover-heading">
+                    <div class="tool-popover-title">
+                      <span class="tool-scope-pill">本浏览器</span>
+                      <strong>工作区布局</strong>
+                    </div>
+                    <span>自动记住尺寸与模式</span>
+                  </div>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>聊天空间</strong>
+                      <span>需要专注时隐藏两侧</span>
+                    </div>
+                    <button class="layout-focus-card" id="toggle-focus-mode" type="button" aria-pressed="false">
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"></path>
+                      </svg>
+                      <span>
+                        <strong>聊天最大化</strong>
+                        <small>退出后恢复原来的左右布局</small>
+                      </span>
+                      <b id="layout-focus-status">开启</b>
+                    </button>
+                  </section>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>信息密度</strong>
+                      <span>左右栏与消息同步变化</span>
+                    </div>
+                    <div class="layout-density-control" role="radiogroup" aria-label="工作区信息密度">
+                      <button id="layout-density-compact" data-density="compact" type="button" role="radio" aria-checked="false">
+                        <strong>简洁</strong>
+                        <small>更多内容，隐藏次要说明</small>
+                      </button>
+                      <button id="layout-density-detailed" data-density="detailed" type="button" role="radio" aria-checked="true">
+                        <strong>详细</strong>
+                        <small>保留签名、回执与预览</small>
+                      </button>
+                    </div>
+                  </section>
+                  <section class="tool-section">
+                    <div class="tool-section-heading">
+                      <strong>输入与边界</strong>
+                      <span>上下、左右均可调节</span>
+                    </div>
+                    <div class="layout-action-grid">
+                      <button id="layout-toggle-composer" type="button" aria-pressed="false">
+                        <span>输入区</span>
+                        <strong id="layout-composer-status">展开</strong>
+                      </button>
+                      <button id="reset-workspace-layout" type="button">
+                        <span>所有边界</span>
+                        <strong>恢复默认</strong>
+                      </button>
+                    </div>
+                  </section>
+                  <p class="layout-hint">拖动左右分隔线调整侧栏；拖动输入区上沿调整高度，双击任一分隔线可复位。</p>
+                </div>
+              </details>
               <details class="tool-menu room-search-menu" id="room-search-menu">
                 <summary aria-label="展开聊天室搜索">
                   <svg class="tool-menu-icon" viewBox="0 0 20 20" aria-hidden="true">
@@ -341,6 +422,23 @@
             </svg>
             <span id="new-message-count" hidden></span>
           </button>
+          <div class="composer-resize-bar">
+            <div
+              class="composer-resizer"
+              id="composer-resizer"
+              role="separator"
+              aria-label="调整输入区高度"
+              aria-orientation="horizontal"
+              aria-valuemin="58"
+              aria-valuemax="300"
+              aria-valuenow="58"
+              tabindex="0"
+              title="上下拖动调整输入区高度；双击恢复默认"
+            ><span aria-hidden="true"></span></div>
+            <button class="composer-collapse-button" id="toggle-composer-panel" type="button" aria-expanded="true" aria-controls="owner-message-form" title="收起输入区">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5"></path></svg>
+            </button>
+          </div>
           <form class="message-composer" id="owner-message-form">
             <div class="composer-context" id="composer-context" hidden>
               <div>
@@ -375,6 +473,19 @@
             </div>
           </form>
         </section>
+
+        <div
+          class="workspace-resizer people-resizer"
+          id="people-resizer"
+          role="separator"
+          aria-label="调整成员列表宽度"
+          aria-orientation="vertical"
+          aria-valuemin="200"
+          aria-valuemax="420"
+          aria-valuenow="260"
+          tabindex="0"
+          title="左右拖动调整成员列表宽度；双击恢复默认"
+        ></div>
 
         <aside class="people-panel panel">
           <button class="panel-collapse-toggle" id="toggle-people-panel" type="button" aria-controls="people-panel-content" aria-expanded="false" title="展开成员面板">

@@ -103,6 +103,12 @@ const state = {
   },
   roomsPanelCollapsed: false,
   peoplePanelCollapsed: true,
+  workspaceDensity: "detailed",
+  workspaceFocusMode: false,
+  roomsPanelWidth: 236,
+  peoplePanelWidth: 260,
+  composerInputHeight: 58,
+  composerPanelCollapsed: false,
 };
 
 const ROOM_SNAPSHOT_LIMIT = 4;
@@ -115,8 +121,20 @@ const MONITORING_CACHE_MS = 60_000;
 const elements = {
   appShell: document.querySelector("#app-shell"),
   workspace: document.querySelector("#workspace"),
+  layoutMenu: document.querySelector("#layout-menu"),
   toggleRoomsPanel: document.querySelector("#toggle-rooms-panel"),
   togglePeoplePanel: document.querySelector("#toggle-people-panel"),
+  roomsResizer: document.querySelector("#rooms-resizer"),
+  peopleResizer: document.querySelector("#people-resizer"),
+  composerResizer: document.querySelector("#composer-resizer"),
+  toggleComposerPanel: document.querySelector("#toggle-composer-panel"),
+  layoutToggleComposer: document.querySelector("#layout-toggle-composer"),
+  layoutComposerStatus: document.querySelector("#layout-composer-status"),
+  toggleFocusMode: document.querySelector("#toggle-focus-mode"),
+  layoutFocusStatus: document.querySelector("#layout-focus-status"),
+  layoutDensityCompact: document.querySelector("#layout-density-compact"),
+  layoutDensityDetailed: document.querySelector("#layout-density-detailed"),
+  resetWorkspaceLayout: document.querySelector("#reset-workspace-layout"),
   globalToolsMenu: document.querySelector("#global-tools-menu"),
   roomToolsMenu: document.querySelector("#room-tools-menu"),
   roomSearchMenu: document.querySelector("#room-search-menu"),
@@ -634,54 +652,6 @@ function applyTheme(theme) {
 }
 
 applyTheme(state.theme);
-
-function readLayoutPreference(key, fallback) {
-  try {
-    const stored = window.localStorage.getItem(key);
-    return stored === null ? fallback : stored === "collapsed";
-  } catch (error) {
-    return fallback;
-  }
-}
-
-function applyWorkspaceLayout({ persist = false } = {}) {
-  elements.workspace.classList.toggle("rooms-collapsed", state.roomsPanelCollapsed);
-  elements.workspace.classList.toggle("people-collapsed", state.peoplePanelCollapsed);
-  elements.toggleRoomsPanel.setAttribute(
-    "aria-expanded",
-    String(!state.roomsPanelCollapsed),
-  );
-  elements.togglePeoplePanel.setAttribute(
-    "aria-expanded",
-    String(!state.peoplePanelCollapsed),
-  );
-  elements.toggleRoomsPanel.title = state.roomsPanelCollapsed
-    ? "展开聊天室列表"
-    : "收起聊天室列表";
-  elements.togglePeoplePanel.title = state.peoplePanelCollapsed
-    ? "展开成员面板"
-    : "收起成员面板";
-  if (!persist) return;
-  try {
-    window.localStorage.setItem(
-      "agentBridgeRoomsPanel",
-      state.roomsPanelCollapsed ? "collapsed" : "expanded",
-    );
-    window.localStorage.setItem(
-      "agentBridgePeoplePanel",
-      state.peoplePanelCollapsed ? "collapsed" : "expanded",
-    );
-  } catch (error) {
-    // Private browsing or a hardened WebView may disable persistent storage.
-  }
-}
-
-state.roomsPanelCollapsed = readLayoutPreference(
-  "agentBridgeRoomsPanel",
-  window.matchMedia("(max-width: 760px)").matches,
-);
-state.peoplePanelCollapsed = readLayoutPreference("agentBridgePeoplePanel", true);
-applyWorkspaceLayout();
 
 function shortTime(timestamp) {
   if (!timestamp) return "—";
