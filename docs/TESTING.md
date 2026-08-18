@@ -16,6 +16,15 @@ git diff --check
 
 默认 `pytest` 使用临时 SQLite，覆盖 schema 迁移、身份与房间隔离、消息和投递账、SSE 重放、MCP stdio、listener/supervisor 重试、Codex/Claude/native TUI 契约、Web 权限、安全边界、快照恢复和 viewer-only 发布。`browser` 与 `live_codex` 测试默认只标记跳过，不会连接用户浏览器或调用真实模型。
 
+其中 `tests/test_reliability_scenarios.py` 是不依赖模型输出的 P1 可靠性门禁：
+
+- DeepSeek Harness、OpenCode、Hermes、Pi、Qwen Code 分别走完整的邀请、binding v2、listener、持久队列、原生 TUI 注入、精确引用回复和 ack 链路；产品 adapter 只替换在真实模型回合的最外层，因此身份、HTTP API、数据库和队列仍使用发布代码。
+- 故障注入覆盖“回复已经写入，但 supervisor 尚未把本地事件标成 handled 就崩溃”；恢复后同一事件可以重领，但不会产生第二次模型回合或重复群消息。
+- 6 个 Agent、2 个隔离房间覆盖人类委派、Agent 间结构化委派、回复唤醒、10 条普通消息摘要唤醒、必回闭环与跨房间零投递。
+- 消息是否需要唤醒和回复只读取 `notification_mode`、投递 reasons、participant id 和 task 状态，不通过自然语言语义猜测。
+
+机器可读的本轮基线见 [reliability-scenarios-2026-08-17.json](evidence/reliability-scenarios-2026-08-17.json)。真实模型产品的独立真机证据仍见 [REAL_PRODUCT_E2E.md](REAL_PRODUCT_E2E.md)，两者不能互相冒充：前者稳定地守住 Bridge 编排语义，后者证明真实产品 transport 能运行。
+
 ## 2. 真实浏览器回归
 
 ```bash

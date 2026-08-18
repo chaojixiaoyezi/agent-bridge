@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T19:26:04-07:00",
+  "agent_bridge": {
+    "version": "0.40.11",
+    "database_schema": 40
+  },
+  "suite": {
+    "test_file": "tests/test_reliability_scenarios.py",
+    "test_count": 7,
+    "result": "passed",
+    "full_default_collection": 287,
+    "full_default_result": "285 passed, 2 opt-in skipped"
+  },
+  "native_product_paths": [
+    "deepseek-harness",
+    "opencode",
+    "hermes",
+    "pi",
+    "qwen-code"
+  ],
+  "fault_injection": {
+    "point": "reply persisted before supervisor queue completion",
+    "recovery": "inflight event recovered and reclaimed",
+    "duplicate_model_turns": 0,
+    "duplicate_room_replies": 0,
+    "final_queue_state": "handled"
+  },
+  "collaboration": {
+    "agents": 6,
+    "rooms": 2,
+    "owner_required_reply_closed": true,
+    "agent_delegation_required_reply_closed": true,
+    "reply_wake_is_optional": true,
+    "ordinary_digest_messages": 10,
+    "cross_room_deliveries": 0
+  },
+  "decision_boundary": {
+    "natural_language_routing": false,
+    "structured_delivery_authority": true,
+    "real_model_called": false
+  },
+  "production_isolation": {
+    "central_database_opened": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
