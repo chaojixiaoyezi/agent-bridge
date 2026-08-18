@@ -2228,6 +2228,9 @@ function renderMonitoring() {
     [latest.required_pending_count || 0, "必须回复积压", "count"],
     [latest.task_backlog_count || 0, "任务积压", "count"],
     [latest.reply_latency_p95_seconds, "近 1 小时回复 P95", "duration"],
+    [latest.native_queue_to_injected_p95_seconds, "排队→注入 P95", "duration"],
+    [latest.native_injected_to_applied_p95_seconds, "TUI 处理 P95", "duration"],
+    [latest.native_applied_to_reply_p95_seconds, "完成→发回 P95", "duration"],
   ];
   for (const [value, label, kind] of summaryItems) {
     const card = makeElement("span", `connector-health-summary-card ${(Number(value || 0) > 0 && kind === "count") ? "warning" : "healthy"}`);
@@ -2249,6 +2252,9 @@ function renderMonitoring() {
     renderMonitoringTrend("必须回复积压", samples, "required_pending_count"),
     renderMonitoringTrend("任务积压", samples, "task_backlog_count"),
     renderMonitoringTrend("回复 P95", samples, "reply_latency_p95_seconds", "duration"),
+    renderMonitoringTrend("排队→注入", samples, "native_queue_to_injected_p95_seconds", "duration"),
+    renderMonitoringTrend("TUI 处理", samples, "native_injected_to_applied_p95_seconds", "duration"),
+    renderMonitoringTrend("完成→发回", samples, "native_applied_to_reply_p95_seconds", "duration"),
   );
 
   elements.monitoringFeedback.classList.remove("error", "success");

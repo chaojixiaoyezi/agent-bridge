@@ -318,11 +318,19 @@ def test_native_product_invitation_reaches_exact_tui_identity_and_replies(
     ]
     delivery = _database_rows(
         database,
-        "SELECT state, delivery_stage FROM message_deliveries "
+        "SELECT state, delivery_stage, native_injected_at, native_applied_at, "
+        "native_replied_at FROM message_deliveries "
         "WHERE message_id = ? AND participant_id = ?",
         (str(message["message_id"]), str(accepted["participant_id"])),
     )
-    assert delivery == [{"state": "acked", "delivery_stage": "legacy_acked"}]
+    assert len(delivery) == 1
+    assert delivery[0]["state"] == "acked"
+    assert delivery[0]["delivery_stage"] == "replied"
+    assert (
+        float(delivery[0]["native_injected_at"])
+        <= float(delivery[0]["native_applied_at"])
+        <= float(delivery[0]["native_replied_at"])
+    )
     assert not _database_rows(
         database,
         "SELECT message_id FROM messages WHERE conversation_id = ?",

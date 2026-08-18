@@ -140,6 +140,38 @@ def _safe_report_state(client: Any, **kwargs: Any) -> None:
         pass
 
 
+def _report_delivery_stage(
+    client: Any,
+    *,
+    connector_id: str,
+    endpoint_id: str,
+    native_session_id: str,
+    message_ids: list[str],
+    stage: str,
+) -> None:
+    if not message_ids:
+        return
+    client.post(
+        "/agent/connector/tui-delivery-stage",
+        {
+            "connector_id": connector_id,
+            "tui_endpoint_id": endpoint_id,
+            "tui_native_session_id": native_session_id,
+            "message_ids": message_ids,
+            "stage": stage,
+        },
+    )
+
+
+def _safe_report_delivery_stage(client: Any, **kwargs: Any) -> None:
+    try:
+        _report_delivery_stage(client, **kwargs)
+    except Exception:
+        # Older viewers do not expose this telemetry endpoint during a rolling
+        # upgrade. Message delivery and acknowledgement remain authoritative.
+        pass
+
+
 def run_native_wake(batch: dict[str, Any]) -> None:
     bridge_url = _required_env("AGENT_BRIDGE_URL").rstrip("/")
     product = _required_env("AGENT_BRIDGE_PRODUCT")
@@ -250,6 +282,19 @@ def run_native_wake(batch: dict[str, Any]) -> None:
                         for item in conversational
                         if not _requires_reply(item) or item is focus_required
                     ]
+                    turn_message_ids = [
+                        str(item["message_id"])
+                        for item in turn_messages
+                        if item.get("message_id")
+                    ]
+                    _safe_report_delivery_stage(
+                        client,
+                        connector_id=connector_id,
+                        endpoint_id=binding.endpoint_id,
+                        native_session_id=binding.native_session_id,
+                        message_ids=turn_message_ids,
+                        stage="injected",
+                    )
                     reply, _ = native.run_turn(
                         _prompt(
                             identity=identity,
@@ -261,6 +306,14 @@ def run_native_wake(batch: dict[str, Any]) -> None:
                                 else None
                             ),
                         )
+                    )
+                    _safe_report_delivery_stage(
+                        client,
+                        connector_id=connector_id,
+                        endpoint_id=binding.endpoint_id,
+                        native_session_id=binding.native_session_id,
+                        message_ids=turn_message_ids,
+                        stage="applied",
                     )
                     reply = reply.strip()
                     target = focus_required or turn_messages[-1]

@@ -38,6 +38,7 @@ class FakeBridgeClient:
         self.pending = {str(item["message_id"]): item for item in messages}
         self.replies: list[dict[str, Any]] = []
         self.states: list[dict[str, Any]] = []
+        self.delivery_stages: list[dict[str, Any]] = []
         self.wait_payloads: list[dict[str, Any]] = []
 
     def post(
@@ -63,6 +64,9 @@ class FakeBridgeClient:
         if path == "/agent/connector/tui-state":
             self.states.append(dict(payload))
             return {"connector": payload}
+        if path == "/agent/connector/tui-delivery-stage":
+            self.delivery_stages.append(dict(payload))
+            return {"count": len(payload["message_ids"])}
         raise AssertionError(path)
 
 
@@ -121,6 +125,14 @@ def test_native_wake_replies_to_each_required_message_without_acking_it_early(
     assert '"message_id":"msg-2"' not in prompts[0]
     assert '"message_id":"msg-3"' in prompts[0]
     assert [item["state"] for item in bridge.states] == ["busy", "online"]
+    assert [item["stage"] for item in bridge.delivery_stages] == [
+        "injected",
+        "applied",
+        "injected",
+        "applied",
+    ]
+    assert bridge.delivery_stages[0]["message_ids"] == ["msg-1", "msg-3"]
+    assert bridge.delivery_stages[2]["message_ids"] == ["msg-2"]
     assert all("access_mode" not in item for item in bridge.states)
 
 
@@ -175,6 +187,10 @@ def test_native_wake_bounds_only_an_explicit_reconnect_backlog(
         for payload in bridge.wait_payloads[1:]
     )
     assert '"compacted_optional_count":42' in prompts[0]
+    assert [item["stage"] for item in bridge.delivery_stages] == [
+        "injected",
+        "applied",
+    ]
 
 
 def test_native_wake_preserves_required_message_when_tui_is_silent(
@@ -216,5 +232,9 @@ def test_native_wake_preserves_required_message_when_tui_is_silent(
 
     assert set(bridge.pending) == {"msg-1"}
     assert bridge.replies == []
+    assert [item["stage"] for item in bridge.delivery_stages] == [
+        "injected",
+        "applied",
+    ]
     assert [item["state"] for item in bridge.states] == ["busy", "error"]
     assert all("access_mode" not in item for item in bridge.states)

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T20:00:27-07:00",
+  "baseline_commit": "0585b0675fb5f9d8d59380adc1b83debe1439681",
+  "agent_bridge": {
+    "version": "0.41.0",
+    "database_schema": 41
+  },
+  "runtime": {
+    "python": "3.12.13",
+    "sqlite": "3.50.4",
+    "node": "25.8.2"
+  },
+  "full_default_suite": {
+    "collected": 292,
+    "passed": 290,
+    "opt_in_skipped": 2,
+    "result": "passed"
+  },
+  "reconnect_soak": {
+    "cycles": 24,
+    "interval_seconds": 0.0,
+    "identity_count": 1,
+    "replied_stages": 24,
+    "open_deliveries": 0,
+    "result": "passed"
+  },
+  "scale_gate": {
+    "rooms": 100,
+    "agents": 100,
+    "messages": 100000,
+    "database_bytes": 58187776,
+    "room_history_ms": 2.14,
+    "global_search_ms": 18.18,
+    "room_list_ms": 7.01,
+    "result": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 128.91,
+    "authenticated_ready_ms": 325.62,
+    "room_switch_ms": 42.67,
+    "resource_transfer_bytes": 590187,
+    "monitoring_summary_cards": 11,
+    "monitoring_trend_rows": 7,
+    "result": "passed"
+  },
+  "native_latency_segments": [
+    "queue_to_injected",
+    "injected_to_applied",
+    "applied_to_reply"
+  ],
+  "migration": {
+    "from_schema": 40,
+    "to_schema": 41,
+    "monitoring_rows_preserved": true,
+    "business_tables_rebuilt": false
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

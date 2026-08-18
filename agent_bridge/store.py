@@ -911,7 +911,19 @@ CREATE TABLE IF NOT EXISTS operational_metric_samples (
     ),
     reply_sample_count_1h INTEGER NOT NULL CHECK (reply_sample_count_1h >= 0),
     reply_latency_average_seconds REAL,
-    reply_latency_p95_seconds REAL
+    reply_latency_p95_seconds REAL,
+    native_queue_to_injected_sample_count_1h INTEGER NOT NULL DEFAULT 0
+        CHECK (native_queue_to_injected_sample_count_1h >= 0),
+    native_queue_to_injected_average_seconds REAL,
+    native_queue_to_injected_p95_seconds REAL,
+    native_injected_to_applied_sample_count_1h INTEGER NOT NULL DEFAULT 0
+        CHECK (native_injected_to_applied_sample_count_1h >= 0),
+    native_injected_to_applied_average_seconds REAL,
+    native_injected_to_applied_p95_seconds REAL,
+    native_applied_to_reply_sample_count_1h INTEGER NOT NULL DEFAULT 0
+        CHECK (native_applied_to_reply_sample_count_1h >= 0),
+    native_applied_to_reply_average_seconds REAL,
+    native_applied_to_reply_p95_seconds REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_operational_metric_samples_captured
@@ -2003,6 +2015,38 @@ class BridgeStore:
             ).fetchone() is not None
             conn.executescript(DELIVERY_SCHEMA)
             conn.executescript(OPERATIONAL_MONITORING_SCHEMA)
+            monitoring_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(operational_metric_samples)"
+                ).fetchall()
+            }
+            monitoring_additions = {
+                "native_queue_to_injected_sample_count_1h": (
+                    "INTEGER NOT NULL DEFAULT 0 CHECK "
+                    "(native_queue_to_injected_sample_count_1h >= 0)"
+                ),
+                "native_queue_to_injected_average_seconds": "REAL",
+                "native_queue_to_injected_p95_seconds": "REAL",
+                "native_injected_to_applied_sample_count_1h": (
+                    "INTEGER NOT NULL DEFAULT 0 CHECK "
+                    "(native_injected_to_applied_sample_count_1h >= 0)"
+                ),
+                "native_injected_to_applied_average_seconds": "REAL",
+                "native_injected_to_applied_p95_seconds": "REAL",
+                "native_applied_to_reply_sample_count_1h": (
+                    "INTEGER NOT NULL DEFAULT 0 CHECK "
+                    "(native_applied_to_reply_sample_count_1h >= 0)"
+                ),
+                "native_applied_to_reply_average_seconds": "REAL",
+                "native_applied_to_reply_p95_seconds": "REAL",
+            }
+            for name, declaration in monitoring_additions.items():
+                if name not in monitoring_columns:
+                    conn.execute(
+                        "ALTER TABLE operational_metric_samples "
+                        f"ADD COLUMN {name} {declaration}"
+                    )
             conn.executescript(ADMIN_AUDIT_SCHEMA)
             conn.executescript(HISTORY_GOVERNANCE_SCHEMA)
             conn.executescript(RUNTIME_COORDINATION_SCHEMA)
@@ -2091,7 +2135,7 @@ class BridgeStore:
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 40")
+            conn.execute("PRAGMA user_version = 41")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)
@@ -8850,6 +8894,158 @@ class BridgeStore:
         payload["tui"]["room_binding_count"] = endpoint_room_count
         return payload
 
+    def report_native_tui_delivery_stage(
+        self,
+        *,
+        participant_id: str,
+        authorized_session_id: str,
+        connector_id: str,
+        tui_endpoint_id: str,
+        tui_native_session_id: str,
+        message_ids: Sequence[str],
+        stage: str,
+    ) -> dict[str, Any]:
+        """Record exact native TUI injection/application milestones.
+
+        This endpoint is telemetry, not an acknowledgement.  It only accepts a
+        room-bound ``mcp`` session for the connector's immutable native binding,
+        and it never changes delivery state or reply requirements.
+        """
+
+        participant = opaque_id(participant_id, field="participant_id")
+        session_id = opaque_id(
+            authorized_session_id,
+            field="authorized_session_id",
+        )
+        connector = opaque_id(connector_id, field="connector_id")
+        endpoint = opaque_id(tui_endpoint_id, field="tui_endpoint_id")
+        native_session = opaque_id(
+            tui_native_session_id,
+            field="tui_native_session_id",
+        )
+        normalized_ids = [
+            opaque_id(value, field="message_id")
+            for value in dict.fromkeys(message_ids)
+        ]
+        if not normalized_ids:
+            raise ValidationError("message_ids must contain at least one message")
+        if len(normalized_ids) > 100:
+            raise ValidationError("message_ids cannot contain more than 100 entries")
+        normalized_stage = str(stage or "").strip().lower()
+        if normalized_stage not in {"injected", "applied"}:
+            raise ValidationError("native TUI delivery stage must be injected or applied")
+
+        now = time.time()
+        placeholders = ",".join("?" for _ in normalized_ids)
+        with self._transaction() as conn:
+            live_session = self._require_live_session(
+                conn,
+                session_id=session_id,
+                participant_id=participant,
+                now=now,
+            )
+            if str(live_session["component"] or "") != "mcp":
+                raise AuthorizationError(
+                    "only the bound native TUI adapter may report delivery stages"
+                )
+            if str(live_session["connector_id"] or "") != connector:
+                raise AuthenticationError("connector does not belong to this session")
+            conversation = str(live_session["registered_conversation_id"])
+            bound = conn.execute(
+                """
+                SELECT connector.tui_endpoint_id,
+                       connector.tui_native_session_id,
+                       connector.conversation_id,
+                       invitation.tui_adapter_kind
+                FROM agent_connectors AS connector
+                JOIN agent_invitations AS invitation
+                  ON invitation.invitation_id = connector.invitation_id
+                WHERE connector.connector_id = ?
+                  AND connector.accepted_participant_id = ?
+                  AND connector.revoked_at IS NULL
+                  AND invitation.status != 'revoked'
+                """,
+                (connector, participant),
+            ).fetchone()
+            if bound is None:
+                raise NotFoundError("active connector invitation was not found")
+            if str(bound["tui_adapter_kind"] or "") not in NATIVE_TUI_ADAPTERS:
+                raise AuthorizationError(
+                    "connector is not configured for a native TUI adapter"
+                )
+            if conversation != str(bound["conversation_id"]):
+                raise AuthenticationError("native TUI connector room does not match")
+            if not self._constant_time_eq(
+                endpoint,
+                str(bound["tui_endpoint_id"] or ""),
+            ) or not self._constant_time_eq(
+                native_session,
+                str(bound["tui_native_session_id"] or ""),
+            ):
+                raise AuthenticationError("native TUI binding does not match")
+            rows = conn.execute(
+                f"""
+                SELECT delivery.message_id, delivery.state
+                FROM message_deliveries AS delivery
+                JOIN messages AS message
+                  ON message.message_id = delivery.message_id
+                WHERE delivery.participant_id = ?
+                  AND message.conversation_id = ?
+                  AND delivery.message_id IN ({placeholders})
+                """,
+                (participant, conversation, *normalized_ids),
+            ).fetchall()
+            if {str(row["message_id"]) for row in rows} != set(normalized_ids):
+                raise AuthorizationError(
+                    "one or more deliveries do not belong to this native TUI room"
+                )
+            if any(str(row["state"]) == "cancelled" for row in rows):
+                raise ConflictError("cancelled deliveries cannot advance native stages")
+            if normalized_stage == "injected":
+                conn.execute(
+                    f"""
+                    UPDATE message_deliveries
+                    SET delivery_stage = CASE
+                            WHEN delivery_stage IN ('queued', 'legacy_delivered')
+                            THEN 'native_injected'
+                            ELSE delivery_stage
+                        END,
+                        native_session_id = COALESCE(native_session_id, ?),
+                        native_injected_at = COALESCE(native_injected_at, ?)
+                    WHERE participant_id = ?
+                      AND message_id IN ({placeholders})
+                    """,
+                    (native_session, now, participant, *normalized_ids),
+                )
+            else:
+                conn.execute(
+                    f"""
+                    UPDATE message_deliveries
+                    SET delivery_stage = CASE
+                            WHEN delivery_stage = 'replied' THEN 'replied'
+                            ELSE 'native_applied'
+                        END,
+                        native_session_id = COALESCE(native_session_id, ?),
+                        native_injected_at = COALESCE(native_injected_at, ?),
+                        native_applied_at = COALESCE(native_applied_at, ?)
+                    WHERE participant_id = ?
+                      AND message_id IN ({placeholders})
+                    """,
+                    (
+                        native_session,
+                        now,
+                        now,
+                        participant,
+                        *normalized_ids,
+                    ),
+                )
+        return {
+            "stage": normalized_stage,
+            "message_ids": normalized_ids,
+            "count": len(normalized_ids),
+            "recorded_at": now,
+        }
+
     def admin_connector_health(
         self,
         *,
@@ -9850,6 +10046,9 @@ class BridgeStore:
                     "task_terminal_count_1h",
                     "task_failed_count_1h",
                     "reply_sample_count_1h",
+                    "native_queue_to_injected_sample_count_1h",
+                    "native_injected_to_applied_sample_count_1h",
+                    "native_applied_to_reply_sample_count_1h",
                 }
                 else float(row[key]) if row[key] is not None else None
             )
@@ -9892,6 +10091,15 @@ class BridgeStore:
             "created_at": float(row["created_at"]),
             "updated_at": float(row["updated_at"]),
         }
+
+    @staticmethod
+    def _latency_statistics(values: Sequence[float]) -> tuple[int, float | None, float | None]:
+        ordered = sorted(max(0.0, float(value)) for value in values)
+        if not ordered:
+            return 0, None, None
+        average = sum(ordered) / len(ordered)
+        p95 = ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+        return len(ordered), average, p95
 
     def record_operational_sample(self) -> dict[str, Any]:
         """Persist one deduplicated minute of operational evidence.
@@ -9941,6 +10149,33 @@ class BridgeStore:
                 """,
                 (window_start,),
             ).fetchall()
+            native_latency_rows = conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN native_injected_at IS NOT NULL
+                        THEN MAX(0, native_injected_at - created_at)
+                    END AS queue_to_injected,
+                    CASE
+                        WHEN native_injected_at IS NOT NULL
+                         AND native_applied_at IS NOT NULL
+                        THEN MAX(0, native_applied_at - native_injected_at)
+                    END AS injected_to_applied,
+                    CASE
+                        WHEN native_applied_at IS NOT NULL
+                         AND native_replied_at IS NOT NULL
+                        THEN MAX(0, native_replied_at - native_applied_at)
+                    END AS applied_to_reply
+                FROM message_deliveries
+                WHERE created_at >= ?
+                  AND (
+                      native_injected_at IS NOT NULL
+                      OR native_applied_at IS NOT NULL
+                      OR native_replied_at IS NOT NULL
+                  )
+                """,
+                (window_start,),
+            ).fetchall()
             task_rates = conn.execute(
                 """
                 SELECT
@@ -9967,13 +10202,43 @@ class BridgeStore:
             for row in latency_rows
             if row["latency"] is not None
         )
-        latency_average = (
-            sum(latencies) / len(latencies) if latencies else None
+        (
+            reply_sample_count,
+            latency_average,
+            latency_p95,
+        ) = self._latency_statistics(latencies)
+        (
+            queue_to_injected_count,
+            queue_to_injected_average,
+            queue_to_injected_p95,
+        ) = self._latency_statistics(
+            [
+                float(row["queue_to_injected"])
+                for row in native_latency_rows
+                if row["queue_to_injected"] is not None
+            ]
         )
-        latency_p95 = (
-            latencies[max(0, math.ceil(len(latencies) * 0.95) - 1)]
-            if latencies
-            else None
+        (
+            injected_to_applied_count,
+            injected_to_applied_average,
+            injected_to_applied_p95,
+        ) = self._latency_statistics(
+            [
+                float(row["injected_to_applied"])
+                for row in native_latency_rows
+                if row["injected_to_applied"] is not None
+            ]
+        )
+        (
+            applied_to_reply_count,
+            applied_to_reply_average,
+            applied_to_reply_p95,
+        ) = self._latency_statistics(
+            [
+                float(row["applied_to_reply"])
+                for row in native_latency_rows
+                if row["applied_to_reply"] is not None
+            ]
         )
         terminal_count = int(task_rates["terminal_count"] or 0)
         failed_count = int(task_rates["failed_count"] or 0)
@@ -10016,9 +10281,28 @@ class BridgeStore:
             "task_terminal_count_1h": terminal_count,
             "task_failed_count_1h": failed_count,
             "task_failure_rate_1h": failure_rate,
-            "reply_sample_count_1h": len(latencies),
+            "reply_sample_count_1h": reply_sample_count,
             "reply_latency_average_seconds": latency_average,
             "reply_latency_p95_seconds": latency_p95,
+            "native_queue_to_injected_sample_count_1h": (
+                queue_to_injected_count
+            ),
+            "native_queue_to_injected_average_seconds": (
+                queue_to_injected_average
+            ),
+            "native_queue_to_injected_p95_seconds": queue_to_injected_p95,
+            "native_injected_to_applied_sample_count_1h": (
+                injected_to_applied_count
+            ),
+            "native_injected_to_applied_average_seconds": (
+                injected_to_applied_average
+            ),
+            "native_injected_to_applied_p95_seconds": injected_to_applied_p95,
+            "native_applied_to_reply_sample_count_1h": applied_to_reply_count,
+            "native_applied_to_reply_average_seconds": (
+                applied_to_reply_average
+            ),
+            "native_applied_to_reply_p95_seconds": applied_to_reply_p95,
         }
 
         unavailable_count = (
@@ -10119,7 +10403,16 @@ class BridgeStore:
                     task_expired_lease_count, task_terminal_count_1h,
                     task_failed_count_1h, task_failure_rate_1h,
                     reply_sample_count_1h, reply_latency_average_seconds,
-                    reply_latency_p95_seconds
+                    reply_latency_p95_seconds,
+                    native_queue_to_injected_sample_count_1h,
+                    native_queue_to_injected_average_seconds,
+                    native_queue_to_injected_p95_seconds,
+                    native_injected_to_applied_sample_count_1h,
+                    native_injected_to_applied_average_seconds,
+                    native_injected_to_applied_p95_seconds,
+                    native_applied_to_reply_sample_count_1h,
+                    native_applied_to_reply_average_seconds,
+                    native_applied_to_reply_p95_seconds
                 ) VALUES (
                     :sample_minute, :captured_at,
                     :connector_count, :connector_online_count,
@@ -10131,7 +10424,16 @@ class BridgeStore:
                     :task_expired_lease_count, :task_terminal_count_1h,
                     :task_failed_count_1h, :task_failure_rate_1h,
                     :reply_sample_count_1h, :reply_latency_average_seconds,
-                    :reply_latency_p95_seconds
+                    :reply_latency_p95_seconds,
+                    :native_queue_to_injected_sample_count_1h,
+                    :native_queue_to_injected_average_seconds,
+                    :native_queue_to_injected_p95_seconds,
+                    :native_injected_to_applied_sample_count_1h,
+                    :native_injected_to_applied_average_seconds,
+                    :native_injected_to_applied_p95_seconds,
+                    :native_applied_to_reply_sample_count_1h,
+                    :native_applied_to_reply_average_seconds,
+                    :native_applied_to_reply_p95_seconds
                 )
                 ON CONFLICT(sample_minute) DO UPDATE SET
                     captured_at = excluded.captured_at,
@@ -10156,7 +10458,25 @@ class BridgeStore:
                     reply_sample_count_1h = excluded.reply_sample_count_1h,
                     reply_latency_average_seconds =
                         excluded.reply_latency_average_seconds,
-                    reply_latency_p95_seconds = excluded.reply_latency_p95_seconds
+                    reply_latency_p95_seconds = excluded.reply_latency_p95_seconds,
+                    native_queue_to_injected_sample_count_1h =
+                        excluded.native_queue_to_injected_sample_count_1h,
+                    native_queue_to_injected_average_seconds =
+                        excluded.native_queue_to_injected_average_seconds,
+                    native_queue_to_injected_p95_seconds =
+                        excluded.native_queue_to_injected_p95_seconds,
+                    native_injected_to_applied_sample_count_1h =
+                        excluded.native_injected_to_applied_sample_count_1h,
+                    native_injected_to_applied_average_seconds =
+                        excluded.native_injected_to_applied_average_seconds,
+                    native_injected_to_applied_p95_seconds =
+                        excluded.native_injected_to_applied_p95_seconds,
+                    native_applied_to_reply_sample_count_1h =
+                        excluded.native_applied_to_reply_sample_count_1h,
+                    native_applied_to_reply_average_seconds =
+                        excluded.native_applied_to_reply_average_seconds,
+                    native_applied_to_reply_p95_seconds =
+                        excluded.native_applied_to_reply_p95_seconds
                 """,
                 sample,
             )
@@ -10364,6 +10684,15 @@ class BridgeStore:
                 "max_task_backlog": int(maximum("task_backlog_count")),
                 "max_reply_latency_p95_seconds": maximum(
                     "reply_latency_p95_seconds"
+                ),
+                "max_native_queue_to_injected_p95_seconds": maximum(
+                    "native_queue_to_injected_p95_seconds"
+                ),
+                "max_native_injected_to_applied_p95_seconds": maximum(
+                    "native_injected_to_applied_p95_seconds"
+                ),
+                "max_native_applied_to_reply_p95_seconds": maximum(
+                    "native_applied_to_reply_p95_seconds"
                 ),
                 "max_task_failure_rate_1h": maximum("task_failure_rate_1h"),
             },
@@ -16870,6 +17199,19 @@ class BridgeStore:
                     pass
             raise
         self._ack(participant, original_id)
+        replied_at = time.time()
+        with self._transaction() as conn:
+            conn.execute(
+                """
+                UPDATE message_deliveries
+                SET delivery_stage = 'replied',
+                    native_replied_at = COALESCE(native_replied_at, ?)
+                WHERE message_id = ? AND participant_id = ?
+                  AND native_applied_at IS NOT NULL
+                  AND state != 'cancelled'
+                """,
+                (replied_at, original_id, participant),
+            )
         return {
             "reply": reply_message,
             "original_message_id": original_id,

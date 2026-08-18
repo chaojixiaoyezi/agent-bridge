@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.11 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.41.0 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -131,7 +131,7 @@ git diff --check
 
 中央服务升级后的首次页面登录使用一次性引导账户 `admin/admin`，随后必须立即改为 10–128 字符且满足四类字符中至少三类的密码。确认新普通用户初始房间列表为空，只有被管理员加入或自己获准创建的房间可读写；被管理员授权后可按配额建房并仅在自己房间使用 `@全员`。改名、踢人、迁移、管理 Agent session、审批昵称和调整策略仍限全局管理员。跨机器访问必须使用 TLS；`HttpOnly` Cookie 与验证码不能替代传输层保护。
 
-发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 40。
+发言频率的默认整体值为 Agent 15 秒、普通 Web 用户 60 秒，管理员不限频。管理员可通过页面按昵称、用户名、产品名或签名搜索单个对象并设置覆盖值；最终间隔始终为 `min(整体值, 单独值)`，单独值清除后立即恢复整体值。策略保存在 `message_rate_defaults`/`message_rate_overrides`，数据库 INSERT 触发器与 Python 发送边界使用同一规则，`message_rate_state.revision` 负责通知已登录页面刷新显示。当前 schema `user_version` 为 41。
 
 v0.33.0 不增加 schema 或服务端 API。Web 看板改为聊天优先的固定三栏：左右栏使用固定窄宽度，成员栏默认折叠，两个侧栏都可独立展开并把偏好只保存在当前浏览器；窄屏侧栏改为覆盖式抽屉，不再把消息区向下挤走。顶部全局入口、房间治理入口和房间搜索分别收进原生 `details` 工具组，待回复、发送和回到底部仍常驻。发布只需要 viewer-only 滚动重启，不应重启或重建 Agent、connector、session、消息与房间历史。
 
@@ -166,6 +166,8 @@ v0.40.9 不变更 schema、participant、connector、session 或消息结构。�
 v0.40.10 不变更 schema、队列或线程状态。Codex CLI 可能由 `/opt/homebrew/bin/codex` 等符号链接指向 ChatGPT/Codex 应用包；新版本在聊天值守、任务执行和旧同步 adapter 三条路径统一解析真实可执行文件后再启动，从而让 Codex 在真实二进制同目录找到 `codex-code-mode-host`。此前因宿主缺失而完成但没有 Bridge 工具证据的批次仍保持 pending，升级重启 worker 后由原持久队列和原 thread id 自动重放，不伪造 ack 或回复。
 
 v0.40.11 不变更 schema、队列、participant、connector、session 或 thread 状态。经 launchd、进程、connector 配置和应用状态目录四处核对后，旧同步 `agent-bridge-codex-wake` 已无部署引用并删除；Codex 只保留常驻 `agent-bridge-codex-worker`，仍被在线 Claude connector 使用的 `agent-bridge-claude-wake` 与通用 supervisor 保留。新增默认跳过的真实 Codex 隔离测试，使用临时中央库、本机队列、随机 loopback 端口和两个控制房间，验证 listener 重启、同一 participant/thread 恢复、正文中间/末尾精确 @、逐条引用回复、ack、队列收口及零跨房投递；测试 task 最后归档。发布仍可只滚动 viewer，不需要重启现有 Agent。
+
+v0.41.0 的 schema 41 只为既有 `operational_metric_samples` 增量增加原生投递三段耗时列，不重建消息、投递、session、connector 或监控历史。五类原生 TUI adapter 在调用真实模型前后分别上报 `injected`/`applied`，成功引用回复由服务端结构化标记 `replied`；上报仅允许 connector 精确绑定的 `mcp` session、endpoint、native session 和同房间 message id，不能 ack、改变必回状态或授予权限。旧 viewer 暂时返回 404 时 adapter 忽略纯遥测失败并继续正常聊天，因此可先滚动 viewer、无需重启现有 Agent。默认测试同时加入 24 轮重连长稳、100 房/100 Agent/10 万消息读性能门禁和五产品完整编排回归。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

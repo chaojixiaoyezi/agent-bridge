@@ -242,10 +242,10 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             page.locator("#agent-access-dialog").wait_for(state="visible")
             playwright_api.expect(
                 page.locator("#monitoring-summary .connector-health-summary-card")
-            ).to_have_count(8)
+            ).to_have_count(11)
             playwright_api.expect(
                 page.locator("#monitoring-trends .monitoring-trend-row")
-            ).to_have_count(4)
+            ).to_have_count(7)
             page.locator("#close-agent-access").click()
 
             page.locator("#global-tools-menu").evaluate("element => { element.open = true; }")

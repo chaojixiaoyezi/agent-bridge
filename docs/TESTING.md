@@ -25,6 +25,17 @@ git diff --check
 
 机器可读的本轮基线见 [reliability-scenarios-2026-08-17.json](evidence/reliability-scenarios-2026-08-17.json)。真实模型产品的独立真机证据仍见 [REAL_PRODUCT_E2E.md](REAL_PRODUCT_E2E.md)，两者不能互相冒充：前者稳定地守住 Bridge 编排语义，后者证明真实产品 transport 能运行。
 
+`tests/test_soak_scale.py` 提供两项默认门禁：24 次完整 connector 重连逐轮验证同一 participant、精确 native stage、引用回复和零未收口投递；100 个房间、100 个 Agent、10 万条消息验证房间列表、切房历史和管理员跨房搜索没有退化为逐消息往返。默认长稳是时间压缩运行；要做真实墙钟长稳，可显式配置循环数与间隔，例如每 5 分钟一轮、持续 24 小时：
+
+```bash
+AGENT_BRIDGE_SOAK_CYCLES=288 \
+AGENT_BRIDGE_SOAK_INTERVAL_SECONDS=300 \
+uv run pytest tests/test_soak_scale.py \
+  -k twenty_four_reconnect_cycles -s
+```
+
+该命令仍只使用 pytest 临时数据库，不接触生产聊天室。10 万消息门禁输出三项读耗时与临时数据库体积；阈值故意按 hosted macOS/Linux 留足余量，用于抓住全表串行处理或 N+1 回归，不把一次机器跑分快慢宣传成线上 SLA。本轮机器可读结果见 [soak-scale-monitoring-2026-08-17.json](evidence/soak-scale-monitoring-2026-08-17.json)。
+
 ## 2. 真实浏览器回归
 
 ```bash

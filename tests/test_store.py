@@ -297,10 +297,213 @@ def test_operational_monitoring_persists_trends_alerts_and_recovery(
     assert unavailable["status"] == "resolved"
     assert unavailable["resolved_at"] is not None
     with store._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
         assert connection.execute(
             "SELECT COUNT(*) FROM operational_metric_samples"
         ).fetchone()[0] == 1
+
+
+def test_schema_41_adds_native_latency_columns_without_rebuilding_samples(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "monitoring-schema-40.db"
+    store = BridgeStore(database)
+    WebAuthStore(database)
+    original = store.record_operational_sample()
+    original_minute = int(original["sample_minute"])
+
+    new_columns = (
+        "native_applied_to_reply_p95_seconds",
+        "native_applied_to_reply_average_seconds",
+        "native_applied_to_reply_sample_count_1h",
+        "native_injected_to_applied_p95_seconds",
+        "native_injected_to_applied_average_seconds",
+        "native_injected_to_applied_sample_count_1h",
+        "native_queue_to_injected_p95_seconds",
+        "native_queue_to_injected_average_seconds",
+        "native_queue_to_injected_sample_count_1h",
+    )
+    with store._connection() as connection:
+        for column in new_columns:
+            connection.execute(
+                f"ALTER TABLE operational_metric_samples DROP COLUMN {column}"
+            )
+        connection.execute("PRAGMA user_version = 40")
+        connection.commit()
+
+    migrated = BridgeStore(database)
+    with migrated._connection() as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(operational_metric_samples)"
+            ).fetchall()
+        }
+        preserved = connection.execute(
+            "SELECT * FROM operational_metric_samples WHERE sample_minute = ?",
+            (original_minute,),
+        ).fetchone()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
+    assert set(new_columns).issubset(columns)
+    assert preserved is not None
+    assert int(preserved["sample_minute"]) == original_minute
+    assert int(preserved["native_queue_to_injected_sample_count_1h"]) == 0
+    assert int(preserved["native_injected_to_applied_sample_count_1h"]) == 0
+    assert int(preserved["native_applied_to_reply_sample_count_1h"]) == 0
+
+
+def test_native_tui_delivery_stages_require_exact_mcp_binding_and_mark_reply(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "原生阶段群"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="opencode",
+        requested_mode="resident",
+        adapter_kind="manual",
+        tui_adapter_kind="opencode",
+        created_by_web_user_id=admin_id,
+    )
+    enrollment = "enroll_" + "d" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="opencode",
+        username="native-stage",
+        signature="原生阶段测试",
+        enrollment_token=enrollment,
+        connector_binding_version=2,
+        tui_endpoint_id="endpoint-native-stage",
+        tui_native_session_id="session-native-stage",
+        tui_confirmed=True,
+    )
+    native_session = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=str(accepted["connector_id"]),
+        connector_component="mcp",
+        product="opencode",
+        username=str(accepted["username"]),
+        signature="原生阶段测试",
+    )
+    shadow_session = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=str(accepted["connector_id"]),
+        connector_component="chat",
+        product="opencode",
+        username=str(accepted["username"]),
+        signature="原生阶段测试",
+    )
+    message = store.send_owner_message(
+        conversation_id=room,
+        body_text="结构化原生阶段测试",
+        mentions=[str(accepted["participant_id"])],
+    )
+    page = store.wait_messages(
+        participant_id=str(accepted["participant_id"]),
+        authorized_session_id=str(native_session["session_id"]),
+        wait_seconds=0,
+    )
+    assert [item["message_id"] for item in page["messages"]] == [
+        message["message_id"]
+    ]
+
+    common = {
+        "participant_id": str(accepted["participant_id"]),
+        "connector_id": str(accepted["connector_id"]),
+        "tui_endpoint_id": "endpoint-native-stage",
+        "tui_native_session_id": "session-native-stage",
+        "message_ids": [str(message["message_id"])],
+    }
+    with pytest.raises(AuthorizationError, match="native TUI adapter"):
+        store.report_native_tui_delivery_stage(
+            authorized_session_id=str(shadow_session["session_id"]),
+            stage="injected",
+            **common,
+        )
+    with pytest.raises(AuthenticationError, match="binding does not match"):
+        store.report_native_tui_delivery_stage(
+            authorized_session_id=str(native_session["session_id"]),
+            stage="injected",
+            **{**common, "tui_native_session_id": "another-session"},
+        )
+
+    injected = store.report_native_tui_delivery_stage(
+        authorized_session_id=str(native_session["session_id"]),
+        stage="injected",
+        **common,
+    )
+    applied = store.report_native_tui_delivery_stage(
+        authorized_session_id=str(native_session["session_id"]),
+        stage="applied",
+        **common,
+    )
+    assert injected["count"] == applied["count"] == 1
+    store.reply(
+        authorized_session_id=str(native_session["session_id"]),
+        participant_id=str(accepted["participant_id"]),
+        message_id=str(message["message_id"]),
+        body_text="阶段链路已完成。",
+    )
+    with store._connection() as connection:
+        delivery = connection.execute(
+            "SELECT state, delivery_stage, native_injected_at, "
+            "native_applied_at, native_replied_at FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (message["message_id"], accepted["participant_id"]),
+        ).fetchone()
+    assert delivery["state"] == "acked"
+    assert delivery["delivery_stage"] == "replied"
+    assert (
+        float(delivery["native_injected_at"])
+        <= float(delivery["native_applied_at"])
+        <= float(delivery["native_replied_at"])
+    )
+
+
+def test_operational_monitoring_reports_native_pipeline_segments(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "原生分段监控群"
+    agent = register(store, client="opencode", name="分段监控", room=room)
+    message = store.send_owner_message(
+        conversation_id=room,
+        body_text="统计分段耗时",
+        mentions=[str(agent["participant_id"])],
+    )
+    now = time.time()
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE message_deliveries SET created_at = ?, "
+            "native_injected_at = ?, native_applied_at = ?, "
+            "native_replied_at = ?, delivery_stage = 'replied', state = 'acked' "
+            "WHERE message_id = ? AND participant_id = ?",
+            (
+                now - 12,
+                now - 10,
+                now - 6,
+                now - 1,
+                message["message_id"],
+                agent["participant_id"],
+            ),
+        )
+    sample = store.record_operational_sample()
+    assert sample["native_queue_to_injected_sample_count_1h"] == 1
+    assert sample["native_queue_to_injected_p95_seconds"] == pytest.approx(2)
+    assert sample["native_injected_to_applied_sample_count_1h"] == 1
+    assert sample["native_injected_to_applied_p95_seconds"] == pytest.approx(4)
+    assert sample["native_applied_to_reply_sample_count_1h"] == 1
+    assert sample["native_applied_to_reply_p95_seconds"] == pytest.approx(5)
+    dashboard = store.operational_monitoring_dashboard(
+        requesting_web_user_id=admin_id,
+        hours=24,
+    )
+    assert dashboard["summary"][
+        "max_native_queue_to_injected_p95_seconds"
+    ] == pytest.approx(2)
 
 
 def test_runtime_coordination_has_one_leader_and_fenced_failover(
@@ -736,7 +939,7 @@ def test_schema_30_messages_backfill_room_display_sequences(tmp_path: Path) -> N
             "SELECT conversation_id, room_sequence FROM messages "
             "ORDER BY sequence"
         ).fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
     assert [(row["conversation_id"], row["room_sequence"]) for row in rows] == [
         ("迁移房间一", 1),
         ("迁移房间二", 1),
@@ -775,7 +978,7 @@ def test_schema_32_adds_optional_email_recovery_without_rebuilding_users(
             "email_verified_at, pending_email, email_updated_at "
             "FROM web_users WHERE username = 'admin'"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'web_email_tokens'"
@@ -1663,7 +1866,7 @@ def test_legacy_chat_authority_rows_are_preserved_but_frozen(
 
     migrated = BridgeStore(store.database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
         message_columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -1735,7 +1938,7 @@ def test_version_twenty_three_lifecycle_policy_adds_new_column_before_seeding(
         policy = connection.execute(
             "SELECT * FROM agent_lifecycle_policy WHERE singleton = 1"
         ).fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
     assert "avatar_changed_at" in participant_columns
     assert "unactivated_inactivity_days" in columns
     assert policy["inactivity_days"] == 10
@@ -1964,7 +2167,7 @@ def test_schema_thirty_backfills_only_explicit_web_room_access(
     assert member_scope["conversation_ids"] == ["旧成员群", "旧授权群"]
     assert owner_scope["conversation_ids"] == ["旧所有者群"]
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
         assert connection.execute(
             "SELECT COUNT(*) FROM memberships AS membership "
             "LEFT JOIN web_users AS web_user "
@@ -3463,7 +3666,7 @@ def test_version_eleven_migration_promotes_existing_explicit_mentions(
             (message["message_id"], receiver["participant_id"]),
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    assert version == 40
+    assert version == 41
     assert raw["priority"] == "direct"
     assert "agent_mention" in raw["reasons_json"]
     assert '"mention"' not in raw["reasons_json"]
@@ -3535,7 +3738,7 @@ def test_version_twenty_rewrites_legacy_internal_ids_without_replaying_mentions(
         )
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
-    assert version == 40
+    assert version == 41
     assert row["body"] == f"请 @{receiver['display_name']} 看一下旧消息。"
     assert row["mentions_json"] == "[]"
     assert [tuple(item) for item in after_delivery] == [
@@ -3631,7 +3834,7 @@ def test_delivery_migration_keeps_group_history_without_false_old_backlog(
         ).fetchone()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert after_counts == before_counts
-    assert version == 40
+    assert version == 41
     assert len(resolved_deliveries) == 2
     assert {row["state"] for row in resolved_deliveries} == {"acked"}
     assert {int(row["actionable"]) for row in resolved_deliveries} == {0}
@@ -5199,7 +5402,7 @@ def test_native_session_lease_is_exact_idempotent_and_explicitly_replaceable(
                 "PRAGMA table_info(message_deliveries)"
             ).fetchall()
         }
-    assert schema_version == 40
+    assert schema_version == 41
     assert tuple(connector) == ("offline", "native_preferred", None)
     assert {
         "delivery_stage",
@@ -5740,7 +5943,7 @@ def test_v35_scrubs_but_does_not_depend_on_legacy_tui_access_mode(
         values = connection.execute(
             "SELECT DISTINCT tui_access_mode FROM agent_connectors"
         ).fetchall()
-    assert version == 40
+    assert version == 41
     assert [str(row[0]) for row in values] == ["unknown"]
 
 
@@ -6240,7 +6443,7 @@ def test_version_fourteen_invitations_migrate_without_losing_connectors(
     )
     assert newly_accepted["invitation_reusable"] is False
     with migrated._connection() as migrated_connection:
-        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert migrated_connection.execute("PRAGMA user_version").fetchone()[0] == 41
         assert migrated_connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'agent_invitations_v14'"
@@ -6295,7 +6498,7 @@ def test_existing_database_conversations_are_backfilled_as_legacy_rooms(
         version = migrated.execute("PRAGMA user_version").fetchone()[0]
     assert room["creator_kind"] == "legacy"
     assert room["status"] == "active"
-    assert version == 40
+    assert version == 41
 
 
 def test_version_four_invite_sessions_migrate_without_losing_live_tokens(
@@ -7006,7 +7209,7 @@ def test_version_fifteen_connector_rooms_and_lifecycle_migrate_in_place(
 
     migrated = BridgeStore(database)
     with migrated._connection() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 40
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 41
         assert connection.execute(
             "SELECT conversation_id FROM agent_connectors WHERE connector_id = ?",
             (agent["connector_id"],),

@@ -2224,6 +2224,35 @@ def create_app(
             },
         )
 
+    async def report_native_tui_delivery_stage(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "tui_endpoint_id",
+                "tui_native_session_id",
+                "message_ids",
+                "stage",
+            },
+            allowed={
+                "connector_id",
+                "tui_endpoint_id",
+                "tui_native_session_id",
+                "message_ids",
+                "stage",
+            },
+            operation=lambda auth, payload: store.report_native_tui_delivery_stage(
+                participant_id=auth["participant_id"],
+                authorized_session_id=auth["session_id"],
+                connector_id=payload["connector_id"],
+                tui_endpoint_id=payload["tui_endpoint_id"],
+                tui_native_session_id=payload["tui_native_session_id"],
+                message_ids=payload["message_ids"],
+                stage=payload["stage"],
+            ),
+        )
+
     async def bind_native_agent_session(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -4563,6 +4592,11 @@ def create_app(
             Route(
                 "/agent/connector/tui-state",
                 report_agent_tui_state,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/connector/tui-delivery-stage",
+                report_native_tui_delivery_stage,
                 methods=["POST"],
             ),
             Route(
