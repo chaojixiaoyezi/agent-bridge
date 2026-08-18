@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from .executables import resolve_executable_path
 
 
 SENSITIVE_CHILD_ENV = {
@@ -118,7 +119,7 @@ def run_codex(
     working_directory = cwd.expanduser().resolve()
     if not working_directory.is_dir():
         raise CodexAdapterError("Codex working directory does not exist")
-    resolved_binary = shutil.which(codex_binary)
+    resolved_binary = resolve_executable_path(codex_binary)
     if resolved_binary is None:
         raise CodexAdapterError("Codex CLI was not found")
     environment = dict(os.environ)

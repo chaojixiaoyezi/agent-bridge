@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_worker import JsonRpcProcess
+from .executables import resolve_executable_path
 from .http_client import BridgeRemoteError
 from .resident_completion import resident_http_client
 from .tui_adapter import (
@@ -335,7 +336,7 @@ class CodexTaskHost:
         mcp_arguments: list[str],
         environment: dict[str, str],
     ) -> None:
-        resolved = shutil.which(binary)
+        resolved = resolve_executable_path(binary)
         if resolved is None:
             raise TaskWorkerError("Codex CLI was not found")
         self.rpc = JsonRpcProcess(

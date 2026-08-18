@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.40.9。
+当前版本：v0.40.10。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -138,7 +138,7 @@ Claude 接受自动值守邀请后会返回 `resident_setup.launch_command`。�
 
 Pi 首次接入会把 extension 安装到 `~/.pi/agent/extensions/agent-bridge.ts`。若当前 Pi 尚未加载它，执行一次 `/reload`；extension 会按当前 session 自动匹配唯一 endpoint。刚创建且尚未发送过消息的当前 session 虽然还没有 JSONL 文件，也可以直接接收首条 Bridge 消息；不存在且并非当前 session 的路径仍会拒绝。要让同一 Pi TUI 在多个已绑定房间之间自动切换，再执行一次 `/agent-bridge-bind <resident_setup.state_directory>/tui-binding.json`，获得 Pi 明确授予的 session-switch command context。后续给同一 endpoint 增加房间会自动发现；如果本机存在多个 endpoint 且无法由当前 session 唯一判断，必须传具体 binding 路径，不能全局认领。
 
-Codex 使用专用常驻聊天 worker 作为无本机实施权的影子兜底，同时由 `agent-bridge-task-worker` 保持一个持久本体执行席。普通群聊仍由影子讨论；有任务权限的 Web 用户结构化个人 `@` 会在本体组件就绪时直接进入本体，目标正在工作则通过 `turn/steer` 合入同一回合，空闲则立即创建本体任务。这样不会同时让影子抢答同一条本体请求。Agent Bridge MCP 进程按连接器固定身份自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。session token 只保存在 MCP 内存中；状态文件只保存专用 task/thread id，不保存 Bridge token：
+Codex 使用专用常驻聊天 worker 作为无本机实施权的影子兜底，同时由 `agent-bridge-task-worker` 保持一个持久本体执行席。普通群聊仍由影子讨论；有任务权限的 Web 用户结构化个人 `@` 会在本体组件就绪时直接进入本体，目标正在工作则通过 `turn/steer` 合入同一回合，空闲则立即创建本体任务。这样不会同时让影子抢答同一条本体请求。Agent Bridge MCP 进程按连接器固定身份自动登记；模型白名单不含 `agent_register`，不能猜测或改写连接器身份。worker 在启动 Codex 前会把 PATH 或配置给出的符号链接解析到真实可执行文件，使 Codex 能在应用包内找到同目录的 `codex-code-mode-host`；聊天值守、任务席和旧兼容 adapter 使用同一规则。session token 只保存在 MCP 内存中；状态文件只保存专用 task/thread id，不保存 Bridge token：
 
 ```bash
 export AGENT_BRIDGE_CODEX_THREAD_STATE_FILE=/absolute/path/codex-worker-thread

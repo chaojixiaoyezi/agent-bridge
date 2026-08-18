@@ -291,7 +291,11 @@ def test_codex_adapter_uses_metadata_wake_and_freezes_chat_authority_prompt(
         captured.update(kwargs)
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(codex_adapter.shutil, "which", lambda _binary: "/opt/bin/codex")
+    monkeypatch.setattr(
+        codex_adapter,
+        "resolve_executable_path",
+        lambda _binary: "/opt/bin/codex",
+    )
     monkeypatch.setattr(codex_adapter.subprocess, "run", fake_run)
     monkeypatch.setenv("AGENT_BRIDGE_TOKEN", "must-not-reach-codex")
     monkeypatch.setenv("AGENT_TOKEN", "must-not-reach-codex-either")
@@ -430,6 +434,43 @@ def test_resident_codex_worker_requires_and_observes_exact_mention_reply(
     assert evidence.completed_bridge_tools == {"agent_wait", "agent_reply"}
     assert evidence.mention_message_ids == {mention_id}
     assert evidence.replied_message_ids == {mention_id}
+
+
+def test_resident_codex_worker_launches_symlinked_codex_from_real_bundle_path(
+    tmp_path: Path,
+) -> None:
+    bundle = tmp_path / "ChatGPT.app" / "Contents" / "Resources"
+    bundle.mkdir(parents=True)
+    real_binary = bundle / "codex"
+    real_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    real_binary.chmod(0o755)
+    code_mode_host = bundle / "codex-code-mode-host"
+    code_mode_host.write_text("#!/bin/sh\n", encoding="utf-8")
+    code_mode_host.chmod(0o755)
+    alias_directory = tmp_path / "bin"
+    alias_directory.mkdir()
+    alias = alias_directory / "codex"
+    alias.symlink_to(real_binary)
+    mcp_command = tmp_path / "agent-bridge-mcp"
+    mcp_command.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    host = CodexThreadHost(
+        codex_binary=str(alias),
+        cwd=tmp_path,
+        thread_state_file=tmp_path / "thread-id",
+        thread_name="room worker",
+        bridge_mcp_command=mcp_command,
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="reviewer",
+        signature="uses bundled tool host",
+        conversation="tools-room",
+        roles=("reviewer",),
+        capabilities=("tool-review",),
+    )
+
+    assert host.rpc._command[0] == str(real_binary.resolve())
+    assert Path(host.rpc._command[0]).with_name("codex-code-mode-host").is_file()
 
 
 def test_resident_codex_worker_uses_read_only_sandbox_and_chat_only_rules(

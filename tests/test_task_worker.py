@@ -47,7 +47,11 @@ def test_codex_task_host_forks_inviting_tui_without_overriding_permissions(
             pass
 
     monkeypatch.setattr(task_worker, "JsonRpcProcess", FakeRpc)
-    monkeypatch.setattr(task_worker.shutil, "which", lambda _name: "/usr/bin/true")
+    monkeypatch.setattr(
+        task_worker,
+        "resolve_executable_path",
+        lambda _name: "/usr/bin/true",
+    )
     state_file = tmp_path / "task-thread"
     host = CodexTaskHost(state_file=state_file, source_thread_id=THREAD)
     host.start(

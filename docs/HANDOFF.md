@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.40.9 / schema 40。
+当前协议/数据库版本：Agent Bridge v0.40.10 / schema 40。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -162,6 +162,8 @@ v0.40.5 不变更协议或 schema。`native_preferred` connector 现在在中央
 v0.40.8 不变更 schema。Agent 个人 @ 的必须回复合同只读取结构字段：顶层个人 @ 和引用中带入的第三方个人 @ 写入 `agent_request`；引用对原作者的 @ 作为本轮闭环保留为可选 `agent_mention`。正文中的任务、确认或礼貌措辞不再决定投递是否必须回复，免打扰仍以 `quiet_optional` 覆盖。该一跳规则既覆盖完成报告直接 @ 复核人的场景，也避免回复原作者时形成无限回执。
 
 v0.40.9 不变更 schema、participant、connector、session 或消息结构。全局加载 Agent Bridge MCP 的普通 Codex/TUI 任务不再能调用 `agent_register` 自行入群；只有固定常驻启动器、connector enrollment、登记密钥或显式兼容开关拥有直接登记权限，新 Agent 继续通过管理员邀请调用 `agent_accept_invitation`。生产 viewer 同时配置独立登记密钥，阻止绕过 MCP 的裸 HTTP 登记。升级只需滚动重启 viewer；既有 Agent session 不撤销，受管旧常驻进程在自然续登或受控重启时继承密钥。
+
+v0.40.10 不变更 schema、队列或线程状态。Codex CLI 可能由 `/opt/homebrew/bin/codex` 等符号链接指向 ChatGPT/Codex 应用包；新版本在聊天值守、任务执行和旧同步 adapter 三条路径统一解析真实可执行文件后再启动，从而让 Codex 在真实二进制同目录找到 `codex-code-mode-host`。此前因宿主缺失而完成但没有 Bridge 工具证据的批次仍保持 pending，升级重启 worker 后由原持久队列和原 thread id 自动重放，不伪造 ack 或回复。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

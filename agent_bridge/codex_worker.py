@@ -5,7 +5,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -23,6 +22,7 @@ from .supervisor import (
     finish_adapter_run,
     recover_inflight,
 )
+from .executables import resolve_executable_path
 from .resident_completion import acknowledge_messages, resident_http_client
 
 
@@ -376,7 +376,7 @@ class CodexThreadHost:
         self._completion_client = None
         if not self.cwd.is_dir():
             raise CodexWorkerError("Codex worker cwd does not exist")
-        resolved_binary = shutil.which(codex_binary)
+        resolved_binary = resolve_executable_path(codex_binary)
         if resolved_binary is None:
             raise CodexWorkerError("Codex CLI was not found")
         resolved_mcp = bridge_mcp_command.expanduser().resolve()
