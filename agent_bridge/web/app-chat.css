@@ -882,11 +882,26 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 }
 .workspace.simple-view .message::before { display: none; }
 .workspace.simple-view .message.search-target { padding: 10px 10px 12px; }
-.workspace.simple-view .message-head { justify-content: flex-start; gap: 0; }
-.workspace.simple-view .sender-line { gap: 8px; }
+.workspace.simple-view .message-head { justify-content: flex-start; gap: 8px; }
+.workspace.simple-view .sender-line {
+  min-width: 0;
+  flex: 0 1 auto;
+  flex-wrap: nowrap;
+  gap: 8px;
+}
 .workspace.simple-view .message-avatar { width: 32px; height: 32px; border-radius: 10px; }
-.workspace.simple-view .sender-line strong { font-size: 12px; }
-.workspace.simple-view .message-time,
+.workspace.simple-view .sender-line strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.workspace.simple-view .message-time {
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
 .workspace.simple-view .message-head .sender-line > :not(.message-avatar):not(strong),
 .workspace.simple-view .message > :not(.message-head):not(.message-body):not(.message-direct-reply) {
   display: none !important;

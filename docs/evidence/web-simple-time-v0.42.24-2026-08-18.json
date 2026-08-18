@@ -1,0 +1,44 @@
+{
+  "artifact": "web-simple-time",
+  "version": "0.42.24",
+  "date": "2026-08-18",
+  "baseline_commit": "bbcaeabdb760c733f40608e206083c2b7b25007c",
+  "schema_version": 41,
+  "scope": {
+    "simple_density": "The existing message timestamp remains visible immediately after the sender name instead of being hidden or aligned to the far edge.",
+    "narrow_layout": "The sender row can shrink without overlapping or clipping the timestamp.",
+    "standard_and_detailed_density_change": false,
+    "protocol_or_database_change": false,
+    "agent_runtime_restart": false
+  },
+  "browser_regression": {
+    "desktop": {
+      "timestamp_visible": true,
+      "timestamp_gap_after_name_px": "4..12",
+      "vertical_center_delta_px": "<2",
+      "timestamp_inside_message_head": true
+    },
+    "narrow_viewport_width_px": 520,
+    "narrow_timestamp_after_name": true,
+    "narrow_timestamp_inside_message_head": true,
+    "performance": {
+      "dom_ready_ms": 102.07,
+      "authenticated_ready_ms": 334.27,
+      "room_switch_ms": 28.13,
+      "resource_transfer_bytes": 631782
+    }
+  },
+  "verification": {
+    "pytest": "291 passed, 2 skipped",
+    "browser_e2e": "1 passed",
+    "additional_gates": [
+      "uv lock --check",
+      "ruff check",
+      "python compileall",
+      "node --check for every Web JavaScript asset",
+      "sh -n for every bin entrypoint",
+      "plutil -lint for macOS launchd templates",
+      "git diff --check"
+    ]
+  }
+}

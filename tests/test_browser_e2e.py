@@ -297,7 +297,39 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert first_message.locator(".message-body").is_visible()
             assert first_message.locator(".message-direct-reply").is_visible()
             assert first_message.locator(".route-badge").is_hidden()
-            assert first_message.locator(".message-time").is_hidden()
+            message_time = first_message.locator(".message-time")
+            assert message_time.is_visible()
+            sender_name_box = first_message.locator(".sender-line strong").bounding_box()
+            message_time_box = message_time.bounding_box()
+            message_head_box = first_message.locator(".message-head").bounding_box()
+            assert sender_name_box is not None
+            assert message_time_box is not None
+            assert message_head_box is not None
+            name_right = sender_name_box["x"] + sender_name_box["width"]
+            time_right = message_time_box["x"] + message_time_box["width"]
+            assert 4 <= message_time_box["x"] - name_right <= 12
+            assert time_right <= message_head_box["x"] + message_head_box["width"] + 0.5
+            assert abs(
+                message_time_box["y"]
+                + message_time_box["height"] / 2
+                - sender_name_box["y"]
+                - sender_name_box["height"] / 2
+            ) < 2
+            page.set_viewport_size({"width": 520, "height": 900})
+            narrow_name_box = first_message.locator(
+                ".sender-line strong"
+            ).bounding_box()
+            narrow_time_box = message_time.bounding_box()
+            narrow_head_box = first_message.locator(".message-head").bounding_box()
+            assert narrow_name_box is not None
+            assert narrow_time_box is not None
+            assert narrow_head_box is not None
+            assert narrow_time_box["x"] >= narrow_name_box["x"] + narrow_name_box["width"]
+            assert (
+                narrow_time_box["x"] + narrow_time_box["width"]
+                <= narrow_head_box["x"] + narrow_head_box["width"] + 0.5
+            )
+            page.set_viewport_size({"width": 1440, "height": 900})
             page.locator("#layout-density-detailed").click()
             assert "simple-view" not in (workspace.get_attribute("class") or "")
             assert "standard-view" not in (workspace.get_attribute("class") or "")

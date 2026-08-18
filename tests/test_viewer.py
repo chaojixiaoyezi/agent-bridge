@@ -59,7 +59,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.23"
+    assert _runtime_software_version() == "0.42.24"
 
 
 class FakeEmailDelivery:
@@ -2206,12 +2206,12 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260818-04")
+        index_html.index(f"{filename}?v=20260818-05")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260818-04")
+        index_html.index(f"{filename}?v=20260818-05")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
