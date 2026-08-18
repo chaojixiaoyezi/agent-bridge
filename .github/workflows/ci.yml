@@ -117,14 +117,16 @@ jobs:
       - name: Install Python 3.12
         run: uv python install 3.12
 
-      - name: Install locked dependencies and Chromium
-        run: |
-          uv sync --locked --dev
-          uv run playwright install --with-deps chromium
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+
+      - name: Verify runner Chrome
+        run: google-chrome --version
 
       - name: Run real browser regression suite
         env:
           AGENT_BRIDGE_RUN_BROWSER_TESTS: "1"
+          AGENT_BRIDGE_BROWSER_CHANNEL: chrome
         run: uv run pytest tests/test_browser_e2e.py -s
 
       - name: Check patch whitespace
