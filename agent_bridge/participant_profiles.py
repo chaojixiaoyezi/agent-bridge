@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import uuid
 from typing import Any
@@ -539,4 +540,87 @@ class ParticipantProfileMixin:
             ),
             "digest_wake_suppressed": active,
             "direct_notifications_optional": active,
+        }
+
+    @staticmethod
+    def _participant_profile_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("participant row disappeared")
+        avatar_changed_at = (
+            float(row["avatar_changed_at"])
+            if row["avatar_changed_at"] is not None
+            else None
+        )
+        avatar_change_available_at = (
+            avatar_changed_at + AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS
+            if avatar_changed_at is not None
+            else None
+        )
+        return {
+            "participant_id": str(row["participant_id"]),
+            "client_type": str(row["client_type"]),
+            "display_name": str(row["display_name"]),
+            "signature": str(row["signature"]),
+            "avatar_key": str(row["avatar_key"] or "auto"),
+            "avatar_changed_at": avatar_changed_at,
+            "avatar_change_available_at": avatar_change_available_at,
+            "avatar_change_remaining_seconds": max(
+                0.0,
+                (avatar_change_available_at or 0.0) - time.time(),
+            ),
+            "avatar_change_cooldown_seconds": (
+                AGENT_AVATAR_CHANGE_COOLDOWN_SECONDS
+            ),
+            "session_alias": str(row["session_alias"]),
+            "status": str(row["status"]),
+            "last_seen": float(row["last_seen"]),
+        }
+
+    @staticmethod
+    def _follow_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("follow row disappeared")
+        return {
+            "conversation_id": str(row["conversation_id"]),
+            "follower_participant_id": str(row["follower_participant_id"]),
+            "followed_participant_id": str(row["followed_participant_id"]),
+            "followed_client_type": str(row["client_type"]),
+            "followed_display_name": str(row["display_name"]),
+            "followed_signature": str(row["signature"]),
+            "following": bool(row["active"]),
+            "created_at": float(row["created_at"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _nickname_request_payload(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise NotFoundError("nickname request row disappeared")
+        requested_at = float(row["requested_at"])
+        return {
+            "request_id": str(row["request_id"]),
+            "participant_id": str(row["participant_id"]),
+            "client_type": str(row["client_type"]),
+            "current_display_name": str(row["display_name"]),
+            "signature": str(row["signature"]),
+            "requested_display_name": str(row["requested_display_name"]),
+            "status": str(row["status"]),
+            "requested_at": requested_at,
+            "reviewed_at": (
+                float(row["reviewed_at"])
+                if row["reviewed_at"] is not None
+                else None
+            ),
+            "review_note": (
+                str(row["review_note"])
+                if row["review_note"] is not None
+                else None
+            ),
+            "reviewed_by_web_user_id": (
+                str(row["reviewed_by_web_user_id"])
+                if "reviewed_by_web_user_id" in set(row.keys())
+                and row["reviewed_by_web_user_id"] is not None
+                else None
+            ),
+            "next_request_at": requested_at + NICKNAME_REQUEST_COOLDOWN_SECONDS,
         }
