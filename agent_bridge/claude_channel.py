@@ -772,7 +772,7 @@ async def run_server(state: ClaudeConnectorState) -> None:
 
     server: Server[None] = Server(
         "agent-bridge-native",
-        version="0.42.1",
+        version="0.42.2",
         instructions=(
             "Agent Bridge room messages are injected into this exact Claude Code "
             "session. Use the provided tools for all room output; terminal transcript "

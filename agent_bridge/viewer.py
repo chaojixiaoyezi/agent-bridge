@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import secrets
 import shlex
 import socket
-import sqlite3
 import time
 import tomllib
 from collections.abc import Callable
@@ -20,11 +18,10 @@ from urllib.parse import quote
 import uvicorn
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
-from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from starlette.routing import Route, compile_path
+from starlette.routing import Route
 
 from .a2a_gateway import (
     A2A_PROTOCOL_VERSION,
@@ -56,20 +53,16 @@ from .resident_health import (
 from .security import (
     MAX_REQUEST_BODY_BYTES,
     PublicTransportMiddleware,
-    RequestRateLimitExceeded,
     SlidingWindowRateLimiter,
     ViewerSecurityPolicy,
     request_client_key,
 )
 from .store import (
-    AvatarRateLimitError,
     AuthenticationError,
     AuthorizationError,
     BridgeStore,
     ConflictError,
-    NicknameRateLimitError,
     NotFoundError,
-    RateLimitError,
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
 )
 from .validation import (
@@ -78,12 +71,27 @@ from .validation import (
     opaque_id,
     token,
 )
+from .viewer_http import (
+    HttpInputError,
+    _agent_json_call,
+    _authenticate_request,
+    _event_cursor,
+    _int_query,
+    _is_same_origin_intent,
+    _json_body,
+    _json_call,
+    _json_error,
+    _optional_float_query,
+    _optional_positive_int_query,
+    _public_web_identity,
+    _sse_event,
+)
+from .viewer_middleware import AdminAuditMiddleware, SecurityHeadersMiddleware
 from .viewer_store import ViewerRepository
 from .web_auth import (
     WebAuthenticationError,
     WebAuthorizationError,
     WebAuthStore,
-    WebConflictError,
     password_policy_payload,
 )
 
@@ -109,308 +117,6 @@ def _runtime_software_version() -> str:
                 return str(tomllib.load(handle)["project"]["version"])
         except (KeyError, OSError, tomllib.TOMLDecodeError):
             return "source"
-
-
-ADMIN_AUDIT_ACTIONS: dict[tuple[str, str], tuple[str, str]] = {
-    ("POST", "/api/a2a/grants"): ("access", "a2a_grant.create"),
-    ("POST", "/api/a2a/grants/{grant_id:str}/revoke"): (
-        "access",
-        "a2a_grant.revoke",
-    ),
-    ("POST", "/api/admin/web-registration-codes"): (
-        "access",
-        "registration_code.create",
-    ),
-    ("POST", "/api/admin/web-registration-codes/{code_id:str}/revoke"): (
-        "access",
-        "registration_code.revoke",
-    ),
-    ("POST", "/api/rooms"): ("room", "room.create"),
-    ("PATCH", "/api/admin/web-users/{user_id:str}/room-permission"): (
-        "permission",
-        "room_creation_permission.update",
-    ),
-    ("PUT", "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
-        "membership",
-        "web_room_member.upsert",
-    ),
-    ("DELETE", "/api/admin/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
-        "membership",
-        "web_room_member.remove",
-    ),
-    ("PUT", "/api/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
-        "membership",
-        "web_room_member.upsert",
-    ),
-    ("DELETE", "/api/rooms/{conversation_id:str}/web-users/{user_id:str}"): (
-        "membership",
-        "web_room_member.remove",
-    ),
-    ("PATCH", "/api/rooms/{conversation_id:str}"): ("room", "room.rename"),
-    ("PATCH", "/api/agent-lifecycle"): (
-        "lifecycle",
-        "agent_lifecycle.update",
-    ),
-    ("POST", "/api/admin/monitoring/alerts/{alert_id:str}/acknowledge"): (
-        "monitoring",
-        "monitoring_alert.acknowledge",
-    ),
-    ("PATCH", "/api/admin/history/retention"): (
-        "history",
-        "history.retention_policy.update",
-    ),
-    ("POST", "/api/admin/history/redaction-preview"): (
-        "history",
-        "history.redaction.preview",
-    ),
-    ("POST", "/api/admin/history/redaction-execute"): (
-        "history",
-        "history.redaction.execute",
-    ),
-    (
-        "POST",
-        "/api/admin/rooms/{conversation_id:str}/history-export",
-    ): ("history", "history.export"),
-    ("POST", "/api/admin/connectors/{connector_id:str}/rotation-request"): (
-        "connector",
-        "connector.rotation_request",
-    ),
-    ("POST", "/api/admin/connectors/{connector_id:str}/revoke"): (
-        "connector",
-        "connector.revoke",
-    ),
-    (
-        "POST",
-        "/api/rooms/{conversation_id:str}/participants/{participant_id:str}/kick",
-    ): ("membership", "agent_room_member.kick"),
-    ("POST", "/api/room-memberships/migrate"): (
-        "membership",
-        "agent_room_member.copy",
-    ),
-    ("PATCH", "/api/message-rates/global/{actor_kind:str}"): (
-        "rate_limit",
-        "message_rate.global_update",
-    ),
-    ("PUT", "/api/message-rates/participants/{participant_id:str}"): (
-        "rate_limit",
-        "message_rate.override_set",
-    ),
-    ("DELETE", "/api/message-rates/participants/{participant_id:str}"): (
-        "rate_limit",
-        "message_rate.override_clear",
-    ),
-    ("POST", "/api/agent-access"): ("access", "agent_invitation.create"),
-    ("POST", "/api/agent-invitations/{invitation_id:str}/revoke"): (
-        "access",
-        "agent_invitation.revoke",
-    ),
-    ("POST", "/api/sessions/cleanup"): ("session", "session.cleanup"),
-    ("POST", "/api/sessions/{session_id:str}/revoke"): (
-        "session",
-        "session.revoke",
-    ),
-    (
-        "PUT",
-        "/api/rooms/{conversation_id:str}/messages/{message_id:str}/markers/{marker_kind:str}",
-    ): ("knowledge", "message_marker.set"),
-    (
-        "DELETE",
-        "/api/rooms/{conversation_id:str}/messages/{message_id:str}/markers/{marker_kind:str}",
-    ): ("knowledge", "message_marker.remove"),
-    ("POST", "/api/rooms/{conversation_id:str}/tasks"): ("task", "task.create"),
-    ("POST", "/api/messages/{message_id:str}/convert-to-task"): (
-        "task",
-        "task.convert_from_message",
-    ),
-    ("PATCH", "/api/rooms/{conversation_id:str}/wake-policy"): (
-        "policy",
-        "wake_policy.update",
-    ),
-    ("PATCH", "/api/rooms/{conversation_id:str}/task-policy"): (
-        "permission",
-        "task_policy.update",
-    ),
-    ("PUT", "/api/rooms/{conversation_id:str}/task-grants/{user_id:str}"): (
-        "permission",
-        "task_grant.update",
-    ),
-    ("POST", "/api/tasks/{task_id:str}/cancel"): ("task", "task.cancel"),
-    ("POST", "/api/messages/{message_id:str}/authorization/revoke"): (
-        "authorization",
-        "chat_authorization.revoke",
-    ),
-    ("POST", "/api/messages/{message_id:str}/forward"): (
-        "knowledge",
-        "message.forward",
-    ),
-    ("POST", "/api/rooms/{conversation_id:str}/residents/repair"): (
-        "connector",
-        "room_residents.repair",
-    ),
-    ("POST", "/api/nickname-requests/{request_id:str}/review"): (
-        "identity",
-        "nickname_request.review",
-    ),
-}
-
-ADMIN_AUDIT_TARGET_PARAMETERS = (
-    ("grant_id", "a2a_grant"),
-    ("code_id", "registration_code"),
-    ("user_id", "web_user"),
-    ("alert_id", "monitoring_alert"),
-    ("connector_id", "connector"),
-    ("participant_id", "participant"),
-    ("actor_kind", "rate_scope"),
-    ("invitation_id", "agent_invitation"),
-    ("session_id", "session"),
-    ("task_id", "task"),
-    ("message_id", "message"),
-    ("request_id", "nickname_request"),
-)
-
-ADMIN_AUDIT_ROUTE_MATCHERS = tuple(
-    (
-        method,
-        route_path,
-        specification,
-        compile_path(route_path)[0],
-        compile_path(route_path)[2],
-    )
-    for (method, route_path), specification in ADMIN_AUDIT_ACTIONS.items()
-)
-
-
-class SecurityHeadersMiddleware:
-    def __init__(self, app, *, public_mode: bool = False, hsts_seconds: int = 0):
-        self.app = app
-        self.public_mode = bool(public_mode)
-        self.hsts_seconds = max(0, int(hsts_seconds))
-
-    async def __call__(self, scope, receive, send):
-        request_id = f"req_{secrets.token_hex(12)}"
-        scope["agent_bridge.request_id"] = request_id
-
-        async def send_with_headers(message):
-            if message["type"] == "http.response.start":
-                headers = MutableHeaders(scope=message)
-                path = str(scope.get("path") or "")
-                headers["Cache-Control"] = (
-                    "public, max-age=31536000, immutable"
-                    if path.startswith("/assets/")
-                    else "no-store"
-                )
-                headers["Content-Security-Policy"] = (
-                    "default-src 'self'; script-src 'self'; style-src 'self'; "
-                    "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
-                    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-                )
-                headers["Referrer-Policy"] = "no-referrer"
-                headers["X-Content-Type-Options"] = "nosniff"
-                headers["X-Frame-Options"] = "DENY"
-                headers["Permissions-Policy"] = (
-                    "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
-                )
-                headers["Cross-Origin-Opener-Policy"] = "same-origin"
-                headers["Cross-Origin-Resource-Policy"] = "same-origin"
-                headers["X-Permitted-Cross-Domain-Policies"] = "none"
-                headers["X-Request-ID"] = request_id
-                if self.public_mode and self.hsts_seconds > 0:
-                    headers["Strict-Transport-Security"] = (
-                        f"max-age={self.hsts_seconds}"
-                    )
-            await send(message)
-
-        await self.app(scope, receive, send_with_headers)
-
-
-class AdminAuditMiddleware:
-    def __init__(self, app, *, store: BridgeStore):
-        self.app = app
-        self.store = store
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        request_method = str(scope.get("method") or "").upper()
-        request_path = str(scope.get("path") or "")
-        matched_route = None
-        matched_parameters: dict[str, str] = {}
-        for (
-            method,
-            route_path,
-            specification,
-            path_regex,
-            convertors,
-        ) in ADMIN_AUDIT_ROUTE_MATCHERS:
-            if request_method != method:
-                continue
-            match = path_regex.match(request_path)
-            if match is None:
-                continue
-            matched_route = (route_path, specification)
-            matched_parameters = {
-                key: str(convertors[key].convert(value))
-                for key, value in match.groupdict().items()
-            }
-            break
-        status_code = 500
-
-        async def send_with_status(message):
-            nonlocal status_code
-            if message["type"] == "http.response.start":
-                status_code = int(message["status"])
-            await send(message)
-
-        await self.app(scope, receive, send_with_status)
-        identity = (scope.get("state") or {}).get("web_identity")
-        if matched_route is None or not isinstance(identity, dict):
-            return
-        route_path, specification = matched_route
-        category, action = specification
-        outcome = (
-            "success"
-            if 200 <= status_code < 400
-            else "denied"
-            if status_code in {401, 403, 429}
-            else "failed"
-        )
-        path_parameters = matched_parameters
-        target_kind = None
-        target_id = None
-        for parameter, kind in ADMIN_AUDIT_TARGET_PARAMETERS:
-            value = path_parameters.get(parameter)
-            if value:
-                target_kind = kind
-                target_id = value
-                break
-        try:
-            await asyncio.to_thread(
-                self.store.record_admin_audit_event,
-                actor_web_user_id=str(identity["user_id"]),
-                actor_username=str(identity["username"]),
-                actor_display_name=str(identity["display_name"]),
-                actor_role=str(identity["role"]),
-                category=category,
-                action=action,
-                outcome=outcome,
-                status_code=status_code,
-                http_method=request_method,
-                route=route_path,
-                request_id=str(
-                    scope.get("agent_bridge.request_id")
-                    or f"req_{secrets.token_hex(12)}"
-                ),
-                conversation_id=path_parameters.get("conversation_id"),
-                target_kind=target_kind,
-                target_id=target_id,
-                detail={"path_parameters": path_parameters},
-            )
-        except Exception:
-            # Auditing is append-only but deliberately sidecar-only: a damaged
-            # audit table must never turn a completed governance action into a
-            # failed chat/API response or interrupt existing Agent sessions.
-            pass
 
 
 def create_app(
@@ -4790,255 +4496,6 @@ def create_app(
         hsts_seconds=policy.hsts_seconds,
     )
     return app
-
-
-def _public_web_identity(identity: dict[str, object]) -> dict[str, object]:
-    fields = (
-        "user_id",
-        "username",
-        "role",
-        "is_admin",
-        "participant_id",
-        "display_name",
-        "signature",
-        "avatar_key",
-        "must_change_password",
-        "can_create_rooms",
-        "room_limit",
-        "created_at",
-        "password_changed_at",
-        "last_login_at",
-        "email_masked",
-        "email_verified",
-        "email_verified_at",
-        "pending_email_masked",
-        "email_verification_pending",
-        "email_updated_at",
-    )
-    return {field: identity[field] for field in fields}
-
-
-def _json_call(
-    callable_,
-    *,
-    before=None,
-    success_status: int = 200,
-) -> JSONResponse:
-    try:
-        if before is not None:
-            before()
-        return JSONResponse(callable_(), status_code=success_status)
-    except (AuthenticationError, WebAuthenticationError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=401)
-    except (AuthorizationError, WebAuthorizationError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=403)
-    except (
-        RateLimitError,
-        NicknameRateLimitError,
-        AvatarRateLimitError,
-        RequestRateLimitExceeded,
-    ) as exc:
-        return JSONResponse(
-            {
-                "error": str(exc),
-                "retry_after_seconds": exc.retry_after_seconds,
-            },
-            status_code=429,
-            headers={
-                "Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))
-            },
-        )
-    except (ConflictError, WebConflictError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=409)
-    except NotFoundError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=404)
-    except (TypeError, ValueError, ValidationError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    except sqlite3.Error:
-        return JSONResponse(
-            {"error": "SQLite is temporarily unavailable"},
-            status_code=503,
-        )
-
-
-class HttpInputError(ValueError):
-    def __init__(self, message: str, *, status_code: int = 400) -> None:
-        self.status_code = status_code
-        super().__init__(message)
-
-
-async def _json_body(
-    request: Request,
-    *,
-    required: set[str],
-    allowed: set[str],
-) -> dict:
-    content_type = request.headers.get("content-type", "").split(";", 1)[0]
-    if content_type.strip().lower() != "application/json":
-        raise HttpInputError("Content-Type must be application/json", status_code=415)
-    raw = await request.body()
-    if len(raw) > 70_000:
-        raise HttpInputError("request body is too large", status_code=413)
-    try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HttpInputError("invalid JSON body") from exc
-    if not isinstance(payload, dict):
-        raise HttpInputError("JSON body must be an object")
-    keys = set(payload)
-    missing = required - keys
-    extras = keys - allowed
-    if missing:
-        raise HttpInputError(f"missing fields: {', '.join(sorted(missing))}")
-    if extras:
-        raise HttpInputError(f"unsupported fields: {', '.join(sorted(extras))}")
-    return payload
-
-
-def _authenticate_request(request: Request, store: BridgeStore) -> dict:
-    authorization = request.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token:
-        raise AuthenticationError("Bearer agent session token is required")
-    return store.authenticate_session(token)
-
-
-def _event_cursor(value: str | None) -> int:
-    if value is None or not value.strip():
-        return 0
-    try:
-        cursor = int(value)
-    except ValueError as exc:
-        raise HttpInputError("Last-Event-ID must be a non-negative integer") from exc
-    if cursor < 0:
-        raise HttpInputError("Last-Event-ID must be a non-negative integer")
-    return cursor
-
-
-def _sse_event(
-    event: str,
-    payload: dict,
-    *,
-    event_id: int | None = None,
-) -> bytes:
-    lines: list[str] = []
-    if event_id is not None:
-        lines.append(f"id: {int(event_id)}")
-    lines.append(f"event: {event}")
-    lines.append(
-        "data: "
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    )
-    return ("\n".join(lines) + "\n\n").encode("utf-8")
-
-
-async def _agent_json_call(
-    request: Request,
-    store: BridgeStore,
-    *,
-    required: set[str],
-    allowed: set[str],
-    operation,
-) -> Response:
-    try:
-        auth = _authenticate_request(request, store)
-        payload = await _json_body(request, required=required, allowed=allowed)
-        return JSONResponse(operation(auth, payload))
-    except Exception as exc:
-        return _json_error(exc)
-
-
-def _json_error(exc: Exception) -> JSONResponse:
-    if isinstance(exc, HttpInputError):
-        return JSONResponse({"error": str(exc)}, status_code=exc.status_code)
-    if isinstance(exc, (AuthenticationError, WebAuthenticationError)):
-        return JSONResponse({"error": str(exc)}, status_code=401)
-    if isinstance(exc, (AuthorizationError, WebAuthorizationError)):
-        return JSONResponse({"error": str(exc)}, status_code=403)
-    if isinstance(
-        exc,
-        (
-            RateLimitError,
-            NicknameRateLimitError,
-            AvatarRateLimitError,
-            RequestRateLimitExceeded,
-        ),
-    ):
-        return JSONResponse(
-            {
-                "error": str(exc),
-                "retry_after_seconds": exc.retry_after_seconds,
-            },
-            status_code=429,
-            headers={
-                "Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))
-            },
-        )
-    if isinstance(exc, (ConflictError, WebConflictError)):
-        return JSONResponse({"error": str(exc)}, status_code=409)
-    if isinstance(exc, NotFoundError):
-        return JSONResponse({"error": str(exc)}, status_code=404)
-    if isinstance(exc, (TypeError, ValueError, ValidationError)):
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    if isinstance(exc, sqlite3.Error):
-        return JSONResponse(
-            {"error": "SQLite is temporarily unavailable"},
-            status_code=503,
-        )
-    return JSONResponse({"error": "internal bridge error"}, status_code=500)
-
-
-def _is_same_origin_intent(
-    request: Request,
-    *,
-    intent: str,
-    policy: ViewerSecurityPolicy | None = None,
-) -> bool:
-    host = request.headers.get("host", "")
-    if not host:
-        return False
-    expected_origin = f"{request.url.scheme}://{host}"
-    origin = request.headers.get("origin")
-    if origin != expected_origin:
-        return False
-    if policy is not None and not policy.origin_allowed(origin):
-        return False
-    fetch_site = request.headers.get("sec-fetch-site")
-    if fetch_site and fetch_site != "same-origin":
-        return False
-    return request.headers.get("x-agent-bridge-intent") == intent
-
-
-def _int_query(
-    request: Request,
-    key: str,
-    *,
-    default: int,
-    maximum: int,
-) -> int:
-    raw = request.query_params.get(key)
-    value = int(raw) if raw is not None else default
-    return max(1, min(value, maximum))
-
-
-def _optional_positive_int_query(request: Request, key: str) -> int | None:
-    raw = request.query_params.get(key)
-    if raw is None or not raw.strip():
-        return None
-    value = int(raw)
-    if value < 1:
-        raise ValueError(f"{key} must be a positive integer")
-    return value
-
-
-def _optional_float_query(request: Request, key: str) -> float | None:
-    raw = request.query_params.get(key)
-    if raw is None or not raw.strip():
-        return None
-    value = float(raw)
-    if not math.isfinite(value):
-        raise ValueError(f"{key} must be finite")
-    return value
 
 
 def main() -> None:

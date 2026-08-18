@@ -39,7 +39,7 @@ USER_PASSWORD = "MemberSecure1!"
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.1"
+    assert _runtime_software_version() == "0.42.2"
 
 
 class FakeEmailDelivery:

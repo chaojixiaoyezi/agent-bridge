@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T22:38:59-07:00",
+  "baseline_commit": "651611de04068ac44c52caa15ca10344425b1aee",
+  "agent_bridge": {
+    "version": "0.42.2",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/viewer.py",
+    "viewer_lines_before": 5084,
+    "viewer_lines_after": 4541,
+    "targets": [
+      "agent_bridge/viewer_http.py",
+      "agent_bridge/viewer_middleware.py"
+    ],
+    "top_level_function_ast_equivalence": 12,
+    "top_level_class_ast_equivalence": 3,
+    "audit_definitions_moved": 3,
+    "schema_changed": false,
+    "http_api_changed": false,
+    "authentication_semantics_changed": false,
+    "rate_limit_semantics_changed": false,
+    "security_headers_changed": false,
+    "admin_audit_semantics_changed": false
+  },
+  "verification": {
+    "focused_viewer_passed": 42,
+    "full_default_collected": 292,
+    "full_default_passed": 290,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 199.74,
+    "authenticated_ready_ms": 501.65,
+    "room_switch_ms": 64.59,
+    "resource_transfer_bytes": 590320,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}
