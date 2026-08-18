@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-17T23:32:18-07:00",
+  "baseline_commit": "4df846bc2ab8bc813c8701d5895d30e6c5d4a88b",
+  "agent_bridge": {
+    "version": "0.42.5",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/viewer.py",
+    "viewer_lines_before": 1859,
+    "viewer_lines_after": 304,
+    "targets": [
+      "agent_bridge/viewer_room_routes.py",
+      "agent_bridge/viewer_resident_routes.py",
+      "agent_bridge/viewer_event_routes.py",
+      "agent_bridge/viewer_runtime.py"
+    ],
+    "nested_function_ast_equivalence": 32,
+    "route_declarations_moved": 25,
+    "baseline_route_count": 118,
+    "resulting_route_count": 118,
+    "route_path_method_order_equal": true,
+    "schema_changed": false,
+    "http_api_changed": false,
+    "room_acl_semantics_changed": false,
+    "resident_repair_semantics_changed": false,
+    "runtime_lifecycle_semantics_changed": false
+  },
+  "verification": {
+    "focused_viewer_passed": 49,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 206.8,
+    "authenticated_ready_ms": 519.31,
+    "room_switch_ms": 65.61,
+    "resource_transfer_bytes": 590152,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

@@ -11,7 +11,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
-from agent_bridge import viewer as viewer_module
+from agent_bridge import viewer_resident_routes as viewer_resident_routes_module
 from agent_bridge import web_auth as web_auth_module
 from agent_bridge.security import (
     DEFAULT_HSTS_SECONDS,
@@ -39,7 +39,7 @@ USER_PASSWORD = "MemberSecure1!"
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.4"
+    assert _runtime_software_version() == "0.42.5"
 
 
 class FakeEmailDelivery:
@@ -2269,7 +2269,7 @@ def test_admin_can_repair_known_room_residents_without_changing_chat_state(
     repaired: list[str] = []
 
     monkeypatch.setattr(
-        viewer_module,
+        viewer_resident_routes_module,
         "repair_known_identity_services",
         lambda client_type, **_kwargs: repaired.append(client_type)
         or {
@@ -2278,7 +2278,7 @@ def test_admin_can_repair_known_room_residents_without_changing_chat_state(
         },
     )
     monkeypatch.setattr(
-        viewer_module,
+        viewer_resident_routes_module,
         "configure_existing_connector_from_disk",
         lambda _client_type: None,
     )

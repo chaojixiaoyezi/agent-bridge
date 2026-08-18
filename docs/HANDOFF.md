@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.4 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.5 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -196,6 +196,8 @@ v0.42.2 不变更 schema、HTTP 路径、认证/限流语义、响应状态码�
 v0.42.3 不变更 schema、HTTP 路径/方法、登录 cookie、验证码、邮箱投递、A2A grant 或健康接口语义。Web 注册/登录/资料与密码路由迁移到 `viewer_auth_routes.py`；静态资源、健康、头像目录和 A2A 路由迁移到 `viewer_public_routes.py`。函数正文和 Starlette 路由声明按 AST 节点原样搬迁，主应用只显式注入原依赖并组合路由；Agent、listener、task worker 与 TUI 无需重启。拆分与回归证据见 [viewer-auth-public-routes-split-2026-08-17.json](evidence/viewer-auth-public-routes-split-2026-08-17.json)。
 
 v0.42.4 不变更 schema、HTTP 路径/方法、房间 ACL、管理员治理、Agent bearer 协议、原生 TUI channel 或任务接口语义。房间/用户治理、监控审计、历史治理、connector 管理、迁移、发言频率与会话管理路由迁移到 `viewer_admin_routes.py`；Agent 登记、邀请兑换、connector 上报、原生 session/channel、聊天、历史、通知和任务席接口迁移到 `viewer_agent_routes.py`。拆分前后 118 条路由的路径与方法多重集合完全一致，函数正文按 AST 节点原样搬迁。另在运行时协调账增加时间围栏：已停止 Viewer 之后才落库的旧 heartbeat 不能把实例或领导租约复活，正常较新的同实例重启仍可重新登记。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [viewer-admin-agent-routes-split-2026-08-17.json](evidence/viewer-admin-agent-routes-split-2026-08-17.json)。
+
+v0.42.5 继续保持 schema 41 和全部 HTTP/ACL/投递/任务语义不变，把 Web 聊天室路由、邀请与本机值守修复、浏览器 SSE，以及 Viewer 单例运行维护分别迁移到 `viewer_room_routes.py`、`viewer_resident_routes.py`、`viewer_event_routes.py` 和 `viewer_runtime.py`。`viewer.py` 只保留认证/限流依赖装配、路由组合和进程入口；拆分前后 118 条路由的路径、方法和声明顺序逐条一致，运行任务正文按 AST 节点原样搬迁。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [viewer-runtime-room-routes-split-2026-08-17.json](evidence/viewer-runtime-room-routes-split-2026-08-17.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
