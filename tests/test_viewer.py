@@ -11,7 +11,9 @@ import pytest
 from starlette.testclient import TestClient
 
 from agent_bridge.store import ROOM_ABANDON_AFTER_SECONDS, BridgeStore
-from agent_bridge import viewer_resident_routes as viewer_resident_routes_module
+from agent_bridge import (
+    viewer_resident_management_routes as viewer_resident_routes_module,
+)
 from agent_bridge import web_auth as web_auth_module
 from agent_bridge.security import (
     DEFAULT_HSTS_SECONDS,
@@ -57,7 +59,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.42.15"
+    assert _runtime_software_version() == "0.42.16"
 
 
 class FakeEmailDelivery:
