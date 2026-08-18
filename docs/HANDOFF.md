@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.41.9 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.0 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -186,6 +186,8 @@ v0.41.7 不变更 schema、HTTP/MCP API、房间 ACL、成员关系或消息状�
 v0.41.8 不变更 schema、HTTP/MCP API、任务权限、领取租约、任务输入重投或消息路由语义。Web 任务创建与普通消息转任务、执行席定向路由、房间任务策略/授权、领取/等待、补充输入、状态更新和子任务委派从 `store.py` 原样迁移到 `room_tasks.py`；发送与实时投递仍通过原 `BridgeStore` 方法协作，原任务 worker、TUI 与 connector 无需重启。拆分与回归证据见 [room-task-split-2026-08-17.json](evidence/room-task-split-2026-08-17.json)。
 
 v0.41.9 不变更 schema、HTTP/MCP API、发送事务、结构化 @、投递候选、唤醒策略或跨房转发语义。mention 规范化/诊断、收件候选与持久投递生成迁移到 `message_routing.py`；认证发送、房间唤醒策略及显式带来源转发迁移到 `message_composer.py`。`BridgeStore` 保留全部原方法和公共常量，实时等待/ack/历史读取仍在原主链；既有 Agent、listener、task worker 与 TUI 无需重启。拆分与回归证据见 [message-routing-composer-split-2026-08-17.json](evidence/message-routing-composer-split-2026-08-17.json)。
+
+v0.42.0 不变更 schema、HTTP/MCP API、wait/claim/release/ack 状态机、摘要唤醒阈值、历史查询或消息投影。实时积压、通知快照、领取/释放/确认迁移到 `message_delivery.py`；只读历史、房间搜索、成员列表和消息序列化迁移到 `message_history.py`。房间消息序号 schema 随其唯一消费者迁移但执行顺序不变；所有方法、循环等待间隔、事务和异常保持原样，线上仍只滚动 Viewer。拆分与回归证据见 [message-delivery-history-split-2026-08-17.json](evidence/message-delivery-history-split-2026-08-17.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 
