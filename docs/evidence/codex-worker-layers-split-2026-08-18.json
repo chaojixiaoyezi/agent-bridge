@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "completed_at": "2026-08-18T01:11:50-07:00",
+  "baseline_commit": "bba41d3bf5a47b8613c538651928664ac9a27e07",
+  "agent_bridge": {
+    "version": "0.42.14",
+    "database_schema_before": 41,
+    "database_schema_after": 41
+  },
+  "extraction": {
+    "source": "agent_bridge/codex_worker.py",
+    "source_lines_before": 1104,
+    "source_lines_after": 299,
+    "targets": [
+      "agent_bridge/codex_worker_contracts.py",
+      "agent_bridge/codex_rpc.py",
+      "agent_bridge/codex_thread.py"
+    ],
+    "definitions_or_assignments_moved": 9,
+    "definition_or_assignment_ast_equal": 9,
+    "public_import_surface_changed": false,
+    "schema_changed": false,
+    "rpc_semantics_changed": false,
+    "thread_resume_semantics_changed": false,
+    "wake_queue_semantics_changed": false,
+    "completion_evidence_semantics_changed": false
+  },
+  "verification": {
+    "focused_codex_worker_passed": 24,
+    "focused_opt_in_skipped": 1,
+    "full_default_collected": 293,
+    "full_default_passed": 291,
+    "opt_in_skipped": 2,
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "browser_gate": {
+    "browser": "chrome",
+    "dom_ready_ms": 136.29,
+    "authenticated_ready_ms": 339.77,
+    "room_switch_ms": 44.08,
+    "resource_transfer_bytes": 592676,
+    "result": "passed"
+  },
+  "production_isolation": {
+    "central_database_opened_by_tests": false,
+    "production_rooms_written": 0,
+    "production_agent_processes_restarted": 0
+  }
+}

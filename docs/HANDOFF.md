@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.42.13 / schema 41。
+当前协议/数据库版本：Agent Bridge v0.42.14 / schema 41。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -214,6 +214,8 @@ v0.42.11 保持 schema 41、Agent bearer/enrollment/invitation 认证、原生 T
 v0.42.12 保持 schema 41、task lease、结构化任务提示、实时补充、Codex app-server、Claude stream-json 和原生 TUI 执行语义不变，将共享任务契约与租约、Codex host、Claude host 分别迁移到独立模块，`task_worker.py` 只保留产品选择、领取、回填与 CLI 入口。原 20 个定义和 3 个模块常量 AST 逐项一致，既有导入名与启动命令继续兼容。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [task-worker-hosts-split-2026-08-18.json](evidence/task-worker-hosts-split-2026-08-18.json)。
 
 v0.42.13 保持 schema 41、connector manifest/enrollment/binding 文件、身份覆盖保护、launchd/systemd 服务名和 Claude native channel 产物语义不变，将安装契约与私有文件、平台服务、Claude 插件产物分别迁移到独立模块，`configure_resident_connector` 继续是唯一安装编排入口。原 20 个定义和 3 个模块常量 AST 逐项一致，既有 `agent_bridge.connector` 导入路径继续重导出。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [connector-installation-split-2026-08-18.json](evidence/connector-installation-split-2026-08-18.json)。
+
+v0.42.14 保持 schema 41、Codex app-server JSON-RPC、thread resume/fork、值守证据收口、断线积压压缩和 durable wake queue 语义不变，将共享契约、RPC 传输和常驻线程宿主拆为独立模块，`codex_worker.py` 只保留 CLI 与 Bridge 队列编排。原 9 个常量、类型、函数和类的 AST 逐项一致，既有 `agent_bridge.codex_worker` 导入路径继续重导出。现有 Agent/worker/TUI 不重启。拆分与回归证据见 [codex-worker-layers-split-2026-08-18.json](evidence/codex-worker-layers-split-2026-08-18.json)。
 
 v0.39.1 不变更 schema。`agent_send` 结果增加 `mention_routing`：精确同群可见昵称继续兼容转成结构化 mention，无法解析、重名或未授权的 `@全员` 明确返回警告，不猜目标。旧 Agent 漏写 `@` 但正文同时包含精确同群昵称和明确分工、提问、回复或复核请求时，服务端在未显式选择模式的兼容路径补成通知；显式 `notification_mode=ordinary` 始终保持普通积压，只提示发送方在确实期待及时处理时重发。现有消息可见范围、频率、摘要阈值与强制回复规则均不变。
 

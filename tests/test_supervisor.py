@@ -627,8 +627,8 @@ def test_resident_codex_worker_deterministically_acks_only_optional_messages(
         captured["message_ids"] = set(message_ids)
         return frozenset(message_ids)
 
-    monkeypatch.setattr("agent_bridge.codex_worker.resident_http_client", make_client)
-    monkeypatch.setattr("agent_bridge.codex_worker.acknowledge_messages", acknowledge)
+    monkeypatch.setattr("agent_bridge.codex_thread.resident_http_client", make_client)
+    monkeypatch.setattr("agent_bridge.codex_thread.acknowledge_messages", acknowledge)
 
     assert host.acknowledge_optional_messages(evidence) == frozenset({"msg-optional"})
     assert evidence.resolved_message_ids == {
@@ -675,7 +675,7 @@ def test_resident_codex_worker_compacts_reconnect_backlog_via_bridge(
             }
 
     monkeypatch.setattr(
-        "agent_bridge.codex_worker.resident_http_client",
+        "agent_bridge.codex_thread.resident_http_client",
         lambda **_identity: CompletionClient(),
     )
 
