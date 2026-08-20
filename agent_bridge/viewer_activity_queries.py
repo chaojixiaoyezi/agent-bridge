@@ -619,9 +619,49 @@ class ViewerActivityQueries:
                 ).fetchone()[0]
                 or 0
             )
-            receipt_revision = float(
+            receipt_revision = str(
                 connection.execute(
-                    "SELECT COALESCE(MAX(acked_at), 0) FROM receipts"
+                    """
+                    SELECT CAST(delivery.delivery_count AS TEXT)
+                        || ':' || CAST(delivery.latest_milestone AS TEXT)
+                        || ':' || CAST(delivery.cancelled_count AS TEXT)
+                        || ':' || CAST(receipt.receipt_count AS TEXT)
+                        || ':' || CAST(receipt.latest_ack AS TEXT)
+                        || ':' || CAST(dnd.dnd_count AS TEXT)
+                        || ':' || CAST(dnd.active_dnd_count AS TEXT)
+                        || ':' || CAST(dnd.latest_update AS TEXT)
+                    FROM (
+                        SELECT COUNT(*) AS delivery_count,
+                               COALESCE(MAX(MAX(
+                                created_at,
+                                COALESCE(first_delivered_at, 0),
+                                COALESCE(last_delivered_at, 0),
+                                COALESCE(acked_at, 0),
+                                COALESCE(native_injected_at, 0),
+                                COALESCE(native_applied_at, 0),
+                                COALESCE(native_replied_at, 0),
+                                COALESCE(shadow_seen_at, 0)
+                               )), 0) AS latest_milestone,
+                               COALESCE(SUM(
+                                   state = 'cancelled'
+                                   OR delivery_stage = 'cancelled'
+                               ), 0) AS cancelled_count
+                        FROM message_deliveries
+                    ) AS delivery
+                    CROSS JOIN (
+                        SELECT COUNT(*) AS receipt_count,
+                               COALESCE(MAX(acked_at), 0) AS latest_ack
+                        FROM receipts
+                    ) AS receipt
+                    CROSS JOIN (
+                        SELECT COUNT(*) AS dnd_count,
+                               COALESCE(SUM(expires_at > ?), 0)
+                                   AS active_dnd_count,
+                               COALESCE(MAX(updated_at), 0) AS latest_update
+                        FROM agent_room_dnd
+                    ) AS dnd
+                    """,
+                    (now,),
                 ).fetchone()[0]
             )
             if visible is None:

@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.43.1"
+    assert _runtime_software_version() == "0.43.2"
 
 
 class FakeEmailDelivery:
@@ -2190,6 +2190,101 @@ def test_room_message_search_is_scoped_composable_paginated_and_jumpable(
     ).status_code == 400
 
 
+def test_message_delivery_projection_distinguishes_native_read_offline_and_dnd(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "bridge.db"
+    store, sender, receiver = seed(database)
+    repository = ViewerRepository(database)
+    first = repository.messages("room-one")[0]
+    initial_revision = repository.event_snapshot()["state_revisions"]["receipts"]
+    now = time.time()
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE message_deliveries "
+            "SET delivery_stage = 'native_applied', "
+            "native_injected_at = ?, native_applied_at = ? "
+            "WHERE message_id = ? AND participant_id = ?",
+            (now - 1, now, first["message_id"], receiver["participant_id"]),
+        )
+        connection.execute(
+            "INSERT INTO agent_room_dnd "
+            "(participant_id, conversation_id, enabled_at, expires_at, "
+            "timezone_name, updated_at) VALUES (?, 'room-one', ?, ?, 'UTC', ?)",
+            (receiver["participant_id"], now, now + 3600, now),
+        )
+
+    native_read = repository.messages("room-one")[0]
+    assert native_read["agent_delivery_summary"]["read"] == 1
+    assert native_read["agent_delivery_summary"]["dnd"] == 1
+    assert native_read["agent_deliveries"] == [
+        {
+            **native_read["agent_deliveries"][0],
+            "participant_id": receiver["participant_id"],
+            "status": "read",
+            "delivery_stage": "native_applied",
+            "active_endpoint": True,
+            "dnd_active": True,
+        }
+    ]
+    assert (
+        repository.event_snapshot()["state_revisions"]["receipts"]
+        != initial_revision
+    )
+
+    receipt = next(
+        item
+        for item in repository.message_receipts("room-one")
+        if item["message_id"] == first["message_id"]
+    )
+    assert receipt["agent_delivery_summary"] == native_read[
+        "agent_delivery_summary"
+    ]
+    assert receipt["agent_deliveries"] == native_read["agent_deliveries"]
+
+    store.reply(
+        participant_id=receiver["participant_id"],
+        message_id=first["message_id"],
+        body_text="已按原消息完成结构化回复。",
+        authorized_session_id=receiver["session_id"],
+    )
+    replied = next(
+        item
+        for item in repository.messages("room-one")
+        if item["message_id"] == first["message_id"]
+    )
+    assert replied["agent_delivery_summary"]["replied"] == 1
+    assert replied["agent_deliveries"][0]["status"] == "replied"
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE messages SET created_at = ? WHERE message_id = ?",
+            (now - 3600, first["message_id"]),
+        )
+        connection.execute(
+            "UPDATE agent_sessions SET expires_at = ? WHERE participant_id = ?",
+            (now - 1, receiver["participant_id"]),
+        )
+    second = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id="room-one",
+        body_text="离线接收状态必须明确显示。",
+        audience_kind="participant",
+        audience_value=receiver["participant_id"],
+    )
+    offline = next(
+        item
+        for item in repository.messages("room-one")
+        if item["message_id"] == second["message_id"]
+    )
+    assert offline["agent_delivery_summary"]["offline"] == 1
+    assert offline["agent_delivery_summary"]["unreceived"] == 1
+    assert offline["agent_deliveries"][0]["active_endpoint"] is False
+    assert offline["agent_deliveries"][0]["dnd_active"] is True
+
+
 def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     tmp_path: Path,
 ) -> None:
@@ -2227,6 +2322,8 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     assert [item["message_id"] for item in receipts] == [
         item["message_id"] for item in payload["messages"]
     ]
+    assert all("agent_deliveries" in item for item in payload["messages"])
+    assert all("agent_delivery_summary" in item for item in receipts)
     event_snapshot = ViewerRepository(database).event_snapshot(
         after_sequence=payload["messages"][0]["sequence"]
     )

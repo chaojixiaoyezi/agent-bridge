@@ -1296,6 +1296,7 @@ function refreshModeForEvent(changedFacets) {
   if (!changedFacets.length) return null;
   const changed = new Set(changedFacets);
   const onlyContains = (allowed) => [...changed].every((item) => allowed.has(item));
+  if (changed.size === 1 && changed.has("receipts")) return "receipt";
   if (onlyContains(new Set(["messages", "rooms", "receipts", "highlights"]))) return "room";
   if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts", "highlights"]))) return "task";
   if (["participants", "memberships", "online", "sessions", "connectors", "monitoring"].some(
@@ -1358,7 +1359,12 @@ function connectOwnerEvents() {
           mode,
           refreshTaskState: changedFacets.includes("nicknames")
             || changedFacets.includes("participants"),
-          refreshReceipts: changedFacets.includes("receipts"),
+          refreshReceipts: [
+            "receipts",
+            "memberships",
+            "sessions",
+            "connectors",
+          ].some((facet) => changedFacets.includes(facet)),
           refreshHighlights: changedFacets.includes("highlights"),
           forceMonitoring: changedFacets.includes("monitoring"),
         });

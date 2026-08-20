@@ -841,6 +841,43 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .authorization-badge.revoked { color: #a1a8b5; border-color: rgba(161,168,181,.18); background: rgba(161,168,181,.06); }
 .message-body { margin: 0; color: var(--text); font-size: 13px; line-height: 1.72; white-space: pre-wrap; overflow-wrap: anywhere; }
 .reply-label, .claim-label, .receipt-label, .mention-label, .authorization-label, .forward-label { margin-top: 8px; color: #727a89; font-size: 9px; }
+.message-delivery-details { margin-top: 8px; color: var(--muted); font-size: 9px; }
+.message-delivery-details > summary { width: fit-content; margin: 0; cursor: pointer; list-style-position: outside; }
+.message-delivery-details[open] > summary { color: var(--muted-strong); }
+.message-delivery-body { margin-top: 8px; }
+.message-delivery-list { display: grid; gap: 5px; max-width: 620px; }
+.message-delivery-row {
+  display: grid;
+  grid-template-columns: 24px minmax(110px, 1fr) minmax(150px, auto);
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--surface-soft) 82%, transparent);
+}
+.message-delivery-avatar { width: 24px; height: 24px; border-radius: 8px; }
+.message-delivery-identity { min-width: 0; display: grid; gap: 1px; }
+.message-delivery-identity strong,
+.message-delivery-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-delivery-identity strong { color: var(--text); font-size: 9px; }
+.message-delivery-identity small { color: var(--muted); font-size: 7px; }
+.message-delivery-state { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 4px; }
+.message-delivery-state time { color: var(--muted); font-size: 7px; font-variant-numeric: tabular-nums; }
+.message-delivery-chip { padding: 2px 5px; border: 1px solid var(--line); border-radius: 999px; font-size: 7px; font-weight: 750; }
+.message-delivery-chip.status-replied,
+.message-delivery-chip.status-read { color: var(--cyan); border-color: color-mix(in srgb, var(--cyan) 30%, var(--line)); background: var(--cyan-soft); }
+.message-delivery-chip.status-injected,
+.message-delivery-chip.status-acknowledged,
+.message-delivery-chip.status-notified { color: var(--purple); border-color: color-mix(in srgb, var(--purple) 28%, var(--line)); background: color-mix(in srgb, var(--purple) 9%, transparent); }
+.message-delivery-chip.status-queued { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 30%, var(--line)); background: color-mix(in srgb, var(--amber) 9%, transparent); }
+.message-delivery-chip.status-offline,
+.message-delivery-chip.status-unavailable,
+.message-delivery-chip.status-cancelled,
+.message-delivery-chip.offline { color: var(--muted); background: var(--surface-soft); }
+.message-delivery-chip.dnd { color: var(--amber); border-color: color-mix(in srgb, var(--amber) 30%, var(--line)); }
+.message-delivery-chip.required { color: #db5a7a; border-color: color-mix(in srgb, #db5a7a 32%, var(--line)); background: color-mix(in srgb, #db5a7a 8%, transparent); }
+.message-delivery-empty { margin: 0; color: var(--muted); font-size: 8px; }
 .forward-label { color: var(--amber); }
 .forward-button { margin-left: 6px; color: var(--amber); }
 .forward-source-preview { max-height: 110px; margin: -6px 0 18px; padding: 10px 11px; overflow-y: auto; border: 1px solid rgba(242,181,99,.16); border-radius: 10px; color: var(--muted-strong); background: rgba(242,181,99,.05); font-size: 10px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1033,7 +1070,7 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .workspace:is(.simple-view, .standard-view) .message-head { margin-bottom: 4px; }
 .workspace:is(.simple-view, .standard-view) .message-body { font-size: 12px; line-height: 1.58; }
 .workspace:is(.simple-view, .standard-view) .client-label,
-.workspace:is(.simple-view, .standard-view) .receipt-label { display: none; }
+.workspace:is(.simple-view, .standard-view) .message-delivery-details { display: none; }
 .workspace:is(.simple-view, .standard-view) .reply-label,
 .workspace:is(.simple-view, .standard-view) .claim-label,
 .workspace:is(.simple-view, .standard-view) .mention-label,

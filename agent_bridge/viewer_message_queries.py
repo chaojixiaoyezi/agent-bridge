@@ -6,9 +6,10 @@ from typing import Any
 
 from .message_assets import MessageAssetMixin
 from .validation import conversation_id as validate_conversation_id
+from .viewer_delivery_projection import ViewerDeliveryProjectionMixin
 
 
-class ViewerMessageQueries(MessageAssetMixin):
+class ViewerMessageQueries(ViewerDeliveryProjectionMixin, MessageAssetMixin):
     """Read-only message, thread, search, and receipt projections."""
 
     def messages(
@@ -135,14 +136,8 @@ class ViewerMessageQueries(MessageAssetMixin):
                         SELECT COUNT(*) FROM messages AS reply
                         WHERE reply.reply_to = m.message_id
                     ) AS reply_count,
-                    (
-                        SELECT COUNT(*) FROM receipts AS r
-                        WHERE r.message_id = m.message_id AND r.state = 'acked'
-                    ) AS ack_count,
-                    (
-                        SELECT COUNT(*) FROM message_deliveries AS d
-                        WHERE d.message_id = m.message_id
-                    ) AS receipt_count
+                    0 AS ack_count,
+                    0 AS receipt_count
                 FROM messages AS m
                 JOIN participants AS sender
                   ON sender.participant_id = m.sender_participant_id
@@ -166,6 +161,10 @@ class ViewerMessageQueries(MessageAssetMixin):
                 connection,
                 [str(row["message_id"]) for row in rows],
             )
+            delivery_projections = self._message_delivery_projection_locked(
+                connection,
+                [str(row["message_id"]) for row in rows],
+            )
         ordered_rows = (
             rows
             if after_sequence is not None or around_sequence is not None
@@ -175,6 +174,7 @@ class ViewerMessageQueries(MessageAssetMixin):
         for row in ordered_rows:
             payload = self._message_payload(row)
             payload.update(projections[str(row["message_id"])])
+            payload.update(delivery_projections[str(row["message_id"])])
             result.append(payload)
         return result
 
@@ -757,23 +757,14 @@ class ViewerMessageQueries(MessageAssetMixin):
         *,
         after_sequence: int = 0,
         limit: int = 500,
-    ) -> list[dict[str, int | str]]:
+    ) -> list[dict[str, Any]]:
         conversation = validate_conversation_id(conversation_id)
         normalized_after = max(0, int(after_sequence))
         normalized_limit = max(1, min(int(limit), 1_000))
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT m.sequence, m.message_id,
-                       (
-                           SELECT COUNT(*) FROM receipts AS receipt
-                           WHERE receipt.message_id = m.message_id
-                             AND receipt.state = 'acked'
-                       ) AS ack_count,
-                       (
-                           SELECT COUNT(*) FROM message_deliveries AS delivery
-                           WHERE delivery.message_id = m.message_id
-                       ) AS receipt_count
+                SELECT m.sequence, m.message_id
                 FROM messages AS m
                 WHERE m.conversation_id = ? AND m.sequence > ?
                 ORDER BY m.sequence DESC
@@ -781,15 +772,19 @@ class ViewerMessageQueries(MessageAssetMixin):
                 """,
                 (conversation, normalized_after, normalized_limit),
             ).fetchall()
-        return [
-            {
+            projections = self._message_delivery_projection_locked(
+                connection,
+                [str(row["message_id"]) for row in rows],
+            )
+        result: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            payload: dict[str, Any] = {
                 "sequence": int(row["sequence"]),
                 "message_id": str(row["message_id"]),
-                "ack_count": int(row["ack_count"] or 0),
-                "receipt_count": int(row["receipt_count"] or 0),
             }
-            for row in reversed(rows)
-        ]
+            payload.update(projections[str(row["message_id"])])
+            result.append(payload)
+        return result
 
     @staticmethod
     def _message_payload(row: sqlite3.Row) -> dict[str, Any]:

@@ -159,6 +159,105 @@ function senderSeatLabel(message) {
   }[message.sender_seat || "unknown"];
 }
 
+const DELIVERY_STATUS_LABELS = {
+  replied: "已回复",
+  read: "本体已读取",
+  injected: "已注入本体 TUI",
+  acknowledged: "已确认",
+  notified: "已通知",
+  queued: "等待接收",
+  offline: "Bridge 会话离线",
+  unavailable: "已离开聊天室",
+  cancelled: "已取消",
+};
+
+function deliverySummaryText(message) {
+  const summary = message.agent_delivery_summary;
+  if (!summary || Number(summary.total || 0) === 0) {
+    return `#${roomSequence(message)} · ${message.ack_count || 0}/${message.receipt_count || 0} 已确认/已通知`;
+  }
+  const segments = [];
+  const replied = Number(summary.replied || 0);
+  const read = Number(summary.read || 0);
+  const receivedWaiting = ["injected", "acknowledged", "notified"]
+    .reduce((total, key) => total + Number(summary[key] || 0), 0);
+  const queued = Number(summary.queued || 0);
+  const offline = Number(summary.offline || 0);
+  const unavailable = Number(summary.unavailable || 0);
+  const cancelled = Number(summary.cancelled || 0);
+  if (replied) segments.push(`${replied} 已回复`);
+  if (read) segments.push(`${read} 本体已读`);
+  if (receivedWaiting) segments.push(`${receivedWaiting} 已收到未回复`);
+  if (queued) segments.push(`${queued} 排队未收到`);
+  if (offline) segments.push(`${offline} 离线未收到`);
+  if (unavailable) segments.push(`${unavailable} 已离群`);
+  if (cancelled) segments.push(`${cancelled} 已取消`);
+  if (Number(summary.dnd || 0)) segments.push(`${summary.dnd} 免打扰`);
+  return `#${roomSequence(message)} · ${segments.join(" · ") || "无 Agent 接收目标"}`;
+}
+
+function deliveryMoment(delivery) {
+  return delivery.status_at;
+}
+
+function populateDeliveryDetails(container, message) {
+  const deliveries = Array.isArray(message.agent_deliveries)
+    ? message.agent_deliveries
+    : [];
+  const list = makeElement("div", "message-delivery-list");
+  if (!deliveries.length) {
+    list.append(makeElement("p", "message-delivery-empty", "这条消息没有 Agent 接收目标。"));
+  }
+  for (const delivery of deliveries) {
+    const row = makeElement("div", `message-delivery-row status-${delivery.status || "queued"}`);
+    row.append(createAvatarElement({
+      avatarKey: delivery.avatar_key,
+      clientType: delivery.client_type,
+      label: delivery.display_name,
+      className: "message-delivery-avatar",
+    }));
+    const identity = makeElement("span", "message-delivery-identity");
+    identity.append(makeElement("strong", "", delivery.display_name || delivery.client_type));
+    identity.append(makeElement("small", "", delivery.client_type || delivery.participant_id));
+    row.append(identity);
+    const stateBox = makeElement("span", "message-delivery-state");
+    stateBox.append(makeElement(
+      "span",
+      `message-delivery-chip status-${delivery.status || "queued"}`,
+      DELIVERY_STATUS_LABELS[delivery.status] || delivery.status || "等待接收",
+    ));
+    if (delivery.dnd_active) {
+      stateBox.append(makeElement("span", "message-delivery-chip dnd", "免打扰至 0 点"));
+    }
+    if (delivery.actionable) {
+      stateBox.append(makeElement("span", "message-delivery-chip required", "要求回复"));
+    }
+    if (!delivery.active_endpoint && !["offline", "unavailable", "cancelled"].includes(delivery.status)) {
+      stateBox.append(makeElement("span", "message-delivery-chip offline", "当前离线"));
+    }
+    const moment = deliveryMoment(delivery);
+    if (moment) stateBox.append(makeElement("time", "", fullTime(moment)));
+    row.append(stateBox);
+    list.append(row);
+  }
+  container.replaceChildren(list);
+}
+
+function createDeliveryDetails(message) {
+  const details = makeElement("details", "message-delivery-details");
+  details.append(makeElement("summary", "receipt-label", deliverySummaryText(message)));
+  const body = makeElement("div", "message-delivery-body");
+  details.append(body);
+  details.addEventListener("toggle", () => {
+    if (!details.open) return;
+    const latest = state.messages.find(
+      (item) => item.message_id === message.message_id,
+    ) || message;
+    populateDeliveryDetails(body, latest);
+  });
+  return details;
+}
+
 function createMessageElement(message) {
   const article = makeElement("article", "message");
   article.dataset.messageId = message.message_id;
@@ -383,7 +482,7 @@ function createMessageElement(message) {
       article.append(submitButton);
     }
   }
-  article.append(makeElement("p", "receipt-label", `#${roomSequence(message)} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`));
+  article.append(createDeliveryDetails(message));
 
   if (message.refs?.length) {
     const refs = makeElement("div", "ref-list");
@@ -500,7 +599,7 @@ function updateNewMessageIndicator() {
 }
 
 function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${item.reply_count || 0}:${item.visibility?.kind || "room"}:${(item.attachments || []).map((asset) => asset.attachment_id).join(",")}:${(item.links || []).map((link) => link.link_id).join(",")}`).join("|")}`;
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${(item.agent_deliveries || []).map((delivery) => `${delivery.participant_id},${delivery.status},${delivery.active_endpoint ? 1 : 0},${delivery.dnd_active ? 1 : 0}`).join(";")}:${item.reply_count || 0}:${item.visibility?.kind || "room"}:${(item.attachments || []).map((asset) => asset.attachment_id).join(",")}:${(item.links || []).map((link) => link.link_id).join(",")}`).join("|")}`;
 }
 
 function renderMessages(
@@ -638,7 +737,12 @@ function updateReceiptLabels(messages) {
     if (!message) continue;
     const label = article.querySelector(".receipt-label");
     if (label) {
-      label.textContent = `#${roomSequence(message)} · ${message.ack_count}/${message.receipt_count} 已确认/已通知`;
+      label.textContent = deliverySummaryText(message);
+    }
+    const details = article.querySelector(".message-delivery-details");
+    const body = details?.querySelector(".message-delivery-body");
+    if (details?.open && body) {
+      populateDeliveryDetails(body, message);
     }
   }
   state.messageRenderSignature = messageSignature(state.messages);

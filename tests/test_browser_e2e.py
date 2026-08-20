@@ -14,6 +14,7 @@ import uvicorn
 
 from agent_bridge.store import MESSAGE_COOLDOWN_SECONDS, BridgeStore
 from agent_bridge.viewer import create_app
+from agent_bridge.viewer_store import ViewerRepository
 
 
 pytestmark = pytest.mark.browser
@@ -127,7 +128,7 @@ def _running_viewer(database: Path):
         listener.close()
         raise RuntimeError("browser test viewer did not start")
     try:
-        yield f"http://127.0.0.1:{port}"
+        yield f"http://127.0.0.1:{port}", store
     finally:
         server.should_exit = True
         thread.join(timeout=10.0)
@@ -168,7 +169,8 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
     database = tmp_path / "bridge.db"
     _seed_browser_database(database)
 
-    with _running_viewer(database) as base_url:
+    with _running_viewer(database) as runtime:
+        base_url, store = runtime
         with playwright_api.sync_playwright() as playwright:
             browser_channel = os.environ.get(
                 "AGENT_BRIDGE_BROWSER_CHANNEL",
@@ -588,6 +590,116 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             playwright_api.expect(
                 composite_message.locator(".message-visibility-label")
             ).to_contain_text("发送时本聊天室的全部 Agent")
+            playwright_api.expect(
+                page.locator("#owner-message-feedback")
+            ).to_contain_text("已发送")
+            page.wait_for_function(
+                "() => !state.refreshing && !state.queuedRefresh "
+                "&& !state.roomRequestController",
+                timeout=10_000,
+            )
+            page.wait_for_timeout(150)
+            page.wait_for_function(
+                "() => !state.refreshing && !state.queuedRefresh "
+                "&& !state.roomRequestController",
+                timeout=10_000,
+            )
+
+            expected_revisions = ViewerRepository(database).event_snapshot()[
+                "state_revisions"
+            ]
+            page.wait_for_function(
+                """expected => Object.entries(expected).every(
+                  ([key, value]) => JSON.stringify(state.eventRevisions?.[key])
+                    === JSON.stringify(value)
+                )""",
+                arg=expected_revisions,
+                timeout=10_000,
+            )
+            page.wait_for_function(
+                "() => !state.refreshing && !state.queuedRefresh "
+                "&& !state.roomRequestController",
+                timeout=10_000,
+            )
+            page.wait_for_timeout(50)
+            receipt_refresh_urls: list[str] = []
+            page.on(
+                "request",
+                lambda request: receipt_refresh_urls.append(request.url)
+                if "/api/" in request.url
+                else None,
+            )
+            with store._connection() as connection:
+                delivery = connection.execute(
+                    "SELECT delivery.message_id, delivery.participant_id "
+                    "FROM message_deliveries AS delivery "
+                    "JOIN messages AS message "
+                    "ON message.message_id = delivery.message_id "
+                    "WHERE message.conversation_id = 'browser-room-two' "
+                    "AND message.sender_participant_id = 'participant_web_owner' "
+                    "ORDER BY message.sequence DESC LIMIT 1"
+                ).fetchone()
+            assert delivery is not None
+            composite_message = page.locator(
+                f'#timeline article[data-message-id="{delivery["message_id"]}"]'
+            )
+            playwright_api.expect(composite_message).to_have_count(1)
+            composite_message.evaluate(
+                "element => { element.dataset.receiptFastPathProbe = 'stable'; }"
+            )
+            assert composite_message.get_attribute(
+                "data-receipt-fast-path-probe"
+            ) == "stable", receipt_refresh_urls
+            receipt_refresh_urls.clear()
+            with page.expect_response(
+                lambda response: "/receipts?" in response.url
+                and response.status == 200,
+                timeout=10_000,
+            ):
+                with store._transaction() as connection:
+                    stage_at = time.time()
+                    connection.execute(
+                        "UPDATE message_deliveries "
+                        "SET delivery_stage = 'native_applied', "
+                        "native_injected_at = ?, native_applied_at = ? "
+                        "WHERE message_id = ? AND participant_id = ?",
+                        (
+                            stage_at - 0.1,
+                            stage_at,
+                            str(delivery["message_id"]),
+                            str(delivery["participant_id"]),
+                        ),
+                    )
+            page.wait_for_timeout(250)
+            receipt_only_api_requests = [
+                url
+                for url in receipt_refresh_urls
+                if "/receipts?" in url
+                or "/api/rooms?limit=200" in url
+                or "/api/pending-responses" in url
+            ]
+            assert any("/receipts?" in url for url in receipt_only_api_requests)
+            assert not any(
+                "/api/rooms?limit=200" in url for url in receipt_only_api_requests
+            )
+            assert not any(
+                "/api/pending-responses" in url
+                for url in receipt_only_api_requests
+            )
+            assert len(receipt_only_api_requests) == 1
+            playwright_api.expect(
+                composite_message.locator(".receipt-label")
+            ).to_contain_text("本体已读")
+            assert composite_message.get_attribute(
+                "data-receipt-fast-path-probe"
+            ) == "stable", receipt_refresh_urls
+            composite_message.locator(".receipt-label").click()
+            playwright_api.expect(
+                composite_message.locator(".message-delivery-chip.status-read")
+            ).to_have_text("本体已读取")
+            measurements["receipt_only_api_requests"] = len(
+                receipt_only_api_requests
+            )
 
             page.set_viewport_size({"width": 390, "height": 844})
             page.wait_for_timeout(100)

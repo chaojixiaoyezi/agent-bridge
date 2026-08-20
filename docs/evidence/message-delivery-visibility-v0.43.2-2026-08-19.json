@@ -1,0 +1,107 @@
+{
+  "artifact": "message-delivery-visibility-and-receipt-fast-path",
+  "version": "0.43.2",
+  "date": "2026-08-19",
+  "baseline_commit": "401579d0dcb3c71b05c734f292407e9e5fac854c",
+  "database_schema_before": 42,
+  "database_schema_after": 42,
+  "root_causes": [
+    {
+      "area": "delivery_visibility",
+      "finding": "The Web message projection exposed only aggregate ack_count and receipt_count even though message_deliveries already stored native injection, application, reply, membership and endpoint facts.",
+      "impact": "A user could not distinguish an Agent that had not received a message from one that had read it but had not replied."
+    },
+    {
+      "area": "event_revision",
+      "finding": "The receipt SSE revision observed only receipts.acked_at and therefore did not change when a native TUI reported injected or applied.",
+      "impact": "The database could contain the correct native milestone while an open dashboard remained stale until an unrelated event."
+    },
+    {
+      "area": "browser_refresh",
+      "finding": "A receipt-only SSE event used room refresh mode, fetching the room list, pending center and current-room receipts before re-rendering shared UI.",
+      "impact": "Frequent delivery milestones caused unrelated network requests and avoidable sidebar work."
+    }
+  ],
+  "changes": {
+    "authority": "viewer_delivery_projection.py is the single structured projection used by both message and receipt APIs.",
+    "statuses": [
+      "queued",
+      "offline",
+      "notified",
+      "injected",
+      "read",
+      "acknowledged",
+      "replied",
+      "unavailable",
+      "cancelled"
+    ],
+    "orthogonal_facts": [
+      "active_endpoint",
+      "dnd_active",
+      "actionable"
+    ],
+    "event_revision": "One aggregate delivery scan plus receipt and DND aggregates observes native milestones, cancellation, acknowledgement and DND expiry without changing schema or write semantics.",
+    "browser": "Detailed mode lazily expands per-Agent status rows; simple and standard modes remain unchanged. Receipt-only events update labels in place through the current-room receipts endpoint.",
+    "query_optimization": "Active sessions, connectors and exact replies are materialized once per batch instead of executing correlated checks for every delivery row."
+  },
+  "production_read_only_sample": {
+    "conversation_id": "工具修改的聊天室",
+    "messages": 60,
+    "agent_deliveries": 342,
+    "projected_json_bytes": 231976,
+    "status_counts": {
+      "acknowledged": 105,
+      "cancelled": 3,
+      "offline": 174,
+      "queued": 1,
+      "read": 32,
+      "replied": 27
+    }
+  },
+  "performance": {
+    "receipt_only_browser_requests_before": 3,
+    "receipt_only_browser_requests_after": 1,
+    "request_reduction_percent": 66.67,
+    "timeline_article_replacements_after": 0,
+    "batch_query_median_before_cte_ms": {
+      "messages_60": 13.221,
+      "receipts_60": 13.933
+    },
+    "batch_query_median_after_cte_ms": {
+      "messages_60": 10.818,
+      "receipts_60": 9.689
+    },
+    "batch_query_p95_after_cte_ms": {
+      "messages_60": 12.188,
+      "receipts_60": 12.257
+    }
+  },
+  "verification": {
+    "pytest": "300 collected; 298 passed and 2 explicitly skipped; 0 failed",
+    "soak_and_reliability": "9 passed",
+    "real_chrome_e2e": "1 passed",
+    "browser_metrics": {
+      "dom_ready_ms": 124.57,
+      "authenticated_ready_ms": 310.4,
+      "room_switch_ms": 48.76,
+      "receipt_only_api_requests": 1,
+      "resource_transfer_bytes": 819674
+    },
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "pi_biome": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "compatibility": {
+    "natural_language_classification_added": false,
+    "agent_delivery_write_contract_changed": false,
+    "wake_or_dnd_policy_changed": false,
+    "existing_ack_and_receipt_fields_preserved": true,
+    "schema_migration_required": false,
+    "agent_process_restart_required": false,
+    "viewer_only_rolling_release": true
+  }
+}

@@ -1398,7 +1398,7 @@ async function refreshActiveRoom(
   cacheActiveRoomSnapshot();
 }
 
-const REFRESH_MODE_PRIORITY = { room: 1, task: 2, presence: 3, full: 4 };
+const REFRESH_MODE_PRIORITY = { receipt: 0, room: 1, task: 2, presence: 3, full: 4 };
 
 function mergeRefreshOptions(current, incoming) {
   if (!current) return { ...incoming };
@@ -1439,6 +1439,19 @@ async function refresh(options = {}) {
   state.refreshing = true;
   if (mode === "full") elements.refreshButton.classList.add("spinning");
   try {
+    if (mode === "receipt") {
+      await refreshActiveRoom(false, false, {
+        refreshParticipants: false,
+        refreshReceipts: true,
+      });
+      const currentLabel = elements.connectionLabel.textContent || "";
+      setConnection(
+        true,
+        currentLabel.includes("使用中") ? currentLabel : "事件连接正常",
+      );
+      elements.lastSync.textContent = DATE_TIME_FORMATTERS.syncTime.format(new Date());
+      return;
+    }
     const refreshPresence = mode === "full" || mode === "presence";
     const sessionRequest = isAdmin() && refreshPresence
       ? fetchJson("/api/sessions")
