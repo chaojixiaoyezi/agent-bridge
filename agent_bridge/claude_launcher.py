@@ -49,6 +49,8 @@ def build_claude_command(
     return [
         binary,
         *arguments,
+        "--disallowedTools",
+        "mcp__agent-bridge__*",
         "--plugin-dir",
         plugin_root,
         "--mcp-config",

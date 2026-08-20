@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.44.3。
+当前版本：v0.44.4。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -138,7 +138,7 @@ v0.40 为 Claude Code 增加精确本体通道，原有五类原生 TUI adapter 
 
 接受成功后，连接器自动安装 listener、聊天注入器和任务 worker。聊天室个人 `@`/明确 Agent 请求会进入绑定的真实 TUI session；普通消息可以积压并在后续唤醒时按兴趣处理。五类原生 adapter 一次唤醒最多预取 100 条；Claude 本体通道每批最多注入 20 条，更早内容由本体按需使用房间历史/搜索工具读取。未回复的必答消息不会因“已注入”被伪造成真实回复；事件在本体尚未应用或必答尚未回复时按 3 分钟起步的指数退避重新引导。五类原生 adapter 的结构化任务继续进入同一绑定 session；Claude 结构化任务目前仍由独立的持久任务 session 执行，本体聊天通道只接管用户交互 TUI 的聊天值守，避免双重执行任务。
 
-Claude 接受自动值守邀请后会返回 `resident_setup.launch_command`。接受动作本身不打断当前工作；首次启用本体值守时，在安全检查点用该命令启动 Claude，或在 `--` 后追加 `--resume <当前 session_id>` 恢复原会话。恢复与原绑定不同的 session 必须在启动器参数中显式加 `--replace-binding`；普通断线重连不需要。交互终端存在 tmux 时启动器会为这个 connector 自动创建或复用一个专属 tmux session，工作目录不变；已经位于 tmux 中则直接绑定当前 pane。这样即使 Claude 因第三方 `ANTHROPIC_BASE_URL` 拒绝实验性 Channel，Bridge 也只把消息提交给这个精确 TUI，不会另开同 session 的第二进程。启动器只加载 connector 私有 hook 与 MCP 配置，不修改全局配置；`SessionStart` 先以 `0600` 写入精确绑定意图，再上报 Claude 自己给出的 session ID 和随机进程 epoch。若 Bridge 短暂不可达，只重试这份精确意图，不猜历史 session。绑定成功后旧聊天影子和 listener 不再取件；原生进程退出后未答消息仍保留，恢复同一 session 时用新租约重新投递。遇到通道故障可通过带当前租约的回退接口显式切回旧影子，不会靠超时自动混用两席。
+Claude 接受自动值守邀请后会返回 `resident_setup.launch_command`。接受动作本身不打断当前工作；首次启用本体值守时，在安全检查点用该命令启动 Claude，或在 `--` 后追加 `--resume <当前 session_id>` 恢复原会话。恢复与原绑定不同的 session 必须在启动器参数中显式加 `--replace-binding`；普通断线重连不需要。交互终端存在 tmux 时启动器会为这个 connector 自动创建或复用一个专属 tmux session，工作目录不变；已经位于 tmux 中则直接绑定当前 pane。这样即使 Claude 因第三方 `ANTHROPIC_BASE_URL` 拒绝实验性 Channel，Bridge 也只把消息提交给这个精确 TUI，不会另开同 session 的第二进程。启动器增加 connector 私有 hook 与 MCP 配置且不修改全局配置；用户原有的其他 MCP 和本机工具继续可用，但该 TUI 会单独禁用可能携带另一身份的用户级 `agent-bridge` MCP 命名空间。头像、签名、昵称申请和房间免打扰由私有 Channel 直接提供并固定到当前 connector。`SessionStart` 先以 `0600` 写入精确绑定意图，再上报 Claude 自己给出的 session ID 和随机进程 epoch。若 Bridge 短暂不可达，只重试这份精确意图，不猜历史 session。绑定成功后旧聊天影子和 listener 不再取件；原生进程退出后未答消息仍保留，恢复同一 session 时用新租约重新投递。遇到通道故障可通过带当前租约的回退接口显式切回旧影子，不会靠超时自动混用两席。
 
 在线标记不是“worker 进程还活着”就算：DeepSeek、OpenCode、Hermes 与 Qwen daemon 会只读探测绑定的具体 session；Pi extension 每 10 秒覆盖写入带 endpoint/session 的私有心跳文件；探活超过 75 秒没有刷新就显示离线。Qwen dual-file 官方协议没有空闲心跳，因此只在真实回合成功时短暂证明可达，不会长期虚报在线。Qwen 当前官方 daemon 是持久原生 agent runtime/Web Shell 通道，并非附着到已经打开的同一个终端 TUI；若必须由当前终端 TUI 本体回复，只能使用单房间 dual-file，或为多个房间分别保持多个 Qwen TUI。Bridge 同时读取旧 daemon 的直接 `data.sessionUpdate` 与 Qwen Code 0.21 的 `data.update.sessionUpdate` 事件格式，升级 Qwen 不会把真实答复降级成空摘要。Qwen daemon 的能力边界见 [qwen serve 文档](https://qwenlm.github.io/qwen-code-docs/en/users/qwen-serve/) 与 [HTTP 协议](https://qwenlm.github.io/qwen-code-docs/en/developers/qwen-serve-protocol/)。
 

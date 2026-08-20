@@ -189,6 +189,8 @@ def test_claude_launcher_preserves_resume_and_adds_one_exact_channel(
     ]
     assert "--plugin-dir" in command
     assert "--mcp-config" in command
+    assert "--strict-mcp-config" not in command
+    assert command[command.index("--disallowedTools") + 1] == ("mcp__agent-bridge__*")
 
 
 def test_claude_launcher_preserves_the_tui_working_directory(
@@ -276,9 +278,7 @@ def test_claude_session_hook_binds_exact_id_without_persisting_permission() -> N
                 native_session_id=intent["native_session_id"],
                 process_epoch=FakeState.process_epoch,
                 binding_source=intent["binding_source"],
-                replace_existing_session=intent[
-                    "replace_existing_session"
-                ],
+                replace_existing_session=intent["replace_existing_session"],
                 metadata=intent["metadata"],
             )
             FakeState.write_lease(
@@ -328,13 +328,9 @@ def test_claude_session_hook_binds_exact_id_without_persisting_permission() -> N
                 None,
             )
         else:
-            os.environ[
-                "AGENT_BRIDGE_CLAUDE_ALLOW_SESSION_REPLACEMENT"
-            ] = previous
+            os.environ["AGENT_BRIDGE_CLAUDE_ALLOW_SESSION_REPLACEMENT"] = previous
     assert result["lease"]["lease_id"] == "lease_hook_one"
-    assert calls[0]["native_session_id"] == (
-        "5ac0d6f3-a939-47e0-8386-4ac3be33a38c"
-    )
+    assert calls[0]["native_session_id"] == ("5ac0d6f3-a939-47e0-8386-4ac3be33a38c")
     assert calls[0]["replace_existing_session"] is True
     assert calls[1]["replace_existing_session"] is True
     assert calls[2]["replace_existing_session"] is False
@@ -524,6 +520,10 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
                 "saved_path": str(payload["destination_path"]),
             }
 
+        def post(self, path, payload):
+            calls.append(("post", {"path": path, "payload": payload}))
+            return {"path": path, "payload": payload}
+
         def heartbeat_native_session(self, **payload):
             calls.append(("heartbeat", payload))
             return {"lease_id": payload["lease_id"]}
@@ -621,9 +621,7 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
     assert notification_messages[0]["attachments"][0]["attachment_id"] == (
         "attachment_channel_tool"
     )
-    assert notification_messages[0]["links"][0]["url"] == (
-        "https://example.com/spec"
-    )
+    assert notification_messages[0]["links"][0]["url"] == ("https://example.com/spec")
     assert "recipients" not in notification_messages[0]["visibility"]
 
     delivered: list[str] = []
@@ -691,6 +689,54 @@ def test_claude_channel_tools_keep_route_token_out_of_model_input(
                 },
             )
         )
+
+    avatar_result = asyncio.run(
+        runtime.call_tool(
+            "agent_bridge_list_avatars",
+            {"event_id": "event-channel-tool", "vendor": "deepseek"},
+        )
+    )
+    assert avatar_result == {
+        "path": "/agent/avatars",
+        "payload": {"vendor": "deepseek"},
+    }
+    profile_result = asyncio.run(
+        runtime.call_tool(
+            "agent_bridge_update_profile",
+            {
+                "event_id": "event-channel-tool",
+                "signature": "新签名",
+                "avatar_key": "deepseek-01",
+            },
+        )
+    )
+    assert profile_result == {
+        "path": "/agent/profile",
+        "payload": {"signature": "新签名", "avatar_key": "deepseek-01"},
+    }
+    nickname_result = asyncio.run(
+        runtime.call_tool(
+            "agent_bridge_request_nickname",
+            {"event_id": "event-channel-tool", "display_name": "新名字"},
+        )
+    )
+    assert nickname_result == {
+        "path": "/agent/nickname/request",
+        "payload": {"display_name": "新名字"},
+    }
+    dnd_result = asyncio.run(
+        runtime.call_tool(
+            "agent_bridge_set_room_dnd",
+            {"event_id": "event-channel-tool", "enabled": True},
+        )
+    )
+    assert dnd_result == {
+        "path": "/agent/room-dnd",
+        "payload": {
+            "conversation_id": "工具修改的聊天室",
+            "enabled": True,
+        },
+    }
 
 
 def test_claude_channel_keeps_large_message_batch_as_valid_json(
@@ -760,10 +806,7 @@ def test_claude_channel_bounds_many_first_class_links_without_invalid_json(
             "links": [
                 {
                     "link_id": f"link_{index}_{link_index}",
-                    "url": (
-                        f"https://example.com/{index}/{link_index}/"
-                        + "x" * 1_900
-                    ),
+                    "url": (f"https://example.com/{index}/{link_index}/" + "x" * 1_900),
                     "host": "example.com",
                     "display": f"example.com/{index}/{link_index}",
                 }
@@ -781,9 +824,7 @@ def test_claude_channel_bounds_many_first_class_links_without_invalid_json(
             "messages": messages,
         }
     )
-    decoded = json.loads(
-        notification.params.content.split("MESSAGES_JSON:\n", 1)[1]
-    )
+    decoded = json.loads(notification.params.content.split("MESSAGES_JSON:\n", 1)[1])
     assert len(notification.params.content) <= 96_000
     assert sum(int(item.get("links_omitted_count") or 0) for item in decoded) > 0
     assert any(item["links"] for item in decoded)
@@ -1012,9 +1053,7 @@ def test_claude_channel_stdio_declares_channel_capability_and_tools(
 
     async def scenario() -> None:
         environment = dict(os.environ)
-        environment["AGENT_BRIDGE_CLAUDE_STATE_DIRECTORY"] = (
-            configured.state_directory
-        )
+        environment["AGENT_BRIDGE_CLAUDE_STATE_DIRECTORY"] = configured.state_directory
         environment["AGENT_BRIDGE_CLAUDE_PROCESS_EPOCH"] = "epoch-stdio-one"
         parameters = StdioServerParameters(
             command=str(BRIDGE_ROOT / "bin" / "agent-bridge-claude-channel"),
@@ -1025,9 +1064,7 @@ def test_claude_channel_stdio_declares_channel_capability_and_tools(
         async with stdio_client(parameters) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 initialized = await session.initialize()
-                assert initialized.capabilities.experimental == {
-                    "claude/channel": {}
-                }
+                assert initialized.capabilities.experimental == {"claude/channel": {}}
                 listed = await session.list_tools()
                 assert {tool.name for tool in listed.tools} >= {
                     "agent_bridge_apply_event",
@@ -1037,6 +1074,10 @@ def test_claude_channel_stdio_declares_channel_capability_and_tools(
                     "agent_bridge_history",
                     "agent_bridge_search_history",
                     "agent_bridge_download_attachment",
+                    "agent_bridge_list_avatars",
+                    "agent_bridge_update_profile",
+                    "agent_bridge_request_nickname",
+                    "agent_bridge_set_room_dnd",
                 }
 
     asyncio.run(scenario())

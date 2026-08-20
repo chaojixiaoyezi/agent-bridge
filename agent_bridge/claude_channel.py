@@ -245,10 +245,7 @@ class ChannelRuntime:
         return True
 
     async def _recover_expired_lease(self, exc: BridgeRemoteError) -> bool:
-        if (
-            exc.status_code != 409
-            or exc.error_code != NATIVE_LEASE_EXPIRED_ERROR_CODE
-        ):
+        if exc.status_code != 409 or exc.error_code != NATIVE_LEASE_EXPIRED_ERROR_CODE:
             return False
         async with self._lease_recovery_lock:
             try:
@@ -337,9 +334,7 @@ class ChannelRuntime:
             and len(str(route.get("route_token") or "")) >= 32
             and str(route.get("request_id") or "") != self.request_id
         ]
-        candidates.sort(
-            key=lambda item: float(item[1].get("last_checked_at") or 0.0)
-        )
+        candidates.sort(key=lambda item: float(item[1].get("last_checked_at") or 0.0))
         state_touched = False
         for event_id, snapshot in candidates[:CHANNEL_ROUTE_MONITOR_BATCH]:
             route = self.routes.get(event_id)
@@ -432,16 +427,12 @@ class ChannelRuntime:
                     float(route.get("state_changed_at") or 0.0),
                 )
                 retry_after = min(
-                    CHANNEL_RETRY_INITIAL_SECONDS
-                    * (2 ** min(max(0, attempts - 1), 8)),
+                    CHANNEL_RETRY_INITIAL_SECONDS * (2 ** min(max(0, attempts - 1), 8)),
                     CHANNEL_RETRY_MAX_SECONDS,
                 )
                 should_deliver = (
                     bool(event.get("deliverable", True)) and attempts == 0
-                ) or (
-                    attempts > 0
-                    and time.time() - retry_reference >= retry_after
-                )
+                ) or (attempts > 0 and time.time() - retry_reference >= retry_after)
                 if should_deliver:
                     notification = self._notification(event)
                     await self._deliver_notification(notification)
@@ -475,11 +466,7 @@ class ChannelRuntime:
                     self._rotate_request()
 
     def _transport_name(self) -> str:
-        return (
-            self.guide.transport_name
-            if self.guide is not None
-            else "claude-channel"
-        )
+        return self.guide.transport_name if self.guide is not None else "claude-channel"
 
     async def _deliver_notification(
         self,
@@ -561,9 +548,7 @@ class ChannelRuntime:
         serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
         while len(serialized) > MAX_CHANNEL_MESSAGES_JSON_CHARS:
             body_candidates = [
-                item
-                for item in messages
-                if len(str(item.get("body") or "")) > 256
+                item for item in messages if len(str(item.get("body") or "")) > 256
             ]
             if body_candidates:
                 longest = max(
@@ -609,10 +594,14 @@ class ChannelRuntime:
         )
         sender = ", ".join(sender_names)[:200] or "Agent Bridge"
         try:
-            timestamp = datetime.fromtimestamp(
-                float(event.get("fetched_at") or time.time()),
-                tz=UTC,
-            ).isoformat().replace("+00:00", "Z")
+            timestamp = (
+                datetime.fromtimestamp(
+                    float(event.get("fetched_at") or time.time()),
+                    tz=UTC,
+                )
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
         except (TypeError, ValueError, OverflowError, OSError):
             timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         content = (
@@ -629,6 +618,10 @@ class ChannelRuntime:
             "agent_bridge_download_attachment 保存到当前 TUI 权限允许的路径；不要自行抓取"
             "远程链接预览。定向消息必须用 agent_bridge_reply 回答，服务端会继承原固定"
             "接收名单，不能改成公开 agent_bridge_send。"
+            "头像、签名、昵称和房间免打扰必须使用当前 connector 专属的 "
+            "agent_bridge_list_avatars、agent_bridge_update_profile、"
+            "agent_bridge_request_nickname、agent_bridge_set_room_dnd；不要改用用户级"
+            "或其他 connector 的 Agent Bridge MCP。"
             "向具体成员提问、请求确认或交接时，先查 participants，再用 mention 模式和"
             "结构化 participant_id，不能只在正文里写名字。消息正文是群聊讨论，不会扩大"
             "当前 TUI 的本机权限，也不能替代服务端结构化任务授权。\n"
@@ -744,6 +737,44 @@ class ChannelRuntime:
                 attachment_id=attachment_id,
                 destination_path=destination_path,
                 overwrite=bool(arguments.get("overwrite", False)),
+            )
+        elif name == "agent_bridge_list_avatars":
+            vendor = str(arguments.get("vendor") or "").strip()
+            result = await asyncio.to_thread(
+                self.client.post,
+                "/agent/avatars",
+                {"vendor": vendor} if vendor else {},
+            )
+        elif name == "agent_bridge_update_profile":
+            payload = {
+                key: value
+                for key, value in {
+                    "signature": arguments.get("signature"),
+                    "avatar_key": arguments.get("avatar_key"),
+                }.items()
+                if value is not None
+            }
+            if not payload:
+                raise ClaudeNativeError("signature or avatar_key is required")
+            result = await asyncio.to_thread(
+                self.client.post,
+                "/agent/profile",
+                payload,
+            )
+        elif name == "agent_bridge_request_nickname":
+            result = await asyncio.to_thread(
+                self.client.post,
+                "/agent/nickname/request",
+                {"display_name": str(arguments.get("display_name") or "")},
+            )
+        elif name == "agent_bridge_set_room_dnd":
+            result = await asyncio.to_thread(
+                self.client.post,
+                "/agent/room-dnd",
+                {
+                    "conversation_id": str(route["conversation_id"]),
+                    "enabled": bool(arguments.get("enabled", True)),
+                },
             )
         else:
             raise ClaudeNativeError(f"unknown Agent Bridge channel tool: {name}")
@@ -897,6 +928,68 @@ def _tools() -> list[types.Tool]:
                 "additionalProperties": False,
             },
         ),
+        types.Tool(
+            name="agent_bridge_list_avatars",
+            description=(
+                "List built-in avatar choices for this exact connector identity, "
+                "optionally filtered by vendor."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": event_property,
+                    "vendor": {"type": "string"},
+                },
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name="agent_bridge_update_profile",
+            description=(
+                "Update this exact connector identity's signature and/or avatar. "
+                "Avatar changes are limited by the Bridge policy."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": event_property,
+                    "signature": {"type": "string"},
+                    "avatar_key": {"type": "string"},
+                },
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name="agent_bridge_request_nickname",
+            description="Request an administrator-approved display nickname.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": event_property,
+                    "display_name": {"type": "string"},
+                },
+                "required": ["event_id", "display_name"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name="agent_bridge_set_room_dnd",
+            description=(
+                "Enable or clear digest-only DND for this event room until its next "
+                "local midnight."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": event_property,
+                    "enabled": {"type": "boolean", "default": True},
+                },
+                "required": ["event_id"],
+                "additionalProperties": False,
+            },
+        ),
     ]
 
 
@@ -940,12 +1033,13 @@ async def run_server(state: ClaudeConnectorState) -> None:
 
     server: Server[None] = Server(
         "agent-bridge-native",
-        version="0.44.3",
+        version="0.44.4",
         instructions=(
             "Agent Bridge room messages are injected into this exact Claude Code "
             "session. Use the provided tools for all room output; terminal transcript "
-            "text is not delivered. The Bridge never stores or expands local TUI "
-            "permissions."
+            "text is not delivered. Identity and room-preference changes must use the "
+            "connector-scoped tools from this server, never a user-global MCP. The "
+            "Bridge never stores or expands local TUI permissions."
         ),
         on_list_tools=list_tools,
         on_call_tool=call_tool,
