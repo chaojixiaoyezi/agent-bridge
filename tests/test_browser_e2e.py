@@ -525,10 +525,15 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             scroll_before = timeline_locator.evaluate("element => element.scrollTop")
             with page.expect_response("**/api/rooms?limit=200"):
                 page.locator("#refresh-button").click()
-            page.evaluate(
-                "() => new Promise(resolve => requestAnimationFrame("
-                "() => requestAnimationFrame(resolve)))"
+            page.wait_for_function(
+                "() => !state.refreshing && !state.queuedRefresh "
+                "&& !state.roomRequestController"
             )
+            assert page.evaluate("state.messages.length") == 1_260
+            assert timeline_locator.get_attribute("data-virtual-total") == "1260"
+            assert page.locator(
+                "#timeline article[data-message-id]"
+            ).count() <= 96
             scroll_after = timeline_locator.evaluate("element => element.scrollTop")
             assert abs(scroll_after - scroll_before) < 4
 

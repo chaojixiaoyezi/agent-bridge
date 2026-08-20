@@ -1301,11 +1301,12 @@ async function refreshActiveRoom(
   const requestVersion = ++state.requestVersion;
   const encodedRoom = encodeURIComponent(selectedRoom);
   const activeRoom = state.rooms.find((room) => room.conversation_id === selectedRoom);
-  const initialLoad = fullRoom || state.loadedRoom !== selectedRoom;
-  const browsingHistory = !initialLoad && state.hasLaterMessages;
+  const roomChanged = state.loadedRoom !== selectedRoom;
+  const browsingHistory = !roomChanged && state.hasLaterMessages;
+  const replaceLoadedWindow = roomChanged || (fullRoom && browsingHistory);
   const lastLoadedSequence = state.messages[state.messages.length - 1]?.sequence || 0;
   const hasServerUpdates = Number(activeRoom?.last_sequence || 0) > lastLoadedSequence;
-  const messageRequest = initialLoad
+  const messageRequest = roomChanged || fullRoom
     ? fetchJson(
         `/api/rooms/${encodedRoom}/messages?limit=${INITIAL_ROOM_MESSAGE_LIMIT}`,
         { signal: controller.signal },
@@ -1329,7 +1330,7 @@ async function refreshActiveRoom(
         { signal: controller.signal },
       )
     : Promise.resolve(null);
-  const highlightRequest = initialLoad || refreshHighlights
+  const highlightRequest = roomChanged || fullRoom || refreshHighlights
     ? fetchJson(
         `/api/rooms/${encodedRoom}/highlights?limit=200`,
         { signal: controller.signal },
@@ -1368,7 +1369,7 @@ async function refreshActiveRoom(
   if (messagePayload) {
     let addedCount = 0;
     let appendedMessages = [];
-    if (initialLoad) {
+    if (replaceLoadedWindow) {
       state.messages = messagePayload.messages;
       state.hasEarlierMessages = Boolean(
         messagePayload.has_earlier ?? messagePayload.has_more,
@@ -1385,6 +1386,14 @@ async function refreshActiveRoom(
       );
       addedCount = appendedMessages.length;
       state.messages = mergeMessages(state.messages, messagePayload.messages);
+      if (fullRoom) {
+        state.hasEarlierMessages = Boolean(
+          state.hasEarlierMessages
+          || messagePayload.has_earlier
+          || messagePayload.has_more,
+        );
+        state.hasLaterMessages = false;
+      }
     }
     if (receiptPayload) {
       const receiptById = new Map(
@@ -1395,7 +1404,8 @@ async function refreshActiveRoom(
         return receipt ? { ...message, ...receipt } : message;
       });
     }
-    const appendOnly = !initialLoad
+    const appendOnly = !replaceLoadedWindow
+      && !fullRoom
       && !refreshTaskState
       && !highlightPayload
       && appendedMessages.length > 0
@@ -1406,7 +1416,12 @@ async function refreshActiveRoom(
       renderMessages(state.messages, { forceBottom: forceScroll, addedCount });
     }
     if (receiptPayload) updateReceiptLabels(state.messages);
-    if (!initialLoad && !refreshTaskState && messagePayload.has_more) {
+    if (
+      !roomChanged
+      && !fullRoom
+      && !refreshTaskState
+      && messagePayload.has_more
+    ) {
       window.setTimeout(() => refresh({ mode: "room" }), 0);
     }
   } else if (receiptPayload) {

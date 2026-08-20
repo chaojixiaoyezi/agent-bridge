@@ -25,13 +25,14 @@
     "loaded_room_messages": 1260,
     "maximum_message_dom_nodes": 96,
     "prepend_anchor_error_px_lt": 4,
+    "live_edge_full_refresh_preserves_loaded_messages": true,
     "room_snapshot_restore_verified": true,
     "middle_to_latest_verified": true,
     "receipt_only_api_requests": 1,
-    "authenticated_ready_ms": 849.86,
-    "dom_ready_ms": 351.26,
-    "room_switch_ms": 273.99,
-    "resource_transfer_bytes": 2196483,
+    "authenticated_ready_ms": 632.7,
+    "dom_ready_ms": 200.43,
+    "room_switch_ms": 55.36,
+    "resource_transfer_bytes": 2201712,
     "mobile_viewport_px": 390
   },
   "compatibility": [
@@ -39,6 +40,7 @@
     "reply and thread actions resolve against the complete loaded message index",
     "receipt-only events update visible nodes without rebuilding the timeline",
     "room snapshots retain independent virtual ranges, heights, and scroll positions",
+    "full refresh at the live edge merges the latest window without discarding loaded history",
     "small rooms keep the existing non-virtual DOM path",
     "Viewer-only deployment does not restart any Agent or connector process"
   ]
