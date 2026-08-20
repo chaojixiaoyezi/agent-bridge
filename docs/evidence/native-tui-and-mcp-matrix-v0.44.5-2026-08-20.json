@@ -1,0 +1,150 @@
+{
+  "version": "0.44.5",
+  "schema": 43,
+  "verified_at": "2026-08-20",
+  "scope": "native TUI reliability, reconnect isolation, and all MCP tool interfaces",
+  "production_issue": {
+    "room": "工具修改的聊天室",
+    "message_sequence": 2637,
+    "cause": "Claude selected the user-level generic MCP profile tool instead of its connector-private identity channel",
+    "fixed_by": "v0.44.4 connector-private profile tools and generic Bridge tool deny rule",
+    "verified_avatar_key": "deepseek-01-joyful",
+    "database_schema_changed": false
+  },
+  "local_verification": {
+    "pytest_collected": 314,
+    "pytest_passed": 312,
+    "pytest_skipped": 2,
+    "ruff": "passed",
+    "diff_check": "passed",
+    "pi_biome": "passed",
+    "pi_typescript_strict": "passed",
+    "pi_node_tests": {
+      "passed": 1,
+      "failed": 0
+    }
+  },
+  "mcp_stdio_matrix": {
+    "tool_count": 22,
+    "all_tools_called": true,
+    "tools": [
+      "agent_register",
+      "agent_accept_invitation",
+      "agent_update_profile",
+      "agent_list_avatars",
+      "agent_request_nickname",
+      "agent_set_follow",
+      "agent_following",
+      "agent_set_room_dnd",
+      "agent_heartbeat",
+      "agent_send",
+      "agent_create_room",
+      "agent_wait",
+      "agent_notifications",
+      "agent_message_action",
+      "agent_reply",
+      "agent_history",
+      "agent_search_history",
+      "agent_download_attachment",
+      "agent_participants",
+      "agent_task_next",
+      "agent_task_update",
+      "agent_task_delegate"
+    ],
+    "directed_attachment_recipient_download": "passed",
+    "directed_attachment_bystander_denied": "passed",
+    "task_claim_update_delegate_complete": "passed"
+  },
+  "remote_machine_verification": {
+    "host": "192.168.1.9",
+    "topology": "temporary isolated products, workspaces, Bridge databases, and loopback service ports",
+    "products": {
+      "opencode_1_18_19": {
+        "status": "passed",
+        "two_session_isolation": true,
+        "active_steer": true,
+        "same_session_restart": true,
+        "bridge_reply_seconds": [
+          1.43,
+          1.9
+        ]
+      },
+      "claude_code_2_1_237": {
+        "status": "passed",
+        "full_access_native_tui": true,
+        "active_work_reply_seconds": 7.12,
+        "same_session_resume_seconds": 9.43,
+        "viewer_outage_recovered_seconds": 130,
+        "two_session_isolation": true
+      },
+      "deepseek_harness": {
+        "status": "passed",
+        "two_session_isolation": true,
+        "same_session_restart": true,
+        "bridge_reply_seconds": [
+          3.09,
+          8.62
+        ],
+        "active_steer_seconds": 153.52,
+        "short_reply_429_reuses_same_model_output": true
+      },
+      "pi_0_84_2": {
+        "status": "passed",
+        "active_steer_seconds": 7.67,
+        "steer_acknowledged_only_after_native_acceptance": true,
+        "same_session_resume_seconds": [
+          8.08,
+          8.59
+        ],
+        "concurrent_two_session_reply_seconds": [
+          2.8,
+          2.99,
+          2.96,
+          3.62
+        ],
+        "cross_session_marker_leak": false
+      },
+      "qwen_code_0_21_14": {
+        "status": "passed",
+        "official_daemon_loopback": true,
+        "concurrent_two_session_reply_seconds": [
+          5.75,
+          5.61,
+          5.81,
+          6.05
+        ],
+        "cross_session_marker_leak": false
+      },
+      "hermes_0_19_1": {
+        "status": "transport_passed_provider_blocked",
+        "durable_stored_session_resume": true,
+        "new_runtime_id_per_websocket_supported": true,
+        "model_blocker": "The supplied MiniMax Anthropic-compatible streaming response intermittently reaches Hermes as an untyped dictionary where Hermes expects an Anthropic SDK model."
+      },
+      "codex_0_148_0": {
+        "status": "protocol_passed_provider_not_applicable",
+        "initialize": true,
+        "thread_start": true,
+        "process_restart_thread_resume": true,
+        "model_blocker": "Codex custom providers require the Responses API; the supplied test provider exposes an Anthropic-compatible API."
+      }
+    },
+    "existing_services": {
+      "port_8800_preserved": true,
+      "port_3080_preserved": true
+    },
+    "cleanup": {
+      "temporary_root_removed": true,
+      "temporary_model_credential_removed": true,
+      "temporary_tmux_package_removed": true,
+      "test_ports_19111_through_19114_closed": true
+    }
+  },
+  "rollout_contract": {
+    "viewer_only_restart": true,
+    "existing_agent_restart_required": false,
+    "existing_connector_restart_required": false,
+    "existing_messages_rewritten": false,
+    "existing_memberships_rewritten": false
+  }
+}

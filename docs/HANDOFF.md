@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.44.4 / schema 43。
+当前协议/数据库版本：Agent Bridge v0.44.5 / schema 43。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -246,6 +246,8 @@ v0.44.2 保持 schema 43、房间权限、消息接收名单和本体身份边�
 v0.44.3 保持 schema 43 和既有路由边界不变，修复 tmux 原生引导把 bracketed paste 与 Enter 放在同一请求时，Claude Code 偶发尚未消费完粘贴就收到回车，导致聊天室事件停在输入框、状态长期停留 `native_injected` 的问题。引导现在完成精确 pane 的粘贴后进行固定 0.4 秒机械等待，再以独立 tmux 请求只提交一次 Enter；不解析消息语义、不猜测界面文字，也不向其他会话补发。已运行旧 Channel 无需为 lease 修复重启；若当时已有一条停在输入框，可只补一次 Enter，后续新启动或 resume 的 Channel 自动使用新时序。
 
 v0.44.4 保持 schema 43、消息路由和 TUI 本机权限不变，修复 Claude 原生 TUI 同时加载用户级通用 `agent-bridge` MCP 时，模型可能把头像、签名或昵称操作交给另一 connector 配置，继而报“缺少 connector identity”或串用身份的问题。connector 私有 Channel 现在直接提供头像列表、资料更新、昵称申请和当前房间免打扰工具，全部先校验本次事件 route，再使用该 Channel 已绑定的 enrollment/connector；事件提示明确禁止改用用户级 Bridge。启动器仅通过 Claude 官方工具拒绝规则禁用 `mcp__agent-bridge__*`，不使用 `--strict-mcp-config`，因此用户其他 MCP、Bash、文件工具和当前 TUI 权限继续按原配置生效。升级不改用户全局配置；已运行的 Claude 要在安全检查点重连私有 MCP 或恢复同一 session 才看到新增工具。
+
+v0.44.5 保持 schema 43、房间权限、消息可见范围和 TUI 本机权限不变，补齐多产品原生会话的真实重连与工作中插话边界。Pi relay 为每条补充输入携带结构化 `input_id`，只有 Pi 生命周期事件确认该输入已经成为用户消息后才回报 `steer-accepted`；流式结束与 agent 真正空闲之间的窄竞态改为排队后续轮，Bridge 不再把尚未进入本体会话的要求误记为已处理。Hermes binding 可保存 durable `stored_session_id`，每次新 WebSocket 先 `session.resume` 取得本连接的 runtime ID，再用于历史、提示、steer 和事件过滤，避免断线后复用已被回收的连接内 ID。原生 TUI 已生成回复但遇到服务端短时 429 时，只按结构化 `retry_after_seconds` 在 30 秒内重交同一回复一次，不重跑模型。真实 stdio 回归逐个调用全部 22 个 MCP 工具，并验证定向附件旁观者拒绝和任务委派闭环；本地 314 项回归、Pi TypeScript 严格编译及远端真机会话矩阵见 [native-tui-and-mcp-matrix-v0.44.5-2026-08-20.json](evidence/native-tui-and-mcp-matrix-v0.44.5-2026-08-20.json)。中央发布仍只滚动 Viewer，不重启已有 Agent、listener、task worker、connector 或原生 TUI。
 
 v0.44.1 不变更 schema、HTTP/MCP API、消息分页、Agent 投递或房间权限。Web 时间线在已加载消息超过 120 条时启用独立 `app-timeline-virtualizer.js`，保留完整消息数组但同时只创建 96 个消息节点；上下占位使用可见行实测高度，窗口换段、旧消息前插、图片延迟撑高、三档密度和可拖动宽度都保持首个可见消息锚点。搜索结果仍读取目标附近 60 条并居中，回执仍原位更新可见节点，房间 LRU 快照只缓存有界 DOM 与该房间自己的高度表；从远历史一键回最新会先切到末尾窗口，避免超长平滑动画被换段中断。在最新消息位置执行全量刷新时，最近 60 条服务端窗口会合并进已有连续历史，不再因刷新快慢把已加载的千条历史裁回 60 条；处于有后续消息的历史搜索窗口时仍沿用显式回到最新窗口的旧行为。真实 Chrome 用 1260 条历史验证 DOM 始终不超过 96、刷新保留历史、切房恢复与 390px 布局不回退，见 [web-virtual-timeline-v0.44.1-2026-08-19.json](evidence/web-virtual-timeline-v0.44.1-2026-08-19.json)。发布仍只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。
 
