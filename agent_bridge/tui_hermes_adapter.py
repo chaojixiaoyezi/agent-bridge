@@ -15,6 +15,47 @@ from .tui_transport import MAX_WEBSOCKET_MESSAGE_BYTES
 class HermesTuiMixin:
     """Drive one explicitly bound Hermes WebSocket session."""
 
+    def _resolve_hermes_session_id(
+        self,
+        rpc: Callable[[str, dict[str, Any]], dict[str, Any]],
+    ) -> str:
+        """Attach a stable Hermes session to this WebSocket when available.
+
+        Hermes runtime session IDs are connection-local and are reclaimed after
+        a WebSocket disconnect.  ``stored_session_id`` is durable; resuming it
+        returns the current runtime ID and also transfers event delivery to the
+        new transport.  The fallback keeps freshly-created, not-yet-persisted
+        sessions usable until their first prompt is committed.
+        """
+
+        runtime_session_id = self.binding.native_session_id
+        stored_session_id = str(
+            self.binding.transport.get("stored_session_id") or ""
+        ).strip()
+        if not stored_session_id:
+            return runtime_session_id
+        try:
+            resumed = rpc(
+                "session.resume",
+                {
+                    "session_id": stored_session_id,
+                    "source": "tool",
+                },
+            )
+        except NativeTuiError as exc:
+            if "session not found" in str(exc).lower():
+                return runtime_session_id
+            raise
+        resolved = str(resumed.get("session_id") or "").strip()
+        if (
+            not resolved
+            or len(resolved) > 256
+            or "\x00" in resolved
+            or any(character.isspace() for character in resolved)
+        ):
+            raise NativeTuiError("Hermes session.resume returned an invalid session")
+        return resolved
+
     def _probe_hermes(self, *, timeout: float) -> None:
         try:
             from websockets.sync.client import connect
@@ -39,39 +80,51 @@ class HermesTuiMixin:
                 origin=origin,
                 proxy=None,
             ) as websocket:
-                websocket.send(
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": rpc_id,
-                            "method": "session.history",
-                            "params": {"session_id": self.binding.native_session_id},
-                        }
+
+                def rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                    current_rpc_id = f"{rpc_id}-{uuid.uuid4().hex}"
+                    websocket.send(
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": current_rpc_id,
+                                "method": method,
+                                "params": params,
+                            }
+                        )
                     )
-                )
-                while time.monotonic() < deadline:
-                    try:
-                        raw = websocket.recv(
-                            timeout=min(0.5, max(0.05, deadline - time.monotonic()))
-                        )
-                    except TimeoutError:
-                        continue
-                    try:
-                        value = json.loads(raw)
-                    except (TypeError, json.JSONDecodeError):
-                        continue
-                    if not isinstance(value, dict) or value.get("id") != rpc_id:
-                        continue
-                    if value.get("error"):
-                        raise NativeTuiError(
-                            f"Hermes session.history failed: {value['error']}"
-                        )
-                    result = value.get("result")
-                    if not isinstance(result, dict) or not isinstance(
-                        result.get("messages"), list
-                    ):
-                        raise NativeTuiError("Hermes session history is invalid")
-                    return
+                    while time.monotonic() < deadline:
+                        try:
+                            raw = websocket.recv(
+                                timeout=min(
+                                    0.5,
+                                    max(0.05, deadline - time.monotonic()),
+                                )
+                            )
+                        except TimeoutError:
+                            continue
+                        try:
+                            value = json.loads(raw)
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if (
+                            not isinstance(value, dict)
+                            or value.get("id") != current_rpc_id
+                        ):
+                            continue
+                        if value.get("error"):
+                            raise NativeTuiError(
+                                f"Hermes {method} failed: {value['error']}"
+                            )
+                        result = value.get("result")
+                        return result if isinstance(result, dict) else {}
+                    raise NativeTuiError(f"Hermes {method} probe timed out")
+
+                session_id = self._resolve_hermes_session_id(rpc)
+                result = rpc("session.history", {"session_id": session_id})
+                if not isinstance(result.get("messages"), list):
+                    raise NativeTuiError("Hermes session history is invalid")
+                return
         except NativeTuiError:
             raise
         except Exception as exc:
@@ -153,20 +206,21 @@ class HermesTuiMixin:
             def history() -> list[dict[str, Any]]:
                 result = rpc(
                     "session.history",
-                    {"session_id": self.binding.native_session_id},
+                    {"session_id": session_id},
                 )
                 values = result.get("messages")
                 if not isinstance(values, list):
                     return []
                 return [item for item in values if isinstance(item, dict)]
 
+            session_id = self._resolve_hermes_session_id(rpc)
             messages = history()
             baseline_count = len(messages)
             current_prompt = prompt
             rpc(
                 "prompt.submit",
                 {
-                    "session_id": self.binding.native_session_id,
+                    "session_id": session_id,
                     "text": current_prompt,
                     "queued": True,
                 },
@@ -189,7 +243,7 @@ class HermesTuiMixin:
                         steered = rpc(
                             "session.steer",
                             {
-                                "session_id": self.binding.native_session_id,
+                                "session_id": session_id,
                                 "text": input_text,
                             },
                         )
@@ -219,7 +273,7 @@ class HermesTuiMixin:
                 if not isinstance(params, dict):
                     continue
                 event_session = str(params.get("session_id") or "")
-                if event_session and event_session != self.binding.native_session_id:
+                if event_session and event_session != session_id:
                     continue
                 event_type = str(params.get("type") or "")
                 if event_type == "message.start":
@@ -270,7 +324,7 @@ class HermesTuiMixin:
                         rpc(
                             "prompt.submit",
                             {
-                                "session_id": self.binding.native_session_id,
+                                "session_id": session_id,
                                 "text": current_prompt,
                                 "queued": True,
                             },

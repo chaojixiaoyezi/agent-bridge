@@ -155,6 +155,12 @@ def validate_native_tui_binding(
                 allow_query=True,
             ),
         }
+        stored_session_id = str(raw_transport.get("stored_session_id") or "").strip()
+        if stored_session_id:
+            normalized["stored_session_id"] = _identifier(
+                stored_session_id,
+                field="Hermes stored_session_id",
+            )
     elif adapter == "pi":
         if kind not in {"pi", "pi-extension"}:
             raise NativeTuiError("Pi requires pi-extension transport")

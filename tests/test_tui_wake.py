@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 import agent_bridge.tui_wake as tui_wake
+from agent_bridge.http_client import BridgeRemoteError
 from agent_bridge.tui_adapter import validate_native_tui_binding
 
 
@@ -238,3 +239,61 @@ def test_native_wake_preserves_required_message_when_tui_is_silent(
     ]
     assert [item["state"] for item in bridge.states] == ["busy", "error"]
     assert all("access_mode" not in item for item in bridge.states)
+
+
+def test_native_wake_retries_short_reply_rate_limit_without_rerunning_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_environment(monkeypatch, tmp_path)
+    binding = validate_native_tui_binding(
+        adapter_kind="opencode",
+        endpoint_id="endpoint-opencode",
+        native_session_id="session-room-one",
+        transport={
+            "kind": "opencode-http",
+            "base_url": "http://127.0.0.1:9201",
+        },
+    )
+
+    class RateLimitedBridge(FakeBridgeClient):
+        def __init__(self) -> None:
+            super().__init__([_message("msg-1", required=True)])
+            self.reply_attempts = 0
+
+        def post(
+            self, path: str, payload: dict[str, Any], **kwargs: Any
+        ) -> dict[str, Any]:
+            if path == "/agent/reply":
+                self.reply_attempts += 1
+                if self.reply_attempts == 1:
+                    raise BridgeRemoteError(
+                        "rate limited",
+                        status_code=429,
+                        retry_after_seconds=5.5,
+                    )
+            return super().post(path, payload, **kwargs)
+
+    bridge = RateLimitedBridge()
+    native_turns: list[str] = []
+
+    class FakeNative:
+        def __init__(self, _binding: Any) -> None:
+            pass
+
+        def run_turn(self, prompt: str) -> tuple[str, list[str]]:
+            native_turns.append(prompt)
+            return "只生成一次", []
+
+    monkeypatch.setattr(tui_wake, "load_native_tui_binding", lambda _path: binding)
+    monkeypatch.setattr(tui_wake, "resident_http_client", lambda **_kwargs: bridge)
+    monkeypatch.setattr(tui_wake, "NativeTuiClient", FakeNative)
+    monkeypatch.setattr(tui_wake.time, "sleep", lambda seconds: sleeps.append(seconds))
+    sleeps: list[float] = []
+
+    tui_wake.run_native_wake({"event_count": 1})
+
+    assert bridge.reply_attempts == 2
+    assert len(native_turns) == 1
+    assert bridge.replies == [{"message_id": "msg-1", "body": "只生成一次"}]
+    assert sleeps == [5.6]

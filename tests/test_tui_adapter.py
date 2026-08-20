@@ -86,6 +86,20 @@ def test_native_tui_http_bindings_are_loopback_and_do_not_store_permissions(
     assert "access_mode" not in compatibility.payload()
 
 
+def test_hermes_binding_preserves_durable_session_identity(tmp_path: Path) -> None:
+    configured = binding(
+        tmp_path,
+        "hermes",
+        {
+            "kind": "hermes-websocket",
+            "websocket_url": "ws://127.0.0.1:9202/api/ws?token=local",
+            "stored_session_id": "20260820_hermes_durable",
+        },
+    )
+
+    assert configured.transport["stored_session_id"] == "20260820_hermes_durable"
+
+
 def test_native_tui_v1_binding_loads_without_republishing_stale_access_mode(
     tmp_path: Path,
 ) -> None:
@@ -236,7 +250,9 @@ def test_native_tui_http_response_has_a_safety_limit(
         def read(limit: int) -> bytes:
             return b"x" * limit
 
-    monkeypatch.setattr(tui_transport, "_open_local", lambda *_a, **_k: OversizedResponse())
+    monkeypatch.setattr(
+        tui_transport, "_open_local", lambda *_a, **_k: OversizedResponse()
+    )
     with pytest.raises(NativeTuiError, match="safety limit"):
         tui_adapter._json_http_get("http://127.0.0.1:9201/probe", timeout=1)
 
@@ -648,6 +664,108 @@ def test_hermes_adapter_reads_result_from_matching_session_history(
     assert prompt_call["params"]["queued"] is True
 
 
+def test_hermes_adapter_resumes_durable_session_before_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict] = []
+            self.events: list[dict] = []
+            self.history_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            self.sent.append(request)
+            method = request["method"]
+            if method == "session.resume":
+                self.events.append(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {
+                            "session_id": "runtime-after-resume",
+                            "resumed": "stored-session-one",
+                        },
+                    }
+                )
+            elif method == "session.history":
+                self.history_calls += 1
+                messages = []
+                if self.history_calls >= 2:
+                    messages.append({"role": "user", "text": "重连复核"})
+                if self.history_calls >= 3:
+                    messages.append({"role": "assistant", "text": "重连完成。"})
+                self.events.append(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": {"count": len(messages), "messages": messages},
+                    }
+                )
+            elif method == "prompt.submit":
+                self.events.extend(
+                    [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": {"status": "queued"},
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "type": "message.start",
+                                "session_id": "runtime-after-resume",
+                            },
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "event",
+                            "params": {
+                                "type": "message.complete",
+                                "session_id": "runtime-after-resume",
+                            },
+                        },
+                    ]
+                )
+
+        def recv(self, **_kwargs) -> str:
+            if not self.events:
+                raise TimeoutError
+            return json.dumps(self.events.pop(0))
+
+    socket = FakeSocket()
+    monkeypatch.setattr("websockets.sync.client.connect", lambda *_a, **_k: socket)
+    client = NativeTuiClient(
+        binding(
+            tmp_path,
+            "hermes",
+            {
+                "kind": "hermes-websocket",
+                "websocket_url": "ws://127.0.0.1:9202/api/ws?token=local",
+                "stored_session_id": "stored-session-one",
+            },
+        )
+    )
+
+    result, applied = client.run_turn("重连复核", timeout=1)
+
+    assert result == "重连完成。"
+    assert applied == []
+    assert socket.sent[0]["method"] == "session.resume"
+    assert socket.sent[0]["params"]["session_id"] == "stored-session-one"
+    for request in socket.sent[1:]:
+        if request["method"] in {"session.history", "prompt.submit"}:
+            assert request["params"]["session_id"] == "runtime-after-resume"
+
+
 def test_pi_file_relay_correlates_results_and_keeps_session_file(
     tmp_path: Path,
 ) -> None:
@@ -698,6 +816,129 @@ def test_pi_file_relay_correlates_results_and_keeps_session_file(
     result, applied = client.run_turn("处理", timeout=2)
     thread.join(timeout=1)
     assert result == "Pi 完成。"
+    assert applied == []
+
+
+def test_pi_file_relay_marks_input_applied_only_after_extension_accepts_it(
+    tmp_path: Path,
+) -> None:
+    command_file = tmp_path / "pi-commands.jsonl"
+    event_file = tmp_path / "pi-events.jsonl"
+    session_file = tmp_path / "pi-session.jsonl"
+    session_file.touch()
+    client = NativeTuiClient(
+        binding(
+            tmp_path,
+            "pi",
+            {
+                "kind": "pi-extension",
+                "command_file": str(command_file),
+                "event_file": str(event_file),
+                "session_file": str(session_file),
+            },
+        )
+    )
+
+    def relay() -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            lines = (
+                command_file.read_text(encoding="utf-8").splitlines()
+                if command_file.exists()
+                else []
+            )
+            if len(lines) < 2:
+                time.sleep(0.02)
+                continue
+            commands = [json.loads(line) for line in lines]
+            request_id = commands[0]["request_id"]
+            assert commands[1]["type"] == "steer"
+            assert commands[1]["input_id"] == "input-1"
+            event_file.write_text(
+                "".join(
+                    json.dumps(event, ensure_ascii=False) + "\n"
+                    for event in [
+                        {
+                            "type": "steer-accepted",
+                            "request_id": request_id,
+                            "input_id": "input-1",
+                        },
+                        {
+                            "type": "complete",
+                            "request_id": request_id,
+                            "text": "补充要求已处理。",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            return
+
+    thread = threading.Thread(target=relay, daemon=True)
+    thread.start()
+    result, applied = client.run_turn(
+        "先处理原任务",
+        timeout=2,
+        poll_inputs=lambda: [{"input_id": "input-1", "body": "补充要求"}],
+    )
+    thread.join(timeout=1)
+    assert result == "补充要求已处理。"
+    assert applied == ["input-1"]
+
+
+def test_pi_file_relay_does_not_claim_unaccepted_input(tmp_path: Path) -> None:
+    command_file = tmp_path / "pi-commands.jsonl"
+    event_file = tmp_path / "pi-events.jsonl"
+    session_file = tmp_path / "pi-session.jsonl"
+    session_file.touch()
+    client = NativeTuiClient(
+        binding(
+            tmp_path,
+            "pi",
+            {
+                "kind": "pi-extension",
+                "command_file": str(command_file),
+                "event_file": str(event_file),
+                "session_file": str(session_file),
+            },
+        )
+    )
+
+    def relay() -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            lines = (
+                command_file.read_text(encoding="utf-8").splitlines()
+                if command_file.exists()
+                else []
+            )
+            if len(lines) < 2:
+                time.sleep(0.02)
+                continue
+            request_id = json.loads(lines[0])["request_id"]
+            event_file.write_text(
+                json.dumps(
+                    {
+                        "type": "complete",
+                        "request_id": request_id,
+                        "text": "原任务完成。",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return
+
+    thread = threading.Thread(target=relay, daemon=True)
+    thread.start()
+    result, applied = client.run_turn(
+        "先处理原任务",
+        timeout=2,
+        poll_inputs=lambda: [{"input_id": "input-1", "body": "补充要求"}],
+    )
+    thread.join(timeout=1)
+    assert result == "原任务完成。"
     assert applied == []
 
 

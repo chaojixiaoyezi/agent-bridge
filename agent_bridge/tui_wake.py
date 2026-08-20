@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from .http_client import BridgeRemoteError
 from .resident_completion import acknowledge_messages, resident_http_client
 from .tui_adapter import (
     NativeTuiClient,
@@ -17,6 +19,7 @@ from .tui_adapter import (
 
 MAX_PREFETCH_MESSAGES = 100
 MAX_REQUIRED_TURNS = 20
+MAX_REPLY_RATE_LIMIT_RETRY_SECONDS = 30.0
 SILENT_MARKER = "[[SILENT]]"
 
 
@@ -176,6 +179,28 @@ def _safe_report_delivery_stage(client: Any, **kwargs: Any) -> None:
         pass
 
 
+def _post_reply(client: Any, payload: dict[str, Any]) -> None:
+    """Submit one generated reply without rerunning the native turn on a short 429."""
+
+    try:
+        client.post("/agent/reply", payload)
+        return
+    except BridgeRemoteError as exc:
+        retry_after = exc.retry_after_seconds
+        try:
+            delay = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError, OverflowError):
+            delay = None
+        if (
+            exc.status_code != 429
+            or delay is None
+            or not 0 <= delay <= MAX_REPLY_RATE_LIMIT_RETRY_SECONDS
+        ):
+            raise
+    time.sleep(delay + 0.1)
+    client.post("/agent/reply", payload)
+
+
 def run_native_wake(batch: dict[str, Any]) -> None:
     bridge_url = _required_env("AGENT_BRIDGE_URL").rstrip("/")
     product = _required_env("AGENT_BRIDGE_PRODUCT")
@@ -328,8 +353,8 @@ def run_native_wake(batch: dict[str, Any]) -> None:
                             f"native TUI omitted required reply for {target_id}"
                         )
                     if reply and SILENT_MARKER not in reply and target_id:
-                        client.post(
-                            "/agent/reply",
+                        _post_reply(
+                            client,
                             {"message_id": target_id, "body": reply[:10_000]},
                         )
                     remaining = {

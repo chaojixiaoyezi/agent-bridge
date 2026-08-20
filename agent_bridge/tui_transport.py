@@ -347,18 +347,22 @@ def _wait_jsonl_result(
     offset: int,
     timeout: float,
     poll_inputs: Callable[[], list[dict[str, Any]]] | None,
-    steer: Callable[[str], None],
+    steer: Callable[[str, str], None],
 ) -> tuple[str, list[str]]:
     deadline = time.monotonic() + timeout
     applied: list[str] = []
+    queued: set[str] = set()
     remainder = b""
     while time.monotonic() < deadline:
         if poll_inputs is not None:
             for item in poll_inputs():
                 input_id = str(item.get("input_id") or "")
-                if input_id and input_id not in applied:
-                    steer(str(item.get("body") or item.get("body_text") or ""))
-                    applied.append(input_id)
+                if input_id and input_id not in applied and input_id not in queued:
+                    steer(
+                        input_id,
+                        str(item.get("body") or item.get("body_text") or ""),
+                    )
+                    queued.add(input_id)
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
@@ -381,6 +385,11 @@ def _wait_jsonl_result(
                 if str(event.get("request_id") or "") != request_id:
                     continue
                 event_type = str(event.get("type") or "")
+                if event_type == "steer-accepted":
+                    input_id = str(event.get("input_id") or "")
+                    if input_id and input_id not in applied:
+                        applied.append(input_id)
+                    continue
                 if event_type in {"error", "failed"}:
                     raise NativeTuiError(
                         str(event.get("error") or "native TUI turn failed")

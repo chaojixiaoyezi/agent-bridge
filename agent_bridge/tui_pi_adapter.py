@@ -26,13 +26,14 @@ class PiTuiMixin:
         offset = event_file.stat().st_size if event_file.exists() else 0
         request_id = f"bridge-{uuid.uuid4().hex}"
 
-        def steer(text: str) -> None:
+        def steer(input_id: str, text: str) -> None:
             _append_jsonl(
                 command_file,
                 {
                     "type": "steer",
                     "request_id": request_id,
                     "session_id": self.binding.native_session_id,
+                    "input_id": input_id,
                     "text": text,
                 },
             )

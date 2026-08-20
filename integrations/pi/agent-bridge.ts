@@ -11,6 +11,7 @@ type RelayCommand = {
 	request_id: string;
 	session_id: string;
 	text: string;
+	input_id?: string;
 };
 
 type Binding = {
@@ -31,7 +32,14 @@ type ActiveRequest = {
 	prompt: string;
 	targetSessionFile: string;
 	started: boolean;
-	pendingSteers: string[];
+	pendingSteers: PendingSteer[];
+	dispatchedSteer?: PendingSteer;
+	continuationScheduled: boolean;
+};
+
+type PendingSteer = {
+	text: string;
+	inputId?: string;
 };
 
 type SharedRelayState = {
@@ -79,6 +87,25 @@ function assistantText(message: unknown): string {
 		)
 		.map((part) => part.text)
 		.join("");
+}
+
+function userText(message: unknown): string {
+	if (!message || typeof message !== "object") return "";
+	const value = message as { role?: unknown; content?: unknown };
+	if (value.role !== "user") return "";
+	if (typeof value.content === "string") return value.content;
+	if (!Array.isArray(value.content)) return "";
+	return value.content
+		.filter((part): part is { type: "text"; text: string } =>
+			Boolean(
+				part &&
+					typeof part === "object" &&
+					(part as { type?: unknown }).type === "text" &&
+					typeof (part as { text?: unknown }).text === "string",
+			),
+		)
+		.map((part) => part.text)
+		.join("\n");
 }
 
 function lastAssistantText(messages: unknown): string {
@@ -175,6 +202,48 @@ export default function (pi: ExtensionAPI) {
 	const watchedFiles = new Map<string, fs.StatsListener>();
 	const terminalRequests = new Set<string>();
 
+	const acceptDispatchedSteer = (text: string): boolean => {
+		const active = shared.activeRequest;
+		const steer = active?.dispatchedSteer;
+		if (!active || !steer || steer.text !== text) return false;
+		appendEvent(active.eventFile, {
+			type: "steer-accepted",
+			request_id: active.id,
+			...(steer.inputId ? { input_id: steer.inputId } : {}),
+		});
+		active.dispatchedSteer = undefined;
+		return true;
+	};
+
+	const dispatchNextSteer = (): boolean => {
+		const active = shared.activeRequest;
+		if (
+			!active?.started ||
+			active.dispatchedSteer ||
+			active.pendingSteers.length === 0
+		) {
+			return false;
+		}
+		const steer = active.pendingSteers.shift();
+		if (!steer) return false;
+		active.dispatchedSteer = steer;
+		pi.sendUserMessage(steer.text, { deliverAs: "steer" });
+		return true;
+	};
+
+	const continuePendingSteerAfterIdle = (): void => {
+		const active = shared.activeRequest;
+		if (!active || active.continuationScheduled) return;
+		active.continuationScheduled = true;
+		const timer = setTimeout(() => {
+			const current = shared.activeRequest;
+			if (!current || current.id !== active.id) return;
+			current.continuationScheduled = false;
+			dispatchNextSteer();
+		}, 0);
+		timer.unref();
+	};
+
 	const deliver = async (binding: Binding, command: RelayCommand) => {
 		if (command.session_id !== binding.native_session_id) {
 			throw new Error("relay command session does not match this room binding");
@@ -186,11 +255,15 @@ export default function (pi: ExtensionAPI) {
 			) {
 				throw new Error("Pi TUI has no matching active Bridge request");
 			}
-			if (shared.activeRequest.started) {
-				pi.sendUserMessage(command.text, { deliverAs: "steer" });
-			} else {
-				shared.activeRequest.pendingSteers.push(command.text);
-			}
+			// The relay watcher runs independently from Pi's agent lifecycle. Calling
+			// sendUserMessage here can land in the narrow state where Pi has finished
+			// streaming but its underlying run is still active, which Pi correctly
+			// rejects as a second prompt. Queue the input and flush it at a lifecycle
+			// boundary where the delivery mode is unambiguous.
+			shared.activeRequest.pendingSteers.push({
+				text: command.text,
+				inputId: command.input_id,
+			});
 			return;
 		}
 		if (shared.activeRequest) {
@@ -216,6 +289,7 @@ export default function (pi: ExtensionAPI) {
 			targetSessionFile: binding.transport.session_file,
 			started: false,
 			pendingSteers: [],
+			continuationScheduled: false,
 		};
 		if (
 			currentSession &&
@@ -459,29 +533,36 @@ export default function (pi: ExtensionAPI) {
 		if (shared.activeRequest && event.prompt === shared.activeRequest.prompt) {
 			shared.activeRequest.started = true;
 		}
+		acceptDispatchedSteer(event.prompt);
 	});
 
-	pi.on("agent_start", () => {
-		if (
-			!shared.activeRequest?.started ||
-			shared.activeRequest.pendingSteers.length === 0
-		) {
-			return;
-		}
-		for (const text of shared.activeRequest.pendingSteers.splice(0)) {
-			pi.sendUserMessage(text, { deliverAs: "steer" });
-		}
+	pi.on("message_start", (event) => {
+		acceptDispatchedSteer(userText(event.message));
+	});
+
+	pi.on("turn_end", () => {
+		dispatchNextSteer();
 	});
 
 	pi.on("agent_end", (event) => {
-		if (!shared.activeRequest?.started) return;
-		const requestId = shared.activeRequest.id;
-		appendEvent(shared.activeRequest.eventFile, {
+		const active = shared.activeRequest;
+		if (!active?.started) return;
+		if (active.dispatchedSteer) {
+			// A dispatched message that never appeared as a user message was not
+			// consumed by this run. Retry it only after Pi has fully become idle.
+			active.pendingSteers.unshift(active.dispatchedSteer);
+			active.dispatchedSteer = undefined;
+		}
+		if (active.pendingSteers.length > 0) {
+			continuePendingSteerAfterIdle();
+			return;
+		}
+		appendEvent(active.eventFile, {
 			type: "complete",
-			request_id: requestId,
+			request_id: active.id,
 			text: lastAssistantText(event.messages),
 		});
-		terminalRequests.add(requestId);
+		terminalRequests.add(active.id);
 		shared.activeRequest = undefined;
 	});
 
