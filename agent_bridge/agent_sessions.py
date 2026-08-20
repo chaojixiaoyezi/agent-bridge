@@ -11,6 +11,7 @@ from typing import Any
 
 from .store_constants import (
     AGENT_ACTIVE_ROOM_LIMIT,
+    CONNECTOR_ONLINE_WINDOW_SECONDS,
     CONNECTOR_SESSION_IDLE_RETIRE_SECONDS,
     CONNECTOR_SESSION_MIN_RETAIN,
     DEFAULT_SESSION_TTL_SECONDS,
@@ -534,8 +535,35 @@ class AgentSessionMixin:
                         AND session.revoked_at IS NULL
                         AND session.expires_at > ?
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM web_sessions AS web_session
+                      JOIN web_users AS web_user
+                        ON web_user.user_id = web_session.user_id
+                      WHERE web_user.participant_id = participants.participant_id
+                        AND web_user.active = 1
+                        AND web_session.revoked_at IS NULL
+                        AND web_session.expires_at > ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM agent_connectors AS connector
+                      WHERE connector.accepted_participant_id =
+                            participants.participant_id
+                        AND connector.revoked_at IS NULL
+                        AND connector.setup_status = 'configured'
+                        AND (
+                            COALESCE(connector.connector_last_seen_at, 0) >= ?
+                            OR COALESCE(connector.tui_last_seen_at, 0) >= ?
+                        )
+                  )
                 """,
-                (cleared_at,),
+                (
+                    cleared_at,
+                    cleared_at,
+                    cleared_at - CONNECTOR_ONLINE_WINDOW_SECONDS,
+                    cleared_at - CONNECTOR_ONLINE_WINDOW_SECONDS,
+                ),
             )
         result = {
             "cleared_count": int(cleared_count),

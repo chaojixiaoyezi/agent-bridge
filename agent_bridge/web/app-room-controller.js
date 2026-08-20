@@ -1563,7 +1563,10 @@ async function refresh(options = {}) {
     if (state.queuedRefresh) {
       const queued = state.queuedRefresh;
       state.queuedRefresh = null;
-      window.setTimeout(() => refresh(queued), 0);
+      // Drain the merged refresh before this refresh promise settles. A zero-delay
+      // timer left an unobservable gap where `refreshing` and `queuedRefresh` were
+      // both clear even though a full room refresh was still scheduled.
+      await refresh(queued);
     }
   }
 }

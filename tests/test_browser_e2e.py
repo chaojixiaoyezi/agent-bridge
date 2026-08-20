@@ -681,7 +681,7 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert any("/receipts?" in url for url in receipt_only_api_requests)
             assert not any(
                 "/api/rooms?limit=200" in url for url in receipt_only_api_requests
-            )
+            ), receipt_refresh_urls
             assert not any(
                 "/api/pending-responses" in url
                 for url in receipt_only_api_requests

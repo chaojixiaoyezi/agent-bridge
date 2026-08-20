@@ -4445,6 +4445,35 @@ def test_inactive_sessions_can_be_cleared_without_deleting_audit_links(
     }
 
 
+def test_inactive_agent_cleanup_preserves_live_web_presence(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    auth = WebAuthStore(store.database, captcha_generator=lambda: "ABCDE")
+    challenge = auth.create_captcha()
+    admin, session_token = auth.login(
+        username="admin",
+        password="admin",
+        captcha_id=str(challenge["captcha_id"]),
+        captcha_answer="ABCDE",
+    )
+
+    store.clear_inactive_sessions()
+    with store._connection() as connection:
+        active_status = connection.execute(
+            "SELECT status FROM participants WHERE participant_id = ?",
+            (admin["participant_id"],),
+        ).fetchone()["status"]
+    assert active_status == "online"
+
+    auth.logout(session_token)
+    store.clear_inactive_sessions()
+    with store._connection() as connection:
+        logged_out_status = connection.execute(
+            "SELECT status FROM participants WHERE participant_id = ?",
+            (admin["participant_id"],),
+        ).fetchone()["status"]
+    assert logged_out_status == "offline"
+
+
 def test_signature_and_owner_approved_nickname_are_separate_from_identity(
     tmp_path: Path,
 ) -> None:

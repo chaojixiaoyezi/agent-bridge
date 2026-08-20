@@ -20,6 +20,16 @@
       "area": "browser_refresh",
       "finding": "A receipt-only SSE event used room refresh mode, fetching the room list, pending center and current-room receipts before re-rendering shared UI.",
       "impact": "Frequent delivery milestones caused unrelated network requests and avoidable sidebar work."
+    },
+    {
+      "area": "refresh_queue",
+      "finding": "Queued refreshes were released through an untracked zero-delay timer after refreshing and queuedRefresh had both been cleared.",
+      "impact": "A slower browser could start an unexpected full room refresh after the UI appeared idle, defeating the receipt fast path and making request behavior timing-dependent."
+    },
+    {
+      "area": "presence_cleanup",
+      "finding": "Agent-session cleanup marked every participant without a live Agent credential offline, even when that participant had a live Web session or connector endpoint.",
+      "impact": "Startup maintenance could race a Web login, emit an unrelated online-state change and make the dashboard perform a full presence refresh during a receipt update."
     }
   ],
   "changes": {
@@ -41,7 +51,8 @@
       "actionable"
     ],
     "event_revision": "One aggregate delivery scan plus receipt and DND aggregates observes native milestones, cancellation, acknowledgement and DND expiry without changing schema or write semantics.",
-    "browser": "Detailed mode lazily expands per-Agent status rows; simple and standard modes remain unchanged. Receipt-only events update labels in place through the current-room receipts endpoint.",
+    "browser": "Detailed mode lazily expands per-Agent status rows; simple and standard modes remain unchanged. Receipt-only events update labels in place through the current-room receipts endpoint, and merged refreshes drain before the active refresh promise settles.",
+    "presence_cleanup": "Inactive Agent-session maintenance now preserves participants backed by a live Web session or a fresh configured connector/TUI endpoint.",
     "query_optimization": "Active sessions, connectors and exact replies are materialized once per batch instead of executing correlated checks for every delivery row."
   },
   "production_read_only_sample": {
@@ -77,15 +88,17 @@
     }
   },
   "verification": {
-    "pytest": "300 collected; 298 passed and 2 explicitly skipped; 0 failed",
+    "pytest": "301 collected; 299 passed and 2 explicitly skipped; 0 failed",
     "soak_and_reliability": "9 passed",
-    "real_chrome_e2e": "1 passed",
+    "real_chrome_e2e": "4 consecutive passes after CI race diagnosis",
     "browser_metrics": {
-      "dom_ready_ms": 124.57,
-      "authenticated_ready_ms": 310.4,
-      "room_switch_ms": 48.76,
+      "sample_count": 4,
+      "aggregation": "median",
+      "dom_ready_ms": 148.99,
+      "authenticated_ready_ms": 410.51,
+      "room_switch_ms": 69.44,
       "receipt_only_api_requests": 1,
-      "resource_transfer_bytes": 819674
+      "resource_transfer_bytes": 811507
     },
     "ruff": "passed",
     "compileall": "passed",
