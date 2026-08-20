@@ -36,6 +36,14 @@ class HttpInputError(ValueError):
         super().__init__(message)
 
 
+def _error_payload(exc: Exception) -> dict[str, object]:
+    payload: dict[str, object] = {"error": str(exc)}
+    error_code = str(getattr(exc, "error_code", "") or "").strip()
+    if error_code:
+        payload["error_code"] = error_code
+    return payload
+
+
 def _public_web_identity(identity: dict[str, object]) -> dict[str, object]:
     fields = (
         "user_id",
@@ -93,7 +101,7 @@ def _json_call(
             },
         )
     except (ConflictError, WebConflictError) as exc:
-        return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(_error_payload(exc), status_code=409)
     except NotFoundError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     except (TypeError, ValueError, ValidationError) as exc:
@@ -218,7 +226,7 @@ def _json_error(exc: Exception) -> JSONResponse:
             },
         )
     if isinstance(exc, (ConflictError, WebConflictError)):
-        return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(_error_payload(exc), status_code=409)
     if isinstance(exc, NotFoundError):
         return JSONResponse({"error": str(exc)}, status_code=404)
     if isinstance(exc, (TypeError, ValueError, ValidationError)):

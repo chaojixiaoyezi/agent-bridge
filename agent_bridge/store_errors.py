@@ -15,6 +15,30 @@ class ConflictError(BridgeError):
     pass
 
 
+class NativeSessionLeaseExpiredError(ConflictError):
+    """The exact native process still owns a lease whose liveness TTL elapsed."""
+
+    error_code = "native_session_lease_expired"
+
+
+class NativeSessionLeaseEndedError(ConflictError):
+    """The native process explicitly ended its exact-session lease."""
+
+    error_code = "native_session_lease_ended"
+
+
+class NativeSessionLeaseSupersededError(ConflictError):
+    """A different exact native process now owns the connector."""
+
+    error_code = "native_session_lease_superseded"
+
+
+class NativeDeliveryInactiveError(ConflictError):
+    """The connector no longer routes chat through its native TUI."""
+
+    error_code = "native_delivery_inactive"
+
+
 class RateLimitError(ConflictError):
     def __init__(self, *, retry_after_seconds: float, conversation_id: str) -> None:
         self.retry_after_seconds = max(0.0, float(retry_after_seconds))

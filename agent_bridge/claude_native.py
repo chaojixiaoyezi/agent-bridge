@@ -74,6 +74,32 @@ class ClaudeConnectorState:
             (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
         )
 
+    def refresh_lease(self, server_lease: dict[str, Any]) -> dict[str, Any]:
+        """Persist authoritative liveness fields for the exact local lease."""
+
+        current = self.read_lease()
+        if current is None:
+            raise ClaudeNativeError("Claude native lease file is missing")
+        for field, expected in (
+            ("lease_id", current.get("lease_id")),
+            ("connector_id", self.connector_id),
+            ("process_epoch", self.process_epoch),
+        ):
+            actual = str(server_lease.get(field) or "")
+            if actual and actual != str(expected or ""):
+                raise ClaudeNativeError(
+                    f"Claude native lease refresh returned mismatched {field}"
+                )
+        updated = dict(current)
+        for field in ("last_seen_at", "expires_at"):
+            if server_lease.get(field) is not None:
+                updated[field] = float(server_lease[field])
+        if server_lease.get("ended_at") is not None:
+            updated["ended"] = True
+            updated["ended_at"] = float(server_lease["ended_at"])
+        self.write_lease(updated)
+        return updated
+
     def read_binding_intent(self) -> dict[str, Any] | None:
         try:
             payload = json.loads(self.binding_intent_file.read_text(encoding="utf-8"))
@@ -126,6 +152,8 @@ class ClaudeConnectorState:
                 "process_epoch": self.process_epoch,
                 "binding_source": str(intent["binding_source"]),
                 "bound_at": time.time(),
+                "last_seen_at": float(lease["last_seen_at"]),
+                "expires_at": float(lease["expires_at"]),
                 "ended": False,
             }
         )

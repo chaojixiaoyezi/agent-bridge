@@ -20,6 +20,7 @@ from agent_bridge.claude_guide import (
 from agent_bridge.claude_launcher import build_tmux_bootstrap_command
 from agent_bridge.claude_session_hook import handle_hook
 from agent_bridge.connector import configure_resident_connector
+from agent_bridge.http_client import BridgeRemoteError
 
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -384,6 +385,114 @@ def test_claude_channel_recovers_a_pending_exact_binding_intent(
     assert lease is not None
     assert lease["lease_id"] == "lease-channel-recovery"
     assert recovered[0]["client"] is client
+
+
+def test_claude_channel_recovers_expired_exact_lease_before_delivery(
+    tmp_path: Path,
+) -> None:
+    waited = 0
+    heartbeats: list[dict] = []
+    refreshed: list[dict] = []
+    delivered: list[str] = []
+    local_lease = {
+        "connector_id": "connector_channel_expired",
+        "process_epoch": "epoch-channel-expired",
+        "lease_id": "lease-channel-expired",
+        "ended": False,
+    }
+
+    class FakeClient:
+        def wait_native_channel_event(self, **payload):
+            nonlocal waited
+            waited += 1
+            if waited == 1:
+                raise BridgeRemoteError(
+                    "native TUI lease expired; bind the session again",
+                    status_code=409,
+                    error_code="native_session_lease_expired",
+                )
+            if waited > 2:
+                raise asyncio.CancelledError
+            return {
+                "event": {
+                    "event_id": "event-after-expiry-recovery",
+                    "conversation_id": "工具修改的聊天室",
+                    "state": "fetched",
+                    "deliverable": True,
+                    "fetched_at": 1_700_000_000,
+                    "required_message_ids": ["message-after-expiry-recovery"],
+                    "required_reply_count": 1,
+                    "message_ids": ["message-after-expiry-recovery"],
+                    "messages": [
+                        {
+                            "message_id": "message-after-expiry-recovery",
+                            "sequence": 1,
+                            "sender_participant_id": "participant_sender",
+                            "sender_display_name": "发送者",
+                            "sender_client_type": "web-user",
+                            "body": "请确认自动续租。",
+                            "reply_to": None,
+                        }
+                    ],
+                }
+            }
+
+        def heartbeat_native_session(self, **payload):
+            heartbeats.append(payload)
+            return {
+                "lease": {
+                    **local_lease,
+                    "last_seen_at": 1_700_000_010.0,
+                    "expires_at": 1_700_000_100.0,
+                }
+            }
+
+        @staticmethod
+        def receive_native_channel_event(**payload):
+            assert payload["event_id"] == "event-after-expiry-recovery"
+            assert payload["stage"] == "injected"
+            return {"event": {"state": "injected"}}
+
+    client = FakeClient()
+
+    class FakeState:
+        state_directory = tmp_path
+        process_epoch = "epoch-channel-expired"
+        connector_id = "connector_channel_expired"
+
+        @staticmethod
+        def client():
+            return client
+
+        @staticmethod
+        def read_lease():
+            return dict(local_lease)
+
+        @staticmethod
+        def refresh_lease(server_lease):
+            refreshed.append(dict(server_lease))
+            return server_lease
+
+    class FakeGuide:
+        transport_name = "claude-tmux-guide"
+
+        @staticmethod
+        def deliver(prompt: str) -> None:
+            delivered.append(prompt)
+
+    runtime = ChannelRuntime(FakeState())  # type: ignore[arg-type]
+    runtime.guide = FakeGuide()  # type: ignore[assignment]
+    runtime.session = object()  # type: ignore[assignment]
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runtime._poll_loop())
+
+    assert waited == 3
+    assert len(heartbeats) == 1
+    assert heartbeats[0]["lease_id"] == "lease-channel-expired"
+    assert refreshed[0]["expires_at"] == 1_700_000_100.0
+    assert len(delivered) == 1
+    assert "请确认自动续租" in delivered[0]
 
 
 def test_claude_channel_tools_keep_route_token_out_of_model_input(

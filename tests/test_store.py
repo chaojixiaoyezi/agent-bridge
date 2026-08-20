@@ -5743,6 +5743,15 @@ def test_native_session_lease_is_exact_idempotent_and_explicitly_replaceable(
         ).fetchone()
     assert superseded["ended_at"] is not None
     assert superseded["superseded_at"] is not None
+    with pytest.raises(ConflictError) as stale_process:
+        store.heartbeat_native_agent_session(
+            participant_id=accepted["participant_id"],
+            authorized_session_id=accepted["session_id"],
+            connector_id=accepted["connector_id"],
+            lease_id=first_lease["lease_id"],
+            process_epoch="epoch-first-process",
+        )
+    assert stale_process.value.error_code == "native_session_lease_ended"
 
     heartbeat = store.heartbeat_native_agent_session(
         participant_id=accepted["participant_id"],
@@ -5796,6 +5805,129 @@ def test_native_session_lease_is_exact_idempotent_and_explicitly_replaceable(
         "native_replied_at",
         "shadow_seen_at",
     } <= delivery_columns
+
+
+def test_exact_expired_native_lease_heartbeat_revives_and_redelivers_once(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "claude-native-expiry-recovery"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-expiry-owner",
+        signature="保持同一真实 Claude TUI 会话。",
+    )
+    sender = register(
+        store,
+        client="codex",
+        name="native-expiry-sender",
+        room=room,
+    )
+    bound = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="native-expiry-endpoint",
+        native_session_id="native-expiry-session",
+        process_epoch="native-expiry-epoch",
+        binding_source="resume",
+    )
+    lease_id = str(bound["lease"]["lease_id"])
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id=room,
+        body_text="@native-expiry-owner 请确认断线恢复。",
+        mentions=[accepted["participant_id"]],
+        notification_mode="mention",
+    )
+    expired_at = time.time() - 1
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE native_session_leases SET expires_at = ? WHERE lease_id = ?",
+            (expired_at, lease_id),
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET native_lease_expires_at = ? "
+            "WHERE connector_id = ?",
+            (expired_at, accepted["connector_id"]),
+        )
+        connector_row = store._agent_connector_row_locked(
+            connection,
+            str(accepted["connector_id"]),
+        )
+        stale_connector = store._agent_connector_payload(
+            connector_row,
+            now=time.time(),
+        )
+    assert stale_connector["native_delivery"]["lease_active"] is False
+    assert stale_connector["tui"]["state"] == "offline"
+
+    with pytest.raises(ConflictError) as expired:
+        store.wait_native_channel_event(
+            participant_id=accepted["participant_id"],
+            authorized_session_id=accepted["session_id"],
+            connector_id=accepted["connector_id"],
+            lease_id=lease_id,
+            process_epoch="native-expiry-epoch",
+            request_id="request_expired_before_recovery",
+            route_token="route_" + "e" * 48,
+            wait_seconds=0,
+        )
+    assert expired.value.error_code == "native_session_lease_expired"
+
+    recovered = store.heartbeat_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="native-expiry-epoch",
+        state="online",
+    )
+    assert recovered["lease_id"] == lease_id
+    assert recovered["native_session_id"] == "native-expiry-session"
+    assert recovered["process_epoch"] == "native-expiry-epoch"
+    assert recovered["expires_at"] > time.time()
+
+    event = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="native-expiry-epoch",
+        request_id="request_expired_after_recovery",
+        route_token="route_" + "r" * 48,
+        wait_seconds=0,
+    )["event"]
+    assert event["message_ids"] == [message["message_id"]]
+    assert event["required_message_ids"] == [message["message_id"]]
+
+    store.end_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=lease_id,
+        process_epoch="native-expiry-epoch",
+    )
+    with pytest.raises(ConflictError) as ended:
+        store.heartbeat_native_agent_session(
+            participant_id=accepted["participant_id"],
+            authorized_session_id=accepted["session_id"],
+            connector_id=accepted["connector_id"],
+            lease_id=lease_id,
+            process_epoch="native-expiry-epoch",
+        )
+    assert ended.value.error_code == "native_session_lease_ended"
 
 
 def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(

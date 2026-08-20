@@ -33,6 +33,9 @@ CHANNEL_RETRY_INITIAL_SECONDS = 180.0
 CHANNEL_RETRY_MAX_SECONDS = 1_800.0
 CHANNEL_STATE_POLL_SECONDS = 5.0
 CHANNEL_ROUTE_MONITOR_BATCH = 8
+CHANNEL_ERROR_RETRY_INITIAL_SECONDS = 1.0
+CHANNEL_ERROR_RETRY_MAX_SECONDS = 30.0
+NATIVE_LEASE_EXPIRED_ERROR_CODE = "native_session_lease_expired"
 
 
 def _event_attachment_ids(event: dict[str, Any]) -> list[str]:
@@ -73,6 +76,8 @@ class ChannelRuntime:
         self.route_token = ""
         self.next_binding_retry_at = 0.0
         self._event_lock = asyncio.Lock()
+        self._lease_recovery_lock = asyncio.Lock()
+        self._channel_error_retry_seconds = CHANNEL_ERROR_RETRY_INITIAL_SECONDS
         self.guide: TmuxClaudeGuide | None = tmux_guide_from_environment()
         self.state_file = state.state_directory / "native-channel-state.json"
         self._load_runtime_state()
@@ -207,21 +212,63 @@ class ChannelRuntime:
     async def _heartbeat_loop(self) -> None:
         while True:
             try:
-                lease = self._active_lease()
-                if lease is not None:
-                    await asyncio.to_thread(
-                        self.client.heartbeat_native_session,
-                        connector_id=self.state.connector_id,
-                        lease_id=str(lease["lease_id"]),
-                        process_epoch=self.state.process_epoch,
-                        state="online",
-                        detail={"transport": self._transport_name()},
-                    )
+                await self._heartbeat_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._record_error(exc)
             await asyncio.sleep(25)
+
+    def _remember_server_lease(self, response: object) -> None:
+        if not isinstance(response, dict):
+            return
+        server_lease = response.get("lease")
+        if not isinstance(server_lease, dict):
+            return
+        refresh = getattr(self.state, "refresh_lease", None)
+        if callable(refresh):
+            refresh(server_lease)
+
+    async def _heartbeat_once(self) -> bool:
+        lease = self._active_lease()
+        if lease is None:
+            return False
+        response = await asyncio.to_thread(
+            self.client.heartbeat_native_session,
+            connector_id=self.state.connector_id,
+            lease_id=str(lease["lease_id"]),
+            process_epoch=self.state.process_epoch,
+            state="online",
+            detail={"transport": self._transport_name()},
+        )
+        self._remember_server_lease(response)
+        return True
+
+    async def _recover_expired_lease(self, exc: BridgeRemoteError) -> bool:
+        if (
+            exc.status_code != 409
+            or exc.error_code != NATIVE_LEASE_EXPIRED_ERROR_CODE
+        ):
+            return False
+        async with self._lease_recovery_lock:
+            try:
+                return await self._heartbeat_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as recovery_exc:
+                self._record_error(recovery_exc)
+                return False
+
+    def _reset_channel_error_retry(self) -> None:
+        self._channel_error_retry_seconds = CHANNEL_ERROR_RETRY_INITIAL_SECONDS
+
+    def _next_channel_error_retry(self) -> float:
+        delay = self._channel_error_retry_seconds
+        self._channel_error_retry_seconds = min(
+            max(CHANNEL_ERROR_RETRY_INITIAL_SECONDS, delay * 2),
+            CHANNEL_ERROR_RETRY_MAX_SECONDS,
+        )
+        return delay
 
     async def _poll_loop(self) -> None:
         while True:
@@ -242,6 +289,7 @@ class ChannelRuntime:
                     wait_seconds=25,
                     limit=20,
                 )
+                self._reset_channel_error_retry()
                 event = response.get("event")
                 if not isinstance(event, dict):
                     continue
@@ -254,8 +302,11 @@ class ChannelRuntime:
             except asyncio.CancelledError:
                 raise
             except BridgeRemoteError as exc:
+                if await self._recover_expired_lease(exc):
+                    self._reset_channel_error_retry()
+                    continue
                 self._record_error(exc)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self._next_channel_error_retry())
             except Exception as exc:
                 self._record_error(exc)
                 await asyncio.sleep(1.0)
@@ -268,6 +319,9 @@ class ChannelRuntime:
                     await self._monitor_routes_once(lease)
             except asyncio.CancelledError:
                 raise
+            except BridgeRemoteError as exc:
+                if not await self._recover_expired_lease(exc):
+                    self._record_error(exc)
             except Exception as exc:
                 self._record_error(exc)
             await asyncio.sleep(CHANNEL_STATE_POLL_SECONDS)
@@ -307,7 +361,8 @@ class ChannelRuntime:
                     limit=20,
                 )
             except BridgeRemoteError as exc:
-                self._record_error(exc)
+                if not await self._recover_expired_lease(exc):
+                    self._record_error(exc)
                 continue
             event = response.get("event")
             if not isinstance(event, dict):
@@ -695,7 +750,7 @@ class ChannelRuntime:
         lease = self._active_lease()
         if lease is not None:
             try:
-                await asyncio.to_thread(
+                response = await asyncio.to_thread(
                     self.client.heartbeat_native_session,
                     connector_id=self.state.connector_id,
                     lease_id=str(lease["lease_id"]),
@@ -703,6 +758,7 @@ class ChannelRuntime:
                     state="online",
                     detail={"transport": self._transport_name(), "last_tool": name},
                 )
+                self._remember_server_lease(response)
             except Exception as exc:
                 self._record_error(exc)
         return result
@@ -884,7 +940,7 @@ async def run_server(state: ClaudeConnectorState) -> None:
 
     server: Server[None] = Server(
         "agent-bridge-native",
-        version="0.44.1",
+        version="0.44.2",
         instructions=(
             "Agent Bridge room messages are injected into this exact Claude Code "
             "session. Use the provided tools for all room output; terminal transcript "

@@ -21,6 +21,10 @@ from .store_errors import (
     AuthenticationError,
     AuthorizationError,
     ConflictError,
+    NativeDeliveryInactiveError,
+    NativeSessionLeaseEndedError,
+    NativeSessionLeaseExpiredError,
+    NativeSessionLeaseSupersededError,
     NotFoundError,
 )
 from .validation import ValidationError, compact_json, opaque_id, string_tokens
@@ -201,8 +205,12 @@ class NativeSessionMixin:
             or not self._constant_time_eq(str(lease["process_epoch"]), process_epoch)
         ):
             raise AuthenticationError("native TUI lease does not match")
-        if lease["ended_at"] is not None or float(lease["expires_at"]) <= now:
-            raise ConflictError("native TUI lease expired; bind the session again")
+        if lease["ended_at"] is not None:
+            raise NativeSessionLeaseEndedError("native TUI lease has ended")
+        if float(lease["expires_at"]) <= now:
+            raise NativeSessionLeaseExpiredError(
+                "native TUI lease expired; bind the session again"
+            )
         connector = self._agent_connector_row_locked(conn, connector_id)
         if (
             str(connector["accepted_participant_id"]) != participant_id
@@ -211,9 +219,13 @@ class NativeSessionMixin:
         ):
             raise AuthenticationError("active connector binding was not found")
         if str(connector["native_lease_id"] or "") != lease_id:
-            raise ConflictError("native TUI lease has been superseded")
+            raise NativeSessionLeaseSupersededError(
+                "native TUI lease has been superseded"
+            )
         if str(connector["native_delivery_mode"] or "") != "native_preferred":
-            raise ConflictError("native delivery is not active for this connector")
+            raise NativeDeliveryInactiveError(
+                "native delivery is not active for this connector"
+            )
         return session, lease, connector
 
     def _require_native_channel_event_locked(
@@ -482,15 +494,26 @@ class NativeSessionMixin:
                 or not self._constant_time_eq(str(row["process_epoch"]), epoch)
             ):
                 raise AuthenticationError("native TUI lease does not match")
-            if row["ended_at"] is not None or float(row["expires_at"]) <= now:
-                raise ConflictError("native TUI lease expired; bind the session again")
+            if row["ended_at"] is not None:
+                raise NativeSessionLeaseEndedError("native TUI lease has ended")
             current = conn.execute(
-                "SELECT native_lease_id FROM agent_connectors "
+                "SELECT native_lease_id, native_delivery_mode "
+                "FROM agent_connectors "
                 "WHERE connector_id = ? AND revoked_at IS NULL",
                 (connector,),
             ).fetchone()
             if current is None or str(current["native_lease_id"] or "") != lease:
-                raise ConflictError("native TUI lease has been superseded")
+                raise NativeSessionLeaseSupersededError(
+                    "native TUI lease has been superseded"
+                )
+            if str(current["native_delivery_mode"] or "") != "native_preferred":
+                raise NativeDeliveryInactiveError(
+                    "native delivery is not active for this connector"
+                )
+            # Expiration is a liveness signal, not revocation authority.  An
+            # authenticated heartbeat from the exact lease/process may revive
+            # it only while the connector still points at that same lease.
+            # Explicitly ended or superseded leases remain fenced above.
             conn.execute(
                 "UPDATE native_session_leases SET last_seen_at = ?, expires_at = ?, "
                 "metadata_json = ? WHERE lease_id = ?",

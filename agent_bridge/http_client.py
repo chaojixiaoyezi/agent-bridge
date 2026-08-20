@@ -48,9 +48,11 @@ class BridgeRemoteError(RuntimeError):
         *,
         status_code: int | None = None,
         retry_after_seconds: float | None = None,
+        error_code: str | None = None,
     ) -> None:
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+        self.error_code = str(error_code or "").strip() or None
         super().__init__(message)
 
 
@@ -303,6 +305,7 @@ class BridgeHttpClient:
             raise BridgeRemoteError(
                 str(error_payload.get("error") or f"bridge HTTP {exc.code}"),
                 status_code=exc.code,
+                error_code=error_payload.get("error_code"),
             ) from exc
         except (URLError, OSError, HTTPException) as exc:
             reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
@@ -715,6 +718,7 @@ class BridgeHttpClient:
                 str(error_payload.get("error") or f"bridge HTTP {exc.code}"),
                 status_code=exc.code,
                 retry_after_seconds=error_payload.get("retry_after_seconds"),
+                error_code=error_payload.get("error_code"),
             ) from exc
         except (URLError, OSError, HTTPException) as exc:
             reason = getattr(exc, "reason", None) or str(exc) or type(exc).__name__

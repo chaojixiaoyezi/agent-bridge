@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.1"
+    assert _runtime_software_version() == "0.44.2"
 
 
 class FakeEmailDelivery:
@@ -384,6 +384,46 @@ def test_native_session_lifecycle_http_contract(tmp_path: Path) -> None:
     )
     assert heartbeat.status_code == 200
     assert heartbeat.json()["lease"]["lease_id"] == lease_id
+
+    expired_at = time.time() - 1
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE native_session_leases SET expires_at = ? WHERE lease_id = ?",
+            (expired_at, lease_id),
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET native_lease_expires_at = ? "
+            "WHERE connector_id = ?",
+            (expired_at, accepted["connector_id"]),
+        )
+    expired_wait = client.post(
+        "/agent/native/channel/wait",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-http-epoch",
+            "request_id": "request_native_http_expired",
+            "route_token": "route_" + "x" * 48,
+            "wait_seconds": 0,
+        },
+    )
+    assert expired_wait.status_code == 409
+    assert expired_wait.json()["error_code"] == "native_session_lease_expired"
+
+    recovered = client.post(
+        "/agent/native/session/heartbeat",
+        headers=headers,
+        json={
+            "connector_id": accepted["connector_id"],
+            "lease_id": lease_id,
+            "process_epoch": "native-http-epoch",
+            "state": "online",
+        },
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["lease"]["lease_id"] == lease_id
+    assert recovered.json()["lease"]["expires_at"] > time.time()
 
     ended = client.post(
         "/agent/native/session/end",

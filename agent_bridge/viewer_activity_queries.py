@@ -829,6 +829,9 @@ class ViewerActivityQueries:
                     connector.tui_state,
                     connector.tui_last_seen_at,
                     connector.tui_active_task_id,
+                    connector.native_delivery_mode,
+                    connector.native_lease_id,
+                    connector.native_lease_expires_at,
                     CASE
                         WHEN lifecycle.participant_id IS NOT NULL THEN
                             MAX(
@@ -1030,6 +1033,15 @@ class ViewerActivityQueries:
                         and (
                             row["tui_last_seen_at"] is None
                             or float(row["tui_last_seen_at"]) < connector_online_after
+                            or (
+                                str(row["native_delivery_mode"] or "")
+                                == "native_preferred"
+                                and (
+                                    row["native_lease_id"] is None
+                                    or row["native_lease_expires_at"] is None
+                                    or float(row["native_lease_expires_at"]) <= now
+                                )
+                            )
                         )
                         else str(row["tui_state"] or "unbound")
                     ),

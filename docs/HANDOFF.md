@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.44.1 / schema 43。
+当前协议/数据库版本：Agent Bridge v0.44.2 / schema 43。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -240,6 +240,8 @@ v0.43.0 将 schema 增量升级为 42，增加不可变的消息接收名单、�
 v0.43.1 不变更 schema、Agent 投递/唤醒合同或任务状态机。Web 待处理中心把原来的方向投影提升为“待我处理、等待对方、仅供关注”，顶栏只统计前两类；目标 membership 已停用的投递不再伪装成仍可回复事项，精确回复检查改用既有复合索引的 `NOT EXISTS`，生产库同一投影的平均只读耗时由 21.406ms 降至 12.946ms。Web 用户可对结构化点名自己的消息显式“标为已处理”，批量动作在同房间复用中央 ack/receipt 权威且不产生新聊天消息，不能确认其他 Agent 的队列。发布只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。验证证据见 [pending-attention-center-v0.43.1-2026-08-19.json](evidence/pending-attention-center-v0.43.1-2026-08-19.json)。
 
 v0.44.0 的 schema 43 只新增 `connector_runtime_diagnostics` 最新状态表。绑定 v2 的 listener 以 20 秒为最短间隔、在独立后台线程中读取本机 metadata-only supervisor 队列，并向 `/agent/connector/runtime-diagnostics` 上报白名单字段：队列数量/最早等待时长、worker 心跳与状态、稳定错误码、软件版本和平台。服务端只接受该 connector 的有效 `listener` 席位，使用服务端时间把“多久以前”换算为时间点，并拒绝额外字段、日志、路径和任意错误文本。管理员健康面板把 Bridge→listener→本机队列→聊天 worker/adapter→真实 TUI 展开为结构化链路；旧 listener 没报告时只显示兼容提示，报告超过 75 秒、队列不可读、worker 离线/错误/重试或问题队列超过 5 分钟才形成对应 issue。诊断失败不会阻塞 SSE、入队或 adapter 消费；滚动中央 Viewer 时不重启已有 Agent/connector，旧远端组件可在自然重启后采用新协议。全量回归、真实 Chrome 和 `192.168.1.9` 隔离跨机器证据见 [connector-runtime-diagnostics-v0.44.0-2026-08-19.json](evidence/connector-runtime-diagnostics-v0.44.0-2026-08-19.json)。
+
+v0.44.2 保持 schema 43、房间权限、消息接收名单和本体身份边界不变，修复 Claude 原生 TUI 在 Bridge 连续不可达超过 90 秒后永久卡在旧 lease 的问题。租约过期仍会阻止普通 wait/reply，但来自同一有效 Agent session、同一 connector、同一 lease 与同一 process epoch 的 heartbeat 可以原地恢复该租约；显式结束、已被新进程取代或已退出 `native_preferred` 的旧进程继续 fail closed，不能抢回身份。HTTP 409 增加稳定 `error_code`，Claude Channel 只按结构化 `native_session_lease_expired` 触发一次受锁保护的即时 heartbeat，不从错误文本猜状态，并把服务端 `last_seen_at/expires_at` 原子写回私有 lease 文件；普通传输故障使用 1–30 秒指数退避，避免每秒刷日志。Connector 与成员投影以真实 lease 有效期修正 TUI 在线状态，普通 MCP/task 心跳不再掩盖原生通道失效。Viewer-only 滚动发布后，仍在运行的旧 Claude Channel 会在下一次既有 heartbeat 自动原地恢复，不重启 TUI，也不切影子身份；排队消息继续由同一会话单次领取。
 
 v0.44.1 不变更 schema、HTTP/MCP API、消息分页、Agent 投递或房间权限。Web 时间线在已加载消息超过 120 条时启用独立 `app-timeline-virtualizer.js`，保留完整消息数组但同时只创建 96 个消息节点；上下占位使用可见行实测高度，窗口换段、旧消息前插、图片延迟撑高、三档密度和可拖动宽度都保持首个可见消息锚点。搜索结果仍读取目标附近 60 条并居中，回执仍原位更新可见节点，房间 LRU 快照只缓存有界 DOM 与该房间自己的高度表；从远历史一键回最新会先切到末尾窗口，避免超长平滑动画被换段中断。在最新消息位置执行全量刷新时，最近 60 条服务端窗口会合并进已有连续历史，不再因刷新快慢把已加载的千条历史裁回 60 条；处于有后续消息的历史搜索窗口时仍沿用显式回到最新窗口的旧行为。真实 Chrome 用 1260 条历史验证 DOM 始终不超过 96、刷新保留历史、切房恢复与 390px 布局不回退，见 [web-virtual-timeline-v0.44.1-2026-08-19.json](evidence/web-virtual-timeline-v0.44.1-2026-08-19.json)。发布仍只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。
 

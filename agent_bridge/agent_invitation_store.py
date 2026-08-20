@@ -317,6 +317,27 @@ class AgentInvitationMixin:
             if "tui_adapter_kind" in keys and row["tui_adapter_kind"] is not None
             else None
         )
+        native_delivery_mode = str(
+            row["native_delivery_mode"] or "legacy_shadow"
+        )
+        native_lease_expires_at = (
+            float(row["native_lease_expires_at"])
+            if row["native_lease_expires_at"] is not None
+            else None
+        )
+        native_lease_active = bool(
+            row["native_lease_id"] is not None
+            and native_lease_expires_at is not None
+            and native_lease_expires_at > now
+        )
+        raw_tui_state = str(row["tui_state"] or "unbound")
+        effective_tui_state = (
+            "offline"
+            if native_delivery_mode == "native_preferred"
+            and raw_tui_state in {"online", "busy"}
+            and not native_lease_active
+            else raw_tui_state
+        )
         return {
             "connector_id": str(row["connector_id"]),
             "invitation_id": str(row["invitation_id"]),
@@ -373,7 +394,7 @@ class AgentInvitationMixin:
                     if row["tui_native_session_id"] is not None
                     else None
                 ),
-                "state": str(row["tui_state"] or "unbound"),
+                "state": effective_tui_state,
                 "capabilities": json.loads(str(row["tui_capabilities_json"] or "[]")),
                 "last_seen_at": (
                     float(row["tui_last_seen_at"])
@@ -388,7 +409,7 @@ class AgentInvitationMixin:
                 "detail": json.loads(str(row["tui_detail_json"] or "{}")),
             },
             "native_delivery": {
-                "mode": str(row["native_delivery_mode"] or "legacy_shadow"),
+                "mode": native_delivery_mode,
                 "lease_id": (
                     str(row["native_lease_id"])
                     if row["native_lease_id"] is not None
@@ -399,21 +420,13 @@ class AgentInvitationMixin:
                     if row["native_process_epoch"] is not None
                     else None
                 ),
-                "lease_expires_at": (
-                    float(row["native_lease_expires_at"])
-                    if row["native_lease_expires_at"] is not None
-                    else None
-                ),
+                "lease_expires_at": native_lease_expires_at,
                 "binding_source": (
                     str(row["native_binding_source"])
                     if row["native_binding_source"] is not None
                     else None
                 ),
-                "lease_active": bool(
-                    row["native_lease_id"] is not None
-                    and row["native_lease_expires_at"] is not None
-                    and float(row["native_lease_expires_at"]) > now
-                ),
+                "lease_active": native_lease_active,
             },
             "revoked_at": (
                 float(row["revoked_at"]) if row["revoked_at"] is not None else None

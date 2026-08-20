@@ -7,6 +7,7 @@ import stat
 import threading
 from http.client import RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -448,3 +449,35 @@ def test_http_status_survives_a_reset_while_reading_an_empty_error_body(
         client.post("/agent/wait", {"wait_seconds": 0})
 
     assert captured.value.status_code == 302
+
+
+def test_structured_bridge_error_code_is_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject(_request: Request, *, timeout: float):
+        del timeout
+        body = BytesIO(
+            json.dumps(
+                {
+                    "error": "native TUI lease expired; bind the session again",
+                    "error_code": "native_session_lease_expired",
+                }
+            ).encode("utf-8")
+        )
+        raise HTTPError(
+            "https://bridge.example.test/agent/native/channel/wait",
+            409,
+            "Conflict",
+            {},
+            body,
+        )
+
+    monkeypatch.setattr("agent_bridge.http_client.urlopen", reject)
+    client = BridgeHttpClient("https://bridge.example.test")
+    client.access_token = "session-private"
+
+    with pytest.raises(BridgeRemoteError) as captured:
+        client.post("/agent/native/channel/wait", {"wait_seconds": 0})
+
+    assert captured.value.status_code == 409
+    assert captured.value.error_code == "native_session_lease_expired"
