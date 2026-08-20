@@ -5,11 +5,13 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Mapping
 
 
 MAX_GUIDE_BYTES = 128 * 1024
+TMUX_PASTE_SETTLE_SECONDS = 0.4
 TMUX_PANE_PATTERN = re.compile(r"^%[0-9]{1,12}$")
 
 
@@ -46,11 +48,12 @@ class TmuxClaudeGuide:
         if loaded.returncode != 0:
             raise ClaudeGuideError(self._failure("load", loaded.stderr))
         try:
-            # tmux executes both commands in one server request. Bracketed paste
-            # keeps multiline room JSON as one prompt; Enter submits it to the
-            # already-running Claude TUI and becomes a steering message if a
-            # model turn is active.
-            delivered = subprocess.run(
+            # Keep the multiline room JSON in one bracketed paste. Claude Code
+            # consumes the paste asynchronously, so submitting Enter in the
+            # same tmux command can race and leave the prompt parked in its
+            # input box. Wait a short, content-independent interval and submit
+            # exactly once in a separate tmux request.
+            pasted = subprocess.run(
                 [
                     self.binary,
                     "paste-buffer",
@@ -60,7 +63,20 @@ class TmuxClaudeGuide:
                     buffer_name,
                     "-t",
                     self.pane,
-                    ";",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+            if pasted.returncode != 0:
+                raise ClaudeGuideError(
+                    self._failure("paste", pasted.stderr)
+                )
+            time.sleep(TMUX_PASTE_SETTLE_SECONDS)
+            submitted = subprocess.run(
+                [
+                    self.binary,
                     "send-keys",
                     "-t",
                     self.pane,
@@ -71,9 +87,9 @@ class TmuxClaudeGuide:
                 timeout=5,
                 check=False,
             )
-            if delivered.returncode != 0:
+            if submitted.returncode != 0:
                 raise ClaudeGuideError(
-                    self._failure("paste and submit", delivered.stderr)
+                    self._failure("submit", submitted.stderr)
                 )
         finally:
             # paste-buffer -d normally removes it. This best-effort cleanup is

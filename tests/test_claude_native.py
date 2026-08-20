@@ -83,12 +83,17 @@ def test_tmux_guide_discovers_only_a_safe_inherited_pane(monkeypatch) -> None:
 
 def test_tmux_guide_uses_bracketed_paste_and_one_submit(monkeypatch) -> None:
     calls: list[tuple[list[str], dict]] = []
+    sleeps: list[float] = []
 
     def fake_run(command, **kwargs):
         calls.append((list(command), dict(kwargs)))
         return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr("agent_bridge.claude_guide.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "agent_bridge.claude_guide.time.sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
     monkeypatch.setattr(
         "agent_bridge.claude_guide.secrets.token_hex",
         lambda _bytes: "a" * 16,
@@ -113,13 +118,16 @@ def test_tmux_guide_uses_bracketed_paste_and_one_submit(monkeypatch) -> None:
         buffer_name,
         "-t",
         "%7",
-        ";",
+    ]
+    assert sleeps == [0.4]
+    assert calls[2][0] == [
+        "/opt/homebrew/bin/tmux",
         "send-keys",
         "-t",
         "%7",
         "Enter",
     ]
-    assert calls[2][0] == [
+    assert calls[3][0] == [
         "/opt/homebrew/bin/tmux",
         "delete-buffer",
         "-b",
