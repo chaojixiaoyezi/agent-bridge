@@ -169,6 +169,7 @@ jobs:
             tests/test_store.py::test_admin_audit_ledger_is_append_only_filterable_and_admin_only \
             tests/test_store.py::test_history_governance_is_manual_abandoned_only_and_append_only \
             tests/test_store.py::test_schema_42_adds_message_assets_without_rewriting_existing_messages \
+            tests/test_store.py::test_schema_43_adds_runtime_diagnostics_without_rewriting_connectors \
             tests/test_store.py::test_restricted_attachment_visibility_delivery_history_and_links
 
       - name: Prove public and credential security boundaries

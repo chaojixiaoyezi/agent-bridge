@@ -262,6 +262,7 @@ def configure_resident_connector(
         **common,
         "AGENT_BRIDGE_COMPONENT": "listener",
         "AGENT_BRIDGE_CURSOR_FILE": str(cursor_file),
+        "AGENT_BRIDGE_DIAGNOSTIC_QUEUE_FILE": str(queue_database),
         "AGENT_BRIDGE_WAKE_POLICY": "all",
         "AGENT_BRIDGE_WAKE_COMMAND_JSON": json.dumps(
             [

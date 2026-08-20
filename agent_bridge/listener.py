@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import tomllib
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,10 +26,13 @@ from .config import (
     read_registration_secret,
 )
 from .http_client import BridgeHttpClient, BridgeRemoteError
+from .supervisor import queue_status
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 WAKE_PRIORITIES = {"normal": 0, "important": 1, "mention": 2}
+RUNTIME_DIAGNOSTIC_INTERVAL_SECONDS = 20.0
+RUNTIME_WORKER_ONLINE_SECONDS = 75.0
 SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
@@ -106,6 +114,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--cursor-file",
         default=os.environ.get("AGENT_BRIDGE_CURSOR_FILE"),
         help="Optional file containing only the last SSE sequence (never a token)",
+    )
+    parser.add_argument(
+        "--diagnostic-queue-file",
+        default=os.environ.get("AGENT_BRIDGE_DIAGNOSTIC_QUEUE_FILE"),
+        help=(
+            "Optional local supervisor queue used for sanitized connector health "
+            "reports"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-interval",
+        type=float,
+        default=float(
+            os.environ.get(
+                "AGENT_BRIDGE_DIAGNOSTIC_INTERVAL",
+                str(RUNTIME_DIAGNOSTIC_INTERVAL_SECONDS),
+            )
+        ),
+        help="Minimum seconds between sanitized connector health reports",
     )
     parser.add_argument(
         "--product",
@@ -281,7 +308,231 @@ def _write_cursor(path: Path | None, cursor: int) -> None:
     os.replace(temporary, path)
 
 
-def _iter_sse_events(stream: BinaryIO | Iterable[bytes]) -> Iterator[dict[str, Any]]:
+def _runtime_software_version() -> str:
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    try:
+        with project_file.open("rb") as handle:
+            value = str(tomllib.load(handle)["project"]["version"]).strip()
+            if value:
+                return value[:64]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        pass
+    try:
+        return importlib.metadata.version("agent-bridge")[:64]
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _diagnostic_queue_from_command(
+    explicit: Path | None,
+    command: Sequence[str] | None,
+) -> Path | None:
+    if explicit is not None:
+        return explicit.expanduser()
+    if command is None:
+        return None
+    values = list(command)
+    for index, value in enumerate(values[:-1]):
+        if value == "--database":
+            candidate = str(values[index + 1] or "").strip()
+            return Path(candidate).expanduser() if candidate else None
+    return None
+
+
+def _runtime_diagnostic_payload(
+    *,
+    connector_id: str,
+    queue_database: Path | None,
+) -> dict[str, Any]:
+    queue_payload: dict[str, Any] = {
+        "state": "unavailable",
+        "pending_count": 0,
+        "inflight_count": 0,
+        "deferred_count": 0,
+        "retrying_count": 0,
+        "max_attempt_count": 0,
+        "oldest_pending_age_seconds": None,
+        "oldest_inflight_age_seconds": None,
+        "newest_event_id": None,
+    }
+    worker_payload: dict[str, Any] = {
+        "kind": "unknown",
+        "state": "unknown",
+        "process_epoch": None,
+        "started_age_seconds": None,
+        "last_seen_age_seconds": None,
+        "last_success_age_seconds": None,
+        "last_failure_age_seconds": None,
+        "last_error_code": "queue_unavailable",
+        "active_adapter_runs": 0,
+    }
+    listener_state = "degraded"
+    if queue_database is not None:
+        try:
+            local = queue_status(queue_database)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+            local = None
+        if local is not None:
+            counts = local.get("counts") or {}
+            oldest = local.get("oldest_age_seconds") or {}
+            queue_payload = {
+                "state": "ready",
+                "pending_count": int(counts.get("pending") or 0),
+                "inflight_count": int(counts.get("inflight") or 0),
+                "deferred_count": int(counts.get("deferred") or 0),
+                "retrying_count": int(local.get("retrying_count") or 0),
+                "max_attempt_count": int(local.get("max_attempt_count") or 0),
+                "oldest_pending_age_seconds": oldest.get("pending"),
+                "oldest_inflight_age_seconds": oldest.get("inflight"),
+                "newest_event_id": local.get("newest_event_id"),
+            }
+            runtime = local.get("worker")
+            if isinstance(runtime, dict):
+                worker_state = str(runtime.get("state") or "unknown")
+                last_seen_age = runtime.get("last_seen_age_seconds")
+                if (
+                    last_seen_age is not None
+                    and float(last_seen_age) > RUNTIME_WORKER_ONLINE_SECONDS
+                ):
+                    worker_state = "offline"
+                worker_payload = {
+                    "kind": str(runtime.get("kind") or "unknown"),
+                    "state": worker_state,
+                    "process_epoch": runtime.get("process_epoch"),
+                    "started_age_seconds": runtime.get("started_age_seconds"),
+                    "last_seen_age_seconds": last_seen_age,
+                    "last_success_age_seconds": runtime.get(
+                        "last_success_age_seconds"
+                    ),
+                    "last_failure_age_seconds": runtime.get(
+                        "last_failure_age_seconds"
+                    ),
+                    "last_error_code": runtime.get("last_error_code"),
+                    "active_adapter_runs": int(
+                        local.get("active_adapter_runs") or 0
+                    ),
+                }
+            else:
+                worker_payload["last_error_code"] = None
+            listener_state = "online"
+    return {
+        "connector_id": connector_id,
+        "protocol_version": 1,
+        "software_version": _runtime_software_version(),
+        "platform": platform.system()
+        if platform.system() in {"Darwin", "Linux", "Windows"}
+        else "Other",
+        "listener_state": listener_state,
+        "queue": queue_payload,
+        "worker": worker_payload,
+    }
+
+
+def _post_runtime_diagnostics(
+    *,
+    base_url: str,
+    access_token: str,
+    payload: dict[str, Any],
+    timeout: float = 3.0,
+) -> None:
+    request = Request(
+        f"{base_url}/agent/connector/runtime-diagnostics",
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        ),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "agent-bridge-listener/0.4",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=max(0.25, min(float(timeout), 10.0))) as response:
+            response.read(65_536)
+            if not 200 <= response.status < 300:
+                raise ListenerError(
+                    f"runtime diagnostic endpoint returned HTTP {response.status}"
+                )
+    except HTTPError as exc:
+        raise ListenerError(
+            f"runtime diagnostic endpoint returned HTTP {exc.code}"
+        ) from exc
+    except (URLError, OSError) as exc:
+        raise ListenerError("cannot report connector runtime diagnostics") from exc
+
+
+class RuntimeDiagnosticsReporter:
+    """Best-effort reporter that never blocks wake-event delivery."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        connector_id: str | None,
+        queue_database: Path | None,
+        interval_seconds: float,
+    ) -> None:
+        self.base_url = base_url
+        self.connector_id = str(connector_id or "").strip() or None
+        self.queue_database = queue_database
+        self.interval_seconds = max(5.0, min(float(interval_seconds), 300.0))
+        self._lock = threading.Lock()
+        self._inflight = False
+        self._next_due = 0.0
+
+    def trigger(self, access_token: str, *, force: bool = False) -> None:
+        if self.connector_id is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if self._inflight or (not force and now < self._next_due):
+                return
+            self._inflight = True
+            self._next_due = now + self.interval_seconds
+        threading.Thread(
+            target=self._report,
+            args=(access_token,),
+            daemon=True,
+            name="agent-bridge-runtime-diagnostics",
+        ).start()
+
+    def report_now(self, access_token: str) -> None:
+        if self.connector_id is None:
+            return
+        self._report_payload(access_token)
+
+    def _report_payload(self, access_token: str) -> None:
+        if self.connector_id is None:
+            return
+        payload = _runtime_diagnostic_payload(
+            connector_id=self.connector_id,
+            queue_database=self.queue_database,
+        )
+        _post_runtime_diagnostics(
+            base_url=self.base_url,
+            access_token=access_token,
+            payload=payload,
+        )
+
+    def _report(self, access_token: str) -> None:
+        try:
+            self._report_payload(access_token)
+        except (ListenerError, OSError, RuntimeError, ValueError):
+            # Diagnostics are deliberately best effort. The persistent SSE and
+            # durable local queue remain the delivery authority.
+            pass
+        finally:
+            with self._lock:
+                self._inflight = False
+
+
+def _iter_sse_events(
+    stream: BinaryIO | Iterable[bytes],
+    *,
+    on_keepalive: Callable[[], None] | None = None,
+) -> Iterator[dict[str, Any]]:
     event_name = "message"
     event_id: int | None = None
     data_lines: list[str] = []
@@ -302,6 +553,8 @@ def _iter_sse_events(stream: BinaryIO | Iterable[bytes]) -> Iterator[dict[str, A
             data_lines = []
             continue
         if line.startswith(":"):
+            if on_keepalive is not None:
+                on_keepalive()
             continue
         field, separator, value = line.partition(":")
         if not separator:
@@ -553,11 +806,22 @@ def listen(
     connector_id: str | None = None,
     enrollment_token_loader: Callable[[], str | None] | None = None,
     enrollment_token_file: Path | None = None,
+    diagnostic_queue_file: Path | None = None,
+    diagnostic_interval: float = RUNTIME_DIAGNOSTIC_INTERVAL_SECONDS,
     once: bool = False,
 ) -> None:
     cursor = _read_cursor(cursor_file)
     delay = 1.0
     current_token = str(access_token or "").strip() or None
+    reporter = RuntimeDiagnosticsReporter(
+        base_url=base_url,
+        connector_id=connector_id,
+        queue_database=_diagnostic_queue_from_command(
+            diagnostic_queue_file,
+            command,
+        ),
+        interval_seconds=diagnostic_interval,
+    )
     if current_token is None and registration is None:
         raise ListenerError(
             "AGENT_BRIDGE_TOKEN is absent and auto-registration identity is incomplete"
@@ -608,7 +872,10 @@ def listen(
                 if response.headers.get_content_type() != "text/event-stream":
                     raise ListenerError("Bridge did not return an SSE stream")
                 delay = 1.0
-                for event in _iter_sse_events(response):
+                for event in _iter_sse_events(
+                    response,
+                    on_keepalive=lambda: reporter.trigger(str(current_token)),
+                ):
                     _dispatch_event(
                         event,
                         webhook,
@@ -621,7 +888,12 @@ def listen(
                         # accepted the event. A reconnect can safely redeliver it.
                         cursor = int(event["id"])
                         _write_cursor(cursor_file, cursor)
+                    reporter.trigger(str(current_token))
                     if once:
+                        try:
+                            reporter.report_now(str(current_token))
+                        except (ListenerError, OSError, RuntimeError, ValueError):
+                            pass
                         return
         except KeyboardInterrupt:
             return
@@ -666,6 +938,11 @@ def main(argv: list[str] | None = None) -> None:
         enrollment_token = _read_enrollment_token()
         connector_id = _read_connector_id()
         cursor_file = Path(args.cursor_file).expanduser() if args.cursor_file else None
+        diagnostic_queue_file = (
+            Path(args.diagnostic_queue_file).expanduser()
+            if args.diagnostic_queue_file
+            else None
+        )
         wake_timeout = max(0.25, min(float(args.wake_timeout), 120.0))
         listen(
             base_url=base_url,
@@ -681,6 +958,8 @@ def main(argv: list[str] | None = None) -> None:
             wake_policy=args.wake_policy,
             wake_timeout=wake_timeout,
             cursor_file=cursor_file,
+            diagnostic_queue_file=diagnostic_queue_file,
+            diagnostic_interval=args.diagnostic_interval,
             once=bool(args.once),
         )
     except ListenerError as exc:

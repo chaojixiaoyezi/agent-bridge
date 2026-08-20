@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,6 +14,7 @@ from urllib.request import urlopen
 import pytest
 
 import agent_bridge.listener as listener
+import agent_bridge.supervisor as supervisor
 from agent_bridge.listener import (
     ListenerError,
     Registration,
@@ -220,6 +222,82 @@ def test_wake_command_is_argv_only_and_strips_session_secrets(
     assert "AGENT_BRIDGE_ENROLLMENT_TOKEN" not in captured["env"]
     assert "AGENT_BRIDGE_DB" not in captured["env"]
     assert "AGENT_BRIDGE_HOME" not in captured["env"]
+
+
+def test_listener_runtime_report_contains_no_local_path_or_raw_error(
+    tmp_path: Path,
+) -> None:
+    queue = tmp_path / "private" / "wake-queue.db"
+    supervisor.enqueue_event(
+        queue,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "agent-bridge",
+                "event": "message_available",
+                "event_id": 88,
+                "participant_id": "participant_receiver",
+                "cursor": 88,
+                "wake_priority": "mention",
+                "required_reply_count": 1,
+                "has_new": True,
+                "has_room_activity": True,
+                "backlog": {"pending_count": 1},
+                "new_since_cursor": {"pending_count": 1},
+                "room_activity_since_cursor": {"activity_count": 1},
+                "server_time": 123.0,
+            }
+        ).encode("utf-8"),
+        now=time.time() - 12,
+    )
+    supervisor.record_worker_runtime(
+        queue,
+        worker_kind="supervisor",
+        process_epoch="epoch_listener_123456",
+        state="retrying",
+        successful=False,
+        error_code="adapter_exit",
+    )
+
+    payload = listener._runtime_diagnostic_payload(
+        connector_id="connector_runtime_123456",
+        queue_database=queue,
+    )
+
+    encoded = json.dumps(payload)
+    assert payload["queue"]["pending_count"] == 1
+    assert payload["worker"]["last_error_code"] == "adapter_exit"
+    assert payload["worker"]["state"] == "retrying"
+    assert str(queue) not in encoded
+    assert "last_error" not in payload["queue"]
+    assert "body" not in encoded.casefold()
+
+
+def test_listener_runtime_report_never_blocks_wake_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_report(**_kwargs) -> None:
+        started.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(listener, "_post_runtime_diagnostics", slow_report)
+    reporter = listener.RuntimeDiagnosticsReporter(
+        base_url="https://bridge.example.test",
+        connector_id="connector_async_123456",
+        queue_database=None,
+        interval_seconds=20,
+    )
+
+    before = time.monotonic()
+    reporter.trigger("session-memory-only")
+    elapsed = time.monotonic() - before
+
+    assert elapsed < 0.1
+    assert started.wait(1)
+    release.set()
 
 
 def test_auto_registration_sends_optional_authority_header_without_persisting_token(

@@ -602,6 +602,58 @@
 .connector-health-issue { padding: 3px 6px; border-radius: 999px; color: var(--muted-strong); background: var(--surface-strong); font-size: 8px; }
 .connector-health-issue.warning { color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); }
 .connector-health-issue.error { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.connector-runtime-details {
+  margin-top: 9px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 14%, var(--line));
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--surface-soft) 88%, transparent);
+}
+.connector-runtime-summary {
+  padding: 8px 10px;
+  color: var(--muted-strong);
+  font-size: 9px;
+  cursor: pointer;
+  list-style-position: inside;
+}
+.connector-runtime-details[open] .connector-runtime-summary {
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+}
+.connector-runtime-stages { display: grid; gap: 1px; padding: 7px; }
+.connector-runtime-stage {
+  display: grid;
+  grid-template-columns: minmax(110px, .8fr) auto;
+  gap: 3px 10px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+}
+.connector-runtime-stage strong { color: var(--text); font-size: 9px; }
+.connector-runtime-stage small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-runtime-stage-state { color: var(--cyan); font-size: 8px; text-align: right; }
+.connector-runtime-stage.retrying .connector-runtime-stage-state,
+.connector-runtime-stage.degraded .connector-runtime-stage-state { color: var(--amber); }
+.connector-runtime-stage.error .connector-runtime-stage-state,
+.connector-runtime-stage.offline .connector-runtime-stage-state,
+.connector-runtime-stage.unavailable .connector-runtime-stage-state { color: var(--danger); }
+.connector-runtime-empty,
+.connector-runtime-note,
+.connector-runtime-error,
+.connector-runtime-privacy { margin: 0; padding: 7px 10px; font-size: 8px; }
+.connector-runtime-empty,
+.connector-runtime-note { color: var(--muted-strong); }
+.connector-runtime-error { color: var(--danger); }
+.connector-runtime-privacy {
+  border-top: 1px dashed var(--line);
+  color: var(--muted);
+}
 .monitoring-panel {
   margin: 12px 0;
   padding: 12px;

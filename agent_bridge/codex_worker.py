@@ -20,11 +20,14 @@ from .codex_worker_contracts import (
     _required_reply_count,
 )
 from .supervisor import (
+    WORKER_HEARTBEAT_INTERVAL_SECONDS,
     SupervisorError,
     _batch_envelope,
     attach_adapter_run,
+    classify_worker_error,
     claim_batch,
     finish_adapter_run,
+    record_worker_runtime,
     recover_inflight,
 )
 
@@ -201,7 +204,8 @@ def _host_from_args(args: argparse.Namespace) -> CodexThreadHost:
 
 def run_session(args: argparse.Namespace) -> None:
     database = Path(args.database).expanduser()
-    claim_owner = f"codex-worker:{os.getpid()}:{uuid.uuid4().hex}"
+    process_epoch = uuid.uuid4().hex
+    claim_owner = f"codex-worker:{os.getpid()}:{process_epoch}"
     recover_inflight(
         database,
         reason="recovered after resident Codex worker restart",
@@ -210,8 +214,25 @@ def run_session(args: argparse.Namespace) -> None:
     submitted_batches = 0
     mention_required_by_run: dict[str, bool] = {}
     delay = max(0.1, min(float(args.poll_interval), 30.0))
+    record_worker_runtime(
+        database,
+        worker_kind="codex-worker",
+        process_epoch=process_epoch,
+        state="idle",
+    )
+    next_heartbeat = time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
     try:
         while True:
+            if time.monotonic() >= next_heartbeat:
+                record_worker_runtime(
+                    database,
+                    worker_kind="codex-worker",
+                    process_epoch=process_epoch,
+                    state="busy" if mention_required_by_run else "idle",
+                )
+                next_heartbeat = (
+                    time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
+                )
             if host is not None:
                 while True:
                     completion = host.poll_turn_completion()
@@ -227,6 +248,20 @@ def run_session(args: argparse.Namespace) -> None:
                         error=error,
                         evidence=evidence,
                         batch_required_reply=batch_required_reply,
+                    )
+                    record_worker_runtime(
+                        database,
+                        worker_kind="codex-worker",
+                        process_epoch=process_epoch,
+                        state="idle" if successful else "retrying",
+                        successful=successful,
+                        error_code=(
+                            None
+                            if successful
+                            else classify_worker_error(
+                                completion_error or "adapter contract failure"
+                            )
+                        ),
                     )
                     if args.once and submitted_batches > 0:
                         if not successful:
@@ -263,10 +298,26 @@ def run_session(args: argparse.Namespace) -> None:
                     adapter_run_id=run_id,
                 )
                 submitted_batches += 1
+                record_worker_runtime(
+                    database,
+                    worker_kind="codex-worker",
+                    process_epoch=process_epoch,
+                    state="busy",
+                )
                 continue
             if args.once and submitted_batches == 0:
                 return
             time.sleep(delay)
+    except (CodexWorkerError, SupervisorError, OSError, ValueError) as exc:
+        record_worker_runtime(
+            database,
+            worker_kind="codex-worker",
+            process_epoch=process_epoch,
+            state="error",
+            successful=False,
+            error_code=classify_worker_error(exc),
+        )
+        raise
     finally:
         if host is not None:
             host.close()

@@ -231,6 +231,55 @@ def build_agent_enrollment_routes(
             },
         )
 
+    async def report_agent_connector_runtime_diagnostics(
+        request: Request,
+    ) -> Response:
+        if policy.public_mode:
+            try:
+                enforce_rate(
+                    request,
+                    "agent-connector-diagnostics-ip",
+                    limit=300,
+                    window_seconds=60,
+                )
+            except Exception as exc:
+                return _json_error(exc)
+        return await _agent_json_call(
+            request,
+            store,
+            required={
+                "connector_id",
+                "protocol_version",
+                "software_version",
+                "platform",
+                "listener_state",
+                "queue",
+                "worker",
+            },
+            allowed={
+                "connector_id",
+                "protocol_version",
+                "software_version",
+                "platform",
+                "listener_state",
+                "queue",
+                "worker",
+            },
+            operation=lambda auth, payload: {
+                "diagnostics": store.report_connector_runtime_diagnostics(
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    connector_id=payload["connector_id"],
+                    protocol_version=payload["protocol_version"],
+                    software_version=payload["software_version"],
+                    platform=payload["platform"],
+                    listener_state=payload["listener_state"],
+                    queue=payload["queue"],
+                    worker=payload["worker"],
+                )
+            },
+        )
+
     async def report_agent_tui_state(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -311,6 +360,11 @@ def build_agent_enrollment_routes(
             Route(
                 "/agent/connector/setup",
                 report_agent_connector_setup,
+                methods=["POST"],
+            ),
+            Route(
+                "/agent/connector/runtime-diagnostics",
+                report_agent_connector_runtime_diagnostics,
                 methods=["POST"],
             ),
             Route(

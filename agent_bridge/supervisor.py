@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
@@ -18,6 +19,18 @@ PRIORITIES = {"normal": 0, "important": 1, "mention": 2}
 MAX_RETRY_DELAY_SECONDS = 30.0
 HANDLED_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFERRED_EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 10.0
+WORKER_STATES = {"idle", "busy", "retrying", "error"}
+WORKER_KINDS = {"codex-worker", "supervisor"}
+WORKER_ERROR_CODES = {
+    "adapter_contract_error",
+    "adapter_exit",
+    "adapter_missing",
+    "adapter_session_error",
+    "adapter_timeout",
+    "adapter_unknown",
+    "worker_restarted",
+}
 SENSITIVE_CHILD_ENV = {
     "AGENT_BRIDGE_TOKEN",
     "AGENT_TOKEN",
@@ -231,6 +244,17 @@ def _connect(database: Path) -> sqlite3.Connection:
             ON wake_events(state, available_at, created_at);
         CREATE INDEX IF NOT EXISTS idx_wake_events_priority_dispatch
             ON wake_events(state, available_at, priority, created_at);
+        CREATE TABLE IF NOT EXISTS worker_runtime (
+            runtime_key INTEGER PRIMARY KEY CHECK (runtime_key = 1),
+            worker_kind TEXT NOT NULL,
+            process_epoch TEXT NOT NULL,
+            started_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            state TEXT NOT NULL,
+            last_success_at REAL,
+            last_failure_at REAL,
+            last_error_code TEXT
+        );
         """
     )
     columns = {
@@ -246,6 +270,117 @@ def _connect(database: Path) -> sqlite3.Connection:
     except OSError:
         pass
     return connection
+
+
+def classify_worker_error(error: BaseException | str) -> str:
+    """Map local failures to a bounded code safe for remote reporting."""
+
+    message = str(error or "").casefold()
+    if "timed out" in message or "did not complete" in message:
+        return "adapter_timeout"
+    if (
+        "not found" in message
+        or "no such file" in message
+        or "cannot start" in message
+    ):
+        return "adapter_missing"
+    if "exited with status" in message or "exit status" in message:
+        return "adapter_exit"
+    if "session" in message or "app-server" in message or "rpc" in message:
+        return "adapter_session_error"
+    if "evidence" in message or "contract" in message or "required" in message:
+        return "adapter_contract_error"
+    if "restart" in message or "recovered" in message:
+        return "worker_restarted"
+    return "adapter_unknown"
+
+
+def record_worker_runtime(
+    database: Path,
+    *,
+    worker_kind: str,
+    process_epoch: str,
+    state: str,
+    successful: bool | None = None,
+    error_code: str | None = None,
+    now: float | None = None,
+) -> None:
+    current_time = float(time.time() if now is None else now)
+    normalized_kind = str(worker_kind or "").strip().lower()
+    normalized_epoch = str(process_epoch or "").strip()
+    normalized_state = str(state or "").strip().lower()
+    normalized_error = str(error_code or "").strip().lower() or None
+    if normalized_kind not in WORKER_KINDS:
+        raise SupervisorError("unsupported worker runtime kind")
+    if not normalized_epoch or len(normalized_epoch) > 128:
+        raise SupervisorError("worker runtime process epoch is invalid")
+    if normalized_state not in WORKER_STATES:
+        raise SupervisorError("unsupported worker runtime state")
+    if normalized_error is not None and normalized_error not in WORKER_ERROR_CODES:
+        raise SupervisorError("unsupported worker runtime error code")
+    with closing(_connect(database)) as connection:
+        previous = connection.execute(
+            "SELECT * FROM worker_runtime WHERE runtime_key = 1"
+        ).fetchone()
+        same_process = (
+            previous is not None
+            and str(previous["worker_kind"]) == normalized_kind
+            and str(previous["process_epoch"]) == normalized_epoch
+        )
+        started_at = (
+            float(previous["started_at"])
+            if same_process
+            else current_time
+        )
+        last_success_at = (
+            float(previous["last_success_at"])
+            if previous is not None and previous["last_success_at"] is not None
+            else None
+        )
+        last_failure_at = (
+            float(previous["last_failure_at"])
+            if previous is not None and previous["last_failure_at"] is not None
+            else None
+        )
+        last_error_code = (
+            str(previous["last_error_code"])
+            if previous is not None and previous["last_error_code"] is not None
+            else None
+        )
+        if successful is True:
+            last_success_at = current_time
+            last_error_code = None
+        elif successful is False:
+            last_failure_at = current_time
+            last_error_code = normalized_error or "adapter_unknown"
+        connection.execute(
+            """
+            INSERT INTO worker_runtime (
+                runtime_key, worker_kind, process_epoch, started_at,
+                last_seen_at, state, last_success_at, last_failure_at,
+                last_error_code
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(runtime_key) DO UPDATE SET
+                worker_kind = excluded.worker_kind,
+                process_epoch = excluded.process_epoch,
+                started_at = excluded.started_at,
+                last_seen_at = excluded.last_seen_at,
+                state = excluded.state,
+                last_success_at = excluded.last_success_at,
+                last_failure_at = excluded.last_failure_at,
+                last_error_code = excluded.last_error_code
+            """,
+            (
+                normalized_kind,
+                normalized_epoch,
+                started_at,
+                current_time,
+                normalized_state,
+                last_success_at,
+                last_failure_at,
+                last_error_code,
+            ),
+        )
 
 
 def enqueue_event(database: Path, raw: bytes, *, now: float | None = None) -> bool:
@@ -303,6 +438,21 @@ def queue_status(database: Path) -> dict[str, Any]:
             ).fetchall()
             if row["oldest_created_at"] is not None
         }
+        retry = connection.execute(
+            """
+            SELECT
+                SUM(
+                    CASE WHEN state IN ('pending', 'inflight')
+                                   AND last_error IS NOT NULL
+                         THEN 1 ELSE 0 END
+                ) AS retrying_count,
+                MAX(attempt_count) AS max_attempt_count
+            FROM wake_events
+            """
+        ).fetchone()
+        runtime = connection.execute(
+            "SELECT * FROM worker_runtime WHERE runtime_key = 1"
+        ).fetchone()
     return {
         "database": str(database.expanduser().resolve()),
         "counts": {
@@ -313,6 +463,8 @@ def queue_status(database: Path) -> dict[str, Any]:
         },
         "newest_event_id": newest["event_id"] if newest is not None else None,
         "active_adapter_runs": active_runs,
+        "retrying_count": int(retry["retrying_count"] or 0),
+        "max_attempt_count": int(retry["max_attempt_count"] or 0),
         "oldest_age_seconds": {
             state: max(0.0, now - created_at)
             for state, created_at in oldest.items()
@@ -320,6 +472,38 @@ def queue_status(database: Path) -> dict[str, Any]:
         # Status is intentionally read-only. Retention runs on enqueue/claim,
         # where a single consistent clock is already available.
         "pruned": {"handled": 0, "deferred": 0},
+        "worker": (
+            {
+                "kind": str(runtime["worker_kind"]),
+                "process_epoch": str(runtime["process_epoch"]),
+                "state": str(runtime["state"]),
+                "started_age_seconds": max(
+                    0.0,
+                    now - float(runtime["started_at"]),
+                ),
+                "last_seen_age_seconds": max(
+                    0.0,
+                    now - float(runtime["last_seen_at"]),
+                ),
+                "last_success_age_seconds": (
+                    max(0.0, now - float(runtime["last_success_at"]))
+                    if runtime["last_success_at"] is not None
+                    else None
+                ),
+                "last_failure_age_seconds": (
+                    max(0.0, now - float(runtime["last_failure_at"]))
+                    if runtime["last_failure_at"] is not None
+                    else None
+                ),
+                "last_error_code": (
+                    str(runtime["last_error_code"])
+                    if runtime["last_error_code"] is not None
+                    else None
+                ),
+            }
+            if runtime is not None
+            else None
+        ),
     }
 
 
@@ -635,8 +819,10 @@ def _run_adapter(
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SupervisorError("Agent adapter did not complete") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SupervisorError("Agent adapter timed out") from exc
+    except OSError as exc:
+        raise SupervisorError("Agent adapter cannot start") from exc
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace")[-1000:].strip()
         raise SupervisorError(
@@ -653,6 +839,7 @@ def process_once(
     debounce: float,
     adapter_timeout: float,
     now: float | None = None,
+    runtime_identity: tuple[str, str] | None = None,
 ) -> int:
     current_time = float(time.time() if now is None else now)
     with closing(_connect(database)) as connection:
@@ -666,6 +853,14 @@ def process_once(
         if not rows:
             return 0
         keys = [str(row["idempotency_key"]) for row in rows]
+        if runtime_identity is not None:
+            record_worker_runtime(
+                database,
+                worker_kind=runtime_identity[0],
+                process_epoch=runtime_identity[1],
+                state="busy",
+                now=current_time,
+            )
         try:
             _run_adapter(
                 adapter_command,
@@ -684,6 +879,15 @@ def process_once(
                 """,
                 [(retry_at, str(exc)[-1000:], key) for key in keys],
             )
+            if runtime_identity is not None:
+                record_worker_runtime(
+                    database,
+                    worker_kind=runtime_identity[0],
+                    process_epoch=runtime_identity[1],
+                    state="retrying",
+                    successful=False,
+                    error_code=classify_worker_error(exc),
+                )
             raise
         connection.executemany(
             """
@@ -694,6 +898,14 @@ def process_once(
             """,
             [(current_time, key) for key in keys],
         )
+        if runtime_identity is not None:
+            record_worker_runtime(
+                database,
+                worker_kind=runtime_identity[0],
+                process_epoch=runtime_identity[1],
+                state="idle",
+                successful=True,
+            )
         return len(rows)
 
 
@@ -708,18 +920,38 @@ def run_forever(
     once: bool,
 ) -> None:
     delay = max(0.1, min(float(poll_interval), 60.0))
+    process_epoch = uuid.uuid4().hex
+    runtime_identity = ("supervisor", process_epoch)
     recover_inflight(
         database,
         reason="recovered after adapter supervisor restart",
     )
+    record_worker_runtime(
+        database,
+        worker_kind=runtime_identity[0],
+        process_epoch=runtime_identity[1],
+        state="idle",
+    )
+    next_heartbeat = time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
     while True:
         try:
+            if time.monotonic() >= next_heartbeat:
+                record_worker_runtime(
+                    database,
+                    worker_kind=runtime_identity[0],
+                    process_epoch=runtime_identity[1],
+                    state="idle",
+                )
+                next_heartbeat = (
+                    time.monotonic() + WORKER_HEARTBEAT_INTERVAL_SECONDS
+                )
             handled = process_once(
                 database,
                 adapter_command=adapter_command,
                 wake_policy=wake_policy,
                 debounce=max(0.0, min(float(debounce), 300.0)),
                 adapter_timeout=adapter_timeout,
+                runtime_identity=runtime_identity,
             )
             if once:
                 return
@@ -728,6 +960,14 @@ def run_forever(
         except KeyboardInterrupt:
             return
         except SupervisorError as exc:
+            record_worker_runtime(
+                database,
+                worker_kind=runtime_identity[0],
+                process_epoch=runtime_identity[1],
+                state="retrying",
+                successful=False,
+                error_code=classify_worker_error(exc),
+            )
             print(f"agent-bridge-supervisor: {exc}", file=sys.stderr)
             if once:
                 raise

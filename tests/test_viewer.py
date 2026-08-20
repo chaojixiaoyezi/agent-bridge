@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.43.2"
+    assert _runtime_software_version() == "0.44.0"
 
 
 class FakeEmailDelivery:
@@ -2368,7 +2368,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260818-06")
+        index_html.index(f"{filename}?v=20260819-01")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
@@ -2463,7 +2463,7 @@ def test_web_composite_attachment_message_and_agent_download_acl(
     assert "message-link-card" in javascript
     assert "不会抓取远程预览" in javascript
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260818-06")
+        index_html.index(f"{filename}?v=20260819-01")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
@@ -3370,6 +3370,137 @@ def test_one_time_invitation_enrolls_exact_agent_and_tracks_resident_status(
     assert connector_health["issues"][0]["code"] == "legacy_binding"
     assert invitation_token not in diagnostics.text
     assert enrollment_token not in diagnostics.text
+
+    runtime_payload = {
+        "connector_id": connector_id,
+        "protocol_version": 1,
+        "software_version": "0.44.0",
+        "platform": "Linux",
+        "listener_state": "online",
+        "queue": {
+            "state": "ready",
+            "pending_count": 2,
+            "inflight_count": 1,
+            "deferred_count": 3,
+            "retrying_count": 0,
+            "max_attempt_count": 1,
+            "oldest_pending_age_seconds": 12,
+            "oldest_inflight_age_seconds": 4,
+            "newest_event_id": 42,
+        },
+        "worker": {
+            "kind": "codex-worker",
+            "state": "busy",
+            "process_epoch": "epoch_runtime_123456",
+            "started_age_seconds": 90,
+            "last_seen_age_seconds": 2,
+            "last_success_age_seconds": 30,
+            "last_failure_age_seconds": None,
+            "last_error_code": None,
+            "active_adapter_runs": 1,
+        },
+    }
+    assert client.post(
+        "/agent/connector/runtime-diagnostics",
+        headers=agent_headers,
+        json=runtime_payload,
+    ).status_code == 403
+    listener_registration = client.post(
+        "/agent/register",
+        headers={
+            "X-Agent-Bridge-Enrollment": enrollment_token,
+            "X-Agent-Bridge-Connector": connector_id,
+            "X-Agent-Bridge-Component": "listener",
+            "X-Agent-Bridge-Protocol": "2",
+        },
+        json={
+            "product": "codex",
+            "username": "invitee",
+            "signature": "只处理明确通知。",
+            "conversation_id": "邀请值守群",
+        },
+    )
+    assert listener_registration.status_code == 201
+    assert client.post(
+        "/agent/connector/runtime-diagnostics",
+        headers={
+            "Authorization": (
+                f"Bearer {listener_registration.json()['access_token']}"
+            )
+        },
+        json={
+            **runtime_payload,
+            "queue": {
+                **runtime_payload["queue"],
+                "database": "/private/wake-queue.db",
+            },
+        },
+    ).status_code == 400
+    runtime_report = client.post(
+        "/agent/connector/runtime-diagnostics",
+        headers={
+            "Authorization": (
+                f"Bearer {listener_registration.json()['access_token']}"
+            )
+        },
+        json=runtime_payload,
+    )
+    assert runtime_report.status_code == 200
+    assert runtime_report.json()["diagnostics"]["accepted"] is True
+    reported_health = client.get("/api/admin/connectors/health")
+    assert reported_health.status_code == 200
+    reported_payload = reported_health.json()
+    assert reported_payload["runtime_diagnostic_count"] == 1
+    assert reported_payload["fresh_runtime_diagnostic_count"] == 1
+    reported_runtime = reported_payload["connectors"][0][
+        "runtime_diagnostics"
+    ]
+    assert reported_runtime["fresh"] is True
+    assert reported_runtime["queue"]["pending_count"] == 2
+    assert reported_runtime["worker"]["state"] == "busy"
+    assert "wake-queue.db" not in reported_health.text
+    assert enrollment_token not in reported_health.text
+    stalled_report = client.post(
+        "/agent/connector/runtime-diagnostics",
+        headers={
+            "Authorization": (
+                f"Bearer {listener_registration.json()['access_token']}"
+            )
+        },
+        json={
+            **runtime_payload,
+            "queue": {
+                **runtime_payload["queue"],
+                "pending_count": 1,
+                "inflight_count": 0,
+                "oldest_pending_age_seconds": 360,
+            },
+            "worker": {
+                **runtime_payload["worker"],
+                "state": "retrying",
+                "last_failure_age_seconds": 1,
+                "last_error_code": "adapter_exit",
+                "active_adapter_runs": 0,
+            },
+        },
+    )
+    assert stalled_report.status_code == 200
+    stalled_health = client.get("/api/admin/connectors/health").json()[
+        "connectors"
+    ][0]
+    assert stalled_health["health_state"] == "failed"
+    assert {
+        issue["code"] for issue in stalled_health["issues"]
+    } >= {"remote_worker_retrying", "remote_queue_stalled"}
+    assert client.post(
+        "/agent/connector/runtime-diagnostics",
+        headers={
+            "Authorization": (
+                f"Bearer {listener_registration.json()['access_token']}"
+            )
+        },
+        json=runtime_payload,
+    ).status_code == 200
 
     with BridgeStore(database)._transaction() as connection:
         connection.execute(

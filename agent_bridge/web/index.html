@@ -6,17 +6,17 @@
     <meta name="color-scheme" content="light dark">
     <meta name="referrer" content="no-referrer">
     <title>Agent Bridge · 聊天看板</title>
-    <link rel="stylesheet" href="/assets/app.css?v=20260818-06">
-    <link rel="stylesheet" href="/assets/app-chat.css?v=20260818-06">
-    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260818-06">
-    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260818-06">
-    <script src="/assets/app.js?v=20260818-06" defer></script>
-    <script src="/assets/app-layout.js?v=20260818-06" defer></script>
-    <script src="/assets/app-chat-render.js?v=20260818-06" defer></script>
-    <script src="/assets/app-agent-operations.js?v=20260818-06" defer></script>
-    <script src="/assets/app-room-controller.js?v=20260818-06" defer></script>
-    <script src="/assets/app-governance.js?v=20260818-06" defer></script>
-    <script src="/assets/app-interactions.js?v=20260818-06" defer></script>
+    <link rel="stylesheet" href="/assets/app.css?v=20260819-01">
+    <link rel="stylesheet" href="/assets/app-chat.css?v=20260819-01">
+    <link rel="stylesheet" href="/assets/app-dialogs.css?v=20260819-01">
+    <link rel="stylesheet" href="/assets/app-responsive.css?v=20260819-01">
+    <script src="/assets/app.js?v=20260819-01" defer></script>
+    <script src="/assets/app-layout.js?v=20260819-01" defer></script>
+    <script src="/assets/app-chat-render.js?v=20260819-01" defer></script>
+    <script src="/assets/app-agent-operations.js?v=20260819-01" defer></script>
+    <script src="/assets/app-room-controller.js?v=20260819-01" defer></script>
+    <script src="/assets/app-governance.js?v=20260819-01" defer></script>
+    <script src="/assets/app-interactions.js?v=20260819-01" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>
@@ -1121,7 +1121,7 @@
             </div>
             <button class="secondary-button compact-button" id="refresh-connector-health" type="button">刷新诊断</button>
           </div>
-          <p class="field-help">这里只展示中央 Bridge 能验证的事实；远端机器自己的 supervisor 队列和模型进程错误仍需在对应机器查看。</p>
+          <p class="field-help">这里合并中央事实与远端 listener 主动上报的结构化状态；不会收集远端日志、路径、聊天正文、密钥或 TUI 权限。</p>
           <div class="connector-health-summary" id="connector-health-summary"></div>
           <p class="form-feedback" id="connector-health-feedback" role="status" aria-live="polite"></p>
           <section class="monitoring-panel" aria-labelledby="monitoring-title">

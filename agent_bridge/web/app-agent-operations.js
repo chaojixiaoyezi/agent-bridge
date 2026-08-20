@@ -147,11 +147,122 @@ function connectorHealthStateLabel(value) {
   return {
     healthy: "正常",
     degraded: "需关注",
-    offline: "listener 离线",
+    offline: "链路离线",
     failed: "异常",
     setup: "接入中",
     manual: "手动接入",
   }[value] || value || "未知";
+}
+
+function connectorRuntimeStateLabel(value) {
+  return {
+    online: "在线",
+    ready: "可用",
+    idle: "空闲",
+    busy: "工作中",
+    retrying: "重试中",
+    degraded: "降级",
+    error: "异常",
+    offline: "离线",
+    unavailable: "不可读取",
+    unknown: "等待首次探活",
+  }[value] || value || "未知";
+}
+
+function connectorRuntimeErrorLabel(value) {
+  return {
+    adapter_contract_error: "本体回合未满足结构化回复契约",
+    adapter_exit: "adapter 非零退出",
+    adapter_missing: "adapter 无法启动或文件不存在",
+    adapter_session_error: "本体 TUI/session 通道异常",
+    adapter_timeout: "adapter 执行超时",
+    adapter_unknown: "adapter 出现未分类错误",
+    queue_unavailable: "supervisor 队列不可读取",
+    worker_restarted: "worker 曾发生恢复重启",
+  }[value] || (value ? `未知状态码：${value}` : "无");
+}
+
+function appendConnectorRuntimeDetails(card, connector) {
+  const runtime = connector.runtime_diagnostics || {};
+  const details = makeElement("details", "connector-runtime-details");
+  details.append(makeElement(
+    "summary",
+    "connector-runtime-summary",
+    runtime.available
+      ? `远端故障详情 · ${runtime.fresh ? "刚刚更新" : "报告已过期"}`
+      : "远端故障详情 · 等待 listener 自然升级",
+  ));
+  if (!runtime.available) {
+    details.append(makeElement(
+      "p",
+      "connector-runtime-empty",
+      "旧连接仍可正常聊天；它下次自然重启或重新接入后会自动上报结构化详情。",
+    ));
+    card.append(details);
+    return;
+  }
+  const queue = runtime.queue || {};
+  const worker = runtime.worker || {};
+  const stages = makeElement("div", "connector-runtime-stages");
+  const stageRows = [
+    [
+      "Bridge → listener",
+      connectorRuntimeStateLabel(runtime.listener?.state),
+      `最近报告 ${formatAge(runtime.report_age_seconds || 0)} · v${runtime.software_version || "?"} / ${runtime.platform || "?"}`,
+      runtime.listener?.state || "unknown",
+    ],
+    [
+      "本机 supervisor 队列",
+      connectorRuntimeStateLabel(queue.state),
+      `等待 ${queue.pending_count || 0} · 执行中 ${queue.inflight_count || 0} · 延后 ${queue.deferred_count || 0} · 重试 ${queue.retrying_count || 0}`,
+      queue.state || "unknown",
+    ],
+    [
+      "聊天 worker / adapter",
+      connectorRuntimeStateLabel(worker.state),
+      `${worker.kind || "unknown"} · 心跳 ${worker.last_seen_age_seconds == null ? "尚未出现" : formatAge(worker.last_seen_age_seconds)} · 活跃回合 ${worker.active_adapter_runs || 0}`,
+      worker.state || "unknown",
+    ],
+    [
+      "真实 TUI",
+      connectorRuntimeStateLabel(connector.native_tui?.effective_state || "unknown"),
+      connector.native_tui?.last_seen_age_seconds == null
+        ? "当前产品未报告真实 TUI 心跳"
+        : `最近探活 ${formatAge(connector.native_tui.last_seen_age_seconds)}`,
+      connector.native_tui?.effective_state || "unknown",
+    ],
+  ];
+  for (const [label, value, note, tone] of stageRows) {
+    const row = makeElement("div", `connector-runtime-stage ${tone}`);
+    row.append(makeElement("strong", "", label));
+    row.append(makeElement("span", "connector-runtime-stage-state", value));
+    row.append(makeElement("small", "", note));
+    stages.append(row);
+  }
+  details.append(stages);
+  if (queue.oldest_pending_age_seconds != null || queue.oldest_inflight_age_seconds != null) {
+    const ages = [];
+    if (queue.oldest_pending_age_seconds != null) {
+      ages.push(`最早等待 ${formatAge(queue.oldest_pending_age_seconds)}`);
+    }
+    if (queue.oldest_inflight_age_seconds != null) {
+      ages.push(`最长执行 ${formatAge(queue.oldest_inflight_age_seconds)}`);
+    }
+    details.append(makeElement("p", "connector-runtime-note", ages.join(" · ")));
+  }
+  if (worker.last_error_code) {
+    details.append(makeElement(
+      "p",
+      "connector-runtime-error",
+      `最近安全状态码：${connectorRuntimeErrorLabel(worker.last_error_code)}`,
+    ));
+  }
+  details.append(makeElement(
+    "p",
+    "connector-runtime-privacy",
+    "仅接收状态码、数量和时长；不接收远端日志、路径、聊天正文、密钥或 TUI 权限。",
+  ));
+  card.append(details);
 }
 
 function renderConnectorHealth() {
@@ -261,6 +372,7 @@ function renderConnectorHealth() {
       }
       card.append(issues);
     }
+    appendConnectorRuntimeDetails(card, connector);
     const deviceActions = makeElement("div", "connector-device-actions");
     const rotate = makeElement(
       "button",

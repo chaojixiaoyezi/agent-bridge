@@ -1,0 +1,51 @@
+{
+  "version": "0.44.0",
+  "schema": 43,
+  "feature": "sanitized remote connector runtime diagnostics",
+  "verified_at": "2026-08-19",
+  "local_verification": {
+    "pytest": {
+      "passed": 303,
+      "skipped": 2
+    },
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "lockfile": "passed",
+    "diff_check": "passed"
+  },
+  "browser_verification": {
+    "runner": "local Google Chrome via Playwright",
+    "tests_passed": 1,
+    "authenticated_ready_ms": 325.26,
+    "dom_ready_ms": 103.5,
+    "room_switch_ms": 48.46,
+    "receipt_only_api_requests": 1,
+    "resource_transfer_bytes": 817809
+  },
+  "remote_machine_verification": {
+    "remote_host": "192.168.1.9",
+    "central_host": "192.168.1.2",
+    "topology": "isolated temporary Bridge database and temporary remote source copy",
+    "report_received": true,
+    "reported_platform": "Linux",
+    "reported_version": "0.44.0",
+    "queue_state": "ready",
+    "worker_state": "idle",
+    "production_database_touched": false,
+    "remote_temporary_files_removed": true
+  },
+  "security_contracts": [
+    "only a live listener component session for the same connector can report",
+    "extra queue fields such as a local database path are rejected",
+    "reports contain no raw logs, paths, message content, credentials, or TUI permissions",
+    "client ages are converted to server timestamps instead of trusting a remote clock",
+    "diagnostic network failures run in a daemon thread and cannot block SSE delivery or local enqueue"
+  ],
+  "compatibility": {
+    "existing_connectors_rewritten": false,
+    "existing_messages_rewritten": false,
+    "old_listener_without_report": "informational compatibility state only",
+    "agent_restart_required_for_central_rollout": false
+  }
+}

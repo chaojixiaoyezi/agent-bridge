@@ -203,6 +203,9 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
         "connector_1234567890abcdef"
     )
     assert listener["EnvironmentVariables"]["AGENT_BRIDGE_WAKE_POLICY"] == "all"
+    assert listener["EnvironmentVariables"][
+        "AGENT_BRIDGE_DIAGNOSTIC_QUEUE_FILE"
+    ] == str(state_directory / "wake-queue.db")
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AUTO_REGISTER"] == "1"
     assert worker["EnvironmentVariables"]["AGENT_BRIDGE_AGENT_WAKE_POLICY"] == (
         "mention"

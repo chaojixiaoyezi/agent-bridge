@@ -20,6 +20,7 @@ from agent_bridge.supervisor import (
     enqueue_event,
     process_once,
     queue_status,
+    record_worker_runtime,
     recover_inflight,
 )
 
@@ -79,6 +80,35 @@ def test_supervisor_queue_is_durable_idempotent_and_metadata_only(
     unsafe["backlog"]["body"] = "never persist this room message"
     with pytest.raises(SupervisorError, match="message content"):
         enqueue_event(database, json.dumps(unsafe).encode("utf-8"), now=12)
+
+
+def test_supervisor_status_exposes_sanitized_worker_runtime_only(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state" / "wake-queue.db"
+    record_worker_runtime(
+        database,
+        worker_kind="codex-worker",
+        process_epoch="epoch_safe_123456",
+        state="busy",
+        now=20,
+    )
+    record_worker_runtime(
+        database,
+        worker_kind="codex-worker",
+        process_epoch="epoch_safe_123456",
+        state="retrying",
+        successful=False,
+        error_code="adapter_exit",
+        now=25,
+    )
+
+    status = queue_status(database)
+    assert status["worker"]["kind"] == "codex-worker"
+    assert status["worker"]["state"] == "retrying"
+    assert status["worker"]["last_error_code"] == "adapter_exit"
+    assert status["worker"]["started_age_seconds"] >= 5
+    assert "last_error" not in status["worker"]
 
 
 def test_supervisor_defers_normal_then_coalesces_it_with_a_mention(

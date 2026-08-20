@@ -11,6 +11,9 @@ from .store_constants import CONNECTOR_ONLINE_WINDOW_SECONDS
 from .validation import opaque_id
 
 
+REMOTE_QUEUE_STALLED_SECONDS = 5 * 60.0
+
+
 class ConnectorHealthMixin:
     def admin_connector_health(
         self,
@@ -145,6 +148,9 @@ class ConnectorHealthMixin:
             ).fetchall()
             readiness_rows = conn.execute(
                 "SELECT * FROM connector_component_readiness"
+            ).fetchall()
+            runtime_diagnostic_rows = conn.execute(
+                "SELECT * FROM connector_runtime_diagnostics"
             ).fetchall()
             component_activity_rows = conn.execute(
                 """
@@ -313,6 +319,9 @@ class ConnectorHealthMixin:
                     component["active_session_count"] or 0
                 ),
             }
+        runtime_diagnostics = {
+            str(row["connector_id"]): row for row in runtime_diagnostic_rows
+        }
 
         def diagnostic_detail(raw_value: object) -> str | None:
             try:
@@ -369,6 +378,16 @@ class ConnectorHealthMixin:
             ):
                 effective_native_state = "offline"
             issues: list[dict[str, str]] = []
+            runtime_row = runtime_diagnostics.get(connector_id)
+            runtime_report_age = (
+                max(0.0, now - float(runtime_row["reported_at"]))
+                if runtime_row is not None
+                else None
+            )
+            runtime_report_fresh = bool(
+                runtime_report_age is not None
+                and runtime_report_age <= CONNECTOR_ONLINE_WINDOW_SECONDS
+            )
 
             def add_issue(code: str, severity: str, label: str) -> None:
                 issues.append({"code": code, "severity": severity, "label": label})
@@ -395,6 +414,76 @@ class ConnectorHealthMixin:
                     "info",
                     "旧版连接会在组件自然重连后补齐登记",
                 )
+            if setup_status == "configured" and runtime_row is None:
+                add_issue(
+                    "remote_diagnostics_pending",
+                    "info",
+                    "远端故障详情会在 listener 自然升级后出现",
+                )
+            elif (
+                setup_status == "configured"
+                and runtime_row is not None
+                and not runtime_report_fresh
+            ):
+                add_issue(
+                    "remote_diagnostics_stale",
+                    "warning",
+                    "远端故障详情超过 75 秒未更新",
+                )
+            elif setup_status == "configured" and runtime_row is not None:
+                queue_state = str(runtime_row["queue_state"])
+                worker_state = str(runtime_row["worker_state"])
+                if queue_state == "unavailable":
+                    add_issue(
+                        "remote_queue_unavailable",
+                        "error",
+                        "远端 supervisor 队列不可读取",
+                    )
+                if worker_state == "offline":
+                    add_issue(
+                        "remote_worker_offline",
+                        "error",
+                        "远端聊天 worker 心跳已中断",
+                    )
+                elif worker_state == "error":
+                    add_issue(
+                        "remote_worker_error",
+                        "error",
+                        "远端聊天 adapter 报告错误",
+                    )
+                elif worker_state == "retrying":
+                    add_issue(
+                        "remote_worker_retrying",
+                        "warning",
+                        "远端聊天 adapter 正在重试",
+                    )
+                elif worker_state == "unknown":
+                    add_issue(
+                        "remote_worker_pending",
+                        "info",
+                        "等待远端聊天 worker 首次探活",
+                    )
+                oldest_local_work_at = min(
+                    (
+                        float(value)
+                        for value in (
+                            runtime_row["queue_oldest_pending_at"],
+                            runtime_row["queue_oldest_inflight_at"],
+                        )
+                        if value is not None
+                    ),
+                    default=None,
+                )
+                if (
+                    oldest_local_work_at is not None
+                    and now - oldest_local_work_at >= REMOTE_QUEUE_STALLED_SECONDS
+                    and worker_state in {"offline", "error", "retrying"}
+                ):
+                    add_issue(
+                        "remote_queue_stalled",
+                        "error",
+                        "远端本机队列已有事件等待超过 5 分钟",
+                    )
             if setup_status == "configured" and int(row["active_session_count"] or 0) == 0:
                 add_issue("session_unavailable", "warning", "没有有效 Agent 会话")
             if row["tui_adapter_kind"] is not None:
@@ -427,9 +516,18 @@ class ConnectorHealthMixin:
                 )
 
             issue_codes = {item["code"] for item in issues}
-            if setup_status == "failed" or "native_tui_error" in issue_codes:
+            if setup_status == "failed" or issue_codes & {
+                "native_tui_error",
+                "remote_queue_unavailable",
+                "remote_worker_error",
+                "remote_queue_stalled",
+            }:
                 health_state = "failed"
-            elif issue_codes & {"listener_offline", "native_tui_offline"}:
+            elif issue_codes & {
+                "listener_offline",
+                "native_tui_offline",
+                "remote_worker_offline",
+            }:
                 health_state = "offline"
             elif setup_status == "manual":
                 health_state = "manual"
@@ -551,6 +649,127 @@ class ConnectorHealthMixin:
                     "missing_components": missing_components,
                     "component_registration": readiness.get(connector_id, {}),
                     "component_activity": component_activity.get(connector_id, {}),
+                    "runtime_diagnostics": (
+                        {
+                            "available": True,
+                            "protocol_version": int(
+                                runtime_row["protocol_version"]
+                            ),
+                            "software_version": str(
+                                runtime_row["software_version"]
+                            ),
+                            "platform": str(runtime_row["platform"]),
+                            "reported_at": float(runtime_row["reported_at"]),
+                            "report_age_seconds": runtime_report_age,
+                            "fresh": runtime_report_fresh,
+                            "listener": {
+                                "state": str(runtime_row["listener_state"]),
+                            },
+                            "queue": {
+                                "state": str(runtime_row["queue_state"]),
+                                "pending_count": int(
+                                    runtime_row["queue_pending_count"] or 0
+                                ),
+                                "inflight_count": int(
+                                    runtime_row["queue_inflight_count"] or 0
+                                ),
+                                "deferred_count": int(
+                                    runtime_row["queue_deferred_count"] or 0
+                                ),
+                                "retrying_count": int(
+                                    runtime_row["queue_retrying_count"] or 0
+                                ),
+                                "max_attempt_count": int(
+                                    runtime_row["queue_max_attempt_count"] or 0
+                                ),
+                                "oldest_pending_age_seconds": (
+                                    max(
+                                        0.0,
+                                        now
+                                        - float(
+                                            runtime_row[
+                                                "queue_oldest_pending_at"
+                                            ]
+                                        ),
+                                    )
+                                    if runtime_row[
+                                        "queue_oldest_pending_at"
+                                    ] is not None
+                                    else None
+                                ),
+                                "oldest_inflight_age_seconds": (
+                                    max(
+                                        0.0,
+                                        now
+                                        - float(
+                                            runtime_row[
+                                                "queue_oldest_inflight_at"
+                                            ]
+                                        ),
+                                    )
+                                    if runtime_row[
+                                        "queue_oldest_inflight_at"
+                                    ] is not None
+                                    else None
+                                ),
+                                "newest_event_id": (
+                                    int(runtime_row["newest_event_id"])
+                                    if runtime_row["newest_event_id"] is not None
+                                    else None
+                                ),
+                            },
+                            "worker": {
+                                "kind": str(runtime_row["worker_kind"]),
+                                "state": str(runtime_row["worker_state"]),
+                                "process_epoch": (
+                                    str(runtime_row["worker_process_epoch"])
+                                    if runtime_row["worker_process_epoch"] is not None
+                                    else None
+                                ),
+                                "started_at": (
+                                    float(runtime_row["worker_started_at"])
+                                    if runtime_row["worker_started_at"] is not None
+                                    else None
+                                ),
+                                "last_seen_at": (
+                                    float(runtime_row["worker_last_seen_at"])
+                                    if runtime_row["worker_last_seen_at"] is not None
+                                    else None
+                                ),
+                                "last_seen_age_seconds": (
+                                    max(
+                                        0.0,
+                                        now - float(runtime_row["worker_last_seen_at"]),
+                                    )
+                                    if runtime_row["worker_last_seen_at"] is not None
+                                    else None
+                                ),
+                                "last_success_at": (
+                                    float(runtime_row["worker_last_success_at"])
+                                    if runtime_row["worker_last_success_at"] is not None
+                                    else None
+                                ),
+                                "last_failure_at": (
+                                    float(runtime_row["worker_last_failure_at"])
+                                    if runtime_row["worker_last_failure_at"] is not None
+                                    else None
+                                ),
+                                "last_error_code": (
+                                    str(runtime_row["worker_last_error_code"])
+                                    if runtime_row["worker_last_error_code"] is not None
+                                    else None
+                                ),
+                                "active_adapter_runs": int(
+                                    runtime_row["active_adapter_runs"] or 0
+                                ),
+                            },
+                        }
+                        if runtime_row is not None
+                        else {
+                            "available": False,
+                            "fresh": False,
+                        }
+                    ),
                     "native_tui": {
                         "endpoint_id": (
                             str(row["tui_endpoint_id"])
@@ -643,6 +862,14 @@ class ConnectorHealthMixin:
             "binding_v2_count": sum(
                 item["binding_version"] >= 2 for item in connectors
             ),
+            "runtime_diagnostic_count": sum(
+                bool(item["runtime_diagnostics"].get("available"))
+                for item in connectors
+            ),
+            "fresh_runtime_diagnostic_count": sum(
+                bool(item["runtime_diagnostics"].get("fresh"))
+                for item in connectors
+            ),
             "backlog": {
                 "pending_count": pending_total,
                 "required_pending_count": required_total,
@@ -691,8 +918,9 @@ class ConnectorHealthMixin:
                 REQUIRED_REPLY_DELAY_WARNING_SECONDS
             ),
             "diagnostic_scope": (
-                "Central Bridge state only. Remote supervisor queues and local "
-                "model process errors require that machine's supervisor status/logs."
+                "Central Bridge facts plus sanitized remote listener, supervisor "
+                "queue, and adapter status codes. No remote logs, paths, message "
+                "content, credentials, or TUI permissions are collected."
             ),
             "server_time": now,
         }

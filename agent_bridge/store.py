@@ -20,6 +20,10 @@ from .avatars import (
 from .admin_audit import ADMIN_AUDIT_SCHEMA, AdminAuditMixin
 from .chat_authorization import CHAT_AUTHORIZATION_SCHEMA, ChatAuthorizationMixin
 from .connector_health import ConnectorHealthMixin
+from .connector_runtime_diagnostics import (
+    CONNECTOR_RUNTIME_DIAGNOSTICS_SCHEMA,
+    ConnectorRuntimeDiagnosticsMixin,
+)
 from .store_constants import (
     AGENT_ACTIVE_ROOM_LIMIT as AGENT_ACTIVE_ROOM_LIMIT,
     AUDIENCE_KINDS as AUDIENCE_KINDS,
@@ -173,6 +177,7 @@ class BridgeStore(
     ChatAuthorizationMixin,
     AgentLifecycleMixin,
     AgentConnectorMixin,
+    ConnectorRuntimeDiagnosticsMixin,
     ConnectorHealthMixin,
     AgentSessionMixin,
     NativeSessionMixin,
@@ -415,6 +420,7 @@ class BridgeStore(
             self._migrate_reusable_agent_invitations(conn)
             self._migrate_agent_connector_conversations(conn)
             conn.executescript(INVITATION_SCHEMA)
+            conn.executescript(CONNECTOR_RUNTIME_DIAGNOSTICS_SCHEMA)
             self._migrate_connector_identity_bindings(conn)
             self._migrate_native_tui_bindings(conn)
             if schema_version < 21:
@@ -578,7 +584,7 @@ class BridgeStore(
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 42")
+            conn.execute("PRAGMA user_version = 43")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)

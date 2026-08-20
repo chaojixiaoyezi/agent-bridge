@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.43.2 / schema 42。
+当前协议/数据库版本：Agent Bridge v0.44.0 / schema 43。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -238,6 +238,8 @@ v0.42.24 保持 schema 41、接口、权限、消息正文和 Agent 投递语义
 v0.43.0 将 schema 增量升级为 42，增加不可变的消息接收名单、私有附件元数据与结构化链接表。Web 可把文字、链接和最多 5 个文件/图片组成一条消息；存在附件时必须结构化 @ Agent 或使用有权限的 `@全员`，且整条消息只投递、检索和展示给发送时固化的 Agent，后加入者不会继承，引用回复也只能继承或缩小原名单。链接单独发送仍是公开卡片，Bridge 不抓取远程预览。附件字节写入数据库旁权限 `0700/0600` 的私有 blob 目录，Agent 只能用当前同房 session 和接收名单经 `agent_download_attachment` 原子校验下载；Web 下载继续复核房间 ACL。快照会复制 SQLite 实际引用的 blob，同时仍能在升级前读取没有附件表的 schema 41 数据库。旧消息、房间序号、普通公开 @、现有 Agent session、connector、listener、worker 和 TUI 进程不重建。验证证据见 [restricted-message-assets-v0.43.0-2026-08-18.json](evidence/restricted-message-assets-v0.43.0-2026-08-18.json)。
 
 v0.43.1 不变更 schema、Agent 投递/唤醒合同或任务状态机。Web 待处理中心把原来的方向投影提升为“待我处理、等待对方、仅供关注”，顶栏只统计前两类；目标 membership 已停用的投递不再伪装成仍可回复事项，精确回复检查改用既有复合索引的 `NOT EXISTS`，生产库同一投影的平均只读耗时由 21.406ms 降至 12.946ms。Web 用户可对结构化点名自己的消息显式“标为已处理”，批量动作在同房间复用中央 ack/receipt 权威且不产生新聊天消息，不能确认其他 Agent 的队列。发布只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。验证证据见 [pending-attention-center-v0.43.1-2026-08-19.json](evidence/pending-attention-center-v0.43.1-2026-08-19.json)。
+
+v0.44.0 的 schema 43 只新增 `connector_runtime_diagnostics` 最新状态表。绑定 v2 的 listener 以 20 秒为最短间隔、在独立后台线程中读取本机 metadata-only supervisor 队列，并向 `/agent/connector/runtime-diagnostics` 上报白名单字段：队列数量/最早等待时长、worker 心跳与状态、稳定错误码、软件版本和平台。服务端只接受该 connector 的有效 `listener` 席位，使用服务端时间把“多久以前”换算为时间点，并拒绝额外字段、日志、路径和任意错误文本。管理员健康面板把 Bridge→listener→本机队列→聊天 worker/adapter→真实 TUI 展开为结构化链路；旧 listener 没报告时只显示兼容提示，报告超过 75 秒、队列不可读、worker 离线/错误/重试或问题队列超过 5 分钟才形成对应 issue。诊断失败不会阻塞 SSE、入队或 adapter 消费；滚动中央 Viewer 时不重启已有 Agent/connector，旧远端组件可在自然重启后采用新协议。全量回归、真实 Chrome 和 `192.168.1.9` 隔离跨机器证据见 [connector-runtime-diagnostics-v0.44.0-2026-08-19.json](evidence/connector-runtime-diagnostics-v0.44.0-2026-08-19.json)。
 
 v0.43.2 不变更 schema、投递写状态机、唤醒、免打扰或本体 TUI 权限。`ViewerMessageQueries` 用一个批量结构化投影同时服务消息和回执 API：逐 Agent 显示排队、离线、已通知、已注入、已读、已确认、已回复、已离群和已取消，DND 与 endpoint 在线状态保持正交；精确回复只按 `reply_to + sender_participant_id` 判定，不读取正文。SSE receipt revision 同时覆盖原生 TUI milestone 与 DND，不再只看旧 `receipts.acked_at`；纯回执事件从房间列表、待处理中心、回执 3 个请求降为仅当前房间回执 1 个请求，并原位更新展开明细，不重绘时间线。刷新队列会在当前 Promise 内排空，不再留下“页面显示空闲、下一拍却全量刷新”的隐藏定时器；会话维护按有效 Agent session、Web session 或近期 connector/TUI 端点共同判断在线，不再在 Viewer 启动时把刚登录的 Web 用户误标为离线。发布仍只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。验证证据见 [message-delivery-visibility-v0.43.2-2026-08-19.json](evidence/message-delivery-visibility-v0.43.2-2026-08-19.json)。
 
