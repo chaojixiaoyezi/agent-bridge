@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.0"
+    assert _runtime_software_version() == "0.44.1"
 
 
 class FakeEmailDelivery:
@@ -2368,7 +2368,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260819-01")
+        index_html.index(f"{filename}?v=20260819-02")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
@@ -2463,7 +2463,7 @@ def test_web_composite_attachment_message_and_agent_download_acl(
     assert "message-link-card" in javascript
     assert "不会抓取远程预览" in javascript
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260819-01")
+        index_html.index(f"{filename}?v=20260819-02")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)

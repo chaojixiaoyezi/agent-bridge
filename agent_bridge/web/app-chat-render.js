@@ -124,10 +124,11 @@ function isNearTimelineBottom() {
 
 function captureTimelineAnchor() {
   const timelineTop = elements.timeline.getBoundingClientRect().top;
+  const timelineBottom = timelineTop + elements.timeline.clientHeight;
   const articles = elements.timeline.querySelectorAll("article[data-message-id]");
   for (const article of articles) {
     const rect = article.getBoundingClientRect();
-    if (rect.bottom > timelineTop) {
+    if (rect.bottom > timelineTop && rect.top < timelineBottom) {
       return { messageId: article.dataset.messageId, offset: rect.top - timelineTop };
     }
   }
@@ -249,18 +250,27 @@ function createDeliveryDetails(message) {
   const body = makeElement("div", "message-delivery-body");
   details.append(body);
   details.addEventListener("toggle", () => {
-    if (!details.open) return;
-    const latest = state.messages.find(
-      (item) => item.message_id === message.message_id,
-    ) || message;
+    if (!details.open) {
+      state.openDeliveryDetails.delete(message.message_id);
+      return;
+    }
+    state.openDeliveryDetails.add(message.message_id);
+    const latest = timelineMessageAt(message.message_id) || message;
     populateDeliveryDetails(body, latest);
   });
+  if (state.openDeliveryDetails.has(message.message_id)) {
+    details.open = true;
+    populateDeliveryDetails(body, timelineMessageAt(message.message_id) || message);
+  }
   return details;
 }
 
 function createMessageElement(message) {
   const article = makeElement("article", "message");
   article.dataset.messageId = message.message_id;
+  if (message.message_id === state.roomSearchTargetMessageId) {
+    article.classList.add("search-target");
+  }
   const messageMarkers = roomMarkersForMessage(message.message_id);
   const head = makeElement("div", "message-head");
   const senderLine = makeElement("div", "sender-line");
@@ -457,7 +467,7 @@ function createMessageElement(message) {
     article.append(makeElement("p", "mention-label", `特别通知：${message.mentions.map(participantName).join("、")}`));
   }
   if (message.reply_to) {
-    const original = state.messages.find((item) => item.message_id === message.reply_to);
+    const original = timelineMessageAt(message.reply_to);
     const replyLabel = original
       ? `回复 ${original.sender_display_name || original.sender_client_type}：${original.body.slice(0, 90)}`
       : `回复消息 ${message.reply_to}`;
@@ -530,11 +540,11 @@ function createMessageElement(message) {
     article.append(replyButton);
   }
   const rootMessage = message.reply_to
-    ? state.messages.find((item) => item.message_id === message.reply_to)
+    ? timelineMessageAt(message.reply_to)
     : message;
-  const loadedReplyCount = state.messages.filter(
-    (item) => item.reply_to === (rootMessage?.message_id || message.message_id),
-  ).length;
+  const loadedReplyCount = timelineLoadedReplyCount(
+    rootMessage?.message_id || message.message_id,
+  );
   const replyCount = Math.max(
     loadedReplyCount,
     Number(rootMessage?.reply_count || message.reply_count || 0),
@@ -598,13 +608,22 @@ function updateNewMessageIndicator() {
   elements.newMessageIndicator.title = label;
 }
 
-function messageSignature(messages) {
-  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${roomHighlightSignature()}:${messages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${(item.agent_deliveries || []).map((delivery) => `${delivery.participant_id},${delivery.status},${delivery.active_endpoint ? 1 : 0},${delivery.dnd_active ? 1 : 0}`).join(";")}:${item.reply_count || 0}:${item.visibility?.kind || "room"}:${(item.attachments || []).map((asset) => asset.attachment_id).join(",")}:${(item.links || []).map((link) => link.link_id).join(",")}`).join("|")}`;
+function messageSignature(messages, range = renderedTimelineRange(messages)) {
+  const visibleMessages = messages.slice(range.start, range.end);
+  const firstMessageId = messages[0]?.message_id || "";
+  const lastMessageId = messages[messages.length - 1]?.message_id || "";
+  return `${state.selectedRoom || ""}:${state.hasEarlierMessages}:${state.hasLaterMessages}:${state.roomSearchTargetMessageId || ""}:${roomHighlightSignature()}:${messages.length}:${firstMessageId}:${lastMessageId}:${range.start}:${range.end}:${visibleMessages.map((item) => `${item.message_id}:${item.sender_display_name || ""}:${item.sender_signature || ""}:${item.sender_avatar_key || "auto"}:${item.sender_seat || "unknown"}:${item.task?.updated_at || item.updated_at || 0}:${item.body_delivery?.delivered_count || 0}:${item.body_delivery?.applied_count || 0}:${item.ack_count || 0}:${item.receipt_count || 0}:${(item.agent_deliveries || []).map((delivery) => `${delivery.participant_id},${delivery.status},${delivery.active_endpoint ? 1 : 0},${delivery.dnd_active ? 1 : 0}`).join(";")}:${item.reply_count || 0}:${item.visibility?.kind || "room"}:${(item.attachments || []).map((asset) => asset.attachment_id).join(",")}:${(item.links || []).map((link) => link.link_id).join(",")}`).join("|")}`;
 }
 
 function renderMessages(
   messages,
-  { forceBottom = false, addedCount = 0, targetMessageId = null } = {},
+  {
+    forceBottom = false,
+    addedCount = 0,
+    targetMessageId = null,
+    virtualIndex = null,
+    forceVirtual = false,
+  } = {},
 ) {
   const hadRenderedMessages = Boolean(
     elements.timeline.querySelector("article[data-message-id]"),
@@ -615,8 +634,20 @@ function renderMessages(
     ? isNearTimelineBottom()
     : true;
   const anchor = !wasNearBottom && !forceBottom ? captureTimelineAnchor() : null;
-  const signature = messageSignature(messages);
-  if (!forceBottom && addedCount === 0 && signature === state.messageRenderSignature) {
+  const range = resolveTimelineVirtualRange(messages, {
+    forceBottom,
+    wasNearBottom,
+    targetMessageId,
+    anchor,
+    virtualIndex,
+  });
+  const signature = messageSignature(messages, range);
+  if (
+    !forceBottom
+    && !forceVirtual
+    && addedCount === 0
+    && signature === state.messageRenderSignature
+  ) {
     updateNewMessageIndicator();
     return;
   }
@@ -628,6 +659,7 @@ function renderMessages(
     empty.append(makeElement("p", "", "你或 Agent 发出的第一条讨论会自动出现在这里。"));
     fragment.append(empty);
     elements.timeline.replaceChildren(fragment);
+    syncTimelineVirtualDom(messages);
     state.unreadMessages = 0;
     updateNewMessageIndicator();
     return;
@@ -640,14 +672,22 @@ function renderMessages(
     fragment.append(loadEarlier);
   }
 
-  let activeDay = "";
-  for (const message of messages) {
-    const nextDay = dayLabel(message.created_at);
-    if (nextDay !== activeDay) {
-      activeDay = nextDay;
-      fragment.append(makeElement("div", "day-divider", activeDay));
+  if (range.virtualized) {
+    fragment.append(createTimelineVirtualSpacer("top"));
+    for (let index = range.start; index < range.end; index += 1) {
+      fragment.append(createTimelineVirtualRow(messages[index], index, messages));
     }
-    fragment.append(createMessageElement(message));
+    fragment.append(createTimelineVirtualSpacer("bottom"));
+  } else {
+    let activeDay = "";
+    for (const message of messages) {
+      const nextDay = dayLabel(message.created_at);
+      if (nextDay !== activeDay) {
+        activeDay = nextDay;
+        fragment.append(makeElement("div", "day-divider", activeDay));
+      }
+      fragment.append(createMessageElement(message));
+    }
   }
   if (state.hasLaterMessages) {
     const latest = makeElement("button", "return-latest-button", "回到最新消息");
@@ -656,6 +696,7 @@ function renderMessages(
     fragment.append(latest);
   }
   elements.timeline.replaceChildren(fragment);
+  syncTimelineVirtualDom(messages);
 
   if (targetMessageId) {
     const requestedRoom = state.selectedRoom;
@@ -664,8 +705,12 @@ function renderMessages(
       const target = [...elements.timeline.querySelectorAll("article[data-message-id]")]
         .find((item) => item.dataset.messageId === targetMessageId);
       if (!target) return;
-      const desiredTop = target.offsetTop
-        - Math.max(16, (elements.timeline.clientHeight - target.offsetHeight) / 2);
+      const timelineRect = elements.timeline.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const desiredTop = elements.timeline.scrollTop
+        + targetRect.top
+        - timelineRect.top
+        - Math.max(16, (elements.timeline.clientHeight - targetRect.height) / 2);
       elements.timeline.scrollTop = Math.max(0, desiredTop);
       target.classList.add("search-target");
       state.unreadMessages = 0;
@@ -679,15 +724,11 @@ function renderMessages(
       state.unreadMessages = 0;
       updateNewMessageIndicator();
     });
-  } else if (anchor) {
-    const anchored = [...elements.timeline.querySelectorAll("article[data-message-id]")]
-      .find((item) => item.dataset.messageId === anchor.messageId);
-    if (anchored) {
-      const timelineTop = elements.timeline.getBoundingClientRect().top;
-      elements.timeline.scrollTop += anchored.getBoundingClientRect().top - timelineTop - anchor.offset;
-    } else {
+  } else {
+    const restored = restoreCapturedTimelineAnchor(anchor);
+    if (!restored && !range.virtualized && anchor) {
       const heightDelta = elements.timeline.scrollHeight - previousScrollHeight;
-      elements.timeline.scrollTop = Math.max(0, previousScrollTop + Math.min(0, heightDelta));
+      elements.timeline.scrollTop = Math.max(0, previousScrollTop + heightDelta);
     }
     state.unreadMessages += addedCount;
   }
@@ -696,6 +737,17 @@ function renderMessages(
 
 function appendMessages(messages, { forceBottom = false } = {}) {
   if (!messages.length) return;
+  prepareTimelineMessageIndexes(state.messages);
+  if (
+    state.timelineVirtual?.enabled
+    || state.messages.length > TIMELINE_VIRTUAL_THRESHOLD
+  ) {
+    renderMessages(state.messages, {
+      forceBottom,
+      addedCount: messages.length,
+    });
+    return;
+  }
   if (!elements.timeline.querySelector("article[data-message-id]")) {
     renderMessages(state.messages, { forceBottom, addedCount: messages.length });
     return;
@@ -729,11 +781,9 @@ function appendMessages(messages, { forceBottom = false } = {}) {
 }
 
 function updateReceiptLabels(messages) {
-  const counts = new Map(
-    messages.map((message) => [message.message_id, message]),
-  );
+  prepareTimelineMessageIndexes(messages);
   for (const article of elements.timeline.querySelectorAll("article[data-message-id]")) {
-    const message = counts.get(article.dataset.messageId);
+    const message = timelineMessageAt(article.dataset.messageId);
     if (!message) continue;
     const label = article.querySelector(".receipt-label");
     if (label) {

@@ -40,6 +40,7 @@ WEB_JAVASCRIPT_ASSETS = (
     "app.js",
     "app-layout.js",
     "app-chat-render.js",
+    "app-timeline-virtualizer.js",
     "app-agent-operations.js",
     "app-room-controller.js",
     "app-governance.js",

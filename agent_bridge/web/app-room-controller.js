@@ -395,6 +395,7 @@ function cacheActiveRoomSnapshot() {
     unreadMessages: state.unreadMessages,
     scrollTop: elements.timeline.scrollTop,
     nearBottom: isNearTimelineBottom(),
+    timelineVirtual: captureTimelineVirtualSnapshot(),
     searchTargetMessageId: state.roomSearchTargetMessageId,
     roomHighlights: state.highlightsLoadedRoom === roomId
       ? state.roomHighlights
@@ -417,6 +418,7 @@ function restoreRoomSnapshot(roomId) {
   state.roomSnapshots.set(roomId, snapshot);
   state.loadedRoom = roomId;
   state.messages = snapshot.messages;
+  state.timelineMessageIndexSource = null;
   state.participants = snapshot.participants;
   state.hasEarlierMessages = snapshot.hasEarlierMessages;
   state.hasLaterMessages = Boolean(snapshot.hasLaterMessages);
@@ -426,11 +428,15 @@ function restoreRoomSnapshot(roomId) {
     || { items: [], pins: [], decisions: [], count: 0 };
   state.highlightsLoadedRoom = snapshot.highlightsLoaded ? roomId : null;
   state.roomSnapshotRestoredAt = Number(snapshot.cachedAt || 0);
+  restoreTimelineVirtualSnapshot(snapshot.timelineVirtual, roomId);
+  prepareTimelineMessageIndexes(state.messages);
+  ensureTimelineVirtualState(state.messages);
   state.participantRenderSignature = "";
   renderParticipants(state.participants);
   if (snapshot.timelineNodes?.length) {
     elements.timeline.replaceChildren(...snapshot.timelineNodes);
     state.messageRenderSignature = messageSignature(state.messages);
+    syncTimelineVirtualDom(state.messages);
     updateNewMessageIndicator();
   } else {
     state.messageRenderSignature = "";
@@ -469,9 +475,11 @@ async function selectRoom(roomId) {
   window.localStorage.setItem("agentBridgeSelectedRoom", roomId);
   renderRooms();
   const restored = restoreRoomSnapshot(roomId);
+  state.roomNavigationTarget = restored ? null : roomId;
   if (!restored) {
     state.loadedRoom = null;
     state.messageRenderSignature = "";
+    resetTimelineVirtualState(roomId);
     state.participantRenderSignature = "";
     state.messages = [];
     state.participants = [];
@@ -489,11 +497,20 @@ async function selectRoom(roomId) {
   const snapshotFresh = restored
     && Date.now() - state.roomSnapshotRestoredAt < ROOM_SNAPSHOT_FRESH_MS;
   refreshActiveRoom(!restored, !restored, {
+    navigation: !restored,
     refreshParticipants: !snapshotFresh,
     refreshReceipts: restored && !snapshotFresh,
     refreshHighlights: !snapshotFresh,
   }).catch((error) => {
     if (error.name !== "AbortError") console.error(error);
+  }).finally(() => {
+    if (
+      state.roomNavigationTarget === roomId
+      && state.selectedRoom === roomId
+      && state.loadedRoom !== roomId
+    ) {
+      state.roomNavigationTarget = null;
+    }
   });
 }
 
@@ -519,6 +536,8 @@ function clearRoomMessageSearch({ clearInputs = true } = {}) {
   state.roomSearchNextBefore = null;
   state.roomSearchFingerprint = "";
   state.roomSearchTargetMessageId = null;
+  elements.timeline.querySelector(".message.search-target")?.classList.remove("search-target");
+  state.messageRenderSignature = "";
   if (clearInputs) {
     elements.roomMessageSearchQuery.value = "";
     elements.roomMessageSearchParticipant.value = "";
@@ -1259,6 +1278,7 @@ async function refreshActiveRoom(
   forceScroll = false,
   fullRoom = false,
   {
+    navigation = false,
     refreshParticipants = true,
     refreshTaskState = false,
     refreshReceipts = false,
@@ -1266,11 +1286,19 @@ async function refreshActiveRoom(
   } = {},
 ) {
   if (!state.selectedRoom) return;
+  const selectedRoom = state.selectedRoom;
+  if (
+    !navigation
+    && state.roomNavigationTarget === selectedRoom
+    && state.loadedRoom !== selectedRoom
+  ) {
+    return;
+  }
+  if (navigation && state.roomNavigationTarget !== selectedRoom) return;
   state.roomRequestController?.abort();
   const controller = new AbortController();
   state.roomRequestController = controller;
   const requestVersion = ++state.requestVersion;
-  const selectedRoom = state.selectedRoom;
   const encodedRoom = encodeURIComponent(selectedRoom);
   const activeRoom = state.rooms.find((room) => room.conversation_id === selectedRoom);
   const initialLoad = fullRoom || state.loadedRoom !== selectedRoom;
@@ -1347,6 +1375,9 @@ async function refreshActiveRoom(
       );
       state.hasLaterMessages = Boolean(messagePayload.has_later);
       state.loadedRoom = selectedRoom;
+      if (state.roomNavigationTarget === selectedRoom) {
+        state.roomNavigationTarget = null;
+      }
     } else {
       const knownIds = new Set(state.messages.map((message) => message.message_id));
       appendedMessages = messagePayload.messages.filter(

@@ -1,0 +1,45 @@
+{
+  "version": "0.44.1",
+  "schema": 43,
+  "feature": "bounded virtual timeline for large rooms",
+  "verified_at": "2026-08-19",
+  "contracts": {
+    "initial_message_limit": 60,
+    "virtualization_threshold": 120,
+    "maximum_rendered_messages": 96,
+    "message_data_retained": true,
+    "server_pagination_changed": false,
+    "message_delivery_changed": false,
+    "database_migration_required": false
+  },
+  "local_verification": {
+    "full_pytest": "passed",
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "lockfile": "passed",
+    "diff_check": "passed"
+  },
+  "browser_verification": {
+    "runner": "local Google Chrome via Playwright",
+    "loaded_room_messages": 1260,
+    "maximum_message_dom_nodes": 96,
+    "prepend_anchor_error_px_lt": 4,
+    "room_snapshot_restore_verified": true,
+    "middle_to_latest_verified": true,
+    "receipt_only_api_requests": 1,
+    "authenticated_ready_ms": 849.86,
+    "dom_ready_ms": 351.26,
+    "room_switch_ms": 273.99,
+    "resource_transfer_bytes": 2196483,
+    "mobile_viewport_px": 390
+  },
+  "compatibility": [
+    "search-around keeps its bounded 60-message window and target highlight",
+    "reply and thread actions resolve against the complete loaded message index",
+    "receipt-only events update visible nodes without rebuilding the timeline",
+    "room snapshots retain independent virtual ranges, heights, and scroll positions",
+    "small rooms keep the existing non-virtual DOM path",
+    "Viewer-only deployment does not restart any Agent or connector process"
+  ]
+}

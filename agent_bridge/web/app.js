@@ -63,6 +63,7 @@ const state = {
   roomSnapshots: new Map(),
   roomSnapshotRestoredAt: 0,
   roomRequestController: null,
+  roomNavigationTarget: null,
   roomSearchRequestController: null,
   roomSearchResults: [],
   roomSearchHasMore: false,
@@ -75,6 +76,12 @@ const state = {
   avatarByKey: new Map(),
   profileAvatarKey: "auto",
   timelineScrollFrame: null,
+  timelineVirtual: null,
+  timelineMessageIndexSource: null,
+  timelineMessageById: new Map(),
+  timelineMessagePositionById: new Map(),
+  timelineReplyCounts: new Map(),
+  openDeliveryDetails: new Set(),
   forwardMessageId: null,
   pendingCenter: {
     pending_responses: [],
@@ -849,7 +856,16 @@ function showAuthScreen(message = "") {
   state.passwordChangeRequired = false;
   state.roomSnapshots.clear();
   state.loadedRoom = null;
+  state.roomNavigationTarget = null;
   state.messages = [];
+  if (typeof resetTimelineVirtualState === "function") {
+    resetTimelineVirtualState();
+  }
+  state.timelineMessageIndexSource = null;
+  state.timelineMessageById = new Map();
+  state.timelineMessagePositionById = new Map();
+  state.timelineReplyCounts = new Map();
+  state.openDeliveryDetails.clear();
   state.participants = [];
   state.hasEarlierMessages = false;
   state.hasLaterMessages = false;

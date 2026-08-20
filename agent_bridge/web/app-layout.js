@@ -297,6 +297,9 @@ function applyWorkspaceLayout({ persist = false } = {}) {
   elements.composerResizer.setAttribute("aria-valuetext", `${Math.round(state.composerInputHeight)} 像素`);
 
   scheduleWorkspaceScrollRestore(scrollState);
+  if (typeof scheduleTimelineVirtualLayoutSync === "function") {
+    scheduleTimelineVirtualLayoutSync();
+  }
   if (persist) persistWorkspaceLayout();
 }
 

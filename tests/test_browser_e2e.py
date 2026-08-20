@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import uvicorn
 
-from agent_bridge.store import MESSAGE_COOLDOWN_SECONDS, BridgeStore
+from agent_bridge.store import BridgeStore
 from agent_bridge.viewer import create_app
 from agent_bridge.viewer_store import ViewerRepository
 
@@ -43,29 +43,52 @@ def _seed_browser_database(database: Path) -> None:
             conversation_id=room,
         )
         assert session["participant_id"] == sender["participant_id"]
-        message_count = 72 if room_index == 1 else 4
-        for message_index in range(message_count):
-            store.send(
-                authorized_session_id=str(session["session_id"]),
-                sender_participant_id=str(session["participant_id"]),
-                conversation_id=room,
-                body_text=(
+        message_count = 1_260 if room_index == 1 else 4
+        created_base = time.time() - message_count
+        rows = [
+            (
+                f"message_browser_{room_index}_{message_index + 1:04d}",
+                room,
+                str(session["participant_id"]),
+                "broadcast",
+                "*",
+                "message",
+                (
                     f"{room} browser performance message {message_index + 1}: "
                     "keep the room timeline bounded and stable while switching."
                 ),
+                "[]",
+                "open",
+                created_base + message_index,
+                created_base + message_index,
+                str(session["session_id"]),
+                "[]",
+                "main",
+                "ordinary",
+                message_index + 1,
             )
-            with store._transaction() as connection:
-                connection.execute(
-                    "UPDATE messages SET created_at = created_at - ? "
-                    "WHERE message_id = (SELECT message_id FROM messages "
-                    "WHERE conversation_id = ? AND sender_participant_id = ? "
-                    "ORDER BY sequence DESC LIMIT 1)",
-                    (
-                        MESSAGE_COOLDOWN_SECONDS + 1.0,
-                        room,
-                        str(session["participant_id"]),
-                    ),
-                )
+            for message_index in range(message_count)
+        ]
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE message_rate_defaults SET cooldown_seconds = 0 "
+                "WHERE actor_kind = 'agent'"
+            )
+            connection.executemany(
+                "INSERT INTO messages "
+                "(message_id, conversation_id, sender_participant_id, "
+                "audience_kind, audience_value, message_kind, body, refs_json, "
+                "status, created_at, updated_at, authorized_session_id, "
+                "mentions_json, sender_seat, notification_mode, room_sequence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            connection.execute(
+                "INSERT INTO room_message_sequences (conversation_id, last_sequence) "
+                "VALUES (?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                "last_sequence = excluded.last_sequence",
+                (room, message_count),
+            )
 
 
 @contextmanager
@@ -205,6 +228,11 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             measurements = _login_and_change_bootstrap_password(page, base_url)
             assert measurements["dom_ready_ms"] < 5_000
             assert measurements["authenticated_ready_ms"] < 8_000
+            page.wait_for_function(
+                "() => !state.refreshing && !state.queuedRefresh "
+                "&& !state.roomRequestController",
+                timeout=10_000,
+            )
 
             workspace = page.locator("#workspace")
             shell = page.locator("#app-shell")
@@ -297,8 +325,12 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             page.mouse.move(
                 rooms_resizer_box["x"] + 47,
                 rooms_resizer_box["y"] + 80,
+                steps=6,
             )
             page.mouse.up()
+            page.wait_for_function(
+                "() => Number(localStorage.agentBridgeRoomsWidth) > 260"
+            )
             assert rooms.bounding_box()["width"] > rooms_width_before + 30
             assert int(page.evaluate("localStorage.agentBridgeRoomsWidth")) > 260
 
@@ -314,8 +346,12 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             page.mouse.move(
                 composer_resizer_box["x"] + 30,
                 composer_resizer_box["y"] - 47,
+                steps=6,
             )
             page.mouse.up()
+            page.wait_for_function(
+                "() => Number(localStorage.agentBridgeComposerHeight) > 90"
+            )
             assert composer_textarea.bounding_box()["height"] > composer_height_before + 40
             assert int(page.evaluate("localStorage.agentBridgeComposerHeight")) > 90
 
@@ -398,6 +434,78 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 page.locator("#timeline article[data-message-id]")
             ).to_have_count(60)
             assert page.locator(".load-earlier-button").is_visible()
+            timeline_locator = page.locator("#timeline")
+            first_loaded_message = page.locator(
+                "#timeline article[data-message-id]"
+            ).first
+            timeline_locator.evaluate("element => { element.scrollTop = 0; }")
+            first_loaded_message_id = first_loaded_message.get_attribute(
+                "data-message-id"
+            )
+            anchor_offset_before = page.evaluate(
+                """messageId => {
+                  const timeline = document.querySelector('#timeline');
+                  const article = [...timeline.querySelectorAll('article[data-message-id]')]
+                    .find(item => item.dataset.messageId === messageId);
+                  return article.getBoundingClientRect().top
+                    - timeline.getBoundingClientRect().top;
+                }""",
+                first_loaded_message_id,
+            )
+            page.evaluate("async () => { await loadEarlierMessages(); }")
+            page.wait_for_function(
+                "() => state.messages.length === 260 && !state.roomRequestController"
+            )
+            anchor_offset_after = page.evaluate(
+                """messageId => {
+                  const timeline = document.querySelector('#timeline');
+                  const article = [...timeline.querySelectorAll('article[data-message-id]')]
+                    .find(item => item.dataset.messageId === messageId);
+                  return article.getBoundingClientRect().top
+                    - timeline.getBoundingClientRect().top;
+                }""",
+                first_loaded_message_id,
+            )
+            assert abs(anchor_offset_after - anchor_offset_before) < 4
+            for expected_count in (460, 660, 860, 1_060, 1_260):
+                page.evaluate("async () => { await loadEarlierMessages(); }")
+                page.wait_for_function(
+                    "expected => state.messages.length === expected "
+                    "&& !state.roomRequestController",
+                    arg=expected_count,
+                )
+            virtual_message_count = page.locator(
+                "#timeline article[data-message-id]"
+            ).count()
+            assert virtual_message_count <= 96
+            assert timeline_locator.get_attribute("data-virtualized") == "true"
+            assert timeline_locator.get_attribute("data-virtual-total") == "1260"
+            virtual_start_before_middle = int(
+                timeline_locator.get_attribute("data-virtual-start") or "0"
+            )
+            timeline_locator.evaluate(
+                "element => { element.scrollTop = element.scrollHeight / 2; }"
+            )
+            page.wait_for_function(
+                "previous => Number(document.querySelector('#timeline').dataset.virtualStart) "
+                "!== previous",
+                arg=virtual_start_before_middle,
+            )
+            assert page.locator(
+                "#timeline article[data-message-id]"
+            ).count() <= 96
+            playwright_api.expect(page.locator("#new-message-indicator")).to_be_visible()
+            page.locator("#new-message-indicator").click()
+            page.wait_for_function(
+                """() => {
+                  const timeline = document.querySelector('#timeline');
+                  return Number(timeline.dataset.virtualEnd) === state.messages.length
+                    && timeline.scrollHeight - timeline.scrollTop
+                      - timeline.clientHeight < 80;
+                }"""
+            )
+            measurements["virtual_loaded_messages"] = 1_260
+            measurements["virtual_dom_messages"] = virtual_message_count
             page.locator("#toggle-composer-panel").click()
             playwright_api.expect(page.locator("#owner-message-form")).to_be_hidden()
             page.locator("button.message-reply-button", has_text="回复").last.click()
@@ -408,7 +516,6 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 page.locator("#room-tools-menu > summary")
             ).to_contain_text("房间管理")
 
-            timeline_locator = page.locator("#timeline")
             page.wait_for_function(
                 "element => element.scrollHeight - element.scrollTop "
                 "- element.clientHeight < 80",
@@ -438,6 +545,24 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
                 2,
             )
             assert measurements["room_switch_ms"] < 3_000
+            page.locator(".room-card", has_text="browser-room-one").click()
+            playwright_api.expect(page.locator("#active-room-title")).to_have_text(
+                "browser-room-one"
+            )
+            playwright_api.expect(timeline_locator).to_have_attribute(
+                "data-virtual-total",
+                "1260",
+            )
+            assert page.locator(
+                "#timeline article[data-message-id]"
+            ).count() <= 96
+            page.locator(".room-card", has_text="browser-room-two").click()
+            playwright_api.expect(page.locator("#active-room-title")).to_have_text(
+                "browser-room-two"
+            )
+            playwright_api.expect(
+                page.locator("#timeline article[data-message-id]")
+            ).to_have_count(4)
 
             page.locator("#toggle-rooms-panel").click()
             assert "rooms-collapsed" in (workspace.get_attribute("class") or "")
@@ -460,8 +585,12 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             page.mouse.move(
                 people_resizer_box["x"] - 34,
                 people_resizer_box["y"] + 80,
+                steps=6,
             )
             page.mouse.up()
+            page.wait_for_function(
+                "() => Number(localStorage.agentBridgePeopleWidth) > 290"
+            )
             assert people.bounding_box()["width"] > people_width_before + 30
             assert int(page.evaluate("localStorage.agentBridgePeopleWidth")) > 290
             people_resizer.dblclick()

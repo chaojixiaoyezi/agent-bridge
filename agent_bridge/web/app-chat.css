@@ -428,6 +428,17 @@
 .load-search-results { display: block; margin: 8px auto 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted-strong); background: var(--surface-soft); cursor: pointer; }
 
 .timeline { flex: 1; padding: 20px 24px 54px; overflow-anchor: none; }
+.timeline-virtual-spacer {
+  width: 1px;
+  min-height: 0;
+  pointer-events: none;
+}
+.timeline-virtual-row {
+  display: flow-root;
+  overflow-anchor: none;
+}
+.timeline-virtual-row .message:last-child { padding-bottom: 22px; }
+.timeline-virtual-row.is-final-message .message:last-child { padding-bottom: 5px; }
 .new-message-indicator {
   position: absolute;
   left: 50%;
@@ -1067,6 +1078,8 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 
 .workspace:is(.simple-view, .standard-view) .timeline { padding: 14px 18px 42px; }
 .workspace:is(.simple-view, .standard-view) .message { padding-bottom: 14px; }
+.workspace:is(.simple-view, .standard-view) .timeline-virtual-row .message:last-child { padding-bottom: 14px; }
+.workspace:is(.simple-view, .standard-view) .timeline-virtual-row.is-final-message .message:last-child { padding-bottom: 5px; }
 .workspace:is(.simple-view, .standard-view) .message-head { margin-bottom: 4px; }
 .workspace:is(.simple-view, .standard-view) .message-body { font-size: 12px; line-height: 1.58; }
 .workspace:is(.simple-view, .standard-view) .client-label,

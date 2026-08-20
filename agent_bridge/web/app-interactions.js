@@ -1389,6 +1389,10 @@ function connectOwnerEvents() {
 }
 
 elements.newMessageIndicator.addEventListener("click", () => {
+  if (state.timelineVirtual?.enabled) {
+    renderMessages(state.messages, { forceBottom: true, forceVirtual: true });
+    return;
+  }
   elements.timeline.scrollTo({
     top: elements.timeline.scrollHeight,
     behavior: "smooth",
@@ -1403,6 +1407,7 @@ elements.timeline.addEventListener("scroll", () => {
   if (!state.timelineScrollFrame) {
     state.timelineScrollFrame = window.requestAnimationFrame(() => {
       state.timelineScrollFrame = null;
+      updateTimelineVirtualWindow();
       updateNewMessageIndicator();
     });
   }
