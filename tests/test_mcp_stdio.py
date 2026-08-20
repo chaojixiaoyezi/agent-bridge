@@ -20,6 +20,32 @@ from agent_bridge.web_auth import WebAuthStore
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 
 
+ALL_MCP_TOOLS = {
+    "agent_register",
+    "agent_accept_invitation",
+    "agent_update_profile",
+    "agent_list_avatars",
+    "agent_request_nickname",
+    "agent_set_follow",
+    "agent_following",
+    "agent_set_room_dnd",
+    "agent_heartbeat",
+    "agent_send",
+    "agent_create_room",
+    "agent_wait",
+    "agent_notifications",
+    "agent_message_action",
+    "agent_reply",
+    "agent_history",
+    "agent_search_history",
+    "agent_download_attachment",
+    "agent_participants",
+    "agent_task_next",
+    "agent_task_update",
+    "agent_task_delegate",
+}
+
+
 @contextmanager
 def bridge_server(database: Path):
     with socket.socket() as reservation:
@@ -143,14 +169,19 @@ def test_unconfigured_stdio_mcp_cannot_self_register_into_a_room(
                 )
 
         with store._connection() as connection:
-            assert connection.execute(
-                "SELECT COUNT(*) FROM participants "
-                "WHERE client_type = 'codex-误入的新会话'"
-            ).fetchone()[0] == 0
-            assert connection.execute(
-                "SELECT COUNT(*) FROM memberships "
-                "WHERE conversation_id = '隔离群'"
-            ).fetchone()[0] == 0
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM participants "
+                    "WHERE client_type = 'codex-误入的新会话'"
+                ).fetchone()[0]
+                == 0
+            )
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM memberships WHERE conversation_id = '隔离群'"
+                ).fetchone()[0]
+                == 0
+            )
 
     asyncio.run(scenario())
 
@@ -164,9 +195,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
         store.create_user_room("MCP沟通群")
 
         with bridge_server(database) as server_url:
-            direct_registration = {
-                "AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION": "1"
-            }
+            direct_registration = {"AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION": "1"}
             async with mcp_client(
                 server_url,
                 "codex",
@@ -178,31 +207,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                     extra_env=direct_registration,
                 ) as claude:
                     codex_tools = await codex.list_tools()
-                    expected = {
-                        "agent_register",
-                        "agent_heartbeat",
-                        "agent_send",
-                        "agent_create_room",
-                        "agent_wait",
-                        "agent_notifications",
-                        "agent_message_action",
-                        "agent_reply",
-                        "agent_history",
-                        "agent_download_attachment",
-                        "agent_search_history",
-                        "agent_participants",
-                        "agent_update_profile",
-                        "agent_list_avatars",
-                        "agent_request_nickname",
-                        "agent_set_follow",
-                        "agent_following",
-                        "agent_set_room_dnd",
-                        "agent_accept_invitation",
-                        "agent_task_next",
-                        "agent_task_update",
-                        "agent_task_delegate",
-                    }
-                    assert expected == {tool.name for tool in codex_tools.tools}
+                    assert ALL_MCP_TOOLS == {tool.name for tool in codex_tools.tools}
                     register_tool = next(
                         tool
                         for tool in codex_tools.tools
@@ -258,10 +263,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                         )
                     )
                     assert codex_registration["client_type"] == "codex-小可爱"
-                    assert (
-                        claude_registration["client_type"]
-                        == "claude-code-小鲸鱼娘"
-                    )
+                    assert claude_registration["client_type"] == "claude-code-小鲸鱼娘"
                     assert "access_token" not in codex_registration
 
                     sent = payload(
@@ -271,9 +273,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                                 "conversation_id": "MCP沟通群",
                                 "body": "请复核 settle 事务。",
                                 "audience_kind": "participant",
-                                "audience_value": codex_registration[
-                                    "participant_id"
-                                ],
+                                "audience_value": codex_registration["participant_id"],
                                 "notification_mode": "mention",
                             },
                         )
@@ -296,9 +296,10 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                         )
                     )
                     assert notification["has_new"] is True
-                    assert notification["new_since_cursor"]["priority_counts"][
-                        "mention"
-                    ] == 1
+                    assert (
+                        notification["new_since_cursor"]["priority_counts"]["mention"]
+                        == 1
+                    )
                     assert "请复核 settle 事务。" not in str(notification)
                     received = payload(
                         await codex.call_tool(
@@ -308,9 +309,7 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                     )
                     assert received["messages"][0]["message_id"] == sent["message_id"]
                     assert sent["review_routing"]["notified"] is True
-                    assert sent["review_routing"]["source"] == (
-                        "audience:participant"
-                    )
+                    assert sent["review_routing"]["source"] == ("audience:participant")
 
                     reply = payload(
                         await codex.call_tool(
@@ -336,6 +335,342 @@ def test_two_real_stdio_mcp_processes_use_explicit_direct_registration_chat(
                         },
                     )
                     assert nested.is_error
+
+    asyncio.run(scenario())
+
+
+def test_real_stdio_mcp_all_tool_interfaces_and_acl_matrix(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "bridge.db"
+        store = BridgeStore(database)
+        auth = WebAuthStore(database, captcha_generator=lambda: "ABCDE")
+        captcha = auth.create_captcha()
+        admin, _token = auth.login(
+            username="admin",
+            password="admin",
+            captcha_id=str(captcha["captcha_id"]),
+            captcha_answer="ABCDE",
+        )
+        room = "MCP全接口群"
+        store.create_user_room(room)
+        invitation = store.create_agent_invitation(
+            conversation_id=room,
+            product="future-agent",
+            requested_mode="basic",
+            adapter_kind="manual",
+            created_by_web_user_id=str(admin["user_id"]),
+        )
+        invitation_token = str(invitation["invitation_token"])
+        called: set[str] = set()
+
+        async def invoke(session, name: str, arguments: dict | None = None) -> dict:
+            called.add(name)
+            return payload(await session.call_tool(name, arguments or {}))
+
+        direct = {"AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION": "1"}
+        with bridge_server(database) as server_url:
+            async with mcp_client(
+                server_url,
+                "codex",
+                extra_env=direct,
+            ) as first:
+                async with mcp_client(
+                    server_url,
+                    "claude-code",
+                    extra_env=direct,
+                ) as second:
+                    async with mcp_client(
+                        server_url,
+                        "future-agent",
+                        extra_env={
+                            "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
+                            "AGENT_BRIDGE_CONNECTOR_HOME": str(tmp_path / "connectors"),
+                        },
+                    ) as invited:
+                        listed = await first.list_tools()
+                        assert {tool.name for tool in listed.tools} == ALL_MCP_TOOLS
+
+                        first_identity = await invoke(
+                            first,
+                            "agent_register",
+                            {
+                                "conversation_id": room,
+                                "username": "全接口一号",
+                                "signature": "负责接口主流程。",
+                                "roles": ["reviewer"],
+                            },
+                        )
+                        second_identity = await invoke(
+                            second,
+                            "agent_register",
+                            {
+                                "conversation_id": room,
+                                "username": "全接口二号",
+                                "signature": "负责隔离与委派复核。",
+                                "roles": ["developer"],
+                            },
+                        )
+                        accepted = await invoke(
+                            invited,
+                            "agent_accept_invitation",
+                            {
+                                "username": "受邀接口员",
+                                "signature": "只验证邀请接入接口。",
+                                "workspace_path": str(tmp_path),
+                                "enable_resident": False,
+                            },
+                        )
+                        assert accepted["invitation_accepted"] is True
+
+                        heartbeat = await invoke(
+                            first,
+                            "agent_heartbeat",
+                            {"status": "online"},
+                        )
+                        assert heartbeat["status"] == "online"
+                        avatars = await invoke(
+                            first,
+                            "agent_list_avatars",
+                            {"vendor": "gpt"},
+                        )
+                        assert avatars["avatars"]
+                        profile = await invoke(
+                            first,
+                            "agent_update_profile",
+                            {
+                                "signature": "已完成真实 MCP 全接口复核。",
+                                "avatar_key": avatars["avatars"][0]["key"],
+                            },
+                        )
+                        assert profile["signature"].startswith("已完成真实")
+                        nickname = await invoke(
+                            first,
+                            "agent_request_nickname",
+                            {"display_name": "接口小队长"},
+                        )
+                        assert nickname["status"] == "pending"
+
+                        followed = await invoke(
+                            first,
+                            "agent_set_follow",
+                            {
+                                "conversation_id": room,
+                                "followed_participant_id": second_identity[
+                                    "participant_id"
+                                ],
+                                "following": True,
+                            },
+                        )
+                        assert followed["following"] is True
+                        following = await invoke(
+                            first,
+                            "agent_following",
+                            {"conversation_id": room},
+                        )
+                        assert (
+                            following["following"][0]["followed_participant_id"]
+                            == (second_identity["participant_id"])
+                        )
+                        dnd = await invoke(
+                            first,
+                            "agent_set_room_dnd",
+                            {"conversation_id": room, "enabled": True},
+                        )
+                        assert dnd["active"] is True
+                        created_room = await invoke(
+                            first,
+                            "agent_create_room",
+                            {"conversation_id": "MCP接口员自建群"},
+                        )
+                        assert created_room["creator_kind"] == "agent"
+                        participants = await invoke(
+                            first,
+                            "agent_participants",
+                            {"conversation_id": room},
+                        )
+                        assert len(participants["participants"]) >= 3
+
+                        sent = await invoke(
+                            second,
+                            "agent_send",
+                            {
+                                "conversation_id": room,
+                                "body": "@codex-全接口一号 请复核接口矩阵。",
+                                "audience_kind": "participant",
+                                "audience_value": first_identity["participant_id"],
+                                "mentions": [first_identity["participant_id"]],
+                                "links": ["https://example.com/interface-matrix"],
+                                "notification_mode": "mention",
+                            },
+                        )
+                        notification = await invoke(
+                            first,
+                            "agent_notifications",
+                            {"after_sequence": 0},
+                        )
+                        assert notification["has_new"] is True
+                        claimed = await invoke(
+                            first,
+                            "agent_message_action",
+                            {
+                                "message_id": sent["message_id"],
+                                "action": "claim",
+                                "lease_seconds": 30,
+                            },
+                        )
+                        assert claimed["action"] == "claim"
+                        assert claimed["claimed_by"] == first_identity["participant_id"]
+                        released = await invoke(
+                            first,
+                            "agent_message_action",
+                            {
+                                "message_id": sent["message_id"],
+                                "action": "release",
+                            },
+                        )
+                        assert released["action"] == "release"
+                        assert released["released"] is True
+                        waiting = await invoke(
+                            first,
+                            "agent_wait",
+                            {"wait_seconds": 0},
+                        )
+                        assert (
+                            waiting["messages"][0]["message_id"] == sent["message_id"]
+                        )
+                        reply = await invoke(
+                            first,
+                            "agent_reply",
+                            {
+                                "message_id": sent["message_id"],
+                                "body": "已逐项复核接口矩阵。",
+                            },
+                        )
+                        assert reply["reply"]["reply_to"] == sent["message_id"]
+                        history = await invoke(
+                            first,
+                            "agent_history",
+                            {"conversation_id": room, "limit": 20},
+                        )
+                        assert any(
+                            message["message_id"] == sent["message_id"]
+                            for message in history["messages"]
+                        )
+                        searched = await invoke(
+                            first,
+                            "agent_search_history",
+                            {"conversation_id": room, "query": "接口矩阵"},
+                        )
+                        assert searched["results"]
+
+                        attachment_content = b"agent-bridge-directed-attachment"
+                        attachment_message = store.send_owner_message(
+                            conversation_id=room,
+                            body_text="只让一号读取这份接口证据。",
+                            mentions=[first_identity["participant_id"]],
+                            attachments=[
+                                {
+                                    "filename": "interface-evidence.txt",
+                                    "media_type": "text/plain",
+                                    "content": attachment_content,
+                                }
+                            ],
+                        )
+                        attachment_id = attachment_message["attachments"][0][
+                            "attachment_id"
+                        ]
+                        destination = tmp_path / "downloaded-evidence.txt"
+                        downloaded = await invoke(
+                            first,
+                            "agent_download_attachment",
+                            {
+                                "attachment_id": attachment_id,
+                                "destination_path": str(destination),
+                            },
+                        )
+                        assert (
+                            downloaded["sha256"]
+                            == attachment_message["attachments"][0]["sha256"]
+                        )
+                        assert destination.read_bytes() == attachment_content
+                        denied = await second.call_tool(
+                            "agent_download_attachment",
+                            {
+                                "attachment_id": attachment_id,
+                                "destination_path": str(tmp_path / "must-not-exist"),
+                            },
+                        )
+                        assert denied.is_error
+                        assert not (tmp_path / "must-not-exist").exists()
+
+                        task_message = store.send_web_task(
+                            authorized_session_id=str(admin["session_id"]),
+                            participant_id=str(admin["participant_id"]),
+                            conversation_id=room,
+                            body_text="完成 MCP 任务工具联调。",
+                            target_participant_ids=[first_identity["participant_id"]],
+                        )
+                        task = await invoke(
+                            first,
+                            "agent_task_next",
+                            {"wait_seconds": 0},
+                        )
+                        assert (
+                            task["task"]["task_id"] == task_message["task"]["task_id"]
+                        )
+                        running = await invoke(
+                            first,
+                            "agent_task_update",
+                            {
+                                "task_id": task["task"]["task_id"],
+                                "status": "running",
+                                "execution_cwd": str(tmp_path),
+                                "execution_thread_id": "mcp-matrix-primary",
+                            },
+                        )
+                        assert running["task"]["status"] == "running"
+                        delegated = await invoke(
+                            first,
+                            "agent_task_delegate",
+                            {
+                                "parent_task_id": task["task"]["task_id"],
+                                "body": "复核定向附件 ACL。",
+                                "target_participant_ids": [
+                                    second_identity["participant_id"]
+                                ],
+                            },
+                        )
+                        child = await invoke(
+                            second,
+                            "agent_task_next",
+                            {"wait_seconds": 0},
+                        )
+                        assert (
+                            child["task"]["task_id"]
+                            == delegated["task"]["task_id"]
+                        )
+                        child_done = await invoke(
+                            second,
+                            "agent_task_update",
+                            {
+                                "task_id": child["task"]["task_id"],
+                                "status": "completed",
+                                "result_summary": "ACL 复核通过。",
+                            },
+                        )
+                        assert child_done["task"]["status"] == "completed"
+                        parent_done = await invoke(
+                            first,
+                            "agent_task_update",
+                            {
+                                "task_id": task["task"]["task_id"],
+                                "status": "completed",
+                                "result_summary": "22 个工具接口联调完成。",
+                            },
+                        )
+                        assert parent_done["task"]["status"] == "completed"
+
+        assert called == ALL_MCP_TOOLS
 
     asyncio.run(scenario())
 
