@@ -53,6 +53,10 @@ class ViewerActivityQueries:
                     "oversight": 0,
                     "active_tasks": 0,
                     "needs_input_tasks": 0,
+                    "needs_me": 0,
+                    "waiting_other": 0,
+                    "informational": 0,
+                    "attention_total": 0,
                     "total": 0,
                 },
                 "has_more": False,
@@ -91,7 +95,11 @@ class ViewerActivityQueries:
             "delivery.state IN ('pending', 'delivered')",
             "(instr(delivery.reasons_json, '\"mention\"') > 0 "
             "OR instr(delivery.reasons_json, '\"agent_request\"') > 0)",
-            "exact_reply.reply_to IS NULL",
+            "NOT EXISTS ("
+            "SELECT 1 FROM messages AS exact_reply "
+            "WHERE exact_reply.reply_to = message.message_id "
+            "AND exact_reply.sender_participant_id = delivery.participant_id"
+            ")",
             f"({' OR '.join(access_clauses)})",
             *room_clauses,
         ]
@@ -125,11 +133,6 @@ class ViewerActivityQueries:
         with self._connection() as connection:
             response_rows = connection.execute(
                 f"""
-                WITH exact_replies AS (
-                    SELECT DISTINCT reply_to, sender_participant_id
-                    FROM messages
-                    WHERE reply_to IS NOT NULL
-                )
                 SELECT message.message_id, message.conversation_id,
                        message.sequence, message.room_sequence,
                        message.body, message.created_at,
@@ -142,6 +145,7 @@ class ViewerActivityQueries:
                        target.display_name AS target_display_name,
                        target.avatar_key AS target_avatar_key,
                        delivery.state AS delivery_state,
+                       delivery.delivery_stage,
                        delivery.reasons_json,
                        delivery.first_delivered_at,
                        delivery.last_delivered_at,
@@ -153,18 +157,29 @@ class ViewerActivityQueries:
                   ON sender.participant_id = message.sender_participant_id
                 JOIN participants AS target
                   ON target.participant_id = delivery.participant_id
-                LEFT JOIN exact_replies AS exact_reply
-                  ON exact_reply.reply_to = message.message_id
-                 AND exact_reply.sender_participant_id = delivery.participant_id
+                JOIN memberships AS target_membership
+                  ON target_membership.conversation_id = message.conversation_id
+                 AND target_membership.participant_id = delivery.participant_id
+                 AND target_membership.active = 1
                 JOIN rooms AS room
                   ON room.conversation_id = message.conversation_id
                  AND room.status = 'active'
                 WHERE {" AND ".join(response_where)}
-                ORDER BY message.created_at, message.sequence,
+                ORDER BY CASE
+                             WHEN delivery.participant_id = ? THEN 0
+                             WHEN message.sender_participant_id = ? THEN 1
+                             ELSE 2
+                         END,
+                         message.created_at, message.sequence,
                          delivery.participant_id
                 LIMIT ?
                 """,
-                response_parameters,
+                [
+                    *response_parameters[:-1],
+                    participant,
+                    participant,
+                    response_parameters[-1],
+                ],
             ).fetchall()
             task_rows = connection.execute(
                 f"""
@@ -206,10 +221,13 @@ class ViewerActivityQueries:
             target_id = str(row["target_participant_id"])
             if target_id == participant:
                 direction = "incoming"
+                attention_kind = "needs_me"
             elif sender_id == participant:
                 direction = "outgoing"
+                attention_kind = "waiting_other"
             else:
                 direction = "oversight"
+                attention_kind = "informational"
             direction_counts[direction] += 1
             body = str(row["body"])
             response_items.append(
@@ -223,6 +241,7 @@ class ViewerActivityQueries:
                     "created_at": float(row["created_at"]),
                     "age_seconds": max(0.0, now - float(row["created_at"])),
                     "direction": direction,
+                    "attention_kind": attention_kind,
                     "sender": {
                         "participant_id": sender_id,
                         "client_type": str(row["sender_client_type"]),
@@ -236,6 +255,7 @@ class ViewerActivityQueries:
                         "avatar_key": str(row["target_avatar_key"] or "auto"),
                     },
                     "delivery_state": str(row["delivery_state"]),
+                    "delivery_stage": str(row["delivery_stage"] or "queued"),
                     "delivery_reasons": json.loads(str(row["reasons_json"] or "[]")),
                     "first_delivered_at": (
                         float(row["first_delivered_at"])
@@ -288,6 +308,14 @@ class ViewerActivityQueries:
                     "created_at": float(row["created_at"]),
                     "updated_at": float(row["updated_at"]),
                     "age_seconds": max(0.0, now - float(row["created_at"])),
+                    "attention_kind": (
+                        "needs_me"
+                        if str(row["issuer_participant_id"]) == participant
+                        and str(row["status"]) == "needs_input"
+                        else "waiting_other"
+                        if str(row["issuer_participant_id"]) == participant
+                        else "informational"
+                    ),
                 }
             )
 
@@ -299,11 +327,6 @@ class ViewerActivityQueries:
             with self._connection() as connection:
                 grouped = connection.execute(
                     f"""
-                    WITH exact_replies AS (
-                        SELECT DISTINCT reply_to, sender_participant_id
-                        FROM messages
-                        WHERE reply_to IS NOT NULL
-                    )
                     SELECT CASE
                                WHEN delivery.participant_id = ? THEN 'incoming'
                                WHEN message.sender_participant_id = ? THEN 'outgoing'
@@ -313,9 +336,10 @@ class ViewerActivityQueries:
                     FROM message_deliveries AS delivery
                     JOIN messages AS message
                       ON message.message_id = delivery.message_id
-                    LEFT JOIN exact_replies AS exact_reply
-                      ON exact_reply.reply_to = message.message_id
-                     AND exact_reply.sender_participant_id = delivery.participant_id
+                    JOIN memberships AS target_membership
+                      ON target_membership.conversation_id = message.conversation_id
+                     AND target_membership.participant_id = delivery.participant_id
+                     AND target_membership.active = 1
                     JOIN rooms AS room
                       ON room.conversation_id = message.conversation_id
                      AND room.status = 'active'
@@ -348,6 +372,62 @@ class ViewerActivityQueries:
                     ).fetchone()[0]
                 )
 
+        response_attention_counts = {
+            "needs_me": direction_counts["incoming"],
+            "waiting_other": direction_counts["outgoing"],
+            "informational": direction_counts["oversight"],
+        }
+        task_attention_counts = {
+            "needs_me": 0,
+            "waiting_other": 0,
+            "informational": 0,
+        }
+        for item in task_items:
+            task_attention_counts[str(item["attention_kind"])] += 1
+        if task_total > len(task_items):
+            # The bounded page cannot prove the category totals for omitted
+            # tasks.  Count them directly so the top-level badge never hides
+            # actionable work behind informational oversight rows.
+            with self._connection() as connection:
+                grouped_tasks = connection.execute(
+                    f"""
+                    SELECT CASE
+                               WHEN task.issuer_participant_id = ?
+                                AND task.status = 'needs_input' THEN 'needs_me'
+                               WHEN task.issuer_participant_id = ?
+                               THEN 'waiting_other'
+                               ELSE 'informational'
+                           END AS attention_kind,
+                           COUNT(*) AS count
+                    FROM room_tasks AS task
+                    JOIN rooms AS room
+                      ON room.conversation_id = task.conversation_id
+                     AND room.status = 'active'
+                    WHERE {" AND ".join(task_where)}
+                    GROUP BY attention_kind
+                    """,
+                    [
+                        participant,
+                        participant,
+                        *task_access_parameters,
+                        *task_room_parameters,
+                    ],
+                ).fetchall()
+            task_attention_counts = {
+                "needs_me": 0,
+                "waiting_other": 0,
+                "informational": 0,
+            }
+            for row in grouped_tasks:
+                task_attention_counts[str(row["attention_kind"])] = int(
+                    row["count"]
+                )
+
+        attention_counts = {
+            key: response_attention_counts[key] + task_attention_counts[key]
+            for key in ("needs_me", "waiting_other", "informational")
+        }
+
         return {
             "pending_responses": response_items,
             "active_tasks": task_items,
@@ -356,6 +436,11 @@ class ViewerActivityQueries:
                 **direction_counts,
                 "active_tasks": task_total,
                 "needs_input_tasks": needs_input_tasks,
+                **attention_counts,
+                "attention_total": (
+                    attention_counts["needs_me"]
+                    + attention_counts["waiting_other"]
+                ),
                 "total": response_total + task_total,
             },
             "has_more": (

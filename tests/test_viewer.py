@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.43.0"
+    assert _runtime_software_version() == "0.43.1"
 
 
 class FakeEmailDelivery:
@@ -1403,6 +1403,7 @@ def test_pending_response_center_tracks_exact_replies_tasks_and_room_scope(
         receiver["participant_id"],
     )
     assert admin_items[requested_key]["direction"] == "outgoing"
+    assert admin_items[requested_key]["attention_kind"] == "waiting_other"
     assert any(
         item["conversation_id"] == "room-two"
         for item in admin_center["pending_responses"]
@@ -1412,6 +1413,13 @@ def test_pending_response_center_tracks_exact_replies_tasks_and_room_scope(
         for task in admin_center["active_tasks"]
     )
     assert admin_center["counts"]["total"] >= 3
+    assert admin_center["counts"]["waiting_other"] >= 2
+    assert admin_center["counts"]["informational"] >= 1
+    assert (
+        admin_center["counts"]["attention_total"]
+        == admin_center["counts"]["needs_me"]
+        + admin_center["counts"]["waiting_other"]
+    )
 
     member_center = member_client.get("/api/pending-responses").json()
     member_ids = {
@@ -1425,10 +1433,65 @@ def test_pending_response_center_tracks_exact_replies_tasks_and_room_scope(
         if item["message_id"] == incoming["message_id"]
     )
     assert incoming_item["direction"] == "incoming"
+    assert incoming_item["attention_kind"] == "needs_me"
+    assert incoming_item["delivery_stage"] == "queued"
     assert all(
         task["conversation_id"] == "room-one"
         for task in member_center["active_tasks"]
     )
+
+    with store._connection() as connection:
+        before_ack_message_count = int(
+            connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+    acknowledged = member_client.post(
+        "/api/rooms/room-one/pending-responses/acknowledge",
+        headers=intent_headers(
+            member_client,
+            "acknowledge-pending-responses",
+        ),
+        json={"message_ids": [incoming["message_id"]]},
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["acknowledgement"]["acknowledged_count"] == 1
+    with store._connection() as connection:
+        after_ack_message_count = int(
+            connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+    assert after_ack_message_count == before_ack_message_count
+    after_ack = member_client.get("/api/pending-responses").json()
+    assert incoming["message_id"] not in {
+        item["message_id"] for item in after_ack["pending_responses"]
+    }
+    with store._connection() as connection:
+        delivery = connection.execute(
+            "SELECT state, delivery_stage FROM message_deliveries "
+            "WHERE message_id = ? AND participant_id = ?",
+            (incoming["message_id"], member["participant_id"]),
+        ).fetchone()
+    assert tuple(delivery) == ("acked", "legacy_acked")
+
+    wrong_room = member_client.post(
+        "/api/rooms/room-one/pending-responses/acknowledge",
+        headers=intent_headers(
+            member_client,
+            "acknowledge-pending-responses",
+        ),
+        json={"message_ids": [hidden["message_id"]]},
+    )
+    assert wrong_room.status_code == 404
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE memberships SET active = 0 WHERE conversation_id = ? "
+            "AND participant_id = ?",
+            ("room-two", hidden_target["participant_id"]),
+        )
+    after_deactivation = admin_client.get("/api/pending-responses").json()
+    assert hidden["message_id"] not in {
+        item["message_id"]
+        for item in after_deactivation["pending_responses"]
+    }
 
     store.reply(
         authorized_session_id=receiver["session_id"],

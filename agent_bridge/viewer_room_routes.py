@@ -68,6 +68,35 @@ def build_room_routes(
         except Exception as exc:
             return _json_error(exc)
 
+    async def acknowledge_pending_responses(request: Request) -> Response:
+        try:
+            require_web_intent(
+                request,
+                intent="acknowledge-pending-responses",
+            )
+            identity = authenticated_web_user(request)
+            conversation = request.path_params["conversation_id"]
+            require_web_room_access(identity, conversation)
+            payload = await _json_body(
+                request,
+                required={"message_ids"},
+                allowed={"message_ids"},
+            )
+            raw_message_ids = payload["message_ids"]
+            if not isinstance(raw_message_ids, list):
+                raise ValueError("message_ids must be a list")
+            result = store.acknowledge_web_pending_messages(
+                participant_id=str(identity["participant_id"]),
+                conversation_id=conversation,
+                message_ids=[
+                    opaque_id(message_id, field="message_id")
+                    for message_id in raw_message_ids
+                ],
+            )
+            return JSONResponse({"acknowledgement": result})
+        except Exception as exc:
+            return _json_error(exc)
+
     async def messages(request: Request) -> Response:
         try:
             identity = authenticated_web_user(request)
@@ -634,6 +663,11 @@ def build_room_routes(
 
     return [
         Route("/api/pending-responses", pending_responses, methods=["GET"]),
+        Route(
+            "/api/rooms/{conversation_id:str}/pending-responses/acknowledge",
+            acknowledge_pending_responses,
+            methods=["POST"],
+        ),
         Route(
             "/api/rooms/{conversation_id:str}/messages",
             messages,

@@ -36,7 +36,7 @@
             <span id="connection-label">正在连接</span>
           </div>
           <button class="access-button pending-center-button" id="open-pending-center" type="button">
-            待回复
+            待处理
             <span id="pending-center-badge" hidden>0</span>
           </button>
           <details class="tool-menu global-tools-menu" id="global-tools-menu" data-tool-scope="global">
@@ -1172,12 +1172,15 @@
         <div class="dialog-heading">
           <div>
             <p class="section-kicker">RESPONSE AND TASK INBOX</p>
-            <h2 id="pending-center-title">待回复中心</h2>
+            <h2 id="pending-center-title">待处理中心</h2>
           </div>
           <button class="dialog-close" id="close-pending-center" type="button" aria-label="关闭">×</button>
         </div>
-        <p class="field-help">只显示结构化的“必须回复”投递和仍在进行的任务；普通聊天、@全员及免打扰期间的可选通知不会被误算。点击条目可直接定位到原消息。</p>
+        <p class="field-help">按结构化路由分成“待我处理、等待对方、仅通知”；普通聊天、@全员及免打扰期间的可选通知不会进入待办。查看原文不会自动消除事项，可明确标记为已处理。</p>
         <div class="pending-center-summary" id="pending-center-summary"></div>
+        <div class="pending-center-toolbar">
+          <button class="secondary-button" id="acknowledge-all-pending" type="button" hidden>全部标为已处理</button>
+        </div>
         <p class="form-feedback" id="pending-center-feedback" role="status" aria-live="polite"></p>
         <div class="pending-center-list" id="pending-center-list"></div>
       </div>

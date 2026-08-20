@@ -720,17 +720,19 @@ async function jumpToRoomSearchResult(result) {
 function renderPendingCenter() {
   const payload = state.pendingCenter || {};
   const counts = payload.counts || {};
-  const total = Number(counts.total || 0);
+  const needsMe = Number(counts.needs_me ?? counts.incoming ?? 0);
+  const waitingOther = Number(counts.waiting_other ?? counts.outgoing ?? 0);
+  const informational = Number(counts.informational ?? counts.oversight ?? 0);
+  const total = Number(counts.attention_total ?? (needsMe + waitingOther));
   elements.pendingCenterBadge.hidden = total === 0;
   elements.pendingCenterBadge.textContent = total > 99 ? "99+" : String(total);
   elements.openPendingCenter.classList.toggle("has-pending", total > 0);
 
   elements.pendingCenterSummary.replaceChildren();
   for (const [label, count, tone] of [
-    ["需要我回复", counts.incoming || 0, "urgent"],
-    ["等待对方", counts.outgoing || 0, "waiting"],
-    ["聊天室关注", counts.oversight || 0, "oversight"],
-    ["进行中任务", counts.active_tasks || 0, "task"],
+    ["待我处理", needsMe, "urgent"],
+    ["等待对方", waitingOther, "waiting"],
+    ["仅供关注", informational, "oversight"],
   ]) {
     const card = makeElement("span", `pending-summary-card ${tone}`);
     card.append(
@@ -743,34 +745,72 @@ function renderPendingCenter() {
   elements.pendingCenterList.replaceChildren();
   const responseItems = payload.pending_responses || [];
   const taskItems = payload.active_tasks || [];
+  const incomingItems = responseItems.filter(
+    (item) => (item.attention_kind || item.direction) === "needs_me"
+      || (!item.attention_kind && item.direction === "incoming"),
+  );
+  elements.acknowledgeAllPending.hidden = incomingItems.length === 0;
+  elements.acknowledgeAllPending.textContent = incomingItems.length > 1
+    ? `将 ${incomingItems.length} 项全部标为已处理`
+    : "标为已处理";
   if (!responseItems.length && !taskItems.length) {
     const empty = makeElement("div", "pending-center-empty");
     empty.append(
       makeElement("strong", "", "当前没有待处理事项"),
-      makeElement("p", "", "必须回复的消息已经回应，聊天室任务也都已结束。"),
+      makeElement("p", "", "需要你处理或等待对方的事项已经收口。"),
     );
     elements.pendingCenterList.append(empty);
     return;
   }
 
-  if (responseItems.length) {
-    elements.pendingCenterList.append(makeElement("h3", "pending-section-title", "必须回复"));
-    for (const item of responseItems) {
-      const directionLabels = {
-        incoming: "需要我回复",
-        outgoing: "等待对方",
-        oversight: "聊天室关注",
-      };
-      const button = makeElement("button", `pending-center-item ${item.direction}`);
-      button.type = "button";
+  const sections = [
+    ["needs_me", "待我处理"],
+    ["waiting_other", "等待对方"],
+    ["informational", "仅通知，不计入顶部待办"],
+  ];
+  const attentionKind = (item) => item.attention_kind || ({
+    incoming: "needs_me",
+    outgoing: "waiting_other",
+    oversight: "informational",
+  }[item.direction] || "informational");
+  const deliveryLabels = {
+    queued: "等待送达",
+    legacy_delivered: "已通知，等待处理",
+    native_injected: "已注入本体 TUI",
+    native_applied: "本体已读取，等待回复",
+    replied: "已回复",
+    legacy_acked: "已确认",
+    cancelled: "已取消",
+  };
+  const taskLabels = {
+    queued: "等待领取",
+    claimed: "已领取",
+    running: "执行中",
+    needs_input: "等待补充",
+  };
+
+  for (const [kind, sectionLabel] of sections) {
+    const messages = responseItems.filter((item) => attentionKind(item) === kind);
+    const tasks = taskItems.filter((item) => attentionKind(item) === kind);
+    if (!messages.length && !tasks.length) continue;
+    elements.pendingCenterList.append(
+      makeElement("h3", `pending-section-title ${kind}`, sectionLabel),
+    );
+    for (const item of messages) {
+      const card = makeElement(
+        "article",
+        `pending-center-item ${item.direction} ${kind}`,
+      );
+      const locateButton = makeElement("button", "pending-item-main");
+      locateButton.type = "button";
       const heading = makeElement("span", "pending-item-heading");
       heading.append(
         makeElement("strong", "", item.conversation_id),
-        makeElement("span", `pending-kind ${item.direction}`, directionLabels[item.direction] || "待回复"),
+        makeElement("span", `pending-kind ${item.direction}`, sectionLabel),
       );
       const sender = item.sender?.display_name || item.sender?.client_type || "未知成员";
       const target = item.target?.display_name || item.target?.client_type || "未知成员";
-      button.append(
+      locateButton.append(
         heading,
         makeElement("span", "pending-item-route", `${sender} → ${target}`),
         makeElement(
@@ -781,23 +821,35 @@ function renderPendingCenter() {
         makeElement(
           "small",
           "pending-item-meta",
-          `#${roomSequence(item)} · ${formatAge(item.age_seconds)} · ${item.delivery_state === "delivered" ? "已送达，等待回复" : "等待送达或处理"}`,
+          `#${roomSequence(item)} · ${formatAge(item.age_seconds)} · ${deliveryLabels[item.delivery_stage] || (item.delivery_state === "delivered" ? "已通知" : "等待处理")}`,
         ),
       );
-      button.addEventListener("click", () => locatePendingCenterItem(item));
-      elements.pendingCenterList.append(button);
+      locateButton.addEventListener("click", () => locatePendingCenterItem(item));
+      card.append(locateButton);
+      if (kind === "needs_me") {
+        const actions = makeElement("span", "pending-item-actions");
+        const acknowledge = makeElement(
+          "button",
+          "pending-acknowledge-button",
+          "标为已处理",
+        );
+        acknowledge.type = "button";
+        acknowledge.addEventListener("click", async () => {
+          acknowledge.disabled = true;
+          try {
+            await acknowledgePendingItems([item]);
+          } catch (error) {
+            acknowledge.disabled = false;
+            elements.pendingCenterFeedback.classList.add("error");
+            elements.pendingCenterFeedback.textContent = `处理失败：${error.message}`;
+          }
+        });
+        actions.append(acknowledge);
+        card.append(actions);
+      }
+      elements.pendingCenterList.append(card);
     }
-  }
-
-  if (taskItems.length) {
-    elements.pendingCenterList.append(makeElement("h3", "pending-section-title", "进行中任务"));
-    const taskLabels = {
-      queued: "等待领取",
-      claimed: "已领取",
-      running: "执行中",
-      needs_input: "等待补充",
-    };
-    for (const task of taskItems) {
+    for (const task of tasks) {
       const button = makeElement("button", `pending-center-item task ${task.status}`);
       button.type = "button";
       const heading = makeElement("span", "pending-item-heading");
@@ -838,6 +890,39 @@ function renderPendingCenter() {
   }
 }
 
+async function acknowledgePendingItems(items) {
+  const byRoom = new Map();
+  for (const item of items) {
+    const roomItems = byRoom.get(item.conversation_id) || [];
+    roomItems.push(item.message_id);
+    byRoom.set(item.conversation_id, roomItems);
+  }
+  elements.pendingCenterFeedback.classList.remove("error", "success");
+  elements.pendingCenterFeedback.textContent = "正在标记为已处理…";
+  let acknowledged = 0;
+  for (const [roomId, messageIds] of byRoom) {
+    const payload = await fetchJson(
+      `/api/rooms/${encodeURIComponent(roomId)}/pending-responses/acknowledge`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agent-Bridge-Intent": "acknowledge-pending-responses",
+        },
+        body: JSON.stringify({ message_ids: messageIds }),
+      },
+    );
+    acknowledged += Number(payload.acknowledgement?.acknowledged_count || 0);
+  }
+  await loadPendingCenter();
+  await refreshActiveRoom(false, false, {
+    refreshParticipants: false,
+    refreshReceipts: true,
+  });
+  elements.pendingCenterFeedback.classList.add("success");
+  elements.pendingCenterFeedback.textContent = `已标记 ${acknowledged} 项为已处理；没有发送新的聊天消息。`;
+}
+
 async function loadPendingCenter() {
   const payload = await fetchJson("/api/pending-responses?limit=100");
   state.pendingCenter = payload;
@@ -876,6 +961,26 @@ async function locatePendingCenterItem(item) {
     }
   }
 }
+
+elements.acknowledgeAllPending.addEventListener("click", async () => {
+  const items = (state.pendingCenter?.pending_responses || []).filter(
+    (item) => (item.attention_kind || item.direction) === "needs_me"
+      || (!item.attention_kind && item.direction === "incoming"),
+  );
+  if (!items.length) return;
+  if (!window.confirm(
+    `确认将当前显示的 ${items.length} 项标为已处理？这不会发送聊天回复。`,
+  )) return;
+  elements.acknowledgeAllPending.disabled = true;
+  try {
+    await acknowledgePendingItems(items);
+  } catch (error) {
+    elements.pendingCenterFeedback.classList.add("error");
+    elements.pendingCenterFeedback.textContent = `批量处理失败：${error.message}`;
+  } finally {
+    elements.acknowledgeAllPending.disabled = false;
+  }
+});
 
 elements.openPendingCenter.addEventListener("click", async () => {
   elements.pendingCenterFeedback.classList.remove("error", "success");

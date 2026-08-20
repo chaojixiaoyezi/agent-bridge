@@ -1,0 +1,63 @@
+{
+  "artifact": "pending-attention-center",
+  "version": "0.43.1",
+  "date": "2026-08-19",
+  "baseline_commit": "a826668ddfe671b3baef2d7c982d312d2b180c71",
+  "database_schema_before": 42,
+  "database_schema_after": 42,
+  "production_read_only_findings": {
+    "pending_center_items": 42,
+    "incoming_to_web_owner": 42,
+    "outgoing_from_web_owner": 0,
+    "administrator_oversight": 0,
+    "root_cause": "Web-targeted structured Agent mentions could only leave the pending center after an exact chat reply; the Web UI had no explicit handled action."
+  },
+  "changes": {
+    "categories": [
+      "needs_me",
+      "waiting_other",
+      "informational"
+    ],
+    "top_badge": "Counts needs_me and waiting_other only; informational oversight remains visible without becoming personal work.",
+    "inactive_targets": "Pending required replies whose target room membership is inactive are excluded.",
+    "web_acknowledgement": "An authenticated Web participant can explicitly acknowledge only their own structured mention or agent_request deliveries in the authorized room; one batch uses one transaction and creates no chat message.",
+    "query": "Exact target replies use the existing reply_to, sender_participant_id composite index through NOT EXISTS instead of materializing every historical reply."
+  },
+  "live_read_benchmark": {
+    "iterations": 8,
+    "database_messages": 2313,
+    "before_average_ms": 21.406,
+    "before_max_ms": 28.811,
+    "after_average_ms": 12.946,
+    "after_max_ms": 14.093,
+    "select_statements_before": 2,
+    "select_statements_after": 2,
+    "average_improvement_percent": 39.52
+  },
+  "verification": {
+    "pytest": "297 passed, 2 skipped",
+    "real_chrome_e2e": "1 passed",
+    "browser_metrics": {
+      "dom_ready_ms": 110.54,
+      "authenticated_ready_ms": 319.88,
+      "room_switch_ms": 51.55,
+      "resource_transfer_bytes": 740050
+    },
+    "ruff": "passed",
+    "compileall": "passed",
+    "javascript_syntax": "passed",
+    "shell_syntax": "passed",
+    "launchd_templates": "passed",
+    "pi_biome": "passed",
+    "lockfile": "passed",
+    "patch_whitespace": "passed"
+  },
+  "compatibility": {
+    "natural_language_classification_added": false,
+    "agent_delivery_contract_changed": false,
+    "wake_or_dnd_policy_changed": false,
+    "existing_pending_response_fields_preserved": true,
+    "agent_process_restart_required": false,
+    "viewer_only_rolling_release": true
+  }
+}

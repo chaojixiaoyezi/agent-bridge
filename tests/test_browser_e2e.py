@@ -73,6 +73,31 @@ def _running_viewer(database: Path):
         database,
         captcha_generator=lambda: CAPTCHA_ANSWER,
     )
+    store = BridgeStore(database)
+    with store._transaction() as connection:
+        now = time.time()
+        connection.execute(
+            "INSERT INTO memberships "
+            "(conversation_id, participant_id, roles_json, active, joined_at, updated_at) "
+            "VALUES (?, 'participant_web_owner', '[]', 1, ?, ?) "
+            "ON CONFLICT(conversation_id, participant_id) DO UPDATE SET "
+            "active = 1, updated_at = excluded.updated_at",
+            ("browser-room-one", now, now),
+        )
+    pending_sender = store.register_agent_session(
+        product="pi",
+        username="browser-pending-sender",
+        session_alias="浏览器待处理测试 Agent",
+        conversation_id="browser-room-one",
+    )
+    store.send(
+        authorized_session_id=str(pending_sender["session_id"]),
+        sender_participant_id=str(pending_sender["participant_id"]),
+        conversation_id="browser-room-one",
+        body_text="@admin 请核对待处理中心的结构化收口动作。",
+        mentions=["participant_web_owner"],
+        notification_mode="mention",
+    )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -188,6 +213,24 @@ def test_real_browser_login_layout_room_switch_scroll_and_performance(tmp_path: 
             assert timeline.bounding_box()["width"] > rooms.bounding_box()["width"] * 2
             assert page.locator("#global-tools-menu").get_attribute("open") is None
             assert page.locator("#room-tools-menu").get_attribute("open") is None
+            playwright_api.expect(page.locator("#pending-center-badge")).to_have_text("1")
+            page.locator("#open-pending-center").click()
+            page.locator("#pending-center-dialog").wait_for(state="visible")
+            playwright_api.expect(
+                page.locator("#pending-center-summary .pending-summary-card")
+            ).to_have_count(3)
+            playwright_api.expect(
+                page.locator("#pending-center-list .pending-center-item.needs_me")
+            ).to_have_count(1)
+            page.locator(".pending-acknowledge-button").click()
+            playwright_api.expect(
+                page.locator("#pending-center-list .pending-center-empty")
+            ).to_be_visible()
+            playwright_api.expect(page.locator("#pending-center-badge")).to_be_hidden()
+            playwright_api.expect(
+                page.locator("#pending-center-feedback")
+            ).to_contain_text("没有发送新的聊天消息")
+            page.locator("#close-pending-center").click()
             playwright_api.expect(
                 page.locator("#global-tools-menu > summary")
             ).to_contain_text("系统管理")

@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.43.0 / schema 42。
+当前协议/数据库版本：Agent Bridge v0.43.1 / schema 42。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -236,6 +236,8 @@ v0.42.23 保持 schema 41、接口、权限、消息正文和 Agent 投递语义
 v0.42.24 保持 schema 41、接口、权限、消息正文和 Agent 投递语义不变，在真正简洁模式中恢复发送时间，并把时间紧跟在发送者名字右侧；长名字允许在狭窄聊天区内收缩，时间不会重新顶到消息行最右端。标准与详细模式布局不变，现有 Agent/worker/TUI 不重启。验证证据见 [web-simple-time-v0.42.24-2026-08-18.json](evidence/web-simple-time-v0.42.24-2026-08-18.json)。
 
 v0.43.0 将 schema 增量升级为 42，增加不可变的消息接收名单、私有附件元数据与结构化链接表。Web 可把文字、链接和最多 5 个文件/图片组成一条消息；存在附件时必须结构化 @ Agent 或使用有权限的 `@全员`，且整条消息只投递、检索和展示给发送时固化的 Agent，后加入者不会继承，引用回复也只能继承或缩小原名单。链接单独发送仍是公开卡片，Bridge 不抓取远程预览。附件字节写入数据库旁权限 `0700/0600` 的私有 blob 目录，Agent 只能用当前同房 session 和接收名单经 `agent_download_attachment` 原子校验下载；Web 下载继续复核房间 ACL。快照会复制 SQLite 实际引用的 blob，同时仍能在升级前读取没有附件表的 schema 41 数据库。旧消息、房间序号、普通公开 @、现有 Agent session、connector、listener、worker 和 TUI 进程不重建。验证证据见 [restricted-message-assets-v0.43.0-2026-08-18.json](evidence/restricted-message-assets-v0.43.0-2026-08-18.json)。
+
+v0.43.1 不变更 schema、Agent 投递/唤醒合同或任务状态机。Web 待处理中心把原来的方向投影提升为“待我处理、等待对方、仅供关注”，顶栏只统计前两类；目标 membership 已停用的投递不再伪装成仍可回复事项，精确回复检查改用既有复合索引的 `NOT EXISTS`，生产库同一投影的平均只读耗时由 21.406ms 降至 12.946ms。Web 用户可对结构化点名自己的消息显式“标为已处理”，批量动作在同房间复用中央 ack/receipt 权威且不产生新聊天消息，不能确认其他 Agent 的队列。发布只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。验证证据见 [pending-attention-center-v0.43.1-2026-08-19.json](evidence/pending-attention-center-v0.43.1-2026-08-19.json)。
 
 v0.42.21 保持 schema 41、接口、权限和聊天室投递语义不变，继续修正 Web 看板视觉：聊天室侧栏的新建与收缩按钮进入同一 82px 控制槽，使用相同 34px 尺寸和精确纵坐标，展开态不再出现一高一低；系统管理中的原生配色下拉改为六张可键盘切换的氛围卡，同时预览背景、面板、强调色与冷暖感。补齐独立“青岚”深色主题，并让六套主题共同驱动背景光晕、细网格和半透明面板高光；隐藏的原生 select 继续保留兼容。现有 Agent/worker/TUI 不重启。验证证据见 [web-atmosphere-theme-studio-2026-08-18.json](evidence/web-atmosphere-theme-studio-2026-08-18.json)。
 

@@ -21,7 +21,12 @@ from .store_errors import (
     ConflictError,
     NotFoundError,
 )
-from .validation import ValidationError, compact_json, opaque_id
+from .validation import (
+    ValidationError,
+    compact_json,
+    conversation_id as validate_conversation_id,
+    opaque_id,
+)
 
 
 ROOM_MESSAGE_SEQUENCE_SCHEMA = """
@@ -1631,66 +1636,154 @@ class MessageDeliveryMixin:
                     session=live_session,
                 )
             delivery = self._require_eligible_row(conn, participant, row)
-            actionable = bool(delivery["actionable"])
-            claimed_by = str(row["claimed_by"] or "")
-            claim_until = float(row["claim_until"] or 0.0)
-            if (
-                actionable
-                and claimed_by
-                and claimed_by != participant
-                and claim_until > now
-            ):
-                raise ConflictError("message is currently claimed by another participant")
-            conn.execute(
-                """
-                UPDATE message_deliveries
-                SET state = 'acked',
-                    delivery_stage = CASE
-                        WHEN native_replied_at IS NOT NULL THEN 'replied'
-                        WHEN native_applied_at IS NOT NULL THEN 'native_applied'
-                        ELSE 'legacy_acked'
-                    END,
-                    first_delivered_at = COALESCE(first_delivered_at, ?),
-                    last_delivered_at = COALESCE(last_delivered_at, ?),
-                    acked_at = ?
-                WHERE message_id = ? AND participant_id = ?
-                  AND state != 'cancelled'
-                """,
-                (now, now, now, message, participant),
+            self._ack_delivery_locked(
+                conn,
+                participant=participant,
+                row=row,
+                delivery=delivery,
+                now=now,
             )
-            conn.execute(
-                """
-                INSERT INTO receipts
-                    (message_id, participant_id, state, delivered_at, acked_at)
-                VALUES (?, ?, 'acked', ?, ?)
-                ON CONFLICT(message_id, participant_id) DO UPDATE SET
-                    state = 'acked',
-                    delivered_at = COALESCE(receipts.delivered_at, excluded.delivered_at),
-                    acked_at = excluded.acked_at
-                """,
-                (message, participant, now, now),
-            )
-            globally_resolved = actionable and str(row["audience_kind"]) in {
-                "participant",
-                "role",
-            }
-            if globally_resolved:
-                conn.execute(
-                    "UPDATE messages SET status = 'acked', updated_at = ? "
-                    "WHERE message_id = ?",
-                    (now, message),
-                )
-                conn.execute(
-                    "UPDATE message_deliveries SET actionable = 0 "
-                    "WHERE message_id = ? AND actionable = 1",
-                    (message,),
-                )
         return {
             "message_id": message,
             "action": "ack",
             "acked_by": participant,
             "acked_at": now,
         }
+
+    def acknowledge_web_pending_messages(
+        self,
+        *,
+        participant_id: str,
+        conversation_id: str,
+        message_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        """Explicitly close Web-owned required replies without chat noise.
+
+        This uses the same receipt and delivery state as an Agent ack, but only
+        for the authenticated Web participant's own structured mention rows in
+        one authorized room.  It does not acknowledge another Agent's queue.
+        """
+
+        participant = opaque_id(participant_id, field="participant_id")
+        conversation = validate_conversation_id(conversation_id)
+        messages = list(
+            dict.fromkeys(
+                opaque_id(message_id, field="message_id")
+                for message_id in message_ids
+            )
+        )
+        if not messages:
+            raise ValidationError("message_ids must not be empty")
+        if len(messages) > 200:
+            raise ValidationError("message_ids cannot contain more than 200 items")
+        now = time.time()
+        with self._transaction() as conn:
+            self._archive_stale_rooms_locked(conn, now=now)
+            self._require_active_room(conn, conversation)
+            if conn.execute(
+                "SELECT 1 FROM web_users "
+                "WHERE participant_id = ? AND active = 1",
+                (participant,),
+            ).fetchone() is None:
+                raise AuthorizationError(
+                    "only an active Web participant can close Web pending items"
+                )
+            for message in messages:
+                row = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE message_id = ? AND conversation_id = ?",
+                    (message, conversation),
+                ).fetchone()
+                if row is None:
+                    raise NotFoundError(f"unknown message in room: {message}")
+                delivery = self._require_eligible_row(conn, participant, row)
+                reasons = set(json.loads(str(delivery["reasons_json"] or "[]")))
+                if not reasons.intersection({"mention", "agent_request"}):
+                    raise ConflictError(
+                        "only a structured required reply can be marked handled"
+                    )
+                self._ack_delivery_locked(
+                    conn,
+                    participant=participant,
+                    row=row,
+                    delivery=delivery,
+                    now=now,
+                )
+        return {
+            "conversation_id": conversation,
+            "acked_by": participant,
+            "message_ids": messages,
+            "acknowledged_count": len(messages),
+            "acked_at": now,
+        }
+
+    @staticmethod
+    def _ack_delivery_locked(
+        conn: sqlite3.Connection,
+        *,
+        participant: str,
+        row: sqlite3.Row,
+        delivery: sqlite3.Row,
+        now: float,
+    ) -> None:
+        message = str(row["message_id"])
+        actionable = bool(delivery["actionable"])
+        claimed_by = str(row["claimed_by"] or "")
+        claim_until = float(row["claim_until"] or 0.0)
+        if (
+            actionable
+            and claimed_by
+            and claimed_by != participant
+            and claim_until > now
+        ):
+            raise ConflictError("message is currently claimed by another participant")
+        conn.execute(
+            """
+            UPDATE message_deliveries
+            SET state = 'acked',
+                delivery_stage = CASE
+                    WHEN native_replied_at IS NOT NULL THEN 'replied'
+                    WHEN native_applied_at IS NOT NULL THEN 'native_applied'
+                    ELSE 'legacy_acked'
+                END,
+                first_delivered_at = COALESCE(first_delivered_at, ?),
+                last_delivered_at = COALESCE(last_delivered_at, ?),
+                acked_at = ?
+            WHERE message_id = ? AND participant_id = ?
+              AND state != 'cancelled'
+            """,
+            (now, now, now, message, participant),
+        )
+        conn.execute(
+            """
+            INSERT INTO receipts
+                (message_id, participant_id, state, delivered_at, acked_at)
+            VALUES (?, ?, 'acked', ?, ?)
+            ON CONFLICT(message_id, participant_id) DO UPDATE SET
+                state = 'acked',
+                delivered_at = COALESCE(
+                    receipts.delivered_at,
+                    excluded.delivered_at
+                ),
+                acked_at = excluded.acked_at
+            """,
+            (message, participant, now, now),
+        )
+        globally_resolved = actionable and str(row["audience_kind"]) in {
+            "participant",
+            "role",
+        }
+        if globally_resolved:
+            conn.execute(
+                "UPDATE messages SET status = 'acked', updated_at = ? "
+                "WHERE message_id = ?",
+                (now, message),
+            )
+            conn.execute(
+                "UPDATE message_deliveries SET actionable = 0 "
+                "WHERE message_id = ? AND actionable = 1",
+                (message,),
+            )
 
     def _require_eligible_participant(self, participant_id: str, message_id: str) -> None:
         with self._transaction() as conn:
@@ -1715,7 +1808,8 @@ class MessageDeliveryMixin:
             str(row["conversation_id"]),
         )
         delivery = conn.execute(
-            "SELECT state, actionable, priority FROM message_deliveries "
+            "SELECT state, actionable, priority, reasons_json "
+            "FROM message_deliveries "
             "WHERE message_id = ? AND participant_id = ?",
             (str(row["message_id"]), participant_id),
         ).fetchone()

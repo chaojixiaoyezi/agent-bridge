@@ -288,6 +288,7 @@ const elements = {
   pendingCenterDialog: document.querySelector("#pending-center-dialog"),
   closePendingCenter: document.querySelector("#close-pending-center"),
   pendingCenterSummary: document.querySelector("#pending-center-summary"),
+  acknowledgeAllPending: document.querySelector("#acknowledge-all-pending"),
   pendingCenterFeedback: document.querySelector("#pending-center-feedback"),
   pendingCenterList: document.querySelector("#pending-center-list"),
   roomHighlightsDialog: document.querySelector("#room-highlights-dialog"),
