@@ -43,6 +43,9 @@ class ClaudeConnectorState:
 
         return BridgeHttpClient(
             self.bridge_url,
+            trusted_http_host=(
+                str(self.manifest.get("trusted_http_host") or "").strip() or None
+            ),
             enrollment_token_file=enrollment_file,
             enrollment_token_loader=enrollment_loader,
             connector_id=self.connector_id,

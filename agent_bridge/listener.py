@@ -27,6 +27,7 @@ from .config import (
 )
 from .http_client import BridgeHttpClient, BridgeRemoteError
 from .supervisor import queue_status
+from .transport_security import BridgeTransportError, validate_bridge_url
 
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
@@ -171,27 +172,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow cleartext HTTP to a non-loopback Bridge (unsafe without a tunnel)",
     )
+    parser.add_argument(
+        "--trusted-http-host",
+        default=os.environ.get("AGENT_BRIDGE_TRUSTED_HTTP_HOST", ""),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
-def _validated_base_url(value: str, *, allow_insecure_http: bool) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ListenerError("Bridge URL must be an http(s) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ListenerError("Bridge URL cannot contain credentials or query data")
-    if (
-        parsed.scheme == "http"
-        and parsed.hostname not in LOOPBACK_HOSTS
-        and not allow_insecure_http
-    ):
-        raise ListenerError(
-            "refusing to send a bearer token over non-loopback HTTP; use HTTPS "
-            "or a private tunnel, or explicitly pass --allow-insecure-http"
+def _validated_base_url(
+    value: str,
+    *,
+    allow_insecure_http: bool,
+    trusted_http_host: str | None = None,
+) -> str:
+    try:
+        return validate_bridge_url(
+            value,
+            trusted_http_host=trusted_http_host,
+            allow_insecure_http=allow_insecure_http,
         )
-    return normalized
+    except BridgeTransportError as exc:
+        raise ListenerError(str(exc)) from exc
 
 
 def _validated_webhook(value: str | None) -> str | None:
@@ -930,6 +933,7 @@ def main(argv: list[str] | None = None) -> None:
         base_url = _validated_base_url(
             args.url,
             allow_insecure_http=bool(args.allow_insecure_http),
+            trusted_http_host=args.trusted_http_host,
         )
         webhook = _validated_webhook(args.webhook)
         command = _parse_json_argv(args.wake_command_json)

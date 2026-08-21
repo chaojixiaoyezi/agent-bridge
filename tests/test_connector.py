@@ -62,9 +62,16 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     reported_calls: list[tuple[str, dict]] = []
 
     class FakeClient:
-        def __init__(self, bridge_url, *, invitation_token):
-            assert bridge_url == "http://127.0.0.1:8765"
+        def __init__(
+            self,
+            bridge_url,
+            *,
+            invitation_token,
+            trusted_http_host,
+        ):
+            assert bridge_url == "http://100.79.24.67:8765"
             assert invitation_token == "invite_private"
+            assert trusted_http_host == "100.79.24.67"
 
         def accept_invitation(self, **payload):
             accepted_calls.append(payload)
@@ -109,7 +116,7 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     )
     result = invitation_cli.accept_invitation(
         SimpleNamespace(
-            bridge_url="http://127.0.0.1:8765",
+            bridge_url="http://100.79.24.67:8765",
             product="claude-code",
             username="direct-agent",
             signature="直接接入。",
@@ -131,6 +138,7 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
         }
     ]
     assert setup_calls[0]["workspace_path"] == str(tmp_path.resolve())
+    assert setup_calls[0]["trusted_http_host"] == "100.79.24.67"
     assert setup_calls[0]["enable_resident"] is True
     assert reported_calls[0][0] == "/agent/connector/setup"
     assert result["invitation_accepted"] is True
@@ -144,6 +152,10 @@ def test_direct_invitation_cli_allows_https_remote_but_rejects_remote_http() -> 
     )
     with pytest.raises(invitation_cli.InvitationCliError, match="requires HTTPS"):
         invitation_cli._supported_bridge_url("http://bridge.example.test")
+    assert invitation_cli._supported_bridge_url(
+        "http://100.79.24.67:8765/",
+        trusted_http_host="100.79.24.67",
+    ) == "http://100.79.24.67:8765"
 
 
 def test_codex_connector_writes_private_launchd_services_without_secret_leak(
@@ -218,6 +230,68 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert task["ProgramArguments"][0].endswith("agent-bridge-task-worker")
     assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "codex"
     assert json.loads(manifest_file.read_text(encoding="utf-8"))["schema_version"] == 3
+
+
+def test_tailnet_invitation_pin_is_persisted_for_every_resident_component(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent_bridge.connector.shutil.which",
+        lambda name: "/usr/local/bin/codex" if name == "codex" else None,
+    )
+    result = configure_resident_connector(
+        connector_id="connector_tailnet123456",
+        enrollment_token="enroll_tailnet-private-token",
+        bridge_url="http://100.79.24.67:8765",
+        trusted_http_host="100.79.24.67",
+        product="codex",
+        username="tailnet-agent",
+        signature="通过邀请自动接入。",
+        conversation_id="私网邀请测试群",
+        adapter_kind="codex",
+        requested_mode="resident",
+        workspace_path=str(tmp_path),
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    state = Path(result.state_directory)
+    manifest = json.loads((state / "connector.json").read_text(encoding="utf-8"))
+    assert manifest["trusted_http_host"] == "100.79.24.67"
+    launch_agents = tmp_path / "Library" / "LaunchAgents"
+    service_files = list(launch_agents.glob("*.plist"))
+    assert len(service_files) == 3
+    for service_file in service_files:
+        service = plistlib.loads(service_file.read_bytes())
+        assert service["EnvironmentVariables"][
+            "AGENT_BRIDGE_TRUSTED_HTTP_HOST"
+        ] == "100.79.24.67"
+
+
+def test_tailnet_connector_without_an_invitation_pin_fails_before_writing_state(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConnectorSetupError, match="invitation-pinned"):
+        configure_resident_connector(
+            connector_id="connector_untrusted1234",
+            enrollment_token="enroll_untrusted-private-token",
+            bridge_url="http://100.79.24.67:8765",
+            product="codex",
+            username="untrusted-agent",
+            signature="不应写入。",
+            conversation_id="私网邀请测试群",
+            adapter_kind="codex",
+            requested_mode="resident",
+            workspace_path=str(tmp_path),
+            home=tmp_path,
+            system_name="Darwin",
+            activate=False,
+        )
+    assert not (
+        tmp_path / "Library" / "Application Support" / "AgentBridge"
+    ).exists()
 
 
 def test_claude_connector_installs_generic_exact_session_channel(
@@ -570,6 +644,7 @@ def test_invalid_workspace_is_rejected_before_invitation_is_consumed(
         SimpleNamespace(
             server_url="http://127.0.0.1:8765",
             client_type="codex",
+            trusted_http_host=None,
         ),
     )
 
@@ -582,6 +657,32 @@ def test_invalid_workspace_is_rejected_before_invitation_is_consumed(
             username="值守者",
             signature="只处理明确通知。",
             workspace_path=str(tmp_path / "missing"),
+        )
+
+
+def test_untrusted_remote_transport_is_rejected_before_invitation_is_consumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        bridge_server,
+        "CONFIG",
+        SimpleNamespace(
+            server_url="http://100.79.24.67:8765",
+            client_type="codex",
+            trusted_http_host=None,
+        ),
+    )
+
+    def must_not_connect():
+        raise AssertionError("invitation was consumed before transport preflight")
+
+    monkeypatch.setattr(bridge_server, "get_client", must_not_connect)
+    with pytest.raises(ConnectorSetupError, match="invitation-pinned"):
+        bridge_server.agent_accept_invitation(
+            username="值守者",
+            signature="只处理明确通知。",
+            workspace_path=str(tmp_path),
         )
 
 

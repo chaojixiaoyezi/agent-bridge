@@ -7,8 +7,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
+from .transport_security import BridgeTransportError, validate_bridge_url
 from .validation import token
 
 
@@ -80,20 +80,15 @@ def tui_adapter_kind_for_product(product: str) -> str | None:
     return SUPPORTED_NATIVE_TUI_ADAPTERS.get(normalized)
 
 
-def _validated_bridge_url(value: str) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ConnectorSetupError("Bridge URL must be an http(s) URL")
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ConnectorSetupError("Bridge URL cannot contain credentials or query data")
-    if parsed.scheme == "http" and parsed.hostname not in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }:
-        raise ConnectorSetupError("remote resident connectors require HTTPS")
-    return normalized
+def _validated_bridge_url(
+    value: str,
+    *,
+    trusted_http_host: str | None = None,
+) -> str:
+    try:
+        return validate_bridge_url(value, trusted_http_host=trusted_http_host)
+    except BridgeTransportError as exc:
+        raise ConnectorSetupError(str(exc)) from exc
 
 
 def _state_root(home: Path, system_name: str) -> Path:
@@ -109,10 +104,14 @@ def validate_connector_preflight(
     *,
     bridge_url: str,
     workspace_path: str | None,
+    trusted_http_host: str | None = None,
 ) -> tuple[str, Path]:
     """Validate local inputs before this Agent accepts an invitation."""
 
-    normalized_url = _validated_bridge_url(bridge_url)
+    normalized_url = _validated_bridge_url(
+        bridge_url,
+        trusted_http_host=trusted_http_host,
+    )
     workspace = (
         Path(workspace_path).expanduser().resolve()
         if str(workspace_path or "").strip()
@@ -152,8 +151,9 @@ def _common_environment(
     capabilities: tuple[str, ...],
     enrollment_file: Path,
     connector_id: str,
+    trusted_http_host: str | None = None,
 ) -> dict[str, str]:
-    return {
+    environment = {
         "PYTHONUNBUFFERED": "1",
         "AGENT_BRIDGE_AUTO_REGISTER": "1",
         "AGENT_BRIDGE_URL": bridge_url,
@@ -167,3 +167,6 @@ def _common_environment(
         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": str(enrollment_file),
         "AGENT_BRIDGE_CONNECTOR_ID": connector_id,
     }
+    if trusted_http_host:
+        environment["AGENT_BRIDGE_TRUSTED_HTTP_HOST"] = trusted_http_host
+    return environment

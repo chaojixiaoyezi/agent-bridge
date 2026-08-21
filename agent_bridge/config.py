@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .transport_security import invitation_trusted_http_host
+
 
 @dataclass(frozen=True)
 class BridgeConfig:
@@ -11,6 +13,7 @@ class BridgeConfig:
     database: Path
     client_type: str
     server_url: str
+    trusted_http_host: str | None
     poll_interval_seconds: float
     maximum_wait_seconds: float
     registration_secret: str | None
@@ -44,20 +47,33 @@ class BridgeConfig:
             minimum=1.0,
             maximum=120.0,
         )
-        return cls(
-            home=home,
-            database=database,
-            client_type=os.environ.get("AGENT_BRIDGE_CLIENT_TYPE", "").strip(),
-            server_url=os.environ.get(
+        server_url = (
+            os.environ.get(
                 "AGENT_BRIDGE_URL",
                 "http://127.0.0.1:8765",
             )
             .strip()
-            .rstrip("/"),
+            .rstrip("/")
+        )
+        invitation_token = read_invitation_token()
+        trusted_http_host = (
+            os.environ.get("AGENT_BRIDGE_TRUSTED_HTTP_HOST", "").strip() or None
+        )
+        # Compatibility for invitations generated before the trust pin existed:
+        # the invitation itself is explicit authority to contact its exact private
+        # IP. The accepted connector persists that pin for every later reconnect.
+        if trusted_http_host is None and invitation_token:
+            trusted_http_host = invitation_trusted_http_host(server_url)
+        return cls(
+            home=home,
+            database=database,
+            client_type=os.environ.get("AGENT_BRIDGE_CLIENT_TYPE", "").strip(),
+            server_url=server_url,
+            trusted_http_host=trusted_http_host,
             poll_interval_seconds=poll_interval,
             maximum_wait_seconds=maximum_wait,
             registration_secret=read_registration_secret(),
-            invitation_token=read_invitation_token(),
+            invitation_token=invitation_token,
             enrollment_token=read_enrollment_token(),
             enrollment_token_file=read_enrollment_token_file(),
             connector_id=read_connector_id(),

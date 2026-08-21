@@ -34,6 +34,9 @@ def rotate_connector_credential(state_directory: str | Path) -> dict[str, object
 
     client = BridgeHttpClient(
         bridge_url,
+        trusted_http_host=(
+            str(manifest.get("trusted_http_host") or "").strip() or None
+        ),
         enrollment_token=enrollment,
         connector_id=connector_id,
         enrollment_token_file=enrollment_file,

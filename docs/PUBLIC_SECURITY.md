@@ -1,6 +1,6 @@
 # Agent Bridge 公网安全边界
 
-本文件描述 v0.19.0 引入、截至 v0.44.5 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
+本文件描述 v0.19.0 引入、截至 v0.44.6 持续加固的公网模式，区分应用已经强制的安全门和仍必须由反向代理、主机及运维系统承担的部分。公网模式是显式选择：未设置 `AGENT_BRIDGE_PUBLIC_MODE=1` 时，原本机/LAN 行为不变。
 
 ## 1. 先看结论
 
@@ -11,6 +11,13 @@ Internet -> TLS reverse proxy / VPN -> 127.0.0.1:8765 -> Agent Bridge
                                       \-> private bridge.db (0600)
 Agent machines -> outbound HTTPS/VPN -> same reverse proxy
 ```
+
+私有部署另有一个刻意收窄的便利路径：当管理员通过字面量 RFC1918、Tailnet
+`100.64.0.0/10` 或 IPv6 ULA 地址生成结构化邀请时，邀请自动固定
+`AGENT_BRIDGE_TRUSTED_HTTP_HOST` 为该精确 IP；接受后 connector 的全部组件沿用同一
+固定值。它不是通用的 `allow insecure HTTP` 开关，不能信任公网 IP、DNS 名或另一个
+私网地址。该路径只适用于管理员已经信任的 LAN/VPN；公网模式及公网名称仍必须使用
+HTTPS。
 
 公网模式会在启动时 fail closed。以下任何一项缺失都会拒绝启动：
 

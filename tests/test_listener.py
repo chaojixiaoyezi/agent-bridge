@@ -118,10 +118,24 @@ def test_remote_listener_requires_tls_and_loopback_wake_webhook() -> None:
         )
         == "https://bridge.example.test"
     )
-    with pytest.raises(ListenerError, match="bearer token"):
+    with pytest.raises(ListenerError, match="invitation-pinned"):
         _validated_base_url(
             "http://192.168.1.20:8765",
             allow_insecure_http=False,
+        )
+    assert (
+        _validated_base_url(
+            "http://100.79.24.67:8765/",
+            allow_insecure_http=False,
+            trusted_http_host="100.79.24.67",
+        )
+        == "http://100.79.24.67:8765"
+    )
+    with pytest.raises(ListenerError, match="invitation-pinned"):
+        _validated_base_url(
+            "http://100.79.24.68:8765",
+            allow_insecure_http=False,
+            trusted_http_host="100.79.24.67",
         )
     assert _validated_webhook("http://localhost:9988/wake") is not None
     with pytest.raises(ListenerError, match="loopback"):

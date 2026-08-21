@@ -13,6 +13,7 @@ from starlette.routing import Route
 from .avatars import avatar_invitation_payload
 from .connector import adapter_kind_for_product, tui_adapter_kind_for_product
 from .store import AuthorizationError, BridgeStore, ConflictError
+from .transport_security import invitation_trusted_http_host
 from .validation import conversation_id as validate_conversation_id
 from .validation import token
 from .viewer_http import _int_query, _json_body, _json_error
@@ -68,6 +69,22 @@ def build_resident_access_routes(
             )
             invitation_token = str(invitation.pop("invitation_token"))
             bridge_url = str(request.base_url).rstrip("/")
+            trusted_http_host = invitation_trusted_http_host(bridge_url)
+            transport_environment = {"AGENT_BRIDGE_URL": bridge_url}
+            direct_transport_arguments: list[str] = []
+            if trusted_http_host:
+                transport_environment["AGENT_BRIDGE_TRUSTED_HTTP_HOST"] = (
+                    trusted_http_host
+                )
+                direct_transport_arguments = [
+                    "--trusted-http-host",
+                    trusted_http_host,
+                ]
+            invitation_mcp_environment = {
+                **transport_environment,
+                "AGENT_BRIDGE_CLIENT_TYPE": normalized_product,
+                "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
+            }
             fixed_register_arguments = {"conversation_id": conversation}
             fixed_http_registration_payload = {
                 "product": normalized_product,
@@ -159,6 +176,7 @@ def build_resident_access_routes(
                     direct_accept_command,
                     "--bridge-url",
                     bridge_url,
+                    *direct_transport_arguments,
                     "--product",
                     normalized_product,
                     "--username",
@@ -197,11 +215,7 @@ def build_resident_access_routes(
                                     "transport": "stdio",
                                     "command": command,
                                     "args": [],
-                                    "env": {
-                                        "AGENT_BRIDGE_URL": bridge_url,
-                                        "AGENT_BRIDGE_CLIENT_TYPE": normalized_product,
-                                        "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
-                                    },
+                                    "env": invitation_mcp_environment,
                                     "failOnStartupError": True,
                                 },
                             }
@@ -220,7 +234,7 @@ def build_resident_access_routes(
                                     "command": command,
                                     "args": [],
                                     "env": {
-                                        "AGENT_BRIDGE_URL": bridge_url,
+                                        **transport_environment,
                                         "AGENT_BRIDGE_CLIENT_TYPE": normalized_product,
                                         "AGENT_BRIDGE_ENROLLMENT_TOKEN_FILE": "<resident_setup.state_directory>/enrollment.token",
                                         "AGENT_BRIDGE_CONNECTOR_ID": "<agent_accept_invitation.connector_id>",
@@ -257,6 +271,7 @@ def build_resident_access_routes(
                     direct_accept_command,
                     "--bridge-url",
                     bridge_url,
+                    *direct_transport_arguments,
                     "--product",
                     normalized_product,
                     "--username",
@@ -329,6 +344,19 @@ def build_resident_access_routes(
                 "MCP Server 配置：",
                 f"command={command}",
                 f"AGENT_BRIDGE_URL={bridge_url}",
+                *(
+                    [f"AGENT_BRIDGE_TRUSTED_HTTP_HOST={trusted_http_host}"]
+                    if trusted_http_host
+                    else []
+                ),
+                *(
+                    [
+                        "该 HTTP 地址已由结构化邀请固定为精确私网/Tailnet 端点；"
+                        "直接接受即可，不要再要求 HTTPS、curl 探测或数据库检查。"
+                    ]
+                    if trusted_http_host
+                    else []
+                ),
                 f"AGENT_BRIDGE_CLIENT_TYPE={normalized_product}",
                 f"AGENT_BRIDGE_INVITATION_TOKEN={invitation_token}",
                 expiry_note,
@@ -414,11 +442,7 @@ def build_resident_access_routes(
                         "bridge_url": bridge_url,
                         "mcp": {
                             "command": command,
-                            "env": {
-                                "AGENT_BRIDGE_URL": bridge_url,
-                                "AGENT_BRIDGE_CLIENT_TYPE": normalized_product,
-                                "AGENT_BRIDGE_INVITATION_TOKEN": invitation_token,
-                            },
+                            "env": invitation_mcp_environment,
                         },
                         "invitation": invitation,
                         "requested_mode": requested_mode,

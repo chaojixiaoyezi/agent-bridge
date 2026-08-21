@@ -473,6 +473,9 @@ def configure_existing_connector_from_disk(
             connector_id=str(manifest["connector_id"]),
             enrollment_token=enrollment_token,
             bridge_url=str(manifest["bridge_url"]),
+            trusted_http_host=(
+                str(manifest.get("trusted_http_host") or "").strip() or None
+            ),
             product=str(manifest["product"]),
             username=str(manifest["username"]),
             signature=str(manifest["signature"]),

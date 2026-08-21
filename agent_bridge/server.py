@@ -94,6 +94,7 @@ def get_client() -> BridgeHttpClient:
             }
         _CLIENT = BridgeHttpClient(
             CONFIG.server_url,
+            trusted_http_host=CONFIG.trusted_http_host,
             registration_secret=CONFIG.registration_secret,
             enrollment_token=CONFIG.enrollment_token,
             connector_id=CONFIG.connector_id,
@@ -180,6 +181,7 @@ def agent_accept_invitation(
     _, validated_workspace = validate_connector_preflight(
         bridge_url=CONFIG.server_url,
         workspace_path=workspace_path or None,
+        trusted_http_host=CONFIG.trusted_http_host,
     )
     proposed_tui_adapter = tui_adapter_kind_for_product(CONFIG.client_type)
     if proposed_tui_adapter and (
@@ -220,6 +222,7 @@ def agent_accept_invitation(
             connector_id=connector_id,
             enrollment_token=enrollment_token,
             bridge_url=CONFIG.server_url,
+            trusted_http_host=CONFIG.trusted_http_host,
             product=CONFIG.client_type,
             username=assigned_username,
             signature=signature,

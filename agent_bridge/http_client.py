@@ -11,10 +11,14 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .message_assets import MAX_ATTACHMENT_BYTES, _safe_filename
+from .transport_security import (
+    TRUSTED_HTTP_HOST_ENV,
+    invitation_trusted_http_host,
+    validate_bridge_url,
+)
 
 
 MAX_BRIDGE_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -66,19 +70,33 @@ class BridgeHttpClient:
         connector_id: str | None = None,
         connector_component: str | None = None,
         invitation_token: str | None = None,
+        trusted_http_host: str | None = None,
         auto_registration: dict[str, Any] | None = None,
         enrollment_token_file: str | Path | None = None,
         enrollment_token_loader: Callable[[], str | None] | None = None,
     ) -> None:
-        normalized = str(base_url or "").strip().rstrip("/")
-        parsed = urlparse(normalized)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("AGENT_BRIDGE_URL must be an http(s) URL")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError(
-                "AGENT_BRIDGE_URL cannot contain credentials or query data"
-            )
+        normalized_invitation = str(invitation_token or "").strip() or None
+        configured_trusted_host = (
+            str(
+                trusted_http_host
+                or os.environ.get(TRUSTED_HTTP_HOST_ENV, "")
+            ).strip()
+            or None
+        )
+        if configured_trusted_host is None and normalized_invitation:
+            configured_trusted_host = invitation_trusted_http_host(base_url)
+        normalized = validate_bridge_url(
+            base_url,
+            trusted_http_host=configured_trusted_host,
+            # This low-level client predates connector transport policy and is
+            # also used by explicitly configured legacy deployments. Admission
+            # boundaries (invitation preflight and listener startup) enforce the
+            # pin; keeping syntax-only validation here avoids disconnecting an
+            # already running legacy Agent during a rolling upgrade.
+            allow_insecure_http=True,
+        )
         self.base_url = normalized
+        self.trusted_http_host = configured_trusted_host
         self.registration_secret = str(registration_secret or "").strip() or None
         self.enrollment_token = str(enrollment_token or "").strip() or None
         self.connector_id = str(connector_id or "").strip() or None
@@ -89,7 +107,7 @@ class BridgeHttpClient:
             ).strip().lower()
             or None
         )
-        self.invitation_token = str(invitation_token or "").strip() or None
+        self.invitation_token = normalized_invitation
         self.enrollment_token_file = (
             Path(enrollment_token_file).expanduser()
             if enrollment_token_file is not None
@@ -168,6 +186,13 @@ class BridgeHttpClient:
             raise BridgeRemoteError(
                 "AGENT_BRIDGE_INVITATION_TOKEN is required to accept an invitation"
             )
+        # Keep legacy low-level clients wire-compatible, but never send an
+        # invitation capability until the invitation-specific transport gate
+        # has passed. This executes before enrollment generation or HTTP I/O.
+        validate_bridge_url(
+            self.base_url,
+            trusted_http_host=self.trusted_http_host,
+        )
         proposed_enrollment = self._invitation_enrollment_token
         if proposed_enrollment is None:
             proposed_enrollment = f"enroll_{secrets.token_urlsafe(32)}"

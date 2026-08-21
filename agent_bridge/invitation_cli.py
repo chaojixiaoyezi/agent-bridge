@@ -6,11 +6,15 @@ import os
 import platform
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .avatars import normalize_avatar_key
 from .connector import ConnectorSetupError, configure_resident_connector
 from .http_client import BridgeHttpClient, BridgeRemoteError
+from .transport_security import (
+    BridgeTransportError,
+    invitation_trusted_http_host,
+    validate_bridge_url,
+)
 from .tui_adapter import NativeTuiError, validate_native_tui_binding
 from .validation import agent_username, alias, string_tokens, token
 
@@ -28,30 +32,27 @@ def _stdin_invitation_token() -> str:
     return value
 
 
-def _supported_bridge_url(value: str) -> str:
-    normalized = str(value or "").strip().rstrip("/")
-    parsed = urlparse(normalized)
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.hostname
-        or parsed.username
-        or parsed.password
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise InvitationCliError("Bridge URL must be a credential-free http(s) URL")
-    if parsed.scheme == "http" and parsed.hostname not in {
-        "127.0.0.1",
-        "localhost",
-        "::1",
-    }:
-        raise InvitationCliError("remote direct invitation acceptance requires HTTPS")
-    return normalized
+def _supported_bridge_url(
+    value: str,
+    *,
+    trusted_http_host: str | None = None,
+) -> str:
+    try:
+        return validate_bridge_url(value, trusted_http_host=trusted_http_host)
+    except BridgeTransportError as exc:
+        raise InvitationCliError(str(exc)) from exc
 
 
 def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     invitation_token = _stdin_invitation_token()
-    bridge_url = _supported_bridge_url(args.bridge_url)
+    trusted_http_host = (
+        str(getattr(args, "trusted_http_host", "") or "").strip()
+        or invitation_trusted_http_host(args.bridge_url)
+    )
+    bridge_url = _supported_bridge_url(
+        args.bridge_url,
+        trusted_http_host=trusted_http_host,
+    )
     product = token(args.product, field="product_name")
     username = agent_username(args.username)
     signature = alias(args.signature, field="signature")
@@ -84,10 +85,10 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.is_dir():
         raise InvitationCliError("Agent workspace does not exist")
-    client = BridgeHttpClient(
-        bridge_url,
-        invitation_token=invitation_token,
-    )
+    client_arguments = {"invitation_token": invitation_token}
+    if trusted_http_host:
+        client_arguments["trusted_http_host"] = trusted_http_host
+    client = BridgeHttpClient(bridge_url, **client_arguments)
     acceptance_payload: dict[str, object] = {
         "product": product,
         "username": username,
@@ -115,6 +116,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             connector_id=connector_id,
             enrollment_token=enrollment_token,
             bridge_url=bridge_url,
+            trusted_http_host=trusted_http_host,
             product=product,
             username=assigned_username,
             signature=signature,
@@ -183,6 +185,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Accept one Agent Bridge invitation without configuring MCP"
     )
     parser.add_argument("--bridge-url", required=True)
+    parser.add_argument(
+        "--trusted-http-host",
+        default=os.environ.get("AGENT_BRIDGE_TRUSTED_HTTP_HOST", ""),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--product", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--signature", required=True)

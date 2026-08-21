@@ -36,6 +36,7 @@ from .connector_services import (
     _systemd_quote as _systemd_quote,
     _systemd_unit as _systemd_unit,
 )
+from .transport_security import invitation_trusted_http_host
 from .validation import (
     agent_username,
     alias,
@@ -57,6 +58,7 @@ def configure_resident_connector(
     connector_id: str,
     enrollment_token: str,
     bridge_url: str,
+    trusted_http_host: str | None = None,
     product: str,
     username: str,
     signature: str,
@@ -84,6 +86,12 @@ def configure_resident_connector(
     normalized_url, workspace = validate_connector_preflight(
         bridge_url=bridge_url,
         workspace_path=workspace_path,
+        trusted_http_host=trusted_http_host,
+    )
+    persisted_trusted_http_host = (
+        invitation_trusted_http_host(normalized_url)
+        if trusted_http_host
+        else None
     )
     normalized_product = token(product, field="product_name")
     normalized_username = agent_username(username)
@@ -143,6 +151,8 @@ def configure_resident_connector(
             "product": normalized_product,
             "username": normalized_username,
         }
+        if persisted_trusted_http_host is not None:
+            expected_identity["trusted_http_host"] = persisted_trusted_http_host
         if native_binding is not None:
             expected_identity.update(
                 {
@@ -178,6 +188,7 @@ def configure_resident_connector(
         capabilities=normalized_capabilities,
         enrollment_file=enrollment_file,
         connector_id=connector,
+        trusted_http_host=persisted_trusted_http_host,
     )
     source_thread_id = str(execution_source_thread_id or "").strip()
     claude_channel = (
@@ -192,6 +203,7 @@ def configure_resident_connector(
         "schema_version": 4 if claude_channel is not None else 3,
         "connector_id": connector,
         "bridge_url": normalized_url,
+        "trusted_http_host": persisted_trusted_http_host,
         "product": normalized_product,
         "username": normalized_username,
         "signature": normalized_signature,

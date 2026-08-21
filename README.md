@@ -2,7 +2,7 @@
 
 Agent Bridge 是一个独立的多 Agent 聊天桥。它用 SQLite 保存聊天室、完整历史、成员身份和逐成员投递状态，通过 MCP、HTTP、SSE 与本机网页提供同一套权威语义。
 
-当前版本：v0.44.5。
+当前版本：v0.44.6。
 
 它不属于、也不会修改接入它的 Agent 项目。
 
@@ -170,7 +170,7 @@ worker 只把固定元数据唤醒交给 Codex，不把房间正文放进命令�
 
 本地 webhook 必须返回 2xx、enqueue 命令必须返回 0，表示事件已经**持久进入本机 supervisor 队列**。监听器只在所有已配置 sink 确认后写 cursor；sink 失败会重连并重投同一元数据事件。内置 supervisor 用 `participant_id + event + event_id` 幂等去重，因为前一个 sink 成功而后一个 sink 失败时，重连会再次投递同一事件。cursor 文件只包含最后序号，不包含令牌。兼容旧部署时仍可安全注入 `AGENT_BRIDGE_TOKEN`；不要把 token 放进参数、日志、URL 或 cursor 文件。
 
-生产服务应设置 `AGENT_BRIDGE_REGISTRATION_SECRET_FILE`，旧式远端 listener/MCP 也读取同一私密登记文件或由独立安全渠道获得登记授权。即使兼容服务端未设置密钥，普通 MCP 进程也默认拒绝 `agent_register`；只有固定常驻启动器、connector enrollment，或显式设置 `AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION=1` 的迁移/开发进程可尝试兼容登记。邀请接入不依赖全局登记密钥。非 loopback 的明文 HTTP 默认被拒绝，跨机器应使用 TLS、VPN 或 SSH 隧道。公开仓库内的 `deploy/` 提供 launchd 与 systemd user service 模板，配置文件不应保存 session token。
+生产服务应设置 `AGENT_BRIDGE_REGISTRATION_SECRET_FILE`，旧式远端 listener/MCP 也读取同一私密登记文件或由独立安全渠道获得登记授权。即使兼容服务端未设置密钥，普通 MCP 进程也默认拒绝 `agent_register`；只有固定常驻启动器、connector enrollment，或显式设置 `AGENT_BRIDGE_ALLOW_DIRECT_REGISTRATION=1` 的迁移/开发进程可尝试兼容登记。邀请接入不依赖全局登记密钥。非 loopback 的明文 HTTP 默认被拒绝；通过字面量 RFC1918/Tailnet/ULA 私网地址生成邀请时，邀请会自动携带且只携带该精确 IP 的信任，接受后 listener、聊天/任务 worker 与断线重连共同继承，不需要 Agent 再探测网络或手工放宽安全开关。公网 IP、DNS 名和任何不匹配的 HTTP 地址仍强制 HTTPS；私网直连也只能用于可信 LAN/VPN。公开仓库内的 `deploy/` 提供 launchd 与 systemd user service 模板，配置文件不应保存 session token。
 
 监听器能唤醒一个**已经在线的本地 worker**，不能凭空启动关机、断电或没有守护进程的机器。每台机器分别运行自己的 listener、SQLite 队列和产品 worker，就能唤醒该机器上的 Agent；中央 Bridge 不需要访问远端机器的入站端口。真正的 Agent turn 由 Codex、Claude Code、my-agent 等各自的本地 adapter 决定。普通聊天室文字和历史 `message.authorization` 当前都只作为讨论材料；显式任务会写入 `room_tasks`/`room_task_inputs`。兼容 connector 的有权个人 `@` 仍可使用持久执行席，而 `native_preferred` connector 的普通 `@` 只进入绑定 TUI，断线时等待该 session 恢复。即使 listener 与 Agent 都离线，重新连接时仍会从中央 SQLite backlog 恢复；即使 listener 已收而产品 adapter 暂时失败，事件也会留在远端机器的 supervisor SQLite 队列中。两层持久化都不以 SSE 是否到达作为不丢消息的前提。
 
@@ -234,7 +234,7 @@ AGENT_BRIDGE_CLIENT_TYPE=<产品名>
 
 登录 Web 看板后，管理员可在任意使用中聊天室点击“邀请 Agent”，也可以在接入窗口改选其他使用中的聊天室。页面只要求选择或自定义产品名、聊天室、接入模式和邀请使用范围；稳定用户名、签名、头像、职责、能力及工作目录由 Agent 接受时自己填写，展示昵称仍需管理员审批。邀请会按产品给出对应厂商的 8 个候选；自定义产品会给出各厂商默认款，接入后也可用 `agent_list_avatars` 查看完整目录。
 
-页面默认生成 30 分钟有效的“多人复用”邀请，也可改选“单次使用”。复用邀请可以直接转发给同一产品的多个 Agent；每次接受都获得独立 `connector_id`、session 和 enrollment，不共享长期密钥。新客户端即使提交相同 username 也会由服务端隔离为不同机器身份；旧客户端仍需自行选择唯一 username。单次邀请只允许一个 Agent 接入，底层 API 未显式传 `reusable` 时也保持单次默认。接收方由 Agent 明确调用 `agent_accept_invitation`；普通聊天室文字、`@` 或引用都不能触发安装。网络在接受响应处中断时，只有持有自己最初提交 enrollment 的同一连接器才能幂等重试。
+页面默认生成 30 分钟有效的“多人复用”邀请，也可改选“单次使用”。复用邀请可以直接转发给同一产品的多个 Agent；每次接受都获得独立 `connector_id`、session 和 enrollment，不共享长期密钥。新客户端即使提交相同 username 也会由服务端隔离为不同机器身份；旧客户端仍需自行选择唯一 username。单次邀请只允许一个 Agent 接入，底层 API 未显式传 `reusable` 时也保持单次默认。接收方把整份邀请交给 Agent 后只需明确调用一次 `agent_accept_invitation`；产品身份、网络地址、精确私网信任、常驻服务和重连配置由结构化邀请与安装器一次完成，不要求 Agent 先运行 curl、查数据库或反复测试。普通聊天室文字、`@` 或引用都不能触发安装。网络在接受响应处中断时，只有持有自己最初提交 enrollment 的同一连接器才能幂等重试。
 
 - `codex`：接受“自动值守”邀请后，安装当前用户级 listener、私有持久队列、只读聊天影子和持久本体执行席；活动任务补充使用 `turn/steer`。
 - `claude-code`：接受“自动值守”邀请后，先兼容保留 listener、私有队列、聊天影子和任务席，同时生成 connector 私有 MCP 配置与 `resident_setup.launch_command`。首次通过该命令启动或恢复后，专属 tmux pane 的本机引导（或受支持环境的官方 Channel）唤醒同一个 Claude TUI；精确本体租约生效期间旧影子停止取件。注入、模型应用和真实回复分别记账，只有成功调用 connector 回复工具才算聊天室已回复。

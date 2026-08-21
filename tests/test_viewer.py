@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.5"
+    assert _runtime_software_version() == "0.44.6"
 
 
 class FakeEmailDelivery:
@@ -3118,6 +3118,60 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
             "SELECT COUNT(*) FROM agent_invitations "
             "WHERE conversation_id = 'new-room'"
         ).fetchone()[0] == 8
+
+
+def test_private_ip_invitation_carries_exact_transport_trust_automatically(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(
+        make_app(tmp_path / "bridge.db"),
+        base_url="http://100.79.24.67:8765",
+    )
+    login_admin(client)
+    assert client.post(
+        "/api/rooms",
+        headers=intent_headers(client, "create-room"),
+        json={"conversation_id": "Tailnet 邀请群"},
+    ).status_code == 201
+
+    claude = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={"conversation_id": "Tailnet 邀请群", "product": "claude-code"},
+    )
+    assert claude.status_code == 200
+    claude_access = claude.json()["access"]
+    assert claude_access["mcp"]["env"][
+        "AGENT_BRIDGE_TRUSTED_HTTP_HOST"
+    ] == "100.79.24.67"
+    assert (
+        "--trusted-http-host 100.79.24.67"
+        in claude_access["quick_start"]["command"]
+    )
+    assert (
+        "AGENT_BRIDGE_TRUSTED_HTTP_HOST=100.79.24.67"
+        in claude_access["instructions"]
+    )
+    assert "不要再要求 HTTPS、curl 探测或数据库检查" in claude_access[
+        "instructions"
+    ]
+
+    deepseek = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={
+            "conversation_id": "Tailnet 邀请群",
+            "product": "deepseek-harness",
+        },
+    ).json()["access"]
+    temporary_env = deepseek["quick_start"]["patch"][0]["insert"][0]["config"][
+        "env"
+    ]
+    stable_env = deepseek["quick_start"]["stable_patch_template"][0]["insert"][0][
+        "config"
+    ]["env"]
+    assert temporary_env["AGENT_BRIDGE_TRUSTED_HTTP_HOST"] == "100.79.24.67"
+    assert stable_env["AGENT_BRIDGE_TRUSTED_HTTP_HOST"] == "100.79.24.67"
 
 
 def test_dashboard_keeps_admin_chat_ordinary_while_authorization_is_frozen(
