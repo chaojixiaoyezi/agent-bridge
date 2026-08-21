@@ -22,6 +22,7 @@ SUPPORTED_RESIDENT_ADAPTERS = {
 
 
 SUPPORTED_NATIVE_TUI_ADAPTERS = {
+    "codex": "codex",
     "deepseek": "deepseek-harness",
     "deepseek-harness": "deepseek-harness",
     "dsh": "deepseek-harness",
@@ -52,6 +53,7 @@ class ConnectorSetupResult:
     task_service: str | None
     detail: str
     launch_command: tuple[str, ...] | None = None
+    duty_mode: str | None = None
 
     def public_payload(self) -> dict[str, Any]:
         return {
@@ -64,6 +66,7 @@ class ConnectorSetupResult:
             "worker_service": self.worker_service,
             "task_service": self.task_service,
             "detail": self.detail,
+            "duty_mode": self.duty_mode,
             "launch_command": (
                 list(self.launch_command) if self.launch_command else None
             ),

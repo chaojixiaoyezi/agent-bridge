@@ -171,6 +171,7 @@ class AgentEnrollmentMixin:
                     """
                     SELECT connector.accepted_participant_id,
                            connector.bound_client_type,
+                           connector.tui_native_session_id,
                            invitation.product
                     FROM agent_connectors AS connector
                     JOIN agent_invitations AS invitation
@@ -189,6 +190,18 @@ class AgentEnrollmentMixin:
                 ):
                     raise ConflictError(
                         "native TUI endpoint is already bound to another product identity"
+                    )
+                if (
+                    invitation_tui_adapter == "codex"
+                    and endpoint_owner is not None
+                    and normalized_tui_session is not None
+                    and not self._constant_time_eq(
+                        normalized_tui_session,
+                        str(endpoint_owner["tui_native_session_id"] or ""),
+                    )
+                ):
+                    raise ConflictError(
+                        "native TUI endpoint is already bound to another session"
                     )
                 if normalized_tui_session is not None:
                     duplicate_session = conn.execute(
@@ -221,7 +234,16 @@ class AgentEnrollmentMixin:
                     """,
                     (enrollment_hash,),
                 ).fetchone()
-            if duplicate_session is not None and (
+            shared_codex_tui = bool(
+                invitation_tui_adapter == "codex"
+                and endpoint_owner is not None
+                and normalized_tui_session is not None
+                and self._constant_time_eq(
+                    normalized_tui_session,
+                    str(endpoint_owner["tui_native_session_id"] or ""),
+                )
+            )
+            if duplicate_session is not None and not shared_codex_tui and (
                 existing_connector is None
                 or str(duplicate_session["connector_id"])
                 != str(existing_connector["connector_id"])
@@ -600,6 +622,20 @@ class AgentEnrollmentMixin:
 
     @staticmethod
     def _connector_required_components(connector: sqlite3.Row) -> set[str]:
+        try:
+            raw_setup_detail = (
+                connector["setup_detail_json"]
+                if "setup_detail_json" in connector.keys()
+                else "{}"
+            )
+            setup_detail = json.loads(str(raw_setup_detail or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            setup_detail = {}
+        if (
+            isinstance(setup_detail, dict)
+            and str(setup_detail.get("duty_mode") or "") == "direct_tui"
+        ):
+            return {"mcp"}
         if str(connector["requested_mode"]) == "resident" and (
             str(connector["adapter_kind"]) in {"codex", "claude-code"}
             or (
@@ -702,6 +738,7 @@ class AgentEnrollmentMixin:
                        connector.accepted_participant_id,
                        connector.revoked_at AS connector_revoked_at,
                        connector.binding_version,
+                       connector.setup_detail_json,
                        connector.bound_client_type,
                        connector.bound_roles_json,
                        connector.bound_capabilities_json,

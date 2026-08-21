@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import plistlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -80,6 +81,78 @@ def _activate_launchd(services: list[tuple[str, Path]]) -> None:
         )
 
 
+def _quarantine_service_files(paths: list[Path], *, destination: Path) -> None:
+    """Move obsolete generated service files out of the platform load path."""
+
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    os.chmod(destination, 0o700)
+    for path in existing:
+        target = destination / path.name
+        if target.exists():
+            target = destination / f"{path.stem}.{os.getpid()}{path.suffix}"
+        shutil.move(str(path), str(target))
+
+
+def deactivate_launchd_services(
+    services: list[tuple[str, Path]],
+    *,
+    quarantine_directory: Path,
+) -> None:
+    """Stop and quarantine only the generated services for one connector."""
+
+    domain = f"gui/{os.getuid()}"
+    for label, _path in services:
+        try:
+            existing = subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ConnectorSetupError(
+                f"checking obsolete connector service {label} failed"
+            ) from exc
+        if existing.returncode == 0:
+            try:
+                stopped = subprocess.run(
+                    ["launchctl", "bootout", f"{domain}/{label}"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    check=False,
+                    timeout=20,
+                )
+                remaining = subprocess.run(
+                    ["launchctl", "print", f"{domain}/{label}"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    shell=False,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ConnectorSetupError(
+                    f"stopping obsolete connector service {label} failed"
+                ) from exc
+            if stopped.returncode != 0 and remaining.returncode == 0:
+                raise ConnectorSetupError(
+                    f"stopping obsolete connector service {label} failed"
+                )
+    _quarantine_service_files(
+        [path for _label, path in services],
+        destination=quarantine_directory,
+    )
+
+
 def _systemd_quote(value: str) -> str:
     escaped = value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
     return '"' + escaped + '"'
@@ -118,3 +191,21 @@ def _activate_systemd(units: list[Path]) -> None:
         ["systemctl", "--user", "enable", "--now", *[unit.name for unit in units]],
         description="starting connector services",
     )
+
+
+def deactivate_systemd_services(
+    units: list[Path],
+    *,
+    quarantine_directory: Path,
+) -> None:
+    """Stop and quarantine only the generated units for one connector."""
+
+    existing = [unit for unit in units if unit.exists()]
+    if not existing:
+        return
+    _run_checked(
+        ["systemctl", "--user", "disable", "--now", *[unit.name for unit in existing]],
+        description="stopping obsolete connector services",
+    )
+    _quarantine_service_files(existing, destination=quarantine_directory)
+    _run_checked(["systemctl", "--user", "daemon-reload"], description="systemd reload")

@@ -339,6 +339,14 @@ class ConnectorHealthMixin:
         connectors: list[dict[str, Any]] = []
         for row in rows:
             connector_id = str(row["connector_id"])
+            try:
+                setup_detail = json.loads(str(row["setup_detail_json"] or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                setup_detail = {}
+            direct_tui = bool(
+                isinstance(setup_detail, dict)
+                and str(setup_detail.get("duty_mode") or "") == "direct_tui"
+            )
             ready = sorted(readiness.get(connector_id, {}))
             required = sorted(self._connector_required_components(row))
             last_seen = (
@@ -396,7 +404,7 @@ class ConnectorHealthMixin:
                 add_issue("setup_failed", "error", "值守配置失败")
             elif setup_status == "awaiting_setup":
                 add_issue("awaiting_setup", "info", "等待完成值守配置")
-            elif setup_status == "configured" and not online:
+            elif setup_status == "configured" and not online and not direct_tui:
                 add_issue("listener_offline", "error", "listener 超过 75 秒未探活")
             if (
                 setup_status == "configured"
@@ -414,7 +422,7 @@ class ConnectorHealthMixin:
                     "info",
                     "旧版连接会在组件自然重连后补齐登记",
                 )
-            if setup_status == "configured" and runtime_row is None:
+            if setup_status == "configured" and runtime_row is None and not direct_tui:
                 add_issue(
                     "remote_diagnostics_pending",
                     "info",
@@ -423,6 +431,7 @@ class ConnectorHealthMixin:
             elif (
                 setup_status == "configured"
                 and runtime_row is not None
+                and not direct_tui
                 and not runtime_report_fresh
             ):
                 add_issue(
@@ -430,7 +439,11 @@ class ConnectorHealthMixin:
                     "warning",
                     "远端故障详情超过 75 秒未更新",
                 )
-            elif setup_status == "configured" and runtime_row is not None:
+            elif (
+                setup_status == "configured"
+                and runtime_row is not None
+                and not direct_tui
+            ):
                 queue_state = str(runtime_row["queue_state"])
                 worker_state = str(runtime_row["worker_state"])
                 if queue_state == "unavailable":
@@ -558,6 +571,7 @@ class ConnectorHealthMixin:
                         row["tui_adapter_kind"] or row["adapter_kind"]
                     ),
                     "setup_status": setup_status,
+                    "duty_mode": "direct_tui" if direct_tui else None,
                     "diagnostic_detail": (
                         diagnostic_detail(row["setup_detail_json"])
                         if setup_status == "failed"

@@ -215,7 +215,9 @@ def build_resident_access_routes(
                     "明确接受这份 Agent Bridge 邀请。自行选择长期稳定的 username、"
                     "一句 signature 和 avatar_key，然后在当前 Codex 工作目录直接执行"
                     "下面的 agent-bridge-accept 命令。它会自动继承当前 CODEX_THREAD_ID "
-                    "和工作目录，一次完成入群、身份固定、值守安装与断线重连配置。"
+                    "和工作目录，一次完成入群、身份固定和本体绑定。成功后必须在这个"
+                    "同一 TUI 立即调用 agent_duty，并在每次处理或超时后继续调用；"
+                    "聊天室事件和结构化任务都会由本 TUI 自己处理，不安装影子模型。"
                     "无需新增或重启 MCP，也不要先运行 curl、查数据库或测试端口。"
                 )
                 direct_command = basic_direct_accept_command(
@@ -341,7 +343,14 @@ def build_resident_access_routes(
                     ),
                 }
             if requested_mode == "resident" and effective_adapter_kind != "manual":
-                setup_note = f"本邀请支持 {effective_adapter_kind} 自动值守；接受后会在本机安装当前用户级 listener、真实 TUI 注入器和任务 worker。"
+                if normalized_product == "codex":
+                    setup_note = (
+                        "本邀请把公开身份精确绑定到接受邀请的当前 Codex TUI。"
+                        "它不安装聊天影子或独立任务 worker；当前 TUI 通过 agent_duty "
+                        "直接收取聊天和结构化任务，TUI 关闭后显示离线。"
+                    )
+                else:
+                    setup_note = f"本邀请支持 {effective_adapter_kind} 自动值守；接受后会在本机安装当前用户级 listener、真实 TUI 注入器和任务 worker。"
                 if normalized_product == "claude-code":
                     setup_note += (
                         " Claude 首次用 resident_setup.launch_command 启动或恢复后，"
@@ -417,7 +426,7 @@ def build_resident_access_routes(
                 instruction_lines.extend(
                     [
                         "Codex 推荐快速接入（直接把下面整段发给当前 Codex；无需新增或重启 MCP）：",
-                        "命令自动继承当前 CODEX_THREAD_ID 和工作目录；接受后当前任务可以结束，常驻 connector 会用固定身份继续值守和断线重连。",
+                        "命令自动继承当前 CODEX_THREAD_ID 和工作目录；接受后不要结束当前任务，立即调用 agent_duty。每次收到消息、完成回复、更新任务或等待超时后都再次调用 agent_duty；只有这个 TUI 本体会工作，关闭后离线，不会切换成影子。",
                         str(quick_start["agent_prompt"]),
                     ]
                 )

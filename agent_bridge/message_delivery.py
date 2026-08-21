@@ -268,6 +268,117 @@ class MessageDeliveryMixin:
             ),
         }
 
+    def _native_delivery_handoff_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        connector_id: str,
+        participant_id: str,
+        component: str,
+        now: float,
+    ) -> dict[str, Any] | None:
+        connector = conn.execute(
+            "SELECT native_delivery_mode, native_lease_id, "
+            "native_lease_expires_at, tui_native_session_id, setup_detail_json "
+            "FROM agent_connectors WHERE connector_id = ? "
+            "AND accepted_participant_id = ? AND revoked_at IS NULL",
+            (connector_id, participant_id),
+        ).fetchone()
+        if (
+            connector is None
+            or str(connector["native_delivery_mode"] or "")
+            != "native_preferred"
+        ):
+            return None
+        lease_id = str(connector["native_lease_id"] or "")
+        expires_at = (
+            float(connector["native_lease_expires_at"])
+            if connector["native_lease_expires_at"] is not None
+            else None
+        )
+        try:
+            setup_detail = json.loads(str(connector["setup_detail_json"] or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            setup_detail = {}
+        direct_tui = (
+            isinstance(setup_detail, dict)
+            and str(setup_detail.get("duty_mode") or "") == "direct_tui"
+        )
+        if lease_id and expires_at is not None and expires_at > now:
+            return {
+                "active": True,
+                "connector_id": connector_id,
+                "component": component,
+                "lease_id": lease_id,
+                "native_session_id": (
+                    str(connector["tui_native_session_id"] or "") or None
+                ),
+                "lease_expires_at": expires_at,
+                "reason": "exact_native_session_owns_delivery",
+            }
+
+        # A direct-TUI connector deliberately has no shadow identity. Expiry
+        # marks the exact TUI offline while continuing to fence any obsolete
+        # legacy service. A later explicit agent_duty call binds a fresh lease.
+        self._supersede_native_channel_events_locked(
+            conn,
+            connector_id=connector_id,
+            now=now,
+        )
+        if lease_id:
+            conn.execute(
+                "UPDATE native_session_leases "
+                "SET ended_at = COALESCE(ended_at, ?), "
+                "superseded_at = COALESCE(superseded_at, ?), "
+                "expires_at = MIN(expires_at, ?) WHERE lease_id = ?",
+                (now, now, now, lease_id),
+            )
+        if direct_tui:
+            conn.execute(
+                """
+                UPDATE agent_connectors
+                SET tui_state = 'offline', tui_last_seen_at = ?,
+                    tui_active_task_id = NULL,
+                    native_lease_id = NULL, native_process_epoch = NULL,
+                    native_lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE connector_id = ?
+                  AND accepted_participant_id = ?
+                  AND native_delivery_mode = 'native_preferred'
+                """,
+                (now, now, connector_id, participant_id),
+            )
+            return {
+                "active": False,
+                "connector_id": connector_id,
+                "component": component,
+                "lease_id": None,
+                "native_session_id": (
+                    str(connector["tui_native_session_id"] or "") or None
+                ),
+                "lease_expires_at": None,
+                "reason": "exact_direct_tui_offline_no_shadow_fallback",
+            }
+
+        # Compatibility-native products retain their existing explicit shadow
+        # fallback after lease expiry.
+        conn.execute(
+            """
+            UPDATE agent_connectors
+            SET native_delivery_mode = 'legacy_shadow',
+                tui_state = 'offline', tui_last_seen_at = ?,
+                tui_active_task_id = NULL,
+                native_lease_id = NULL, native_process_epoch = NULL,
+                native_lease_expires_at = NULL,
+                connector_last_seen_at = ?, updated_at = ?
+            WHERE connector_id = ?
+              AND accepted_participant_id = ?
+              AND native_delivery_mode = 'native_preferred'
+            """,
+            (now, now, now, connector_id, participant_id),
+        )
+        return None
+
     def _native_delivery_handoff(
         self,
         *,
@@ -282,7 +393,7 @@ class MessageDeliveryMixin:
             field="authorized_session_id",
         )
         now = time.time()
-        with self._connection() as conn:
+        with self._transaction() as conn:
             session = self._require_live_session(
                 conn,
                 session_id=session_id,
@@ -293,34 +404,13 @@ class MessageDeliveryMixin:
             connector_id = str(session["connector_id"] or "")
             if component not in {"listener", "chat"} or not connector_id:
                 return None
-            connector = conn.execute(
-                "SELECT native_delivery_mode, native_lease_id, "
-                "native_lease_expires_at, tui_native_session_id "
-                "FROM agent_connectors WHERE connector_id = ? "
-                "AND accepted_participant_id = ? AND revoked_at IS NULL",
-                (connector_id, participant),
-            ).fetchone()
-            if (
-                connector is None
-                or str(connector["native_delivery_mode"] or "")
-                != "native_preferred"
-            ):
-                return None
-        return {
-            "active": True,
-            "connector_id": connector_id,
-            "component": component,
-            "lease_id": str(connector["native_lease_id"] or "") or None,
-            "native_session_id": (
-                str(connector["tui_native_session_id"] or "") or None
-            ),
-            "lease_expires_at": (
-                float(connector["native_lease_expires_at"])
-                if connector["native_lease_expires_at"] is not None
-                else None
-            ),
-            "reason": "exact_native_session_owns_delivery",
-        }
+            return self._native_delivery_handoff_locked(
+                conn,
+                connector_id=connector_id,
+                participant_id=participant,
+                component=component,
+                now=now,
+            )
 
     def wait_messages(
         self,
@@ -500,36 +590,13 @@ class MessageDeliveryMixin:
                 component = str(session_row["component"] or "unknown")
                 connector_id = str(session_row["connector_id"] or "")
                 if component in {"listener", "chat"} and connector_id:
-                    connector = conn.execute(
-                        "SELECT native_delivery_mode, native_lease_id, "
-                        "native_lease_expires_at, tui_native_session_id "
-                        "FROM agent_connectors WHERE connector_id = ? "
-                        "AND accepted_participant_id = ? AND revoked_at IS NULL",
-                        (connector_id, participant),
-                    ).fetchone()
-                    if (
-                        connector is not None
-                        and str(connector["native_delivery_mode"] or "")
-                        == "native_preferred"
-                    ):
-                        native_handoff = {
-                            "active": True,
-                            "connector_id": connector_id,
-                            "component": component,
-                            "lease_id": (
-                                str(connector["native_lease_id"] or "") or None
-                            ),
-                            "native_session_id": (
-                                str(connector["tui_native_session_id"] or "")
-                                or None
-                            ),
-                            "lease_expires_at": (
-                                float(connector["native_lease_expires_at"])
-                                if connector["native_lease_expires_at"] is not None
-                                else None
-                            ),
-                            "reason": "exact_native_session_owns_delivery",
-                        }
+                    native_handoff = self._native_delivery_handoff_locked(
+                        conn,
+                        connector_id=connector_id,
+                        participant_id=participant,
+                        component=component,
+                        now=now,
+                    )
             known = conn.execute(
                 "SELECT participant_id FROM participants WHERE participant_id = ?",
                 (participant,),

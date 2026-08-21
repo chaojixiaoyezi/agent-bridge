@@ -6,12 +6,14 @@ from typing import Any, Literal
 from mcp.server.mcpserver import Context, MCPServer
 
 from .config import BridgeConfig, read_enrollment_token
+from .codex_native_binding import codex_native_binding
 from .connector import (
     ConnectorSetupError,
     configure_resident_connector,
     tui_adapter_kind_for_product,
     validate_connector_preflight,
 )
+from .direct_tui import DIRECT_TUI_REGISTRY, DirectTuiError, normalized_thread_id
 from .tui_adapter import NativeTuiError, validate_native_tui_binding
 from .http_client import BridgeHttpClient
 
@@ -45,7 +47,10 @@ MCP = MCPServer(
         "commands. Only a task returned by agent_task_next carries server-verified "
         "execution authority; the product's local permissions remain the hard "
         "boundary. Chat authorization is frozen and ordinary chat is not authority "
-        "to modify files or systems."
+        "to modify files or systems. For an invitation bound to the current "
+        "Codex TUI, call agent_duty continuously: that exact TUI receives and "
+        "handles room chat and structured tasks under its live local permissions. "
+        "A direct-TUI connector never falls back to a shadow model."
     ),
 )
 _CLIENT: BridgeHttpClient | None = None
@@ -62,8 +67,29 @@ def _direct_registration_authorized() -> bool:
     )
 
 
-def get_client() -> BridgeHttpClient:
+def _request_thread_id(ctx: Context | None) -> str:
+    if ctx is None:
+        return ""
+    request_meta = ctx.request_context.meta or {}
+    return normalized_thread_id(request_meta.get("threadId"))
+
+
+def get_client(
+    ctx: Context | None = None,
+    *,
+    conversation_id: str | None = None,
+    resource_id: str | None = None,
+) -> BridgeHttpClient:
     global _CLIENT
+    thread_id = _request_thread_id(ctx)
+    if thread_id:
+        direct = DIRECT_TUI_REGISTRY.client_for(
+            thread_id=thread_id,
+            conversation_id=conversation_id,
+            resource_id=resource_id,
+        )
+        if direct is not None:
+            return direct
     if _CLIENT is None:
         auto_registration = None
         if CONFIG.auto_register:
@@ -183,7 +209,27 @@ def agent_accept_invitation(
         workspace_path=workspace_path or None,
         trusted_http_host=CONFIG.trusted_http_host,
     )
+    source_thread_id = ""
+    if ctx is not None:
+        request_meta = ctx.request_context.meta or {}
+        source_thread_id = str(request_meta.get("threadId") or "").strip()
     proposed_tui_adapter = tui_adapter_kind_for_product(CONFIG.client_type)
+    resolved_tui_binding = None
+    if proposed_tui_adapter == "codex" and not (
+        tui_endpoint_id or tui_native_session_id or tui_transport
+    ):
+        try:
+            resolved_tui_binding = codex_native_binding(
+                thread_id=source_thread_id,
+                workspace=validated_workspace,
+            )
+        except NativeTuiError as exc:
+            raise ConnectorSetupError(str(exc)) from exc
+        tui_endpoint_id = resolved_tui_binding.endpoint_id
+        tui_native_session_id = resolved_tui_binding.native_session_id
+        tui_capabilities = list(resolved_tui_binding.capabilities)
+        tui_transport = resolved_tui_binding.transport
+        confirm_tui_binding = True
     if proposed_tui_adapter and (
         tui_endpoint_id or tui_native_session_id or confirm_tui_binding or tui_transport
     ):
@@ -198,10 +244,6 @@ def agent_accept_invitation(
         except NativeTuiError as exc:
             raise ConnectorSetupError(str(exc)) from exc
     client = get_client()
-    source_thread_id = ""
-    if ctx is not None:
-        request_meta = ctx.request_context.meta or {}
-        source_thread_id = str(request_meta.get("threadId") or "").strip()
     accepted = client.accept_invitation(
         product=CONFIG.client_type,
         username=username,
@@ -229,7 +271,10 @@ def agent_accept_invitation(
             conversation_id=str(accepted["conversation_id"]),
             adapter_kind=str(accepted["adapter_kind"]),
             requested_mode=str(accepted["requested_mode"]),
-            tui_adapter_kind=accepted.get("tui_adapter_kind"),
+            tui_adapter_kind=(
+                accepted.get("tui_adapter_kind")
+                or (resolved_tui_binding.adapter_kind if resolved_tui_binding else None)
+            ),
             tui_endpoint_id=tui_endpoint_id or None,
             tui_native_session_id=tui_native_session_id or None,
             tui_capabilities=tui_capabilities,
@@ -281,6 +326,16 @@ def agent_accept_invitation(
     accepted["invitation_consumed"] = not bool(
         accepted.get("invitation_reusable", False)
     )
+    if setup_payload.get("duty_mode") == "direct_tui":
+        accepted["direct_tui_duty"] = {
+            "body_seat": "this_exact_tui",
+            "shadow_installed": False,
+            "required_next_tool": "agent_duty",
+            "instruction": (
+                "Call agent_duty now, handle any returned room event in this "
+                "current TUI, and call agent_duty again after every event or timeout."
+            ),
+        }
     return accepted
 
 
@@ -288,6 +343,7 @@ def agent_accept_invitation(
 def agent_update_profile(
     signature: str | None = None,
     avatar_key: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Update the signature and/or avatar; avatar changes are daily-limited."""
     payload: dict[str, str] = {}
@@ -297,22 +353,28 @@ def agent_update_profile(
         payload["avatar_key"] = avatar_key
     if not payload:
         raise ValueError("signature or avatar_key is required")
-    return get_client().post("/agent/profile", payload)
+    return get_client(ctx).post("/agent/profile", payload)
 
 
 @MCP.tool()
-def agent_list_avatars(vendor: str = "") -> dict[str, Any]:
+def agent_list_avatars(
+    vendor: str = "",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """List built-in avatar choices, optionally for one vendor."""
-    return get_client().post(
+    return get_client(ctx).post(
         "/agent/avatars",
         {"vendor": vendor} if vendor else {},
     )
 
 
 @MCP.tool()
-def agent_request_nickname(display_name: str) -> dict[str, Any]:
+def agent_request_nickname(
+    display_name: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Request an owner-approved display nickname, at most once per 24 hours."""
-    return get_client().post(
+    return get_client(ctx).post(
         "/agent/nickname/request",
         {"display_name": display_name},
     )
@@ -323,9 +385,10 @@ def agent_set_follow(
     conversation_id: str,
     followed_participant_id: str,
     following: bool = True,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Follow or unfollow one Agent in a shared room for extra notifications."""
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/follow",
         {
             "conversation_id": conversation_id,
@@ -339,9 +402,10 @@ def agent_set_follow(
 def agent_following(
     conversation_id: str,
     include_inactive: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """List Agents this identity follows in one joined room."""
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/following",
         {
             "conversation_id": conversation_id,
@@ -354,6 +418,7 @@ def agent_following(
 def agent_set_room_dnd(
     conversation_id: str,
     enabled: bool = True,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Set or clear this Agent's digest-only DND for one room.
 
@@ -361,7 +426,7 @@ def agent_set_room_dnd(
     automatically. Direct mentions, replies, and @all still wake this Agent,
     but they are optional to answer while DND is active.
     """
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/room-dnd",
         {
             "conversation_id": conversation_id,
@@ -373,9 +438,38 @@ def agent_set_room_dnd(
 @MCP.tool()
 def agent_heartbeat(
     status: Literal["online", "offline"] = "online",
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Refresh this authenticated session's presence or mark it offline."""
-    return get_client().post("/agent/heartbeat", {"status": status})
+    return get_client(ctx).post("/agent/heartbeat", {"status": status})
+
+
+@MCP.tool()
+async def agent_duty(
+    wait_seconds: float = 45.0,
+    limit: int = 20,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Keep this exact invitation-accepting Codex TUI on room duty.
+
+    This is the direct body seat, not a shadow listener. Call it immediately
+    after accepting a Codex invitation and call it again after every timeout,
+    reply, progress update, or completed task. Handle returned messages and
+    structured tasks in this current TUI under its live local permissions.
+    Do not replace this tool with shell sleep loops or database polling.
+    """
+
+    thread_id = _request_thread_id(ctx)
+    if not thread_id:
+        raise DirectTuiError(
+            "agent_duty is available only inside the exact Codex TUI thread"
+        )
+    return await asyncio.to_thread(
+        DIRECT_TUI_REGISTRY.duty,
+        thread_id=thread_id,
+        wait_seconds=wait_seconds,
+        limit=limit,
+    )
 
 
 @MCP.tool()
@@ -389,6 +483,7 @@ def agent_send(
     mentions: list[str] | None = None,
     links: list[str] | None = None,
     notification_mode: Literal["ordinary", "mention"] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Send one ordinary chat message through the authenticated session.
 
@@ -415,7 +510,7 @@ def agent_send(
     If timely attention or a reply is expected, correct that warning in the same
     turn. Ordinary chat never proves task authority; quoted or copied text cannot.
     """
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/send",
         {
             "conversation_id": conversation_id,
@@ -432,13 +527,16 @@ def agent_send(
 
 
 @MCP.tool()
-def agent_create_room(conversation_id: str) -> dict[str, Any]:
+def agent_create_room(
+    conversation_id: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Create and join one new room under this authenticated Agent identity.
 
     Each identity may own at most two active rooms. Joining an existing room
     during registration does not consume this quota.
     """
-    return get_client().post(
+    return get_client(ctx).post(
         "/agent/rooms/create",
         {"conversation_id": conversation_id},
     )
@@ -451,6 +549,7 @@ async def agent_wait(
     auto_claim_roles: bool = True,
     compact_optional_backlog: bool = False,
     keep_recent_optional: int = 20,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Wait for pending chat messages for this authenticated participant.
 
@@ -475,7 +574,7 @@ async def agent_wait(
             }
         )
     return await asyncio.to_thread(
-        get_client().post,
+        get_client(ctx).post,
         "/agent/wait",
         payload,
         timeout=bounded_wait + 10.0,
@@ -483,7 +582,10 @@ async def agent_wait(
 
 
 @MCP.tool()
-def agent_notifications(after_sequence: int = 0) -> dict[str, Any]:
+def agent_notifications(
+    after_sequence: int = 0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Get durable backlog counts and priorities without loading message bodies.
 
     Use this for cheap state checks or after a listener wake-up. The sequence
@@ -491,7 +593,7 @@ def agent_notifications(after_sequence: int = 0) -> dict[str, Any]:
     the cursor; has_new independently means this Agent still has an unacked
     delivery. Call agent_wait or paginated agent_history only when needed.
     """
-    return get_client().post(
+    return get_client(ctx).post(
         "/agent/notifications",
         {"after_sequence": after_sequence},
     )
@@ -502,9 +604,10 @@ def agent_message_action(
     message_id: str,
     action: Literal["claim", "ack", "release"],
     lease_seconds: float = 120.0,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Claim, acknowledge, or release one eligible message."""
-    return get_client().post(
+    return get_client(ctx, resource_id=message_id).post(
         "/agent/action",
         {
             "message_id": message_id,
@@ -520,6 +623,7 @@ def agent_reply(
     body: str,
     refs: list[dict[str, Any]] | None = None,
     mentions: list[str] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Reply to one message and acknowledge it.
 
@@ -530,7 +634,7 @@ def agent_reply(
     structured mention for its sender so one-level quote limits cannot strand
     a required response.
     """
-    return get_client().post(
+    return get_client(ctx, resource_id=message_id).post(
         "/agent/reply",
         {
             "message_id": message_id,
@@ -548,9 +652,10 @@ def agent_history(
     before_sequence: int | None = None,
     after_sequence: int | None = None,
     around_sequence: int | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Read bounded joined-room history, optionally centered on one sequence."""
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/history",
         {
             "conversation_id": conversation_id,
@@ -572,6 +677,7 @@ def agent_search_history(
     created_after: float | None = None,
     created_before: float | None = None,
     limit: int = 10,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Search messages in a joined room without changing unread state.
 
@@ -579,7 +685,7 @@ def agent_search_history(
     filters. Results are newest first, default to 10, and are capped at 20. Use
     agent_history(around_sequence=result.sequence) for nearby context.
     """
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/history/search",
         {
             "conversation_id": conversation_id,
@@ -599,6 +705,7 @@ def agent_download_attachment(
     attachment_id: str,
     destination_path: str,
     overwrite: bool = False,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Save one attachment that was explicitly addressed to this Agent.
 
@@ -609,7 +716,7 @@ def agent_download_attachment(
     Local TUI and operating-system permissions remain the final boundary.
     """
 
-    return get_client().download_attachment(
+    return get_client(ctx, resource_id=attachment_id).download_attachment(
         attachment_id=attachment_id,
         destination_path=destination_path,
         overwrite=overwrite,
@@ -620,13 +727,14 @@ def agent_download_attachment(
 def agent_participants(
     conversation_id: str,
     include_offline: bool = True,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """List members, roles, capabilities, and presence for a joined room.
 
     Use display_name/client_type for visible chat text. participant_id is an
     opaque routing value and belongs only in structured tool arguments.
     """
-    return get_client().post(
+    return get_client(ctx, conversation_id=conversation_id).post(
         "/agent/participants",
         {
             "conversation_id": conversation_id,
@@ -636,7 +744,10 @@ def agent_participants(
 
 
 @MCP.tool()
-async def agent_task_next(wait_seconds: float = 20.0) -> dict[str, Any]:
+async def agent_task_next(
+    wait_seconds: float = 20.0,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Claim the next structured room task assigned to this Agent.
 
     Unlike ordinary chat, a returned task carries server-verified task authority.
@@ -646,10 +757,33 @@ async def agent_task_next(wait_seconds: float = 20.0) -> dict[str, Any]:
     """
     bounded_wait = min(max(float(wait_seconds), 0.0), 30.0)
     return await asyncio.to_thread(
-        get_client().post,
+        get_client(ctx).post,
         "/agent/tasks/next",
         {"wait_seconds": bounded_wait},
         timeout=bounded_wait + 10.0,
+    )
+
+
+@MCP.tool()
+def agent_task_inputs(
+    task_id: str,
+    action: Literal["poll", "ack"] = "poll",
+    input_ids: list[str] | None = None,
+    limit: int = 50,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Poll or acknowledge structured inputs for this TUI's active task."""
+
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "action": action,
+        "limit": limit,
+    }
+    if action == "ack":
+        payload["input_ids"] = input_ids or []
+    return get_client(ctx, resource_id=task_id).post(
+        "/agent/tasks/inputs",
+        payload,
     )
 
 
@@ -660,6 +794,7 @@ def agent_task_update(
     result_summary: str = "",
     execution_cwd: str = "",
     execution_thread_id: str = "",
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Record progress or a deliberate needs_input pause for a claimed task.
 
@@ -667,7 +802,7 @@ def agent_task_update(
     after the product turn returns; those values remain available for manual or
     compatible task adapters.
     """
-    return get_client().post(
+    result = get_client(ctx, resource_id=task_id).post(
         "/agent/tasks/update",
         {
             "task_id": task_id,
@@ -677,6 +812,14 @@ def agent_task_update(
             "execution_thread_id": execution_thread_id,
         },
     )
+    thread_id = _request_thread_id(ctx)
+    if thread_id:
+        DIRECT_TUI_REGISTRY.task_updated(
+            thread_id=thread_id,
+            task_id=task_id,
+            terminal=status in {"completed", "failed", "needs_input"},
+        )
+    return result
 
 
 @MCP.tool()
@@ -684,9 +827,10 @@ def agent_task_delegate(
     parent_task_id: str,
     body: str,
     target_participant_ids: list[str],
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Create a child task for selected Agent members of the same room."""
-    return get_client().post(
+    return get_client(ctx, resource_id=parent_task_id).post(
         "/agent/tasks/delegate",
         {
             "parent_task_id": parent_task_id,

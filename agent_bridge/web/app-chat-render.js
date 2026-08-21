@@ -871,18 +871,25 @@ function createParticipantCard(person) {
     card.append(roles);
   }
   let authLabel;
+  const directTuiDuty = person.native_tui?.duty_mode === "direct_tui";
   if (isWebUser) {
     authLabel = "网页用户";
   } else if (person.native_tui?.state === "busy") {
-    authLabel = `真实 TUI 执行中 · ${person.connector_adapter_kind}`;
+    authLabel = directTuiDuty
+      ? `当前 TUI 本体执行中 · ${person.connector_adapter_kind}`
+      : `真实 TUI 执行中 · ${person.connector_adapter_kind}`;
   } else if (person.native_tui?.state === "waiting_approval") {
     authLabel = `真实 TUI 等待本机确认 · ${person.connector_adapter_kind}`;
   } else if (person.native_tui?.state === "online") {
-    authLabel = `真实 TUI 值守在线 · ${person.connector_adapter_kind}`;
+    authLabel = directTuiDuty
+      ? `当前 TUI 本体值守在线 · ${person.connector_adapter_kind}`
+      : `真实 TUI 值守在线 · ${person.connector_adapter_kind}`;
   } else if (person.native_tui?.state === "error") {
     authLabel = `真实 TUI 异常 · ${person.connector_adapter_kind}`;
   } else if (person.native_tui?.state === "offline" && person.native_tui?.endpoint_id) {
-    authLabel = `真实 TUI 当前离线 · listener 仍会保留消息 · ${person.connector_adapter_kind}`;
+    authLabel = directTuiDuty
+      ? `当前 TUI 本体离线 · 消息保留在 Bridge · ${person.connector_adapter_kind}`
+      : `真实 TUI 当前离线 · listener 仍会保留消息 · ${person.connector_adapter_kind}`;
   } else if (person.native_tui?.state === "awaiting_confirmation") {
     authLabel = `真实 TUI 等待本机确认绑定 · ${person.connector_adapter_kind}`;
   } else if (person.resident_status === "online") {

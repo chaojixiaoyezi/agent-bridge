@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .connector import configure_resident_connector
+from .tui_binding import NativeTuiError, load_native_tui_binding
 from .validation import client_identity
 
 
@@ -469,6 +470,13 @@ def configure_existing_connector_from_disk(
             enrollment_token = enrollment_file.read_text(encoding="utf-8").strip()
         except OSError:
             continue
+        native_binding = None
+        binding_file = manifest_path.parent / "tui-binding.json"
+        if binding_file.exists():
+            try:
+                native_binding = load_native_tui_binding(binding_file)
+            except NativeTuiError:
+                continue
         result = configure_resident_connector(
             connector_id=str(manifest["connector_id"]),
             enrollment_token=enrollment_token,
@@ -482,6 +490,21 @@ def configure_existing_connector_from_disk(
             conversation_id=str(manifest["conversation_id"]),
             adapter_kind=str(manifest["adapter_kind"]),
             requested_mode=str(manifest["requested_mode"]),
+            tui_adapter_kind=(
+                native_binding.adapter_kind if native_binding is not None else None
+            ),
+            tui_endpoint_id=(
+                native_binding.endpoint_id if native_binding is not None else None
+            ),
+            tui_native_session_id=(
+                native_binding.native_session_id if native_binding is not None else None
+            ),
+            tui_capabilities=(
+                list(native_binding.capabilities) if native_binding is not None else None
+            ),
+            tui_transport=(
+                native_binding.transport if native_binding is not None else None
+            ),
             roles=list(manifest.get("roles") or []),
             capabilities=list(manifest.get("capabilities") or []),
             workspace_path=str(manifest.get("workspace_path") or ""),

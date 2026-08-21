@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 
 NATIVE_TUI_ADAPTERS = {
+    "codex",
     "deepseek-harness",
     "opencode",
     "hermes",
@@ -29,6 +30,11 @@ DEFAULT_TURN_TIMEOUT_SECONDS = 3_600.0
 
 
 QWEN_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+CODEX_THREAD_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 
 class NativeTuiError(RuntimeError):
@@ -94,6 +100,16 @@ def _local_file(value: object, *, field: str) -> str:
     return str(path)
 
 
+def _local_directory(value: object, *, field: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise NativeTuiError(f"{field} is required")
+    path = Path(raw).expanduser().resolve()
+    if not path.is_dir():
+        raise NativeTuiError(f"{field} must be an existing local directory")
+    return str(path)
+
+
 def validate_native_tui_binding(
     *,
     adapter_kind: str,
@@ -118,7 +134,21 @@ def validate_native_tui_binding(
     raw_transport = dict(transport or {})
     kind = str(raw_transport.get("kind") or adapter).strip().lower()
     normalized: dict[str, Any]
-    if adapter == "deepseek-harness":
+    if adapter == "codex":
+        if kind not in {"codex", "codex-mcp-duty"}:
+            raise NativeTuiError("Codex requires codex-mcp-duty transport")
+        if CODEX_THREAD_ID_PATTERN.fullmatch(native_session) is None:
+            raise NativeTuiError(
+                "Codex native session must be the exact CODEX_THREAD_ID"
+            )
+        normalized = {
+            "kind": "codex-mcp-duty",
+            "cwd": _local_directory(
+                raw_transport.get("cwd"),
+                field="Codex cwd",
+            ),
+        }
+    elif adapter == "deepseek-harness":
         if kind not in {"deepseek-harness", "deepseek-http"}:
             raise NativeTuiError("DeepSeek Harness requires deepseek-http transport")
         normalized = {

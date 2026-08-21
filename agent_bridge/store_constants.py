@@ -140,6 +140,7 @@ INVITATION_ADAPTERS = {"codex", "claude-code", "manual"}
 
 
 NATIVE_TUI_ADAPTERS = {
+    "codex",
     "deepseek-harness",
     "opencode",
     "hermes",

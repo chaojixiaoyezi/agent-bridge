@@ -6106,6 +6106,98 @@ def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
     assert replied["reply"]["sender_seat"] == "main"
 
 
+def test_expired_native_lease_atomically_returns_delivery_to_shadow(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "native-expired-shadow-fallback"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="claude-code",
+        requested_mode="resident",
+        adapter_kind="claude-code",
+        created_by_web_user_id=admin_id,
+    )
+    enrollment = "enroll_" + "f" * 64
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="claude-code",
+        username="native-expired-fallback",
+        signature="本体失联后允许兼容席接管。",
+        enrollment_token=enrollment,
+    )
+    shadow = store.register_agent_session_from_enrollment(
+        enrollment_token=enrollment,
+        connector_id=accepted["connector_id"],
+        connector_component="chat",
+        product="claude-code",
+        username=accepted["username"],
+        signature="兼容值守。",
+    )
+    sender = register(store, client="codex", name="fallback-sender", room=room)
+    bound = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="native-expired-fallback-endpoint",
+        native_session_id="native-expired-fallback-session",
+        process_epoch="native-expired-fallback-epoch",
+        binding_source="resume",
+    )
+    message = store.send(
+        authorized_session_id=sender["session_id"],
+        sender_participant_id=sender["participant_id"],
+        conversation_id=room,
+        body_text="@native-expired-fallback 请确认兜底。",
+        mentions=[accepted["participant_id"]],
+        notification_mode="mention",
+    )
+    expired_at = time.time() - 1
+    lease_id = str(bound["lease"]["lease_id"])
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE native_session_leases SET expires_at = ? WHERE lease_id = ?",
+            (expired_at, lease_id),
+        )
+        connection.execute(
+            "UPDATE agent_connectors SET native_lease_expires_at = ? "
+            "WHERE connector_id = ?",
+            (expired_at, accepted["connector_id"]),
+        )
+
+    fallback = store.wait_messages(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=shadow["session_id"],
+        wait_seconds=0,
+    )
+
+    assert [item["message_id"] for item in fallback["messages"]] == [
+        message["message_id"]
+    ]
+    assert "native_handoff" not in fallback
+    with store._connection() as connection:
+        connector = connection.execute(
+            "SELECT native_delivery_mode, native_lease_id, tui_state "
+            "FROM agent_connectors WHERE connector_id = ?",
+            (accepted["connector_id"],),
+        ).fetchone()
+    assert tuple(connector) == ("legacy_shadow", None, "offline")
+    with pytest.raises(ConflictError) as stale:
+        store.heartbeat_native_agent_session(
+            participant_id=accepted["participant_id"],
+            authorized_session_id=accepted["session_id"],
+            connector_id=accepted["connector_id"],
+            lease_id=lease_id,
+            process_epoch="native-expired-fallback-epoch",
+        )
+    assert stale.value.error_code in {
+        "native_session_lease_ended",
+        "native_session_lease_superseded",
+    }
+
+
 def test_native_preferred_web_mentions_stay_with_tui_until_explicit_task(
     tmp_path: Path,
 ) -> None:

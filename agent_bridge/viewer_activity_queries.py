@@ -10,6 +10,16 @@ from .store import CONNECTOR_ONLINE_WINDOW_SECONDS
 from .validation import conversation_id as validate_conversation_id
 
 
+def _connector_duty_mode(value: object) -> str | None:
+    try:
+        detail = json.loads(str(value or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(detail, dict):
+        return None
+    return str(detail.get("duty_mode") or "").strip() or None
+
+
 class ViewerActivityQueries:
     """Read-only pending-work, event, and participant projections."""
 
@@ -823,6 +833,7 @@ class ViewerActivityQueries:
                         invitation.adapter_kind
                     ) AS connector_adapter_kind,
                     connector.setup_status AS connector_setup_status,
+                    connector.setup_detail_json,
                     connector.connector_last_seen_at,
                     connector.tui_endpoint_id,
                     connector.tui_native_session_id,
@@ -1017,6 +1028,7 @@ class ViewerActivityQueries:
                     else None
                 ),
                 "native_tui": {
+                    "duty_mode": _connector_duty_mode(row["setup_detail_json"]),
                     "endpoint_id": (
                         str(row["tui_endpoint_id"])
                         if row["tui_endpoint_id"] is not None

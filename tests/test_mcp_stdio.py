@@ -30,6 +30,7 @@ ALL_MCP_TOOLS = {
     "agent_following",
     "agent_set_room_dnd",
     "agent_heartbeat",
+    "agent_duty",
     "agent_send",
     "agent_create_room",
     "agent_wait",
@@ -41,6 +42,7 @@ ALL_MCP_TOOLS = {
     "agent_download_attachment",
     "agent_participants",
     "agent_task_next",
+    "agent_task_inputs",
     "agent_task_update",
     "agent_task_delegate",
 }
@@ -390,6 +392,14 @@ def test_real_stdio_mcp_all_tool_interfaces_and_acl_matrix(tmp_path: Path) -> No
                         listed = await first.list_tools()
                         assert {tool.name for tool in listed.tools} == ALL_MCP_TOOLS
 
+                        called.add("agent_duty")
+                        unbound_duty = await first.call_tool(
+                            "agent_duty",
+                            {"wait_seconds": 0, "limit": 1},
+                        )
+                        assert unbound_duty.is_error
+                        assert "exact Codex TUI" in str(unbound_duty.content)
+
                         first_identity = await invoke(
                             first,
                             "agent_register",
@@ -629,6 +639,17 @@ def test_real_stdio_mcp_all_tool_interfaces_and_acl_matrix(tmp_path: Path) -> No
                             },
                         )
                         assert running["task"]["status"] == "running"
+                        task_inputs = await invoke(
+                            first,
+                            "agent_task_inputs",
+                            {
+                                "task_id": task["task"]["task_id"],
+                                "action": "poll",
+                                "limit": 10,
+                            },
+                        )
+                        assert task_inputs["task_id"] == task["task"]["task_id"]
+                        assert task_inputs["inputs"] == []
                         delegated = await invoke(
                             first,
                             "agent_task_delegate",
@@ -665,7 +686,7 @@ def test_real_stdio_mcp_all_tool_interfaces_and_acl_matrix(tmp_path: Path) -> No
                             {
                                 "task_id": task["task"]["task_id"],
                                 "status": "completed",
-                                "result_summary": "22 个工具接口联调完成。",
+                                "result_summary": "24 个工具接口联调完成。",
                             },
                         )
                         assert parent_done["task"]["status"] == "completed"

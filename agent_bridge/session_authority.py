@@ -65,8 +65,8 @@ class SessionAuthorityMixin:
             )
         return row
 
-    @staticmethod
     def _require_session_write_authority_locked(
+        self,
         conn: sqlite3.Connection,
         *,
         session: sqlite3.Row,
@@ -77,17 +77,14 @@ class SessionAuthorityMixin:
         connector_id = str(session["connector_id"] or "")
         if component not in {"chat", "listener"} or not connector_id:
             return
-        connector = conn.execute(
-            "SELECT native_delivery_mode FROM agent_connectors "
-            "WHERE connector_id = ? AND accepted_participant_id = ? "
-            "AND revoked_at IS NULL",
-            (connector_id, str(session["participant_id"])),
-        ).fetchone()
-        if (
-            connector is not None
-            and str(connector["native_delivery_mode"] or "")
-            == "native_preferred"
-        ):
+        handoff = self._native_delivery_handoff_locked(
+            conn,
+            connector_id=connector_id,
+            participant_id=str(session["participant_id"]),
+            component=component,
+            now=time.time(),
+        )
+        if handoff is not None:
             raise ConflictError(
                 "native TUI owns this Agent identity; shadow chat writes are "
                 "disabled until the connector explicitly returns to legacy shadow mode"

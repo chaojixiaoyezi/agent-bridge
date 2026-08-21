@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .avatars import normalize_avatar_key
 from .connector import ConnectorSetupError, configure_resident_connector
+from .codex_native_binding import codex_native_binding
 from .http_client import BridgeHttpClient, BridgeRemoteError
 from .transport_security import (
     BridgeTransportError,
@@ -61,6 +62,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     capabilities = string_tokens(args.capability, field="capabilities")
     tui_transport: dict[str, object] | None = None
     tui_binding = None
+    auto_confirm_tui_binding = False
     tui_transport_json = str(getattr(args, "tui_transport_json", "") or "")
     if tui_transport_json:
         try:
@@ -92,6 +94,15 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
         ).strip()
         or None
     )
+    if product.casefold() == "codex" and tui_binding is None:
+        try:
+            tui_binding = codex_native_binding(
+                thread_id=execution_source_thread_id,
+                workspace=workspace,
+            )
+        except NativeTuiError as exc:
+            raise InvitationCliError(str(exc)) from exc
+        auto_confirm_tui_binding = True
     client_arguments = {"invitation_token": invitation_token}
     if trusted_http_host:
         client_arguments["trusted_http_host"] = trusted_http_host
@@ -109,7 +120,10 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             {
                 "tui_endpoint_id": tui_binding.endpoint_id,
                 "tui_native_session_id": tui_binding.native_session_id,
-                "tui_confirmed": bool(getattr(args, "confirm_tui_binding", False)),
+                "tui_confirmed": (
+                    auto_confirm_tui_binding
+                    or bool(getattr(args, "confirm_tui_binding", False))
+                ),
             }
         )
     accepted = client.accept_invitation(
@@ -130,7 +144,10 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             conversation_id=str(accepted["conversation_id"]),
             adapter_kind=str(accepted["adapter_kind"]),
             requested_mode=str(accepted["requested_mode"]),
-            tui_adapter_kind=accepted.get("tui_adapter_kind"),
+            tui_adapter_kind=(
+                accepted.get("tui_adapter_kind")
+                or (tui_binding.adapter_kind if tui_binding else None)
+            ),
             tui_endpoint_id=(tui_binding.endpoint_id if tui_binding else None),
             tui_native_session_id=(
                 tui_binding.native_session_id if tui_binding else None
@@ -178,7 +195,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             "local setup finished but Bridge status reporting failed: " + str(exc)
         )
         connector = None
-    return {
+    result = {
         "invitation_accepted": True,
         "invitation_consumed": not bool(accepted.get("invitation_reusable", False)),
         "participant_id": accepted.get("participant_id"),
@@ -186,6 +203,17 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
         "resident_setup": setup_payload,
         "connector": connector,
     }
+    if setup_payload.get("duty_mode") == "direct_tui":
+        result["direct_tui_duty"] = {
+            "body_seat": "this_exact_tui",
+            "shadow_installed": False,
+            "required_next_tool": "agent_duty",
+            "instruction": (
+                "Call agent_duty now in this same TUI. Handle returned room "
+                "events here and call agent_duty again after every event or timeout."
+            ),
+        }
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:

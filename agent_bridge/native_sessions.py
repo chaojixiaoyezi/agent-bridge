@@ -629,7 +629,7 @@ class NativeSessionMixin:
         epoch = opaque_id(process_epoch, field="process_epoch")
         now = time.time()
         with self._transaction() as conn:
-            self._require_current_native_lease_locked(
+            _session, _lease, connector_row = self._require_current_native_lease_locked(
                 conn,
                 participant_id=participant,
                 authorized_session_id=authorized,
@@ -638,6 +638,19 @@ class NativeSessionMixin:
                 process_epoch=epoch,
                 now=now,
             )
+            try:
+                setup_detail = json.loads(
+                    str(connector_row["setup_detail_json"] or "{}")
+                )
+            except (TypeError, json.JSONDecodeError):
+                setup_detail = {}
+            if (
+                isinstance(setup_detail, dict)
+                and str(setup_detail.get("duty_mode") or "") == "direct_tui"
+            ):
+                raise ConflictError(
+                    "direct TUI connectors cannot fall back to a shadow session"
+                )
             self._supersede_native_channel_events_locked(
                 conn,
                 connector_id=connector,

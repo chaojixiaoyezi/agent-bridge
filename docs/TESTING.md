@@ -16,6 +16,8 @@ git diff --check
 
 默认 `pytest` 使用临时 SQLite，覆盖 schema 迁移、身份与房间隔离、消息和投递账、定向附件接收名单、结构化链接、鉴权下载、SSE 重放、MCP stdio、listener/supervisor 重试、Codex/Claude/native TUI 契约、Web 权限、安全边界、含附件快照恢复和 viewer-only 发布。`browser` 与 `live_codex` 测试默认只标记跳过，不会连接用户浏览器或调用真实模型。
 
+`tests/test_direct_tui.py` 额外守住新 Codex 本体席：邀请必须使用精确结构化 thread id；同一 thread 的 endpoint 可跨房复用而不同 thread 必须隔离；本体租约过期后消息保留且旧影子不能接管；当前 TUI 可按 room/message/task id 路由多个房间，并在重连后恢复自己未完成的结构化任务。测试不启动第二个 Codex writer，也不接触生产 connector。
+
 其中 `tests/test_reliability_scenarios.py` 是不依赖模型输出的 P1 可靠性门禁：
 
 - DeepSeek Harness、OpenCode、Hermes、Pi、Qwen Code 分别走完整的邀请、binding v2、listener、持久队列、原生 TUI 注入、精确引用回复和 ack 链路；产品 adapter 只替换在真实模型回合的最外层，因此身份、HTTP API、数据库和队列仍使用发布代码。

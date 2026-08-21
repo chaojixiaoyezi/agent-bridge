@@ -35,6 +35,8 @@ from .connector_services import (
     _run_checked as _run_checked,
     _systemd_quote as _systemd_quote,
     _systemd_unit as _systemd_unit,
+    deactivate_launchd_services,
+    deactivate_systemd_services,
 )
 from .transport_security import invitation_trusted_http_host
 from .validation import (
@@ -162,7 +164,17 @@ def configure_resident_connector(
                 }
             )
         for field, expected in expected_identity.items():
-            if str(existing_manifest.get(field) or "") != expected:
+            existing_value = str(existing_manifest.get(field) or "")
+            # A connector installed by the pre-native Codex path may be upgraded
+            # in place once, but an established native endpoint/session remains
+            # immutable so a later process cannot steal the public identity.
+            native_upgrade = (
+                field
+                in {"tui_adapter_kind", "tui_endpoint_id", "tui_native_session_id"}
+                and not existing_value
+                and native_binding is not None
+            )
+            if existing_value != expected and not native_upgrade:
                 raise ConnectorSetupError(
                     f"existing connector {field} differs; refusing identity overwrite"
                 )
@@ -191,6 +203,18 @@ def configure_resident_connector(
         trusted_http_host=persisted_trusted_http_host,
     )
     source_thread_id = str(execution_source_thread_id or "").strip()
+    direct_tui_duty = bool(
+        native_binding is not None
+        and native_binding.adapter_kind == "codex"
+        and mode == "resident"
+        and enable_resident
+    )
+    if direct_tui_duty and source_thread_id.casefold() != str(
+        native_binding.native_session_id
+    ).casefold():
+        raise ConnectorSetupError(
+            "Codex direct duty must bind the exact invitation source thread"
+        )
     claude_channel = (
         _claude_channel_configuration(
             connector_id=connector,
@@ -200,7 +224,7 @@ def configure_resident_connector(
         else None
     )
     manifest = {
-        "schema_version": 4 if claude_channel is not None else 3,
+        "schema_version": 4,
         "connector_id": connector,
         "bridge_url": normalized_url,
         "trusted_http_host": persisted_trusted_http_host,
@@ -219,6 +243,7 @@ def configure_resident_connector(
         "capabilities": list(normalized_capabilities),
         "workspace_path": str(workspace),
         "execution_source_thread_id": source_thread_id or None,
+        "duty_mode": "direct_tui" if direct_tui_duty else "resident_services",
         "enrollment_token_file": str(enrollment_file),
         "claude_channel": claude_channel,
     }
@@ -248,6 +273,48 @@ def configure_resident_connector(
                 raise ConnectorSetupError("bundled Pi extension is missing") from exc
             _atomic_private_write(pi_extension, extension_bytes)
 
+    if direct_tui_duty:
+        suffix = _service_suffix(connector)
+        quarantine_directory = state_directory / "disabled-services"
+        if activate and host_system == "Darwin":
+            launch_agents = user_home / "Library" / "LaunchAgents"
+            labels = [
+                f"com.agentbridge.connector.{suffix}.listener",
+                f"com.agentbridge.connector.{suffix}.worker",
+                f"com.agentbridge.connector.{suffix}.task",
+            ]
+            deactivate_launchd_services(
+                [
+                    (label, launch_agents / f"{label}.plist")
+                    for label in labels
+                ],
+                quarantine_directory=quarantine_directory,
+            )
+        elif activate and host_system == "Linux":
+            unit_directory = user_home / ".config" / "systemd" / "user"
+            deactivate_systemd_services(
+                [
+                    unit_directory / f"agent-bridge-{suffix}-{component}.service"
+                    for component in ("listener", "worker", "task")
+                ],
+                quarantine_directory=quarantine_directory,
+            )
+        return ConnectorSetupResult(
+            status="configured",
+            platform=host_system,
+            adapter_kind="codex",
+            connector_id=connector,
+            state_directory=str(state_directory),
+            listener_service=None,
+            worker_service=None,
+            task_service=None,
+            detail=(
+                "已精确绑定接受邀请的当前 Codex TUI；不安装影子值守。"
+                "保持该 TUI 打开并调用 agent_duty 即可直接接收聊天与结构化任务。"
+            ),
+            duty_mode="direct_tui",
+        )
+
     if (
         not enable_resident
         or mode != "resident"
@@ -263,6 +330,7 @@ def configure_resident_connector(
             worker_service=None,
             task_service=None,
             detail=("基础接入已完成；该产品需要本地启动命令或 webhook 才能自动唤醒。"),
+            duty_mode=None,
         )
 
     suffix = _service_suffix(connector)
@@ -293,6 +361,21 @@ def configure_resident_connector(
     )
     codex_binary: str | None = None
     claude_binary: str | None = None
+    native_environment: dict[str, str] = {}
+    if native_binding is not None:
+        shared_lock = endpoint_lock_path(
+            native_binding,
+            state_root=_state_root(user_home, host_system),
+        )
+        native_environment = {
+            "AGENT_BRIDGE_TUI_BINDING_FILE": str(tui_binding_file),
+            "AGENT_BRIDGE_TUI_LOCK_FILE": str(shared_lock),
+            "AGENT_BRIDGE_TUI_ADAPTER": native_binding.adapter_kind,
+            "AGENT_BRIDGE_TUI_ENDPOINT_ID": native_binding.endpoint_id,
+            "AGENT_BRIDGE_TUI_NATIVE_SESSION_ID": native_binding.native_session_id,
+        }
+    if adapter == "codex":
+        codex_binary = shutil.which("codex")
     if adapter == "codex":
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-codex-worker"),
@@ -301,7 +384,6 @@ def configure_resident_connector(
         ]
         # launchd 的默认 PATH 不包含 Homebrew 或用户本地 bin；优先把安装时
         # 探测到的 Codex 绝对路径交给 worker，PATH 只作为可迁移的后备入口。
-        codex_binary = shutil.which("codex")
         worker_environment = {
             **common,
             "AGENT_BRIDGE_COMPONENT": "chat",
@@ -345,17 +427,6 @@ def configure_resident_connector(
         if claude_binary:
             worker_environment["AGENT_BRIDGE_CLAUDE_BINARY"] = claude_binary
     elif native_binding is not None:
-        shared_lock = endpoint_lock_path(
-            native_binding,
-            state_root=_state_root(user_home, host_system),
-        )
-        native_environment = {
-            "AGENT_BRIDGE_TUI_BINDING_FILE": str(tui_binding_file),
-            "AGENT_BRIDGE_TUI_LOCK_FILE": str(shared_lock),
-            "AGENT_BRIDGE_TUI_ADAPTER": native_binding.adapter_kind,
-            "AGENT_BRIDGE_TUI_ENDPOINT_ID": native_binding.endpoint_id,
-            "AGENT_BRIDGE_TUI_NATIVE_SESSION_ID": native_binding.native_session_id,
-        }
         worker_arguments = [
             str(PROJECT_ROOT / "bin" / "agent-bridge-supervisor"),
             "run",
@@ -389,7 +460,7 @@ def configure_resident_connector(
         "AGENT_BRIDGE_TASK_THREAD_STATE_FILE": str(task_thread_file),
         "AGENT_BRIDGE_MCP_COMMAND": str(PROJECT_ROOT / "bin" / "agent-bridge-mcp"),
         "PATH": merged_path,
-        **(native_environment if native_binding is not None else {}),
+        **native_environment,
     }
     if source_thread_id:
         task_environment["AGENT_BRIDGE_TASK_SOURCE_THREAD_ID"] = source_thread_id

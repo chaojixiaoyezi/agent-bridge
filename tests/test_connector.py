@@ -17,6 +17,7 @@ from agent_bridge.connector import (
     configure_resident_connector,
 )
 from agent_bridge.connector import ConnectorSetupError
+from agent_bridge.tui_binding import NativeTuiBinding
 
 
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +149,99 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     assert result["resident_setup"]["status"] == "configured"
 
 
+def test_direct_codex_invitation_binds_the_accepting_thread_before_consumption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    thread_id = "019fefee-837c-74a3-a8f2-0c374965125e"
+    monkeypatch.setenv("CODEX_THREAD_ID", thread_id)
+    binding = NativeTuiBinding(
+        adapter_kind="codex",
+        endpoint_id="codex-endpoint-direct",
+        native_session_id=thread_id,
+        capabilities=("chat", "structured-task", "direct-duty"),
+        transport={
+            "kind": "codex-mcp-duty",
+            "cwd": str(tmp_path.resolve()),
+        },
+    )
+    binding_calls: list[dict] = []
+    accepted_calls: list[dict] = []
+    setup_calls: list[dict] = []
+
+    def make_binding(**payload):
+        binding_calls.append(payload)
+        return binding
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def accept_invitation(self, **payload):
+            accepted_calls.append(payload)
+            return {
+                "_enrollment_token": "enroll_codex_native",
+                "connector_id": "connector_codex_native",
+                "participant_id": "participant_codex_native",
+                "conversation_id": "本体群",
+                "adapter_kind": "codex",
+                "requested_mode": "resident",
+            }
+
+        @staticmethod
+        def post(_path, payload):
+            return {"connector": {"setup_status": payload["setup_status"]}}
+
+    def configure(**payload):
+        setup_calls.append(payload)
+        return SimpleNamespace(
+            public_payload=lambda: {
+                "status": "configured",
+                "platform": "Darwin",
+                "adapter_kind": "codex",
+                "connector_id": "connector_codex_native",
+                "state_directory": str(tmp_path / "state"),
+                "listener_service": None,
+                "worker_service": None,
+                "task_service": None,
+                "detail": "ready",
+                "duty_mode": "direct_tui",
+            }
+        )
+
+    monkeypatch.setattr(invitation_cli, "codex_native_binding", make_binding)
+    monkeypatch.setattr(invitation_cli, "BridgeHttpClient", FakeClient)
+    monkeypatch.setattr(invitation_cli, "configure_resident_connector", configure)
+    monkeypatch.setattr(
+        invitation_cli,
+        "_stdin_invitation_token",
+        lambda: "invite_codex_native",
+    )
+
+    invitation_cli.accept_invitation(
+        SimpleNamespace(
+            bridge_url="http://127.0.0.1:8765",
+            product="codex",
+            username="native-codex",
+            signature="原会话本体。",
+            workspace=str(tmp_path),
+            role=[],
+            capability=[],
+            basic=False,
+        )
+    )
+
+    assert binding_calls == [
+        {"thread_id": thread_id, "workspace": tmp_path.resolve()}
+    ]
+    assert accepted_calls[0]["tui_endpoint_id"] == "codex-endpoint-direct"
+    assert accepted_calls[0]["tui_native_session_id"] == thread_id
+    assert accepted_calls[0]["tui_confirmed"] is True
+    assert setup_calls[0]["tui_adapter_kind"] == "codex"
+    assert setup_calls[0]["tui_native_session_id"] == thread_id
+    assert setup_calls[0]["execution_source_thread_id"] == thread_id
+
+
 def test_direct_invitation_cli_allows_https_remote_but_rejects_remote_http() -> None:
     assert invitation_cli._supported_bridge_url("https://bridge.example.test/") == (
         "https://bridge.example.test"
@@ -231,7 +325,56 @@ def test_codex_connector_writes_private_launchd_services_without_secret_leak(
     assert worker["ProgramArguments"][0].endswith("agent-bridge-codex-worker")
     assert task["ProgramArguments"][0].endswith("agent-bridge-task-worker")
     assert task["EnvironmentVariables"]["AGENT_BRIDGE_TASK_ADAPTER"] == "codex"
-    assert json.loads(manifest_file.read_text(encoding="utf-8"))["schema_version"] == 3
+    assert json.loads(manifest_file.read_text(encoding="utf-8"))["schema_version"] == 4
+
+
+def test_codex_native_connector_uses_the_exact_tui_without_shadow_services(
+    tmp_path: Path,
+) -> None:
+    thread_id = "019fefee-837c-74a3-a8f2-0c374965125e"
+    result = configure_resident_connector(
+        connector_id="connector_codexnative123",
+        enrollment_token="enroll_codex-native-private-token",
+        bridge_url="http://127.0.0.1:8765",
+        product="codex",
+        username="codex-native-owner",
+        signature="邀请所在原会话。",
+        conversation_id="Codex本体群",
+        adapter_kind="codex",
+        tui_adapter_kind="codex",
+        tui_endpoint_id="codex-endpoint-stable",
+        tui_native_session_id=thread_id,
+        tui_capabilities=["chat", "structured-task", "direct-duty"],
+        tui_transport={
+            "kind": "codex-mcp-duty",
+            "cwd": str(tmp_path),
+        },
+        requested_mode="resident",
+        workspace_path=str(tmp_path),
+        execution_source_thread_id=thread_id,
+        home=tmp_path,
+        system_name="Darwin",
+        activate=False,
+    )
+
+    state = Path(result.state_directory)
+    manifest = json.loads((state / "connector.json").read_text(encoding="utf-8"))
+    binding = json.loads((state / "tui-binding.json").read_text(encoding="utf-8"))
+
+    assert result.duty_mode == "direct_tui"
+    assert result.listener_service is None
+    assert result.worker_service is None
+    assert result.task_service is None
+    assert manifest["tui_adapter_kind"] == "codex"
+    assert manifest["tui_native_session_id"] == thread_id
+    assert manifest["execution_source_thread_id"] == thread_id
+    assert binding["native_session_id"] == thread_id
+    assert binding["transport"] == {
+        "kind": "codex-mcp-duty",
+        "cwd": str(tmp_path.resolve()),
+    }
+    assert manifest["duty_mode"] == "direct_tui"
+    assert not (tmp_path / "Library" / "LaunchAgents").exists()
 
 
 def test_tailnet_invitation_pin_is_persisted_for_every_resident_component(
@@ -718,7 +861,11 @@ def test_agent_wait_keeps_normal_calls_wire_compatible_and_opts_in_compaction(
         "CONFIG",
         SimpleNamespace(maximum_wait_seconds=30),
     )
-    monkeypatch.setattr(bridge_server, "get_client", CompletionClient)
+    monkeypatch.setattr(
+        bridge_server,
+        "get_client",
+        lambda *_args, **_kwargs: CompletionClient,
+    )
 
     asyncio.run(bridge_server.agent_wait(wait_seconds=0, limit=7))
     asyncio.run(

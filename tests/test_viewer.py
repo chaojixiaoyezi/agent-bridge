@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.7"
+    assert _runtime_software_version() == "0.44.8"
 
 
 class FakeEmailDelivery:
@@ -3705,6 +3705,9 @@ def test_admin_rotates_and_revokes_one_connector_without_exposing_credentials(
             "username": "managed-device",
             "signature": "凭证由本机保管",
             "enrollment_token": old_enrollment,
+            "tui_endpoint_id": "managed-device-endpoint",
+            "tui_native_session_id": "019fefee-837c-74a3-a8f2-0c374965125e",
+            "tui_confirmed": True,
         },
     ).json()
     connector_id = accepted["connector_id"]
@@ -3859,6 +3862,11 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
                 "signature": f"第 {index} 个独立接入。",
                 "enrollment_token": enrollment_token,
                 "connector_binding_version": 2,
+                "tui_endpoint_id": f"multi-endpoint-{index}",
+                "tui_native_session_id": (
+                    f"0000000{index}-0000-0000-0000-00000000000{index}"
+                ),
+                "tui_confirmed": True,
             },
         )
         assert response.status_code == 201
@@ -3878,6 +3886,9 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
             "signature": "同名接入也必须获得独立凭据。",
             "enrollment_token": "enroll_" + ("3" * 48),
             "connector_binding_version": 2,
+            "tui_endpoint_id": "multi-endpoint-3",
+            "tui_native_session_id": "00000003-0000-0000-0000-000000000003",
+            "tui_confirmed": True,
         },
     )
     assert same_requested_name.status_code == 201
@@ -3897,6 +3908,9 @@ def test_reusable_invitation_enrolls_multiple_agents_with_independent_credential
             "username": "multi-one",
             "signature": "第 1 个独立接入。",
             "enrollment_token": enrollment_tokens[0],
+            "tui_endpoint_id": "multi-endpoint-1",
+            "tui_native_session_id": "00000001-0000-0000-0000-000000000001",
+            "tui_confirmed": True,
         },
     )
     assert retry.status_code == 201

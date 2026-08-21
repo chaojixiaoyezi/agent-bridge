@@ -957,6 +957,49 @@ class RoomTaskMixin:
                 "AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?",
                 (now, conversation, now),
             )
+            connector_id = str(session_row["connector_id"] or "")
+            component = str(session_row["component"] or "")
+            direct_tui = False
+            if connector_id and component == "mcp":
+                connector = conn.execute(
+                    "SELECT setup_detail_json FROM agent_connectors "
+                    "WHERE connector_id = ? AND revoked_at IS NULL",
+                    (connector_id,),
+                ).fetchone()
+                if connector is not None:
+                    try:
+                        setup_detail = json.loads(
+                            str(connector["setup_detail_json"] or "{}")
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        setup_detail = {}
+                    direct_tui = bool(
+                        isinstance(setup_detail, dict)
+                        and str(setup_detail.get("duty_mode") or "")
+                        == "direct_tui"
+                    )
+            if direct_tui:
+                existing = conn.execute(
+                    "SELECT * FROM room_tasks WHERE conversation_id = ? "
+                    "AND claimed_by_participant_id = ? "
+                    "AND status IN ('claimed', 'running') "
+                    "ORDER BY claimed_at, created_at, task_id LIMIT 1",
+                    (conversation, participant),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute(
+                        "UPDATE room_tasks SET lease_expires_at = ? "
+                        "WHERE task_id = ?",
+                        (
+                            now + TASK_CLAIM_LEASE_SECONDS,
+                            str(existing["task_id"]),
+                        ),
+                    )
+                    recovered = conn.execute(
+                        "SELECT * FROM room_tasks WHERE task_id = ?",
+                        (str(existing["task_id"]),),
+                    ).fetchone()
+                    return self._task_payload(recovered)
             candidates = conn.execute(
                 "SELECT * FROM room_tasks WHERE conversation_id = ? "
                 "AND status = 'queued' ORDER BY created_at, task_id LIMIT 100",
