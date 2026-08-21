@@ -58,6 +58,7 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread_direct123")
     accepted_calls: list[dict] = []
     reported_calls: list[tuple[str, dict]] = []
 
@@ -139,6 +140,7 @@ def test_direct_invitation_cli_accepts_without_mcp_and_configures_connector(
     ]
     assert setup_calls[0]["workspace_path"] == str(tmp_path.resolve())
     assert setup_calls[0]["trusted_http_host"] == "100.79.24.67"
+    assert setup_calls[0]["execution_source_thread_id"] == "thread_direct123"
     assert setup_calls[0]["enable_resident"] is True
     assert reported_calls[0][0] == "/agent/connector/setup"
     assert result["invitation_accepted"] is True

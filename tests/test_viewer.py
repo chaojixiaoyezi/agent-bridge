@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.6"
+    assert _runtime_software_version() == "0.44.7"
 
 
 class FakeEmailDelivery:
@@ -2953,6 +2953,12 @@ def test_admin_renames_room_and_generates_room_bound_agent_access(
     assert generated["requested_mode"] == "resident"
     assert generated["adapter_kind"] == "codex"
     assert generated["resident_capable"] is True
+    assert generated["quick_start"]["kind"] == "codex-direct-accept"
+    assert generated["quick_start"]["requires_mcp_restart"] is False
+    assert generated["quick_start"]["inherits_current_thread"] is True
+    assert "agent-bridge-accept" in generated["quick_start"]["command"]
+    assert "CODEX_THREAD_ID" in generated["instructions"]
+    assert "无需新增或重启 MCP" in generated["instructions"]
     assert generated["mcp"]["command"].endswith("/bin/agent-bridge-mcp")
     assert "Agent 无需 Web 登录" in generated["instructions"]
     assert "access_token" not in access.text
@@ -3155,6 +3161,15 @@ def test_private_ip_invitation_carries_exact_transport_trust_automatically(
     assert "不要再要求 HTTPS、curl 探测或数据库检查" in claude_access[
         "instructions"
     ]
+
+    codex = client.post(
+        "/api/agent-access",
+        headers=intent_headers(client, "generate-agent-access"),
+        json={"conversation_id": "Tailnet 邀请群", "product": "codex"},
+    ).json()["access"]
+    assert codex["quick_start"]["kind"] == "codex-direct-accept"
+    assert "--trusted-http-host 100.79.24.67" in codex["quick_start"]["command"]
+    assert "无需新增或重启 MCP" in codex["instructions"]
 
     deepseek = client.post(
         "/api/agent-access",

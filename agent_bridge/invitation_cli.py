@@ -85,6 +85,13 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.is_dir():
         raise InvitationCliError("Agent workspace does not exist")
+    execution_source_thread_id = (
+        str(
+            getattr(args, "execution_source_thread_id", "")
+            or os.environ.get("CODEX_THREAD_ID", "")
+        ).strip()
+        or None
+    )
     client_arguments = {"invitation_token": invitation_token}
     if trusted_http_host:
         client_arguments["trusted_http_host"] = trusted_http_host
@@ -133,6 +140,7 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
             roles=list(accepted.get("roles") or []),
             capabilities=list(accepted.get("capabilities") or []),
             workspace_path=str(workspace),
+            execution_source_thread_id=execution_source_thread_id,
             enable_resident=not args.basic,
         )
         setup_payload = setup.public_payload()
@@ -195,6 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--signature", required=True)
     parser.add_argument("--avatar-key", default="auto")
     parser.add_argument("--workspace", default=os.getcwd())
+    parser.add_argument(
+        "--execution-source-thread-id",
+        default=os.environ.get("CODEX_THREAD_ID", ""),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--role", action="append", default=[])
     parser.add_argument("--capability", action="append", default=[])
     parser.add_argument("--tui-adapter", default="")
