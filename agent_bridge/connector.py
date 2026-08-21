@@ -310,7 +310,8 @@ def configure_resident_connector(
             task_service=None,
             detail=(
                 "已精确绑定接受邀请的当前 Codex TUI；不安装影子值守。"
-                "保持该 TUI 打开并调用 agent_duty 即可直接接收聊天与结构化任务。"
+                "保持该 TUI 打开并维持一条 agent_duty 事件订阅，即可直接接收"
+                "聊天与结构化任务；空闲时不会反复请求模型。"
             ),
             duty_mode="direct_tui",
         )

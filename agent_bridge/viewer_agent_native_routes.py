@@ -204,6 +204,7 @@ def build_agent_native_routes(*, store: BridgeStore) -> list[Route]:
                 "route_token",
                 "message_id",
                 "body",
+                "refs",
                 "mentions",
             },
             operation=lambda auth, payload: store.reply_native_channel_event(
@@ -216,6 +217,7 @@ def build_agent_native_routes(*, store: BridgeStore) -> list[Route]:
                 route_token=payload["route_token"],
                 message_id=payload["message_id"],
                 body_text=payload["body"],
+                refs=payload.get("refs"),
                 mentions=payload.get("mentions"),
             ),
         )

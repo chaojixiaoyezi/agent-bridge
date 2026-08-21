@@ -6106,6 +6106,110 @@ def test_native_channel_event_is_idempotent_and_suppresses_shadow_delivery(
     assert replied["reply"]["sender_seat"] == "main"
 
 
+def test_native_channel_wait_honors_room_digest_threshold_for_ordinary_chat(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin_id = admin_web_user_id(store)
+    room = "native-digest-threshold-room"
+    store.create_user_room(room)
+    invitation = store.create_agent_invitation(
+        conversation_id=room,
+        product="codex",
+        requested_mode="resident",
+        adapter_kind="codex",
+        tui_adapter_kind="codex",
+        created_by_web_user_id=admin_id,
+    )
+    accepted = store.accept_agent_invitation(
+        invitation_token=str(invitation["invitation_token"]),
+        product="codex",
+        username="native-digest-owner",
+        signature="普通消息按摘要阈值唤醒。",
+        enrollment_token="enroll_" + "g" * 64,
+        tui_endpoint_id="native-digest-endpoint",
+        tui_native_session_id="019fefee-837c-74a3-a8f2-0c374965125e",
+        tui_confirmed=True,
+    )
+    bound = store.bind_native_agent_session(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        tui_endpoint_id="native-digest-endpoint",
+        native_session_id="019fefee-837c-74a3-a8f2-0c374965125e",
+        process_epoch="native-digest-epoch",
+        binding_source="resume",
+    )
+    for index in range(9):
+        sender = register(
+            store,
+            client="claude-code",
+            name=f"digest-sender-{index + 1}",
+            room=room,
+        )
+        store.send(
+            authorized_session_id=sender["session_id"],
+            sender_participant_id=sender["participant_id"],
+            conversation_id=room,
+            body_text=f"普通积压 {index + 1}",
+            notification_mode="ordinary",
+        )
+
+    route_token = "route_" + "d" * 48
+    before_threshold = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=bound["lease"]["lease_id"],
+        process_epoch="native-digest-epoch",
+        request_id="request_native_digest",
+        route_token=route_token,
+        wait_seconds=0,
+    )
+    assert before_threshold["timed_out"] is True
+    assert before_threshold["event"] is None
+
+    final_sender = register(
+        store,
+        client="claude-code",
+        name="digest-sender-10",
+        room=room,
+    )
+    store.send(
+        authorized_session_id=final_sender["session_id"],
+        sender_participant_id=final_sender["participant_id"],
+        conversation_id=room,
+        body_text="普通积压 10",
+        notification_mode="ordinary",
+    )
+    promoted = store.wait_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=bound["lease"]["lease_id"],
+        process_epoch="native-digest-epoch",
+        request_id="request_native_digest",
+        route_token=route_token,
+        wait_seconds=0,
+    )
+
+    assert promoted["timed_out"] is False
+    assert len(promoted["event"]["messages"]) == 10
+    assert promoted["event"]["required_reply_count"] == 0
+    applied = store.receive_native_channel_event(
+        participant_id=accepted["participant_id"],
+        authorized_session_id=accepted["session_id"],
+        connector_id=accepted["connector_id"],
+        lease_id=bound["lease"]["lease_id"],
+        process_epoch="native-digest-epoch",
+        event_id=promoted["event"]["event_id"],
+        route_token=route_token,
+        stage="applied",
+    )
+    assert applied["optional_acked_count"] == 10
+    assert applied["event"]["required_reply_count"] == 0
+
+
 def test_expired_native_lease_atomically_returns_delivery_to_shadow(
     tmp_path: Path,
 ) -> None:

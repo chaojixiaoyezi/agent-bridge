@@ -10,6 +10,7 @@ from pathlib import Path
 from .avatars import normalize_avatar_key
 from .connector import ConnectorSetupError, configure_resident_connector
 from .codex_native_binding import codex_native_binding
+from .codex_mcp_config import ensure_codex_agent_bridge_timeout
 from .http_client import BridgeHttpClient, BridgeRemoteError
 from .transport_security import (
     BridgeTransportError,
@@ -204,13 +205,18 @@ def accept_invitation(args: argparse.Namespace) -> dict[str, object]:
         "connector": connector,
     }
     if setup_payload.get("duty_mode") == "direct_tui":
+        timeout_config = ensure_codex_agent_bridge_timeout()
         result["direct_tui_duty"] = {
             "body_seat": "this_exact_tui",
             "shadow_installed": False,
             "required_next_tool": "agent_duty",
+            "codex_mcp_timeout": timeout_config,
             "instruction": (
-                "Call agent_duty now in this same TUI. Handle returned room "
-                "events here and call agent_duty again after every event or timeout."
+                "Call agent_duty once in this same TUI and leave the subscription "
+                "pending. Handle each real room event here, then call it once to "
+                "re-arm. Never create a retry loop from an idle timeout. If the "
+                "timeout setting changed, the currently loaded Codex client uses "
+                "it after its next native MCP refresh."
             ),
         }
     return result

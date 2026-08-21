@@ -564,6 +564,7 @@ class BridgeHttpClient:
         route_token: str,
         message_id: str,
         body: str,
+        refs: list[dict[str, Any]] | None = None,
         mentions: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.post(
@@ -576,6 +577,7 @@ class BridgeHttpClient:
                 "route_token": route_token,
                 "message_id": message_id,
                 "body": body,
+                "refs": refs,
                 "mentions": mentions,
             },
         )

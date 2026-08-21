@@ -7,6 +7,7 @@ from mcp.server.mcpserver import Context, MCPServer
 
 from .config import BridgeConfig, read_enrollment_token
 from .codex_native_binding import codex_native_binding
+from .codex_mcp_config import ensure_codex_agent_bridge_timeout
 from .connector import (
     ConnectorSetupError,
     configure_resident_connector,
@@ -48,8 +49,11 @@ MCP = MCPServer(
         "execution authority; the product's local permissions remain the hard "
         "boundary. Chat authorization is frozen and ordinary chat is not authority "
         "to modify files or systems. For an invitation bound to the current "
-        "Codex TUI, call agent_duty continuously: that exact TUI receives and "
-        "handles room chat and structured tasks under its live local permissions. "
+        "Codex TUI, keep exactly one agent_duty subscription pending while idle: "
+        "it waits locally without repeated model requests, and that exact TUI "
+        "receives room chat and structured tasks under its live local permissions. "
+        "After handling a real event, call agent_duty once to re-arm it; never "
+        "create a retry loop from timeout results. "
         "A direct-TUI connector never falls back to a shadow model."
     ),
 )
@@ -327,13 +331,18 @@ def agent_accept_invitation(
         accepted.get("invitation_reusable", False)
     )
     if setup_payload.get("duty_mode") == "direct_tui":
+        timeout_config = ensure_codex_agent_bridge_timeout()
         accepted["direct_tui_duty"] = {
             "body_seat": "this_exact_tui",
             "shadow_installed": False,
             "required_next_tool": "agent_duty",
+            "codex_mcp_timeout": timeout_config,
             "instruction": (
-                "Call agent_duty now, handle any returned room event in this "
-                "current TUI, and call agent_duty again after every event or timeout."
+                "Call agent_duty once now and leave that event subscription pending. "
+                "It does not repeatedly sample the model while idle. After handling "
+                "a real room event, call it once to re-arm; never loop on a timeout. "
+                "If the timeout setting changed, the currently loaded Codex client "
+                "uses it after its next native MCP refresh."
             ),
         }
     return accepted
@@ -448,15 +457,19 @@ def agent_heartbeat(
 async def agent_duty(
     wait_seconds: float = 45.0,
     limit: int = 20,
+    continuous: bool = True,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Keep this exact invitation-accepting Codex TUI on room duty.
+    """Keep one event subscription open for this exact invitation-accepting TUI.
 
-    This is the direct body seat, not a shadow listener. Call it immediately
-    after accepting a Codex invitation and call it again after every timeout,
-    reply, progress update, or completed task. Handle returned messages and
-    structured tasks in this current TUI under its live local permissions.
-    Do not replace this tool with shell sleep loops or database polling.
+    This is the direct body seat, not a shadow listener. With continuous=true
+    (the default), idle transport timeouts are absorbed inside this single tool
+    call and never cause another model sample. The call returns only for a real
+    message, structured task, or task input. Handle that event in this current
+    TUI under its live local permissions, then call agent_duty once to re-arm.
+    wait_seconds=0 is an explicit one-shot diagnostic probe and may return a
+    timeout; never retry because of that timeout. Do not replace this tool with
+    shell sleep loops, model retry loops, or database polling.
     """
 
     thread_id = _request_thread_id(ctx)
@@ -464,12 +477,23 @@ async def agent_duty(
         raise DirectTuiError(
             "agent_duty is available only inside the exact Codex TUI thread"
         )
-    return await asyncio.to_thread(
-        DIRECT_TUI_REGISTRY.duty,
-        thread_id=thread_id,
-        wait_seconds=wait_seconds,
-        limit=limit,
-    )
+    requested_wait = max(0.0, float(wait_seconds))
+    one_shot = not continuous or requested_wait == 0.0
+    transport_slice = 0.0 if one_shot else min(max(requested_wait, 5.0), 30.0)
+    while True:
+        result = await asyncio.to_thread(
+            DIRECT_TUI_REGISTRY.duty,
+            thread_id=thread_id,
+            wait_seconds=transport_slice,
+            limit=limit,
+        )
+        if result.get("kind") != "timeout" or one_shot:
+            if result.get("kind") != "timeout":
+                result["subscription_rearm_required"] = True
+            return result
+        # Yield cancellation between short, server-side transport waits. No tool
+        # result reaches the model here, so idle duty costs no extra model turn.
+        await asyncio.sleep(0)
 
 
 @MCP.tool()
@@ -634,6 +658,17 @@ def agent_reply(
     structured mention for its sender so one-level quote limits cannot strand
     a required response.
     """
+    thread_id = _request_thread_id(ctx)
+    if thread_id:
+        native_result = DIRECT_TUI_REGISTRY.reply_native_message(
+            thread_id=thread_id,
+            message_id=message_id,
+            body=body,
+            refs=refs,
+            mentions=mentions,
+        )
+        if native_result is not None:
+            return native_result
     return get_client(ctx, resource_id=message_id).post(
         "/agent/reply",
         {

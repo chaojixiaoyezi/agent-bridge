@@ -168,6 +168,7 @@ def test_direct_codex_invitation_binds_the_accepting_thread_before_consumption(
     binding_calls: list[dict] = []
     accepted_calls: list[dict] = []
     setup_calls: list[dict] = []
+    timeout_calls: list[bool] = []
 
     def make_binding(**payload):
         binding_calls.append(payload)
@@ -214,11 +215,21 @@ def test_direct_codex_invitation_binds_the_accepting_thread_before_consumption(
     monkeypatch.setattr(invitation_cli, "configure_resident_connector", configure)
     monkeypatch.setattr(
         invitation_cli,
+        "ensure_codex_agent_bridge_timeout",
+        lambda: timeout_calls.append(True)
+        or {
+            "status": "configured",
+            "tool_timeout_sec": 2592000,
+            "active_client_refresh_required": True,
+        },
+    )
+    monkeypatch.setattr(
+        invitation_cli,
         "_stdin_invitation_token",
         lambda: "invite_codex_native",
     )
 
-    invitation_cli.accept_invitation(
+    result = invitation_cli.accept_invitation(
         SimpleNamespace(
             bridge_url="http://127.0.0.1:8765",
             product="codex",
@@ -240,6 +251,8 @@ def test_direct_codex_invitation_binds_the_accepting_thread_before_consumption(
     assert setup_calls[0]["tui_adapter_kind"] == "codex"
     assert setup_calls[0]["tui_native_session_id"] == thread_id
     assert setup_calls[0]["execution_source_thread_id"] == thread_id
+    assert timeout_calls == [True]
+    assert result["direct_tui_duty"]["codex_mcp_timeout"]["status"] == "configured"
 
 
 def test_direct_invitation_cli_allows_https_remote_but_rejects_remote_http() -> None:

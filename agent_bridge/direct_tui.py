@@ -29,6 +29,7 @@ DIRECT_TUI_DUTY_MODE = "direct_tui"
 DIRECT_TUI_HEARTBEAT_SECONDS = 20.0
 DIRECT_TUI_ROOM_SLICE_SECONDS = 2.0
 DIRECT_TUI_TASK_RENEW_SECONDS = 120.0
+NATIVE_EVENT_TERMINAL_STATES = {"replied", "superseded", "cancelled"}
 
 
 class DirectTuiError(RuntimeError):
@@ -79,6 +80,38 @@ class DirectTuiConnection:
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _heartbeat_thread: threading.Thread | None = field(default=None, repr=False)
     _last_task_renewed_at: float = field(default=0.0, repr=False)
+    _native_request_id: str | None = field(default=None, repr=False)
+    _native_route_token: str | None = field(default=None, repr=False)
+    _native_event_id: str | None = field(default=None, repr=False)
+    _native_event_message_ids: set[str] = field(default_factory=set, repr=False)
+    _native_event_delivered: bool = field(default=False, repr=False)
+
+    def _clear_native_event_locked(self) -> None:
+        self._native_request_id = None
+        self._native_route_token = None
+        self._native_event_id = None
+        self._native_event_message_ids.clear()
+        self._native_event_delivered = False
+
+    def _reset_stale_native_lease(
+        self,
+        exc: BridgeRemoteError,
+        *,
+        expected_lease_id: str | None = None,
+    ) -> bool:
+        if exc.error_code not in {
+            "native_session_lease_ended",
+            "native_session_lease_expired",
+            "native_session_lease_superseded",
+            "native_delivery_inactive",
+        }:
+            return False
+        with self._lock:
+            if expected_lease_id and self.lease_id != expected_lease_id:
+                return True
+            self.lease_id = None
+            self._clear_native_event_locked()
+        return True
 
     def ensure_bound(self) -> None:
         with self._lock:
@@ -100,6 +133,7 @@ class DirectTuiConnection:
             if not isinstance(lease, dict) or not str(lease.get("lease_id") or ""):
                 raise DirectTuiError("Bridge did not return a native TUI lease")
             self.lease_id = str(lease["lease_id"])
+            self._clear_native_event_locked()
             self._stop.clear()
             self._start_heartbeat_locked()
 
@@ -141,15 +175,10 @@ class DirectTuiConnection:
                 ):
                     self.renew_task(task_id)
             except BridgeRemoteError as exc:
-                if exc.error_code in {
-                    "native_session_lease_ended",
-                    "native_session_lease_expired",
-                    "native_session_lease_superseded",
-                    "native_delivery_inactive",
-                }:
-                    with self._lock:
-                        if self.lease_id == lease_id:
-                            self.lease_id = None
+                if self._reset_stale_native_lease(
+                    exc,
+                    expected_lease_id=lease_id,
+                ):
                     return
                 # A transient transport outage keeps the same fenced lease. An
                 # explicit later agent_duty call may rebind after it expires.
@@ -175,15 +204,200 @@ class DirectTuiConnection:
                 detail={"duty_mode": DIRECT_TUI_DUTY_MODE},
             )
         except BridgeRemoteError as exc:
-            if exc.error_code in {
-                "native_session_lease_ended",
-                "native_session_lease_expired",
-                "native_session_lease_superseded",
-                "native_delivery_inactive",
-            }:
-                with self._lock:
-                    if self.lease_id == lease_id:
-                        self.lease_id = None
+            self._reset_stale_native_lease(
+                exc,
+                expected_lease_id=lease_id,
+            )
+
+    @staticmethod
+    def _remaining_required(event: dict[str, Any]) -> int:
+        raw = event.get("required_message_ids")
+        if isinstance(raw, list):
+            return len([item for item in raw if str(item or "")])
+        return max(0, int(event.get("required_reply_count") or 0))
+
+    def _event_route(self) -> tuple[str, str, str, str] | None:
+        with self._lock:
+            if not all(
+                (
+                    self.lease_id,
+                    self._native_request_id,
+                    self._native_route_token,
+                    self._native_event_id,
+                )
+            ):
+                return None
+            return (
+                str(self.lease_id),
+                str(self._native_request_id),
+                str(self._native_route_token),
+                str(self._native_event_id),
+            )
+
+    def apply_delivered_event(self) -> dict[str, Any] | None:
+        """Acknowledge one batch only when this TUI asks to re-arm.
+
+        Returning a tool result is the injection boundary.  The next explicit
+        agent_duty call proves that the model had a chance to apply that batch;
+        optional messages can then be acknowledged while required replies stay
+        pending and are redelivered under the same idempotent event.
+        """
+
+        with self._lock:
+            route = self._event_route()
+            delivered = self._native_event_delivered
+        if route is None or not delivered:
+            return None
+        lease_id, _request_id, route_token, event_id = route
+        try:
+            result = self.client.receive_native_channel_event(
+                connector_id=self.connector_id,
+                lease_id=lease_id,
+                process_epoch=self.process_epoch,
+                event_id=event_id,
+                route_token=route_token,
+                stage="applied",
+            )
+        except BridgeRemoteError as exc:
+            if self._reset_stale_native_lease(
+                exc,
+                expected_lease_id=lease_id,
+            ):
+                return None
+            raise
+        event = result.get("event")
+        with self._lock:
+            self._native_event_delivered = False
+            if isinstance(event, dict) and (
+                str(event.get("state") or "") in NATIVE_EVENT_TERMINAL_STATES
+                or self._remaining_required(event) == 0
+            ):
+                self._clear_native_event_locked()
+        return result
+
+    def wait_native_event(
+        self,
+        *,
+        wait_seconds: float,
+        limit: int,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] | None = None
+        lease_id = ""
+        route_token = ""
+        for attempt in range(2):
+            self.ensure_bound()
+            with self._lock:
+                if self._native_request_id is None:
+                    self._native_request_id = (
+                        "request_direct_" + secrets.token_hex(20)
+                    )
+                    self._native_route_token = "route_" + secrets.token_hex(32)
+                lease_id = str(self.lease_id or "")
+                request_id = str(self._native_request_id)
+                route_token = str(self._native_route_token)
+            try:
+                result = self.client.wait_native_channel_event(
+                    connector_id=self.connector_id,
+                    lease_id=lease_id,
+                    process_epoch=self.process_epoch,
+                    request_id=request_id,
+                    route_token=route_token,
+                    wait_seconds=wait_seconds,
+                    limit=limit,
+                )
+                candidate = result.get("event")
+                if (
+                    isinstance(candidate, dict)
+                    and str(candidate.get("state") or "") == "fetched"
+                ):
+                    injected = self.client.receive_native_channel_event(
+                        connector_id=self.connector_id,
+                        lease_id=lease_id,
+                        process_epoch=self.process_epoch,
+                        event_id=str(candidate.get("event_id") or ""),
+                        route_token=route_token,
+                        stage="injected",
+                    )
+                    injected_event = injected.get("event")
+                    if isinstance(injected_event, dict):
+                        candidate = {**candidate, **injected_event}
+                        result = {**result, "event": candidate}
+                break
+            except BridgeRemoteError as exc:
+                stale = self._reset_stale_native_lease(
+                    exc,
+                    expected_lease_id=lease_id,
+                )
+                if not stale or attempt == 1:
+                    raise
+        if result is None:
+            raise DirectTuiError("Bridge returned no native event result")
+        event = result.get("event")
+        if not isinstance(event, dict):
+            return result
+        state = str(event.get("state") or "")
+        if state in NATIVE_EVENT_TERMINAL_STATES or (
+            state == "applied" and self._remaining_required(event) == 0
+        ):
+            with self._lock:
+                self._clear_native_event_locked()
+            return {**result, "event": None, "timed_out": True}
+        event_id = str(event.get("event_id") or "")
+        if not event_id:
+            raise DirectTuiError("Bridge returned a native event without an id")
+        message_ids = {
+            str(item)
+            for item in (event.get("message_ids") or [])
+            if str(item or "")
+        }
+        with self._lock:
+            self._native_event_id = event_id
+            self._native_event_message_ids = message_ids
+            self._native_event_delivered = True
+        return {**result, "event": event, "timed_out": False}
+
+    def reply_native_message(
+        self,
+        *,
+        message_id: str,
+        body: str,
+        refs: list[dict[str, Any]] | None,
+        mentions: list[str] | None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            route = self._event_route()
+            belongs = message_id in self._native_event_message_ids
+        if route is None or not belongs:
+            return None
+        lease_id, _request_id, route_token, event_id = route
+        try:
+            result = self.client.reply_native_channel_event(
+                connector_id=self.connector_id,
+                lease_id=lease_id,
+                process_epoch=self.process_epoch,
+                event_id=event_id,
+                route_token=route_token,
+                message_id=message_id,
+                body=body,
+                refs=refs,
+                mentions=mentions,
+            )
+        except BridgeRemoteError as exc:
+            if self._reset_stale_native_lease(
+                exc,
+                expected_lease_id=lease_id,
+            ):
+                return None
+            raise
+        native_event = result.get("native_event")
+        with self._lock:
+            if isinstance(native_event, dict) and (
+                str(native_event.get("state") or "")
+                in NATIVE_EVENT_TERMINAL_STATES
+                or self._remaining_required(native_event) == 0
+            ):
+                self._clear_native_event_locked()
+        return result
 
     def renew_task(self, task_id: str) -> None:
         self.client.post(
@@ -205,6 +419,7 @@ class DirectTuiConnection:
         with self._lock:
             lease_id = self.lease_id
             self.lease_id = None
+            self._clear_native_event_locked()
         if lease_id:
             try:
                 self.client.end_native_session(
@@ -445,6 +660,7 @@ class DirectTuiRegistry:
         connections = self.connections_for_thread(normalized, required=True)
         for connection in connections:
             connection.ensure_bound()
+            connection.apply_delivered_event()
             with connection._lock:
                 active_task_id = connection.active_task_id
             connection.set_state(
@@ -480,7 +696,7 @@ class DirectTuiRegistry:
                     "next_action": (
                         "apply these structured inputs to the active task, "
                         "acknowledge them with agent_task_inputs, then call "
-                        "agent_duty again"
+                        "agent_duty once to re-arm the event subscription"
                     ),
                 }
 
@@ -510,7 +726,8 @@ class DirectTuiRegistry:
                     **task_payload,
                     "next_action": (
                         "execute in this current TUI under its live local permissions; "
-                        "report with agent_task_update, then call agent_duty again"
+                        "report with agent_task_update, then call agent_duty once "
+                        "to re-arm the event subscription"
                     ),
                 }
 
@@ -521,16 +738,34 @@ class DirectTuiRegistry:
             for connection in connections:
                 remaining = max(0.0, deadline - time.monotonic())
                 request_wait = min(DIRECT_TUI_ROOM_SLICE_SECONDS, remaining)
-                payload = connection.client.post(
-                    "/agent/wait",
-                    {
-                        "wait_seconds": request_wait,
-                        "limit": normalized_limit,
-                        "auto_claim_roles": True,
-                    },
-                    timeout=request_wait + 10.0,
+                native = connection.wait_native_event(
+                    wait_seconds=request_wait,
+                    limit=normalized_limit,
                 )
-                if payload.get("messages"):
+                event = native.get("event")
+                if isinstance(event, dict) and event.get("messages"):
+                    payload = {
+                        "messages": event.get("messages") or [],
+                        "count": len(event.get("messages") or []),
+                        "timed_out": False,
+                        "last_sequence": max(
+                            (
+                                int(item.get("sequence") or 0)
+                                for item in event.get("messages") or []
+                                if isinstance(item, dict)
+                            ),
+                            default=0,
+                        ),
+                        "backlog": event.get("backlog") or native.get("backlog") or {},
+                        "native_event": {
+                            "event_id": event.get("event_id"),
+                            "state": event.get("state"),
+                            "required_message_ids": event.get("required_message_ids")
+                            or [],
+                            "required_reply_count": event.get("required_reply_count")
+                            or 0,
+                        },
+                    }
                     self._record_payload(
                         thread_id=normalized,
                         connection=connection,
@@ -545,7 +780,7 @@ class DirectTuiRegistry:
                         "next_action": (
                             "handle these messages as this current TUI, use the "
                             "normal Agent Bridge reply/send tools, then call "
-                            "agent_duty again"
+                            "agent_duty once to re-arm; do not create a timeout loop"
                         ),
                     }
                 if time.monotonic() >= deadline:
@@ -564,9 +799,36 @@ class DirectTuiRegistry:
                 for item in connections
             ],
             "next_action": (
-                "no event arrived; keep this TUI on duty by calling agent_duty again"
+                "no event arrived during this one-shot probe; stop here because an "
+                "idle timeout never requests a new subscription"
             ),
         }
+
+    def reply_native_message(
+        self,
+        *,
+        thread_id: str,
+        message_id: str,
+        body: str,
+        refs: list[dict[str, Any]] | None,
+        mentions: list[str] | None,
+    ) -> dict[str, Any] | None:
+        normalized = normalized_thread_id(thread_id)
+        connections = self.connections_for_thread(normalized)
+        with self._lock:
+            connector_id = self._message_routes.get((normalized, message_id))
+        connection = next(
+            (item for item in connections if item.connector_id == connector_id),
+            None,
+        )
+        if connection is None:
+            return None
+        return connection.reply_native_message(
+            message_id=message_id,
+            body=body,
+            refs=refs,
+            mentions=mentions,
+        )
 
     def task_updated(self, *, thread_id: str, task_id: str, terminal: bool) -> None:
         if not terminal:

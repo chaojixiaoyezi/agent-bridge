@@ -722,7 +722,10 @@ class NativeSessionMixin:
             ).fetchone()
             if row is None:
                 continue
-            if self._native_event_message_requires_reply(row):
+            if (
+                self._native_event_message_requires_reply(row)
+                and str(row["delivery_state"]) != "acked"
+            ):
                 required_message_ids.append(message_id)
             payload = self._message_payload(
                 row,
@@ -1219,6 +1222,7 @@ class NativeSessionMixin:
         route_token: str,
         message_id: str,
         body_text: str,
+        refs: Sequence[dict[str, Any]] | None = None,
         mentions: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         participant = opaque_id(participant_id, field="participant_id")
@@ -1267,6 +1271,7 @@ class NativeSessionMixin:
             participant_id=participant,
             message_id=message,
             body_text=body_text,
+            refs=refs,
             mentions=mentions,
         )
         replied_at = time.time()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,12 @@ import agent_bridge.resident_health as resident_health
 import agent_bridge.server as bridge_server
 from agent_bridge.codex_native_binding import codex_native_binding
 from agent_bridge.connector import configure_resident_connector
-from agent_bridge.direct_tui import DirectTuiError, DirectTuiRegistry
+from agent_bridge.direct_tui import (
+    DirectTuiConnection,
+    DirectTuiError,
+    DirectTuiRegistry,
+)
+from agent_bridge.http_client import BridgeRemoteError
 from agent_bridge.store_errors import ConflictError
 from agent_bridge.tui_binding import NativeTuiError
 from agent_bridge.web_auth import WebAuthStore
@@ -120,6 +126,7 @@ def test_direct_registry_routes_multiple_rooms_by_exact_thread_and_ids(
             self.heartbeat_calls: list[dict] = []
             self.task: dict | None = None
             self.messages: list[dict] = []
+            self.native_event: dict | None = None
 
         def bind_native_session(self, **payload):
             self.bind_calls.append(payload)
@@ -132,6 +139,43 @@ def test_direct_registry_routes_multiple_rooms_by_exact_thread_and_ids(
         def end_native_session(self, **_payload):
             return {"ended": True}
 
+        def wait_native_channel_event(self, **_payload):
+            if self.native_event is not None:
+                return {"timed_out": False, "event": dict(self.native_event)}
+            messages, self.messages = self.messages, []
+            if not messages:
+                return {"timed_out": True, "event": None, "backlog": {}}
+            self.native_event = {
+                "event_id": f"event_{self.room}",
+                "conversation_id": self.room,
+                "state": "fetched",
+                "messages": messages,
+                "message_ids": [item["message_id"] for item in messages],
+                "required_message_ids": [],
+                "required_reply_count": 0,
+                "backlog": {"pending_count": len(messages)},
+            }
+            return {"timed_out": False, "event": dict(self.native_event)}
+
+        def receive_native_channel_event(self, **payload):
+            assert self.native_event is not None
+            self.native_event["state"] = payload["stage"]
+            if payload["stage"] == "applied":
+                self.native_event["required_message_ids"] = []
+                self.native_event["required_reply_count"] = 0
+            return {"event": dict(self.native_event)}
+
+        def reply_native_channel_event(self, **payload):
+            assert self.native_event is not None
+            self.native_event["state"] = "replied"
+            self.native_event["required_message_ids"] = []
+            self.native_event["required_reply_count"] = 0
+            return {
+                "reply": {"body": payload["body"]},
+                "native_event": dict(self.native_event),
+                "remaining_required_reply_count": 0,
+            }
+
         def post(self, path: str, payload: dict, **_kwargs):
             if path == "/agent/tasks/next":
                 task, self.task = self.task, None
@@ -140,13 +184,6 @@ def test_direct_registry_routes_multiple_rooms_by_exact_thread_and_ids(
                 return {"task": {"task_id": payload["task_id"], "status": "running"}}
             if path == "/agent/tasks/inputs":
                 return {"task_id": payload["task_id"], "inputs": [], "count": 0}
-            if path == "/agent/wait":
-                messages, self.messages = self.messages, []
-                return {
-                    "messages": messages,
-                    "count": len(messages),
-                    "timed_out": not messages,
-                }
             raise AssertionError((path, payload))
 
     monkeypatch.setattr(direct_tui, "BridgeHttpClient", FakeDirectClient)
@@ -193,6 +230,15 @@ def test_direct_registry_routes_multiple_rooms_by_exact_thread_and_ids(
             resource_id="message_direct_one",
             required=True,
         ) is clients["direct-room-one"]
+        native_reply = registry.reply_native_message(
+            thread_id=THREAD_ID,
+            message_id="message_direct_one",
+            body="本体已回复",
+            refs=[{"kind": "test", "value": "native-route"}],
+            mentions=[],
+        )
+        assert native_reply is not None
+        assert native_reply["reply"]["body"] == "本体已回复"
 
         with pytest.raises(DirectTuiError, match="no exact direct-duty"):
             registry.connections_for_thread(
@@ -213,6 +259,205 @@ def test_server_extracts_only_structured_exact_thread_context() -> None:
 
     assert bridge_server._request_thread_id(context) == THREAD_ID
     assert bridge_server._request_thread_id(guessed) == ""
+
+
+def test_agent_duty_absorbs_idle_timeouts_without_resampling_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    class FakeRegistry:
+        @staticmethod
+        def duty(*, thread_id: str, wait_seconds: float, limit: int) -> dict:
+            assert thread_id == THREAD_ID
+            assert limit == 7
+            calls.append(wait_seconds)
+            if len(calls) < 3:
+                return {"kind": "timeout", "timed_out": True}
+            return {
+                "kind": "messages",
+                "timed_out": False,
+                "messages": [{"message_id": "message_event_driven"}],
+            }
+
+    monkeypatch.setattr(bridge_server, "DIRECT_TUI_REGISTRY", FakeRegistry())
+    context = SimpleNamespace(
+        request_context=SimpleNamespace(meta={"threadId": THREAD_ID})
+    )
+
+    result = asyncio.run(
+        bridge_server.agent_duty(
+            wait_seconds=5,
+            limit=7,
+            continuous=True,
+            ctx=context,
+        )
+    )
+
+    assert len(calls) == 3
+    assert calls == [5.0, 5.0, 5.0]
+    assert result["kind"] == "messages"
+    assert result["subscription_rearm_required"] is True
+
+
+def test_agent_duty_zero_wait_is_one_shot_and_never_self_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class FakeRegistry:
+        @staticmethod
+        def duty(**_payload) -> dict:
+            nonlocal calls
+            calls += 1
+            return {
+                "kind": "timeout",
+                "timed_out": True,
+                "next_action": "stop",
+            }
+
+    monkeypatch.setattr(bridge_server, "DIRECT_TUI_REGISTRY", FakeRegistry())
+    context = SimpleNamespace(
+        request_context=SimpleNamespace(meta={"threadId": THREAD_ID})
+    )
+    result = asyncio.run(
+        bridge_server.agent_duty(wait_seconds=0, ctx=context)
+    )
+
+    assert calls == 1
+    assert result == {
+        "kind": "timeout",
+        "timed_out": True,
+        "next_action": "stop",
+    }
+
+
+def test_direct_native_wait_rebinds_once_after_stale_lease(
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.bind_calls: list[dict] = []
+            self.wait_calls: list[dict] = []
+            self.receive_calls: list[dict] = []
+
+        def bind_native_session(self, **payload):
+            self.bind_calls.append(payload)
+            return {"lease": {"lease_id": f"lease_{len(self.bind_calls)}"}}
+
+        def heartbeat_native_session(self, **payload):
+            return {"lease": payload}
+
+        def wait_native_channel_event(self, **payload):
+            self.wait_calls.append(payload)
+            return {
+                "timed_out": False,
+                "event": {
+                    "event_id": "event_rebind",
+                    "state": "fetched",
+                    "messages": [
+                        {"message_id": "message_rebind", "body": "重连后送达"}
+                    ],
+                    "message_ids": ["message_rebind"],
+                    "required_message_ids": ["message_rebind"],
+                    "required_reply_count": 1,
+                },
+            }
+
+        def receive_native_channel_event(self, **payload):
+            self.receive_calls.append(payload)
+            if len(self.receive_calls) == 1:
+                raise BridgeRemoteError(
+                    "lease expired",
+                    error_code="native_session_lease_expired",
+                )
+            return {
+                "event": {
+                    "event_id": "event_rebind",
+                    "state": "injected",
+                    "messages": [
+                        {"message_id": "message_rebind", "body": "重连后送达"}
+                    ],
+                    "message_ids": ["message_rebind"],
+                    "required_message_ids": ["message_rebind"],
+                    "required_reply_count": 1,
+                }
+            }
+
+        def end_native_session(self, **_payload):
+            return {"ended": True}
+
+    client = FakeClient()
+    connection = DirectTuiConnection(
+        thread_id=THREAD_ID,
+        connector_id="connector_rebind_once",
+        conversation_id="room-rebind-once",
+        endpoint_id="endpoint-rebind-once",
+        workspace_path=str(tmp_path),
+        manifest_file=tmp_path / "connector.json",
+        client=client,  # type: ignore[arg-type]
+        process_epoch="process-rebind-once",
+    )
+    try:
+        result = connection.wait_native_event(wait_seconds=0, limit=20)
+        assert result["event"]["state"] == "injected"
+        assert [item["lease_id"] for item in client.wait_calls] == [
+            "lease_1",
+            "lease_2",
+        ]
+        assert len(client.bind_calls) == 2
+
+        connection.lease_id = "lease_newer"
+        assert connection._reset_stale_native_lease(
+            BridgeRemoteError(
+                "old lease ended late",
+                error_code="native_session_lease_ended",
+            ),
+            expected_lease_id="lease_older",
+        )
+        assert connection.lease_id == "lease_newer"
+    finally:
+        connection.close()
+
+
+def test_agent_reply_uses_native_event_route_before_generic_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    class FakeRegistry:
+        @staticmethod
+        def reply_native_message(**payload) -> dict:
+            calls.append(payload)
+            return {"reply": {"message_id": "reply_native"}}
+
+    monkeypatch.setattr(bridge_server, "DIRECT_TUI_REGISTRY", FakeRegistry())
+
+    def reject_generic(*_args, **_kwargs):
+        pytest.fail("native event replies must not use a generic Agent session")
+
+    monkeypatch.setattr(bridge_server, "get_client", reject_generic)
+    context = SimpleNamespace(
+        request_context=SimpleNamespace(meta={"threadId": THREAD_ID})
+    )
+    result = bridge_server.agent_reply(
+        message_id="message_native",
+        body="本体回复",
+        refs=[{"kind": "evidence", "value": "native"}],
+        mentions=["participant_target"],
+        ctx=context,
+    )
+
+    assert result == {"reply": {"message_id": "reply_native"}}
+    assert calls == [
+        {
+            "thread_id": THREAD_ID,
+            "message_id": "message_native",
+            "body": "本体回复",
+            "refs": [{"kind": "evidence", "value": "native"}],
+            "mentions": ["participant_target"],
+        }
+    ]
 
 
 def test_direct_tui_expiry_stays_offline_without_shadow_takeover(
