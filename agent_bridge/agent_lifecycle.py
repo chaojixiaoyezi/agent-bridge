@@ -877,6 +877,11 @@ class AgentLifecycleMixin:
                     participant_names[participant] = str(profile["display_name"])
 
             for participant, source_rooms in participant_sources.items():
+                self._assert_integration_agent_slot_locked(
+                    conn,
+                    conversation_id=target,
+                    participant_id=participant,
+                )
                 target_membership = conn.execute(
                     "SELECT roles_json FROM memberships "
                     "WHERE conversation_id = ? AND participant_id = ?",

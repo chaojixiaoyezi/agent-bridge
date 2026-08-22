@@ -74,7 +74,7 @@ def build_admin_access_routes(
             payload = await _json_body(
                 request,
                 required={"conversation_id"},
-                allowed={"conversation_id"},
+                allowed={"conversation_id", "room_kind"},
             )
             return JSONResponse(
                 {
@@ -83,6 +83,7 @@ def build_admin_access_routes(
                         web_user_id=str(identity["user_id"]),
                         participant_id=str(identity["participant_id"]),
                         conversation_id=payload["conversation_id"],
+                        room_kind=payload.get("room_kind", "chat"),
                     )
                 },
                 status_code=201,

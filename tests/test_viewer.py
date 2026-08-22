@@ -61,7 +61,7 @@ def dashboard_stylesheet() -> str:
 
 
 def test_runtime_software_version_matches_source_project() -> None:
-    assert _runtime_software_version() == "0.44.9"
+    assert _runtime_software_version() == "0.45.0"
 
 
 class FakeEmailDelivery:
@@ -2378,6 +2378,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
         "connectors",
         "permissions",
         "tasks",
+        "runtime_events",
         "task_permissions",
         "receipts",
         "highlights",
@@ -2408,7 +2409,7 @@ def test_dashboard_renders_messages_as_text_and_keeps_read_projection_read_only(
     )
     index_html = (WEB_ROOT / "index.html").read_text(encoding="utf-8")
     script_positions = [
-        index_html.index(f"{filename}?v=20260819-02")
+        index_html.index(f"{filename}?v=20260822-03")
         for filename in WEB_JAVASCRIPT_ASSETS
     ]
     assert script_positions == sorted(script_positions)
@@ -2503,7 +2504,7 @@ def test_web_composite_attachment_message_and_agent_download_acl(
     assert "message-link-card" in javascript
     assert "不会抓取远程预览" in javascript
     stylesheet_positions = [
-        index_html.index(f"{filename}?v=20260819-02")
+        index_html.index(f"{filename}?v=20260822-03")
         for filename in WEB_STYLESHEET_ASSETS
     ]
     assert stylesheet_positions == sorted(stylesheet_positions)
@@ -2816,6 +2817,17 @@ def test_same_origin_browser_user_can_create_room_without_agent_membership(
     )
     assert created.status_code == 201
     assert created.json()["room"]["creator_kind"] == "user"
+    assert created.json()["room"]["room_kind"] == "chat"
+    integration = client.post(
+        "/api/rooms",
+        json={
+            "conversation_id": "Claude 整合演示",
+            "room_kind": "integration",
+        },
+        headers=headers,
+    )
+    assert integration.status_code == 201
+    assert integration.json()["room"]["room_kind"] == "integration"
 
     room = next(
         room
@@ -2823,6 +2835,7 @@ def test_same_origin_browser_user_can_create_room_without_agent_membership(
         if room["conversation_id"] == "大家沟通群"
     )
     assert room["status"] == "active"
+    assert room["room_kind"] == "chat"
     assert room["participant_count"] == 1
     assert room["is_room_owner"] is True
     assert room["can_wake_all"] is True
@@ -2856,6 +2869,8 @@ def test_same_origin_browser_user_can_create_room_without_agent_membership(
     html = client.get("/").text
     assert "pattern=" not in html
     assert "支持中文" in html
+    assert "整合聊天室" in html
+    assert "TUI 指令" in dashboard_javascript()
 
 
 def test_admin_renames_room_and_generates_room_bound_agent_access(

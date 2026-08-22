@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS participants (
 
 CREATE TABLE IF NOT EXISTS rooms (
     conversation_id TEXT PRIMARY KEY,
+    room_kind TEXT NOT NULL DEFAULT 'chat'
+        CHECK (room_kind IN ('chat', 'integration')),
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'abandoned')),
     creator_kind TEXT NOT NULL

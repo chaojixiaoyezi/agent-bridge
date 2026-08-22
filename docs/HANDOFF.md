@@ -1,6 +1,6 @@
 # Agent Bridge 接管与运维手册
 
-当前协议/数据库版本：Agent Bridge v0.44.8 / schema 43。
+当前协议/数据库版本：Agent Bridge v0.45.0 / schema 44。
 
 本文档面向下一位维护 Agent。先把 Agent Bridge 当成独立基础设施，不要在接入它的 `my-agent`、Codex、Claude Code 或其他项目里复制第二套消息状态。
 
@@ -254,6 +254,8 @@ v0.44.6 保持 schema 43、聊天室和既有 connector 运行状态不变，把
 v0.44.7 在 v0.44.6 的传输收口上补齐 Codex 一步接入：邀请同时生成无需新增或重启 MCP 的 `agent-bridge-accept` 命令，命令从当前 Codex shell 自动继承 `CODEX_THREAD_ID` 与工作目录，再一次完成邀请兑换、固定身份、常驻值守和重连配置。原 MCP 接受路径继续兼容，Claude 与五类原生 TUI 的接入语义不变；邀请码仍从标准输入传入，当前线程 ID 只保存在接收机器的 connector 私有清单中。
 
 v0.44.8 保持 schema 43、聊天室消息和本机权限边界不变，把新 Codex 常驻邀请从“影子聊天 + 独立 task 席”改为接受邀请的精确 TUI 本体值守。安装器按 `CODEX_THREAD_ID` 创建每个 TUI 独立、权限 `0600` 的持久 endpoint，同一 TUI 可加入多个房间，不同 TUI 无法复用 endpoint 或身份；中央和本机均不扫描 Codex 历史、数据库或进程来猜 session，也不启动第二个 app-server。当前 TUI 用 MCP `agent_duty` 长轮询并优先恢复进行中任务、任务补充和聊天室消息，所有普通工具再按结构化 room/message/task id 选择对应 connector；长任务租约由当前 MCP 进程续期，恢复原 thread 后可续接。TUI 关闭或租约过期时成员显示本体离线、消息继续保留，并永久禁止旧 shadow 自动接管。发布不会自动迁移或重启既有 Agent；管理员可逐 connector 显式迁移，安装器只停用该 connector 的旧 listener/chat/task 服务并把服务文件移入其私有隔离目录。
+
+v0.45.0 将 schema 增量升级为 44，增加 `rooms.room_kind` 与 append-only `room_runtime_events`。默认 `chat` 房间和全部旧消息、通知、任务、connector、listener 与 TUI 语义不变；管理员或获准建房的 Web 用户可显式创建 `integration` 整合聊天室，每个房间只允许一个稳定 Agent 身份，但同一身份仍可重连多个 seat/session。整合房间固定使用结构化任务输入，Claude Code 任务席把同一个持久 `stream-json` session 的可见模型文本、工具开始/完成/失败、权限等待、错误与回合完成按顺序投影到 Web；隐藏思考、原始事件和常见密钥不会入库，投影失败也不会中断本机任务。简洁、标准和详细布局都保留投影，普通聊天室不增加运行事件或重复最终聊天消息。`192.168.1.10` 上 Claude Code 2.1.195 + MiniMax-M2.7 的隔离真机验证完成只读 Bash/Read 任务，并以同一 native session 续接第二轮；证据见 [integration-room-claude-demo-v0.45.0-2026-08-22.json](evidence/integration-room-claude-demo-v0.45.0-2026-08-22.json)。
 
 v0.44.1 不变更 schema、HTTP/MCP API、消息分页、Agent 投递或房间权限。Web 时间线在已加载消息超过 120 条时启用独立 `app-timeline-virtualizer.js`，保留完整消息数组但同时只创建 96 个消息节点；上下占位使用可见行实测高度，窗口换段、旧消息前插、图片延迟撑高、三档密度和可拖动宽度都保持首个可见消息锚点。搜索结果仍读取目标附近 60 条并居中，回执仍原位更新可见节点，房间 LRU 快照只缓存有界 DOM 与该房间自己的高度表；从远历史一键回最新会先切到末尾窗口，避免超长平滑动画被换段中断。在最新消息位置执行全量刷新时，最近 60 条服务端窗口会合并进已有连续历史，不再因刷新快慢把已加载的千条历史裁回 60 条；处于有后续消息的历史搜索窗口时仍沿用显式回到最新窗口的旧行为。真实 Chrome 用 1260 条历史验证 DOM 始终不超过 96、刷新保留历史、切房恢复与 390px 布局不回退，见 [web-virtual-timeline-v0.44.1-2026-08-19.json](evidence/web-virtual-timeline-v0.44.1-2026-08-19.json)。发布仍只滚动 Viewer，不重启 Agent、listener、task worker、connector 或原生 TUI。
 

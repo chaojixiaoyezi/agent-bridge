@@ -165,6 +165,14 @@ class ViewerMessageQueries(ViewerDeliveryProjectionMixin, MessageAssetMixin):
                 connection,
                 [str(row["message_id"]) for row in rows],
             )
+            runtime_projections = self._room_runtime_event_projection_locked(
+                connection,
+                [
+                    str(row["room_task_id"])
+                    for row in rows
+                    if row["room_task_id"] is not None
+                ],
+            )
         ordered_rows = (
             rows
             if after_sequence is not None or around_sequence is not None
@@ -175,7 +183,86 @@ class ViewerMessageQueries(ViewerDeliveryProjectionMixin, MessageAssetMixin):
             payload = self._message_payload(row)
             payload.update(projections[str(row["message_id"])])
             payload.update(delivery_projections[str(row["message_id"])])
+            if payload.get("task"):
+                payload["task"].update(
+                    runtime_projections.get(
+                        str(payload["task"]["task_id"]),
+                        {
+                            "runtime_events": [],
+                            "runtime_event_count": 0,
+                            "runtime_events_truncated": False,
+                        },
+                    )
+                )
             result.append(payload)
+        return result
+
+    @staticmethod
+    def _room_runtime_event_projection_locked(
+        connection: sqlite3.Connection,
+        task_ids: list[str],
+        *,
+        per_task_limit: int = 240,
+    ) -> dict[str, dict[str, Any]]:
+        normalized = list(dict.fromkeys(task_ids))
+        if not normalized:
+            return {}
+        placeholders = ",".join("?" for _ in normalized)
+        rows = connection.execute(
+            f"""
+            SELECT * FROM (
+                SELECT event.*,
+                       COUNT(*) OVER (PARTITION BY event.task_id) AS event_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY event.task_id
+                           ORDER BY event.event_sequence DESC
+                       ) AS event_rank
+                FROM room_runtime_events AS event
+                WHERE event.task_id IN ({placeholders})
+            )
+            WHERE event_rank <= ?
+            ORDER BY event_sequence
+            """,
+            (*normalized, max(1, min(int(per_task_limit), 500))),
+        ).fetchall()
+        result = {
+            task_id: {
+                "runtime_events": [],
+                "runtime_event_count": 0,
+                "runtime_events_truncated": False,
+            }
+            for task_id in normalized
+        }
+        for row in rows:
+            task_id = str(row["task_id"])
+            event_count = int(row["event_count"] or 0)
+            result[task_id]["runtime_event_count"] = event_count
+            result[task_id]["runtime_events_truncated"] = event_count > per_task_limit
+            result[task_id]["runtime_events"].append(
+                {
+                    "event_sequence": int(row["event_sequence"]),
+                    "event_id": str(row["event_id"]),
+                    "source": str(row["source"]),
+                    "native_session_id": (
+                        str(row["native_session_id"])
+                        if row["native_session_id"] is not None
+                        else None
+                    ),
+                    "event_kind": str(row["event_kind"]),
+                    "tool_use_id": (
+                        str(row["tool_use_id"])
+                        if row["tool_use_id"] is not None
+                        else None
+                    ),
+                    "tool_name": (
+                        str(row["tool_name"])
+                        if row["tool_name"] is not None
+                        else None
+                    ),
+                    "summary": str(row["summary"] or ""),
+                    "created_at": float(row["created_at"]),
+                }
+            )
         return result
 
     def message_thread(

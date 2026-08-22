@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,46 @@ from .tui_adapter import (
     endpoint_turn_lock,
     load_native_tui_binding,
 )
+
+
+class _RuntimeEventReporter:
+    """Best-effort ordered delivery without coupling local work to Viewer uptime."""
+
+    def __init__(self, client: Any, *, task_id: str, source: str) -> None:
+        self.client = client
+        self.task_id = task_id
+        self.source = source
+        self.pending: list[dict[str, Any]] = []
+        self.terminal_emitted = False
+
+    def emit(self, event: dict[str, Any]) -> None:
+        event_kind = str(event.get("event_kind") or "")
+        if event_kind in {"approval_required", "turn_completed", "runtime_error"}:
+            self.terminal_emitted = True
+        self.pending.append(
+            {
+                "task_id": self.task_id,
+                "event_id": f"runtime_{uuid.uuid4().hex}",
+                "source": self.source,
+                "event_kind": event_kind,
+                "native_session_id": event.get("native_session_id"),
+                "tool_use_id": event.get("tool_use_id"),
+                "tool_name": event.get("tool_name"),
+                "summary": event.get("summary"),
+            }
+        )
+        self.flush()
+
+    def flush(self) -> None:
+        while self.pending:
+            try:
+                self.client.post(
+                    "/agent/tasks/runtime-events",
+                    self.pending[0],
+                )
+            except Exception:
+                return
+            self.pending.pop(0)
 
 
 def run_worker(args: argparse.Namespace) -> None:
@@ -162,6 +203,16 @@ def run_worker(args: argparse.Namespace) -> None:
                     return
                 continue
             task_id = str(task["task_id"])
+            room_kind = str(task.get("room_kind") or "chat")
+            runtime_reporter = (
+                _RuntimeEventReporter(
+                    client,
+                    task_id=task_id,
+                    source="claude-code",
+                )
+                if room_kind == "integration" and adapter == "claude-code"
+                else None
+            )
             context_messages: list[dict[str, Any]] = []
             source_sequence = task.get("source_sequence")
             if source_sequence is not None:
@@ -274,6 +325,11 @@ def run_worker(args: argparse.Namespace) -> None:
                         ),
                         environment=environment,
                         poll_inputs=poll_task_inputs,
+                        on_runtime_event=(
+                            runtime_reporter.emit
+                            if runtime_reporter is not None
+                            else None
+                        ),
                     )
                 elif adapter in NATIVE_TUI_ADAPTERS:
                     if (
@@ -339,6 +395,8 @@ def run_worker(args: argparse.Namespace) -> None:
                             "input_ids": applied_input_ids,
                         },
                     )
+                if runtime_reporter is not None:
+                    runtime_reporter.flush()
                 terminal = client.post(
                     "/agent/tasks/update",
                     {
@@ -349,7 +407,10 @@ def run_worker(args: argparse.Namespace) -> None:
                         "execution_thread_id": thread_id,
                     },
                 )
-                if str((terminal.get("task") or {}).get("status")) == "completed":
+                if (
+                    room_kind != "integration"
+                    and str((terminal.get("task") or {}).get("status")) == "completed"
+                ):
                     source_message = str(task.get("source_message_id") or "")
                     try:
                         client.post(
@@ -387,6 +448,21 @@ def run_worker(args: argparse.Namespace) -> None:
                         )
                         else "failed"
                     )
+                    if (
+                        runtime_reporter is not None
+                        and not runtime_reporter.terminal_emitted
+                    ):
+                        runtime_reporter.emit(
+                            {
+                                "event_kind": (
+                                    "approval_required"
+                                    if terminal_status == "needs_input"
+                                    else "runtime_error"
+                                ),
+                                "summary": error_text[:2_000],
+                            }
+                        )
+                        runtime_reporter.flush()
                     client.post(
                         "/agent/tasks/update",
                         {

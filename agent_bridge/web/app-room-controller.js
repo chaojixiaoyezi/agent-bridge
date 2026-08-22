@@ -9,7 +9,13 @@ function roomCreator(room) {
 }
 
 function updateComposer(room) {
-  const canSpeak = Boolean(room && room.status === "active");
+  const integrationRoom = room?.room_kind === "integration";
+  if (integrationRoom) state.composerMode = "task";
+  const canSpeak = Boolean(
+    room
+    && room.status === "active"
+    && (!integrationRoom || room.can_assign_tasks),
+  );
   if (state.composerMode === "task" && !room?.can_assign_tasks) {
     state.composerMode = "chat";
   }
@@ -18,18 +24,24 @@ function updateComposer(room) {
   elements.sendOwnerMessage.disabled = !canSpeak;
   elements.chooseComposerFiles.disabled = !canSpeak || state.composerMode === "task";
   elements.toggleComposerLink.disabled = !canSpeak || state.composerMode === "task";
+  elements.composerChatMode.hidden = integrationRoom;
   elements.composerTaskMode.hidden = !(canSpeak && room?.can_assign_tasks);
+  elements.composerTaskMode.textContent = integrationRoom ? "TUI 指令" : "本体任务";
   elements.composerTaskMode.disabled = Boolean(
     state.composerAttachments.length || state.composerLinks.length,
   );
   elements.composerChatMode.classList.toggle("active", state.composerMode === "chat");
   elements.composerTaskMode.classList.toggle("active", state.composerMode === "task");
-  elements.sendOwnerMessage.textContent = state.composerMode === "task" ? "提交任务" : "发送";
+  elements.sendOwnerMessage.textContent = integrationRoom
+    ? "发送到 Agent"
+    : state.composerMode === "task" ? "提交任务" : "发送";
   elements.wakeAllAgents.hidden = !(
     canSpeak && room?.can_wake_all && state.composerMode === "chat"
   );
   elements.ownerMessageBody.placeholder = canSpeak
-    ? state.composerMode === "task"
+    ? integrationRoom
+      ? "像在 Claude Code TUI 中一样布置工作；本机工作目录和权限保持不变…"
+      : state.composerMode === "task"
       ? "描述要完成的任务；@ Agent 可指定候选，不 @ 则由群内一个 Agent 先领取并按需分工…"
       : `${state.currentUser?.display_name || "Web 用户"}发言（${isAdmin() ? "不限频" : `每个房间间隔 ${formatCooldown(effectiveCooldown)}`}）；Enter 发送，Shift+Enter 换行…`
     : room ? "废弃聊天室仅保留历史，不能继续发言。" : "先选择一个使用中的聊天室。";
@@ -372,11 +384,17 @@ function renderActiveRoomHeader(roomId = state.selectedRoom) {
   elements.roomMessageSearchAdvanced.classList.toggle("disabled", !searchable);
   elements.roomTitle.textContent = roomId || "未选择聊天室";
   const abandoned = activeRoom?.status === "abandoned";
-  elements.roomRoute.textContent = abandoned ? "已废弃 · 仅浏览历史" : "当前聊天室 · 实时消息";
+  const integrationRoom = activeRoom?.room_kind === "integration";
+  elements.workspace.classList.toggle("integration-room", integrationRoom);
+  elements.roomRoute.textContent = abandoned
+    ? "已废弃 · 仅浏览历史"
+    : integrationRoom ? "INTEGRATION ROOM · TUI LIVE VIEW" : "当前聊天室 · 实时消息";
   elements.roomSummary.textContent = activeRoom
     ? abandoned
       ? `已废弃，Agent 不可进入 · ${activeRoom.participant_count} 个历史会话 · ${activeRoom.message_count} 条消息永久保留`
-      : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
+      : integrationRoom
+        ? `${roomCreator(activeRoom)} · 单 Agent 本体会话 · Claude Code 可见输出与工具过程持久投影`
+        : `${roomCreator(activeRoom)} · ${Number(activeRoom.current_participant_count ?? activeRoom.participant_count ?? 0)} 个会话 · ${activeRoom.message_count} 条持久消息`
     : "本机聊天室";
   updateComposer(activeRoom);
   applyUserPermissions();

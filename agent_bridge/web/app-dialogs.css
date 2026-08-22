@@ -100,6 +100,49 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }
+.room-kind-picker {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin: 17px 0 2px;
+  padding: 0;
+  border: 0;
+}
+.room-kind-picker legend {
+  grid-column: 1 / -1;
+  margin-bottom: 1px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 650;
+}
+.room-kind-option {
+  position: relative;
+  display: block;
+  min-height: 78px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+.room-kind-option input { position: absolute; opacity: 0; pointer-events: none; }
+.room-kind-option span { display: grid; gap: 7px; }
+.room-kind-option strong { color: var(--text); font-size: 11px; }
+.room-kind-option small { color: var(--muted); font-size: 9px; line-height: 1.5; }
+.room-kind-option b {
+  margin-left: 4px;
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: var(--cyan);
+  background: var(--cyan-soft);
+  font-size: 7px;
+  letter-spacing: .08em;
+}
+.room-kind-option:has(input:checked) {
+  border-color: color-mix(in srgb, var(--cyan) 52%, var(--line));
+  background: color-mix(in srgb, var(--cyan) 8%, var(--surface-soft));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--cyan) 12%, transparent);
+}
 .access-field { margin-top: 14px; }
 .rate-dialog {
   width: min(760px, calc(100vw - 32px));

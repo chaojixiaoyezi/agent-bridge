@@ -215,6 +215,11 @@ class AgentSessionMixin:
                     now=now,
                 )
 
+        self._assert_integration_agent_slot_locked(
+            conn,
+            conversation_id=conversation,
+            participant_id=participant_id,
+        )
         conn.execute(
             """
             INSERT INTO memberships

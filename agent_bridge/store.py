@@ -132,6 +132,7 @@ from .room_governance import (
     ROOM_KNOWLEDGE_SCHEMA,
     RoomGovernanceMixin,
 )
+from .room_runtime import ROOM_RUNTIME_SCHEMA, RoomRuntimeMixin
 from .room_tasks import ROOM_TASK_SCHEMA, RoomTaskMixin
 from .runtime_coordination import RUNTIME_COORDINATION_SCHEMA, RuntimeCoordinationMixin
 from .session_authority import SessionAuthorityMixin
@@ -182,6 +183,7 @@ class BridgeStore(
     AgentSessionMixin,
     NativeSessionMixin,
     RoomGovernanceMixin,
+    RoomRuntimeMixin,
     RoomTaskMixin,
 ):
     _history_conflict_error = ConflictError
@@ -256,6 +258,16 @@ class BridgeStore(
             schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             self._migrate_invited_sessions(conn)
             conn.executescript(SCHEMA)
+            room_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(rooms)").fetchall()
+            }
+            if "room_kind" not in room_columns:
+                conn.execute(
+                    "ALTER TABLE rooms ADD COLUMN room_kind TEXT "
+                    "NOT NULL DEFAULT 'chat' "
+                    "CHECK (room_kind IN ('chat', 'integration'))"
+                )
             participant_columns = {
                 str(row["name"])
                 for row in conn.execute("PRAGMA table_info(participants)").fetchall()
@@ -398,6 +410,7 @@ class BridgeStore(
             conn.executescript(ROOM_KNOWLEDGE_SCHEMA)
             conn.executescript(ROOM_WAKE_POLICY_SCHEMA)
             conn.executescript(ROOM_TASK_SCHEMA)
+            conn.executescript(ROOM_RUNTIME_SCHEMA)
             if schema_version < 30:
                 self._backfill_room_web_members(conn)
             task_columns = {
@@ -584,7 +597,7 @@ class BridgeStore(
                     "OR instr(reasons_json, '\"agent_mention\"') > 0)"
                 )
             self._archive_stale_rooms_locked(conn, now=time.time())
-            conn.execute("PRAGMA user_version = 43")
+            conn.execute("PRAGMA user_version = 44")
             conn.execute("PRAGMA optimize")
         try:
             os.chmod(self.database, 0o600)

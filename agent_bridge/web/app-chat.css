@@ -926,6 +926,93 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .task-badge { padding: 3px 7px; border: 1px solid color-mix(in srgb, var(--amber) 28%, transparent); border-radius: 999px; color: var(--amber); background: color-mix(in srgb, var(--amber) 9%, transparent); font-size: 8px; font-weight: 750; }
 .task-card { margin-top: 10px; padding: 10px 11px; border: 1px solid color-mix(in srgb, var(--amber) 22%, var(--line)); border-radius: 11px; background: color-mix(in srgb, var(--amber) 5%, var(--surface-soft)); }
 .task-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 9px; }
+.integration-room-badge {
+  flex: none;
+  margin-left: 7px;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, #c99cff 34%, var(--line));
+  border-radius: 999px;
+  color: #9f6ce2;
+  background: color-mix(in srgb, #c99cff 11%, transparent);
+  font-size: 7px;
+  font-weight: 750;
+  letter-spacing: .12em;
+}
+.workspace.integration-room .message { max-width: min(1040px, 96%); }
+.workspace.integration-room .task-card {
+  padding: 11px;
+  border-color: color-mix(in srgb, #9c6ee8 28%, var(--line));
+  background: color-mix(in srgb, #9c6ee8 4%, var(--surface-soft));
+}
+.task-runtime-projection {
+  margin-top: 11px;
+  overflow: hidden;
+  border: 1px solid rgba(163, 174, 196, .18);
+  border-radius: 13px;
+  color: #e8e9ee;
+  background:
+    radial-gradient(circle at 88% 0%, rgba(124, 92, 180, .16), transparent 34%),
+    #17191f;
+  box-shadow: 0 14px 34px rgba(9, 10, 14, .16);
+}
+.task-runtime-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 12px;
+  border-bottom: 1px solid rgba(255,255,255,.07);
+  background: rgba(23,25,31,.94);
+  backdrop-filter: blur(12px);
+  font: 9px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.task-runtime-header strong { color: #f3f0f8; font-size: 10px; }
+.task-runtime-header > span:last-child { margin-left: auto; color: #858b98; }
+.task-runtime-dots { display: flex; gap: 4px; }
+.task-runtime-dots i { width: 6px; height: 6px; border-radius: 50%; background: #5c616d; }
+.task-runtime-dots i:first-child { background: #d46f76; }
+.task-runtime-dots i:nth-child(2) { background: #d6a35b; }
+.task-runtime-dots i:last-child { background: #6eaa80; }
+.task-runtime-stream {
+  max-height: min(620px, 65vh);
+  overflow-y: auto;
+  padding: 9px 0 11px;
+  scrollbar-color: rgba(186,170,215,.34) transparent;
+}
+.task-runtime-event {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 2px;
+  padding: 7px 13px;
+  font: 10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.task-runtime-event + .task-runtime-event { border-top: 1px solid rgba(255,255,255,.035); }
+.task-runtime-mark { padding-top: 1px; color: #8d929e; text-align: center; }
+.task-runtime-event.tool_started .task-runtime-mark { color: #d4a5ff; }
+.task-runtime-event.tool_completed .task-runtime-mark,
+.task-runtime-event.turn_completed .task-runtime-mark { color: #72c594; }
+.task-runtime-event.tool_failed .task-runtime-mark,
+.task-runtime-event.runtime_error .task-runtime-mark { color: #ee7e88; }
+.task-runtime-event.approval_required .task-runtime-mark { color: #e3b460; }
+.task-runtime-event-body { min-width: 0; }
+.task-runtime-event-head { display: flex; align-items: baseline; gap: 10px; }
+.task-runtime-event-head strong { color: #dfe1e8; font-weight: 650; }
+.task-runtime-event-head time { margin-left: auto; color: #6f7480; font-size: 8px; }
+.task-runtime-event pre,
+.task-runtime-assistant {
+  margin: 5px 0 0;
+  color: #aeb3bf;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.task-runtime-assistant { margin: 0; color: #eef0f4; line-height: 1.7; }
+.task-runtime-event.assistant_text { padding-top: 10px; padding-bottom: 10px; }
+.task-runtime-event.assistant_text .task-runtime-mark { color: #bd8bef; }
+.task-runtime-truncated { margin: 0 13px 7px; color: #858b98; font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-status { color: var(--amber); font-weight: 750; }
 .task-status.completed { color: var(--cyan); }
 .task-status.failed, .task-status.cancelled { color: var(--danger); }
@@ -1130,6 +1217,10 @@ body.layout-resizing-rows .composer-resizer span { width: 92px; background: var(
 .workspace.simple-view .message-head .sender-line > :not(.message-avatar):not(strong),
 .workspace.simple-view .message > :not(.message-head):not(.message-body):not(.message-assets):not(.message-links):not(.message-direct-reply) {
   display: none !important;
+}
+#workspace.simple-view.integration-room .message > .task-card {
+  display: block !important;
+  margin-left: 40px;
 }
 .workspace.simple-view .message-body { margin-left: 40px; font-size: 13px; line-height: 1.58; }
 .workspace.simple-view .message-assets,

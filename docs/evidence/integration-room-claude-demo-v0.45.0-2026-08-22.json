@@ -1,0 +1,82 @@
+{
+  "release": "v0.45.0",
+  "date": "2026-08-22",
+  "baseline_commit": "c87875fa467cd76b54723865bf328c615f5854ca",
+  "scope": [
+    "additive room_kind=integration room contract",
+    "one stable Agent identity per integration room",
+    "durable append-only Claude Code visible runtime events",
+    "Web TUI-style task and tool projection",
+    "normal chat rooms remain on the existing path"
+  ],
+  "local_verification": {
+    "full_pytest": {
+      "passed": 354,
+      "skipped": 2
+    },
+    "playwright_browser_e2e": {
+      "passed": 1,
+      "browser": "Playwright Chromium 151"
+    },
+    "interactive_browser_demo": {
+      "room_creation": "passed",
+      "forced_tui_task_mode": "passed",
+      "simple_layout_projection_visible": "passed",
+      "assistant_tool_and_terminal_events_visible": "passed"
+    },
+    "static_checks": [
+      "ruff",
+      "node --check",
+      "compileall",
+      "git diff --check"
+    ]
+  },
+  "migration_rehearsal": {
+    "source_snapshot": "v0.44.9",
+    "schema_before": 43,
+    "schema_after": 44,
+    "counts_preserved": true,
+    "live_database_modified": false,
+    "restored_attachment_count": 1,
+    "verified_artifacts": 18
+  },
+  "real_claude_code_demo": {
+    "host": "192.168.1.10",
+    "isolated_from_production_database": true,
+    "claude_code_version": "2.1.195",
+    "model": "MiniMax-M2.7",
+    "bridge_transport": "invitation-pinned private HTTP test endpoint",
+    "first_turn": {
+      "status": "completed",
+      "duration_seconds": 13.06,
+      "visible_tools": [
+        "agent_history",
+        "Bash",
+        "Read"
+      ],
+      "verified_pwd": "/tmp/agent-bridge-integration-demo-20260822/project",
+      "verified_first_line": "# Agent Bridge"
+    },
+    "resume_turn": {
+      "status": "completed",
+      "duration_seconds": 9.89,
+      "same_native_session_as_first_turn": true,
+      "reused_prior_file_result_without_read_or_bash": true
+    },
+    "model_polling_timer_created": false,
+    "hidden_reasoning_persisted": false,
+    "secret_values_persisted_in_runtime_events": false
+  },
+  "negative_paths_observed": [
+    "invalid MiniMax credentials project as a runtime error",
+    "Claude root bypassPermissions refusal projects as approval_required",
+    "reused runtime event ids with different payloads fail closed"
+  ],
+  "upgrade_boundary": {
+    "database_changes": "additive only",
+    "existing_room_kind_default": "chat",
+    "existing_agent_restart_required": false,
+    "viewer_rolling_restart_required": true,
+    "integration_runtime_worker_upgrade": "required only for Agents used by integration rooms"
+  }
+}

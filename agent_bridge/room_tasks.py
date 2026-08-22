@@ -980,10 +980,12 @@ class RoomTaskMixin:
                     )
             if direct_tui:
                 existing = conn.execute(
-                    "SELECT * FROM room_tasks WHERE conversation_id = ? "
-                    "AND claimed_by_participant_id = ? "
-                    "AND status IN ('claimed', 'running') "
-                    "ORDER BY claimed_at, created_at, task_id LIMIT 1",
+                    "SELECT task.*, room.room_kind FROM room_tasks AS task "
+                    "JOIN rooms AS room ON room.conversation_id = task.conversation_id "
+                    "WHERE task.conversation_id = ? "
+                    "AND task.claimed_by_participant_id = ? "
+                    "AND task.status IN ('claimed', 'running') "
+                    "ORDER BY task.claimed_at, task.created_at, task.task_id LIMIT 1",
                     (conversation, participant),
                 ).fetchone()
                 if existing is not None:
@@ -996,13 +998,19 @@ class RoomTaskMixin:
                         ),
                     )
                     recovered = conn.execute(
-                        "SELECT * FROM room_tasks WHERE task_id = ?",
+                        "SELECT task.*, room.room_kind FROM room_tasks AS task "
+                        "JOIN rooms AS room "
+                        "ON room.conversation_id = task.conversation_id "
+                        "WHERE task.task_id = ?",
                         (str(existing["task_id"]),),
                     ).fetchone()
                     return self._task_payload(recovered)
             candidates = conn.execute(
-                "SELECT * FROM room_tasks WHERE conversation_id = ? "
-                "AND status = 'queued' ORDER BY created_at, task_id LIMIT 100",
+                "SELECT task.*, room.room_kind FROM room_tasks AS task "
+                "JOIN rooms AS room ON room.conversation_id = task.conversation_id "
+                "WHERE task.conversation_id = ? "
+                "AND task.status = 'queued' "
+                "ORDER BY task.created_at, task.task_id LIMIT 100",
                 (conversation,),
             ).fetchall()
             selected = next(
@@ -1032,7 +1040,10 @@ class RoomTaskMixin:
             if changed != 1:
                 return None
             updated = conn.execute(
-                "SELECT * FROM room_tasks WHERE task_id = ?",
+                "SELECT task.*, room.room_kind FROM room_tasks AS task "
+                "JOIN rooms AS room "
+                "ON room.conversation_id = task.conversation_id "
+                "WHERE task.task_id = ?",
                 (str(selected["task_id"]),),
             ).fetchone()
         return self._task_payload(updated)
@@ -1460,6 +1471,11 @@ class RoomTaskMixin:
                 str(row["target_participant_ids_json"] or "[]")
             ),
             "body": str(row["body"]),
+            "room_kind": (
+                str(row["room_kind"])
+                if "room_kind" in row.keys() and row["room_kind"] is not None
+                else "chat"
+            ),
             "status": str(row["status"]),
             "claimed_by_participant_id": (
                 str(row["claimed_by_participant_id"])

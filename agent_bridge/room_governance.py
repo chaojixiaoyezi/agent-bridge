@@ -23,6 +23,7 @@ from .store_errors import (
     ConflictError,
     NotFoundError,
 )
+from .room_runtime import normalize_room_kind
 from .validation import (
     ValidationError,
     alias,
@@ -343,6 +344,11 @@ class RoomGovernanceMixin:
                     "cannot be joined"
                 )
 
+            self._assert_integration_agent_slot_locked(
+                conn,
+                conversation_id=normalized_conversation,
+                participant_id=participant_id,
+            )
             conn.execute(
                 """
                 INSERT INTO memberships
@@ -384,9 +390,15 @@ class RoomGovernanceMixin:
             "owned_active_room_limit": AGENT_ACTIVE_ROOM_LIMIT,
         }
 
-    def create_user_room(self, conversation_id: str) -> dict[str, Any]:
+    def create_user_room(
+        self,
+        conversation_id: str,
+        *,
+        room_kind: str = "chat",
+    ) -> dict[str, Any]:
         """Create an owner-managed room without consuming an agent quota."""
         conversation = validate_conversation_id(conversation_id)
+        normalized_room_kind = normalize_room_kind(room_kind)
         now = time.time()
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
@@ -402,14 +414,15 @@ class RoomGovernanceMixin:
             conn.execute(
                 """
                 INSERT INTO rooms
-                    (conversation_id, status, creator_kind,
+                    (conversation_id, room_kind, status, creator_kind,
                      creator_participant_id, created_at, last_activity_at)
-                VALUES (?, 'active', 'user', NULL, ?, ?)
+                VALUES (?, ?, 'active', 'user', NULL, ?, ?)
                 """,
-                (conversation, now, now),
+                (conversation, normalized_room_kind, now, now),
             )
         return {
             "conversation_id": conversation,
+            "room_kind": normalized_room_kind,
             "status": "active",
             "creator_kind": "user",
             "created_at": now,
@@ -423,6 +436,7 @@ class RoomGovernanceMixin:
         web_user_id: str,
         participant_id: str,
         conversation_id: str,
+        room_kind: str = "chat",
     ) -> dict[str, Any]:
         """Create a Web-owned room under an authenticated account permission."""
 
@@ -433,6 +447,7 @@ class RoomGovernanceMixin:
         user_id = opaque_id(web_user_id, field="web_user_id")
         participant = opaque_id(participant_id, field="participant_id")
         conversation = validate_conversation_id(conversation_id)
+        normalized_room_kind = normalize_room_kind(room_kind)
         now = time.time()
         with self._transaction() as conn:
             self._archive_stale_rooms_locked(conn, now=now)
@@ -474,10 +489,10 @@ class RoomGovernanceMixin:
                 )
             conn.execute(
                 "INSERT INTO rooms "
-                "(conversation_id, status, creator_kind, creator_participant_id, "
+                "(conversation_id, room_kind, status, creator_kind, creator_participant_id, "
                 "created_at, last_activity_at) "
-                "VALUES (?, 'active', 'user', NULL, ?, ?)",
-                (conversation, now, now),
+                "VALUES (?, ?, 'active', 'user', NULL, ?, ?)",
+                (conversation, normalized_room_kind, now, now),
             )
             conn.execute(
                 "INSERT INTO room_web_owners "
@@ -503,6 +518,7 @@ class RoomGovernanceMixin:
             owned_count += 1
         return {
             "conversation_id": conversation,
+            "room_kind": normalized_room_kind,
             "status": "active",
             "creator_kind": "user",
             "owner_web_user_id": user_id,
@@ -1220,6 +1236,7 @@ class RoomGovernanceMixin:
                 "room_task_grants",
                 "room_wake_policies",
                 "room_tasks",
+                "room_runtime_events",
                 "chat_authorization_grants",
                 "a2a_access_grants",
             ):

@@ -718,6 +718,7 @@ elements.createRoomForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!elements.createRoomForm.reportValidity()) return;
   const conversationId = elements.newRoomId.value.trim();
+  const roomKind = elements.newRoomKinds.find((item) => item.checked)?.value || "chat";
   elements.submitCreateRoom.disabled = true;
   elements.createRoomFeedback.classList.remove("error", "success");
   elements.createRoomFeedback.textContent = "正在创建…";
@@ -728,7 +729,7 @@ elements.createRoomForm.addEventListener("submit", async (event) => {
         "Content-Type": "application/json",
         "X-Agent-Bridge-Intent": "create-room",
       },
-      body: JSON.stringify({ conversation_id: conversationId }),
+      body: JSON.stringify({ conversation_id: conversationId, room_kind: roomKind }),
     });
     state.selectedRoom = payload.room.conversation_id;
     state.roomSnapshots.delete(state.selectedRoom);
@@ -880,7 +881,9 @@ elements.ownerMessageForm.addEventListener("submit", async (event) => {
     return;
   }
   const slashTask = message.trimStart().startsWith("/任务");
-  const taskMode = state.composerMode === "task" || slashTask;
+  const taskMode = activeRoom.room_kind === "integration"
+    || state.composerMode === "task"
+    || slashTask;
   if (taskMode && !activeRoom.can_assign_tasks) {
     elements.ownerMessageFeedback.classList.add("error");
     elements.ownerMessageFeedback.textContent = "你没有在这个聊天室布置任务的权限。";
@@ -1082,6 +1085,20 @@ elements.ownerMessageBody.addEventListener("paste", (event) => {
 elements.ownerMessageBody.addEventListener("click", updateMentionMenu);
 elements.ownerMessageBody.addEventListener("blur", () => window.setTimeout(hideMentionMenu, 120));
 
+function syncAgentAccessPolicyForRoom() {
+  const room = state.rooms.find(
+    (item) => item.conversation_id === elements.accessRoom.value,
+  );
+  const integrationRoom = room?.room_kind === "integration";
+  const reusableOption = [...elements.agentAccessPolicy.options]
+    .find((option) => option.value === "reusable");
+  if (reusableOption) reusableOption.disabled = integrationRoom;
+  if (integrationRoom) elements.agentAccessPolicy.value = "single";
+  elements.agentAccessPolicyHelp.textContent = integrationRoom
+    ? "整合聊天室只允许一个 Agent，因此固定生成单次邀请；断线重连继续使用该 Agent 已获得的 connector 凭据。"
+    : "多人复用时，每个 Agent 都会获得独立连接凭据；邀请到期后不能新增接入，管理员撤销会停用该邀请签发的全部连接。Codex、Claude Code、DeepSeek Harness、OpenCode、Hermes、Pi 和 Qwen Code 支持常驻接入；稳定身份、签名、职责、工作目录与当前 TUI 绑定都由 Agent 在接受时填写，网页用户只需选择产品。";
+}
+
 async function openAgentAccessDialog(roomId = null) {
   const room = state.rooms.find((item) => item.conversation_id === roomId);
   if (!isAdmin() && !room?.can_invite_agents) return;
@@ -1094,6 +1111,7 @@ async function openAgentAccessDialog(roomId = null) {
   if (roomId && [...elements.accessRoom.options].some((option) => option.value === roomId)) {
     elements.accessRoom.value = roomId;
   }
+  syncAgentAccessPolicyForRoom();
   renderSessions();
   renderAgentInvitations();
   renderConnectorHealth();
@@ -1173,6 +1191,7 @@ elements.agentAccessDialog.addEventListener("click", (event) => {
   if (event.target === elements.agentAccessDialog) closeAgentAccessDialog();
 });
 elements.accessRoom.addEventListener("change", async () => {
+  syncAgentAccessPolicyForRoom();
   if (isAdmin()) return;
   try {
     const payload = await fetchAgentInvitations(elements.accessRoom.value);
@@ -1191,7 +1210,11 @@ elements.agentAccessForm.addEventListener("submit", async (event) => {
   const room = elements.accessRoom.value;
   const product = elements.accessProduct.value.trim();
   const mode = elements.accessMode.value;
-  const reusable = elements.agentAccessPolicy.value === "reusable";
+  const selectedRoom = state.rooms.find(
+    (item) => item.conversation_id === room,
+  );
+  const reusable = selectedRoom?.room_kind !== "integration"
+    && elements.agentAccessPolicy.value === "reusable";
   elements.generateAccess.disabled = true;
   elements.accessFeedback.classList.remove("error", "success");
   elements.accessFeedback.textContent = "正在生成…";
@@ -1298,7 +1321,14 @@ function refreshModeForEvent(changedFacets) {
   const onlyContains = (allowed) => [...changed].every((item) => allowed.has(item));
   if (changed.size === 1 && changed.has("receipts")) return "receipt";
   if (onlyContains(new Set(["messages", "rooms", "receipts", "highlights"]))) return "room";
-  if (onlyContains(new Set(["messages", "rooms", "tasks", "receipts", "highlights"]))) return "task";
+  if (onlyContains(new Set([
+    "messages",
+    "rooms",
+    "tasks",
+    "runtime_events",
+    "receipts",
+    "highlights",
+  ]))) return "task";
   if (["participants", "memberships", "online", "sessions", "connectors", "monitoring"].some(
     (facet) => changed.has(facet),
   )) {

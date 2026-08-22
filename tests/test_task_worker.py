@@ -7,6 +7,7 @@ from typing import Any
 
 import agent_bridge.task_worker as task_worker
 import agent_bridge.task_worker_codex as task_worker_codex
+import pytest
 from agent_bridge.http_client import BridgeRemoteError
 from agent_bridge.task_worker import (
     TASK_MCP_TOOLS,
@@ -261,6 +262,107 @@ for line in sys.stdin:
     assert (tmp_path / "claude-task-session").read_text(
         encoding="utf-8"
     ).strip() == session_id
+
+
+def test_claude_streaming_task_projects_visible_text_and_redacted_tool_events(
+    tmp_path: Path,
+) -> None:
+    fake_claude = tmp_path / "fake-claude-runtime"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    print(json.dumps({
+        "type": "assistant",
+        "message": {"content": [
+            {"type": "text", "text": "我先运行测试。"},
+            {"type": "tool_use", "id": "tool-1", "name": "Bash",
+             "input": {"command": "API_KEY=secret-value python -m pytest -q"}},
+        ]},
+    }), flush=True)
+    print(json.dumps({
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tool-1",
+             "content": "all passed sk-secretvalue12345"},
+        ]},
+    }), flush=True)
+    print(json.dumps({
+        "type": "result", "subtype": "success", "result": "测试通过。",
+        "duration_ms": 1250, "num_turns": 1,
+    }), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    events: list[dict[str, Any]] = []
+
+    summary, _session_id, _applied = _run_claude_task(
+        prompt="运行测试。",
+        cwd=tmp_path,
+        state_file=tmp_path / "claude-runtime-session",
+        binary=str(fake_claude),
+        mcp_config={},
+        environment=dict(os.environ),
+        on_runtime_event=events.append,
+    )
+
+    assert summary == "测试通过。"
+    assert [event["event_kind"] for event in events] == [
+        "turn_started",
+        "assistant_text",
+        "tool_started",
+        "tool_completed",
+        "turn_completed",
+    ]
+    assert events[1]["summary"] == "我先运行测试。"
+    assert events[2]["tool_name"] == "Bash"
+    assert "secret-value" not in events[2]["summary"]
+    assert "<redacted>" in events[2]["summary"]
+    assert "secretvalue" not in events[3]["summary"]
+    assert "<redacted-key>" in events[3]["summary"]
+
+
+def test_claude_runtime_failure_projects_one_terminal_event(tmp_path: Path) -> None:
+    fake_claude = tmp_path / "fake-claude-runtime-failure"
+    fake_claude.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    print(json.dumps({
+        "type": "result", "subtype": "error", "is_error": True,
+        "result": "permission denied by local TUI",
+    }), flush=True)
+    raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    fake_claude.chmod(0o755)
+    events: list[dict[str, Any]] = []
+
+    with pytest.raises(task_worker.TaskWorkerError):
+        _run_claude_task(
+            prompt="需要本机审批。",
+            cwd=tmp_path,
+            state_file=tmp_path / "claude-runtime-failure-session",
+            binary=str(fake_claude),
+            mcp_config={},
+            environment=dict(os.environ),
+            on_runtime_event=events.append,
+        )
+
+    assert [event["event_kind"] for event in events] == [
+        "turn_started",
+        "approval_required",
+    ]
 
 
 def test_native_tui_task_worker_executes_in_bound_session(

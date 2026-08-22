@@ -619,6 +619,25 @@ class ViewerActivityQueries:
                     "SELECT COALESCE(MAX(updated_at), 0) FROM room_tasks"
                 ).fetchone()[0]
             )
+            if visible is None:
+                runtime_event_revision: object = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(event_sequence), 0) "
+                        "FROM room_runtime_events"
+                    ).fetchone()[0]
+                )
+            elif not visible:
+                runtime_event_revision = 0
+            else:
+                placeholders = ",".join("?" for _ in visible)
+                runtime_event_revision = int(
+                    connection.execute(
+                        f"SELECT COALESCE(MAX(event_sequence), 0) "
+                        f"FROM room_runtime_events "
+                        f"WHERE conversation_id IN ({placeholders})",
+                        sorted(visible),
+                    ).fetchone()[0]
+                )
             task_permission_revision = float(
                 connection.execute(
                     "SELECT MAX(revision) FROM ("
@@ -745,6 +764,10 @@ class ViewerActivityQueries:
                 web_user_permission_revision,
             )
             task_revision = private_revision("tasks", task_revision)
+            runtime_event_revision = private_revision(
+                "runtime-events",
+                runtime_event_revision,
+            )
             task_permission_revision = private_revision(
                 "task-permissions",
                 task_permission_revision,
@@ -779,6 +802,7 @@ class ViewerActivityQueries:
             "connectors": connector_revision,
             "permissions": web_user_permission_revision,
             "tasks": task_revision,
+            "runtime_events": runtime_event_revision,
             "task_permissions": task_permission_revision,
             "receipts": receipt_revision,
             "highlights": highlight_revision,
@@ -809,6 +833,7 @@ class ViewerActivityQueries:
                 receipt_revision,
                 highlight_revision,
                 monitoring_revision,
+                runtime_event_revision,
             ],
             "server_time": now,
         }

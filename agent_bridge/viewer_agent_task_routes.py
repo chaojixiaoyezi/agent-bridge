@@ -110,6 +110,37 @@ def build_agent_task_routes(*, store: BridgeStore) -> list[Route]:
             },
         )
 
+    async def agent_task_runtime_event(request: Request) -> Response:
+        return await _agent_json_call(
+            request,
+            store,
+            required={"task_id", "event_id", "source", "event_kind"},
+            allowed={
+                "task_id",
+                "event_id",
+                "source",
+                "event_kind",
+                "native_session_id",
+                "tool_use_id",
+                "tool_name",
+                "summary",
+            },
+            operation=lambda auth, payload: {
+                "event": store.append_room_runtime_event(
+                    participant_id=auth["participant_id"],
+                    authorized_session_id=auth["session_id"],
+                    task_id=payload["task_id"],
+                    event_id=payload["event_id"],
+                    source=payload["source"],
+                    event_kind=payload["event_kind"],
+                    native_session_id=payload.get("native_session_id"),
+                    tool_use_id=payload.get("tool_use_id"),
+                    tool_name=payload.get("tool_name"),
+                    summary=payload.get("summary"),
+                )
+            },
+        )
+
     async def agent_task_delegate(request: Request) -> Response:
         return await _agent_json_call(
             request,
@@ -131,5 +162,10 @@ def build_agent_task_routes(*, store: BridgeStore) -> list[Route]:
             Route("/agent/tasks/next", agent_task_next, methods=["POST"]),
             Route("/agent/tasks/inputs", agent_task_inputs, methods=["POST"]),
             Route("/agent/tasks/update", agent_task_update, methods=["POST"]),
+            Route(
+                "/agent/tasks/runtime-events",
+                agent_task_runtime_event,
+                methods=["POST"],
+            ),
             Route("/agent/tasks/delegate", agent_task_delegate, methods=["POST"]),
     ]

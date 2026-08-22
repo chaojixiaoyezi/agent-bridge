@@ -67,6 +67,7 @@ class ViewerRepository(ViewerMessageQueries, ViewerActivityQueries):
                     "room_task_policies",
                     "room_task_grants",
                     "room_tasks",
+                    "room_runtime_events",
                     "room_message_markers",
                     "operational_metric_samples",
                     "operational_alerts",
@@ -383,6 +384,7 @@ class ViewerRepository(ViewerMessageQueries, ViewerActivityQueries):
         return [
             {
                 "conversation_id": str(row["conversation_id"]),
+                "room_kind": str(row["room_kind"] or "chat"),
                 "status": str(row["status"]),
                 "creator_kind": str(row["creator_kind"]),
                 "creator_participant_id": (

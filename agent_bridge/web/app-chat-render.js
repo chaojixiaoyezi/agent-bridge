@@ -36,6 +36,7 @@ function renderRooms() {
     state.filter.trim().toLocaleLowerCase("zh-CN"),
     state.rooms.map((room) => [
       room.conversation_id,
+      room.room_kind,
       room.status,
       room.latest_created_at || room.last_activity_at,
       room.latest_sender_client_type || room.latest_sender_alias,
@@ -89,6 +90,9 @@ function renderRooms() {
 
       const titleLine = makeElement("div", "room-card-title");
       titleLine.append(makeElement("strong", "", room.conversation_id));
+      if (room.room_kind === "integration") {
+        titleLine.append(makeElement("span", "integration-room-badge", "TUI"));
+      }
       if (abandoned) {
         titleLine.append(makeElement("span", "abandoned-badge", "已废弃"));
       } else {
@@ -242,6 +246,75 @@ function populateDeliveryDetails(container, message) {
     list.append(row);
   }
   container.replaceChildren(list);
+}
+
+function createTaskRuntimeProjection(task) {
+  const events = Array.isArray(task.runtime_events) ? task.runtime_events : [];
+  if (!events.length) return null;
+  const projection = makeElement("section", "task-runtime-projection");
+  const session = [...events]
+    .reverse()
+    .find((event) => event.native_session_id)?.native_session_id;
+  const header = makeElement("div", "task-runtime-header");
+  const dots = makeElement("span", "task-runtime-dots");
+  dots.append(makeElement("i"), makeElement("i"), makeElement("i"));
+  header.append(dots);
+  header.append(makeElement("strong", "", "Claude Code"));
+  header.append(makeElement(
+    "span",
+    "",
+    session ? `session ${session.slice(0, 8)}` : "native stream",
+  ));
+  projection.append(header);
+  const stream = makeElement("div", "task-runtime-stream");
+  const labels = {
+    turn_started: "新回合",
+    tool_started: "运行",
+    tool_completed: "完成",
+    tool_failed: "失败",
+    approval_required: "等待本机授权",
+    turn_completed: "回合完成",
+    runtime_error: "运行错误",
+  };
+  for (const event of events) {
+    const kind = event.event_kind || "runtime_error";
+    const row = makeElement("div", `task-runtime-event ${kind}`);
+    if (kind === "assistant_text") {
+      row.append(makeElement("span", "task-runtime-mark", "◆"));
+      row.append(makeElement("p", "task-runtime-assistant", event.summary || ""));
+    } else {
+      const mark = {
+        turn_started: "›",
+        tool_started: "●",
+        tool_completed: "✓",
+        tool_failed: "×",
+        approval_required: "!",
+        turn_completed: "✓",
+        runtime_error: "×",
+      }[kind] || "·";
+      row.append(makeElement("span", "task-runtime-mark", mark));
+      const body = makeElement("div", "task-runtime-event-body");
+      const title = event.tool_name
+        ? `${event.tool_name} · ${labels[kind] || kind}`
+        : labels[kind] || kind;
+      const head = makeElement("div", "task-runtime-event-head");
+      head.append(makeElement("strong", "", title));
+      head.append(makeElement("time", "", shortTime(event.created_at)));
+      body.append(head);
+      if (event.summary) body.append(makeElement("pre", "", event.summary));
+      row.append(body);
+    }
+    stream.append(row);
+  }
+  if (task.runtime_events_truncated) {
+    stream.prepend(makeElement(
+      "p",
+      "task-runtime-truncated",
+      `过程较长，仅显示最近 ${events.length}/${task.runtime_event_count} 条事件`,
+    ));
+  }
+  projection.append(stream);
+  return projection;
 }
 
 function createDeliveryDetails(message) {
@@ -412,6 +485,8 @@ function createMessageElement(message) {
     if (task.result_summary) {
       taskCard.append(makeElement("p", "task-summary", task.result_summary));
     }
+    const runtimeProjection = createTaskRuntimeProjection(task);
+    if (runtimeProjection) taskCard.append(runtimeProjection);
     const room = state.rooms.find((item) => item.conversation_id === message.conversation_id);
     if (room?.can_cancel_tasks && !["completed", "failed", "cancelled"].includes(task.status)) {
       const cancelTask = makeElement("button", "message-reply-button task-cancel", "取消任务");

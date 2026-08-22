@@ -476,7 +476,9 @@ class AgentInvitationMixin:
             )
             if not room_permissions["can_invite_agents"]:
                 raise AuthorizationError("你没有邀请 Agent 加入这个聊天室的权限")
-            self._require_active_room(conn, conversation)
+            room = self._require_active_room(conn, conversation)
+            if str(room["room_kind"]) == "integration" and reusable:
+                raise ValidationError("整合聊天室只支持单次 Agent 邀请")
             self._expire_agent_invitations_locked(conn, now=now)
             conn.execute(
                 """
